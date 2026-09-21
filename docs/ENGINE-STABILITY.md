@@ -31,7 +31,7 @@
 
 单次两路线运行记录：单轮图像上传峰值 2,094,080 字节（上限 2,097,152），共 8 个图像上传分块；首个开始输入到首句 338.9 ms，GPU 提交 83 次，资源准入估算峰值 67,160,180 字节。测试同时断言静态标题停止提交、宿主队列不超过 256 项、每轮语义工作不超过 10,000。以上是单次开发环境测量，不是性能分位数或硬件成绩。
 
-CI 工作流已配置；此处记录本地执行结果，远程执行结果以 PR 检查为准。未验证物理 GPU、移动真机及长时间压力场景。
+上表保留初次本地验证。PR #1 合并前的 [GitHub CI](https://github.com/iMMIQ/nir/actions/runs/35557877308) 在提交 `38430ab3105c94f06ee0175393dca68eec72be2f` 上通过原生检查、SDK 构建及 13 项浏览器测试；[浏览器结果](validation/stability/ci-browser-results.json) 已归档。后续修订加入每轮开始时的设备检查，并在 CI 显式使用 X11/Xvfb 和匹配的 SwiftShader/Vulkan 合成配置。未验证物理 GPU、移动真机及长时间压力场景。
 
 证据：[原生测试](validation/stability/stability-all-native.log)、[低预算选择](validation/stability/stability-deadline.log)、[宿主测试](validation/stability/stability-host.log)、[浏览器结果](validation/stability/browser-results.json)、[运行日志](validation/stability/stability-browser-run.log)、[测量](validation/stability/browser-metrics.json)、[独立 SDK](validation/stability/stability-sdk-verification.json)、[发行校验](validation/stability/stability-release.json)。
 
