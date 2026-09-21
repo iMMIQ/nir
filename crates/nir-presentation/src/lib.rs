@@ -4,6 +4,8 @@ pub use cosmic_text;
 use fluent_bundle::{FluentBundle, FluentResource};
 use nir_format::*;
 use serde::Serialize;
+mod reading;
+pub use reading::{ReadingState, ScrollView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -78,6 +80,9 @@ pub struct TextRun {
     pub size: f32,
     pub color: [f32; 4],
     pub emphasis: Vec<(usize, usize)>,
+    pub scroll: f32,
+    pub clip: Option<[f32; 4]>,
+    pub region: Option<ScrollRegion>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticNode {
@@ -98,6 +103,8 @@ pub struct DrawPacket {
     pub height: f32,
     pub stage_size: [u32; 2],
     pub transition_layers: Option<(Vec<Quad>, Vec<Quad>, f32)>,
+    pub scrolls: Vec<ScrollView>,
+    pub(crate) dialogue_hint: Option<usize>,
 }
 pub struct Messages {
     en: FluentBundle<FluentResource>,
@@ -163,6 +170,9 @@ impl DrawPacket {
             size,
             color: c,
             emphasis: vec![],
+            scroll: 0.,
+            clip: None,
+            region: None,
         });
     }
     fn button(
@@ -296,6 +306,16 @@ fn scene(packet: &mut DrawPacket, nodes: &[Node], stage: [f32; 2], alpha: f32) {
 }
 
 pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> DrawPacket {
+    project_measured(m, width, height, messages, &[], 0.)
+}
+fn project_measured(
+    m: &UiModel,
+    width: f32,
+    height: f32,
+    messages: &Messages,
+    choice_heights: &[f32],
+    choice_offset: f32,
+) -> DrawPacket {
     let mut p = DrawPacket {
         width,
         height,
@@ -449,8 +469,12 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                     size,
                     color: t.text,
                     emphasis: d.emphasis.clone(),
+                    scroll: 0.,
+                    clip: None,
+                    region: Some(ScrollRegion::Dialogue),
                 });
                 p.announcement = d.full_text.clone();
+                p.dialogue_hint = Some(p.texts.len());
                 p.text(
                     if d.gate {
                         "…"
@@ -479,22 +503,64 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                     ChoiceComponent::Standard => 14.,
                     ChoiceComponent::Compact => 6.,
                 };
-                let row = t.choice.item_height + gap;
-                let h = m.choices.len() as f32 * row + 32.;
+                let heights: Vec<_> = m
+                    .choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        choice_heights
+                            .get(i)
+                            .copied()
+                            .unwrap_or(t.choice.item_height)
+                    })
+                    .collect();
+                let total = heights.iter().sum::<f32>() + gap * (heights.len() - 1) as f32;
+                let view_height = total.min((height - 176.).max(48.));
                 let x = (width - w) / 2.;
-                let y = ((height - h) / 2. - 40.).max(80.);
-                p.rect([x - 12., y - 16., w + 24., h], t.panel);
-                for (i, c) in m.choices.iter().enumerate() {
-                    p.button(
-                        c.label.clone(),
-                        UiAction::Choose {
-                            option: c.id.clone(),
+                let y = ((height - view_height - 32.) / 2. - 40.).max(80.);
+                let viewport = [x, y, w, view_height];
+                let max = (total - view_height).max(0.);
+                let offset = choice_offset.clamp(0., max);
+                p.rect([x - 12., y - 16., w + 24., view_height + 32.], t.panel);
+                let mut row_y = y - offset;
+                for (c, h) in m.choices.iter().zip(heights) {
+                    if row_y + h > y && row_y < y + view_height {
+                        p.button(
+                            c.label.clone(),
+                            UiAction::Choose {
+                                option: c.id.clone(),
+                            },
+                            [x, row_y, w, h],
+                            false,
+                            t,
+                        );
+                        p.quads.last_mut().unwrap().clip = Some(viewport);
+                        let text = p.texts.last_mut().unwrap();
+                        text.size = 16. * m.prefs.font_scale;
+                        text.clip = Some(viewport);
+                        if !c.enabled {
+                            text.color = t.muted;
+                        }
+                        let node = p.semantics.last_mut().unwrap();
+                        node.enabled = c.enabled;
+                        node.rect[1] = row_y.max(y);
+                        node.rect[3] = (row_y + h).min(y + view_height) - node.rect[1];
+                    }
+                    row_y += h + gap;
+                }
+                if max > 0. {
+                    reading::controls(
+                        &mut p,
+                        ScrollView {
+                            region: ScrollRegion::Choices,
+                            rect: viewport,
+                            offset,
+                            max,
+                            step: (view_height - 32.).max(32.),
                         },
-                        [x, y + i as f32 * row, w, t.choice.item_height],
-                        false,
-                        t,
+                        m,
+                        messages,
                     );
-                    p.semantics.last_mut().unwrap().enabled = c.enabled;
                 }
             }
             let items = [
@@ -750,10 +816,13 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                         x,
                         y: y + 76.,
                         width: w,
-                        height: height - y - 226.,
+                        height: (height - y - 276.).max(40.),
                         size: if narrow { 16. } else { 18. },
                         color: t.text,
                         emphasis: vec![],
+                        scroll: 0.,
+                        clip: None,
+                        region: Some(ScrollRegion::History),
                     });
                     p.button(
                         "←".into(),
@@ -809,6 +878,9 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
             size: 15.,
             color: t.text,
             emphasis: vec![],
+            scroll: 0.,
+            clip: None,
+            region: None,
         });
         if m.fault_recovery.contains(&Recovery::Retry) {
             p.button(
@@ -869,6 +941,23 @@ impl TextEngine {
             run.emphasis,
             run.text
         )
+    }
+    /// Original UTF-8 offsets for the exact paragraph splitter used by shaping.
+    pub fn line_offsets(run: &TextRun) -> Vec<usize> {
+        let mut offsets: Vec<_> = if run.emphasis.is_empty() {
+            cosmic_text::LineIter::new(&run.text)
+                .map(|(range, _)| range.start)
+                .collect()
+        } else {
+            cosmic_text::BidiParagraphs::new(&run.text)
+                .map(|line| line.as_ptr() as usize - run.text.as_ptr() as usize)
+                .collect()
+        };
+        // cosmic-text keeps one empty BufferLine for an empty string.
+        if offsets.is_empty() {
+            offsets.push(0);
+        }
+        offsets
     }
     pub fn layout(&mut self, packet: &DrawPacket) {
         for r in &packet.texts {

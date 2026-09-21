@@ -3,7 +3,7 @@
 #![cfg(target_arch = "wasm32")]
 use nir_format::*;
 use nir_player::{AppCommand, AppEvent, Player, SaveEnvelope};
-use nir_presentation::{project, DrawPacket, Messages, SlotView};
+use nir_presentation::{DrawPacket, Messages, ReadingState, SlotView};
 use nir_render_wgpu::{wgpu, Renderer};
 use std::collections::BTreeSet;
 use wasm_bindgen::prelude::*;
@@ -39,6 +39,8 @@ pub struct Engine {
     renderer: Renderer,
     messages: Messages,
     packet: DrawPacket,
+    reading: ReadingState,
+    view_sequence: (u32, u32),
     fonts: BTreeSet<String>,
     outbox: Vec<AppCommand>,
     width: f32,
@@ -68,6 +70,8 @@ impl Engine {
             renderer,
             messages: Messages::default(),
             packet: DrawPacket::default(),
+            reading: ReadingState::default(),
+            view_sequence: (0, 0),
             fonts: BTreeSet::new(),
             outbox: vec![],
             width: 1280.,
@@ -186,7 +190,70 @@ impl Engine {
         sequence: u32,
         session: u32,
     ) -> std::result::Result<(), JsValue> {
-        let action: UiAction = nir_content::parse(json.as_bytes(), "action").map_err(js)?;
+        let mut action: UiAction = nir_content::parse(json.as_bytes(), "action").map_err(js)?;
+        let identity = (
+            self.player.generation.session,
+            self.player.current_interaction(),
+        );
+        if self.ready
+            && !self.player.is_loading()
+            && session == identity.0
+            && interaction == identity.1
+            && matches!(action, UiAction::Advance | UiAction::Scroll { .. })
+        {
+            // Earlier inputs in this same owner turn may have revealed more text.
+            // Navigation must use current layout, not the previous submitted frame.
+            self.packet = self.reading.project(
+                &self.player.model(),
+                identity,
+                self.width,
+                self.height,
+                &self.messages,
+                &mut self.renderer.text,
+            );
+        }
+
+        if self.view_sequence.0 == session && sequence <= self.view_sequence.1 {
+            return Ok(());
+        }
+        let valid = session == identity.0
+            && interaction == identity.1
+            && sequence > self.player.core().state().last_input
+            && self.reading.matches(identity)
+            && !self.player.is_loading();
+        if let UiAction::Scroll { region, delta } = action {
+            if !valid {
+                return Ok(());
+            }
+            self.reading.scroll(region, delta, &self.packet);
+            self.view_sequence = (session, sequence);
+        } else if action == UiAction::Advance
+            && valid
+            && !self.player.paused()
+            && self.player.screen == nir_presentation::Screen::Story
+            && self.player.core().state().choice.is_none()
+        {
+            if let Some((_, dialogue)) = self.player.core().dialogue() {
+                if (dialogue.awaiting_advance || dialogue.at_gate)
+                    && self
+                        .packet
+                        .scrolls
+                        .iter()
+                        .any(|s| s.region == ScrollRegion::Dialogue && s.offset < s.max - 0.5)
+                {
+                    self.reading.scroll(ScrollRegion::Dialogue, 1, &self.packet);
+                    self.view_sequence = (session, sequence);
+                    action = UiAction::Scroll {
+                        region: ScrollRegion::Dialogue,
+                        delta: 1,
+                    };
+                } else if !dialogue.awaiting_advance && !dialogue.at_gate {
+                    // Reveal-to-gate keeps the reader's viewport; subsequent Advance browses it.
+                    self.reading.hold_dialogue();
+                    self.view_sequence = (session, sequence);
+                }
+            }
+        }
         self.pump(vec![AppEvent::Action {
             action,
             interaction,
@@ -310,7 +377,17 @@ impl Engine {
             self.pump(vec![])?;
         }
         if self.ready {
-            self.packet = project(&self.player.model(), width, height, &self.messages);
+            self.packet = self.reading.project(
+                &self.player.model(),
+                (
+                    self.player.generation.session,
+                    self.player.current_interaction(),
+                ),
+                width,
+                height,
+                &self.messages,
+                &mut self.renderer.text,
+            );
             let signature = format!(
                 "{:?}:{:?}:{:?}:{}",
                 self.packet.quads, self.packet.texts, self.packet.transition_layers, dpr
@@ -328,7 +405,7 @@ impl Engine {
     }
     pub fn state(&self) -> String {
         let c = self.player.core();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
     }
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
@@ -382,11 +459,13 @@ impl Engine {
             let mut events = vec![];
             for command in commands {
                 if let AppCommand::PreparePresentation { request } = command {
-                    let preview = project(
+                    let preview = ReadingState::default().project(
                         &self.player.preview(),
+                        (0, request),
                         self.width,
                         self.height,
                         &self.messages,
+                        &mut self.renderer.text,
                     );
                     let start = nir_platform_web::now_us();
                     let prepared = self.renderer.prepare(&preview, self.dpr, true);

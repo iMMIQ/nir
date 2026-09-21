@@ -6,11 +6,13 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 
 `examples/rain-letters/`（《雨后书简》）是随仓库提供的测试工程，用于验证引擎功能、运行两条剧情测试路线，以及演示作品工程格式。其简单图像和合成音频用于测试。
 
-这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 、[诊断和性能测量](docs/DIAGNOSTICS.md) 与 [作品配置和主题契约](docs/PROJECT-THEMES.md)。
+这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 、[诊断和性能测量](docs/DIAGNOSTICS.md) 、[作品配置和主题契约](docs/PROJECT-THEMES.md) 与 [作者阅读和预览](docs/AUTHOR-READING.md)。
 
 ## 使用 SDK 创建作品
 
 从 [GitHub Releases](https://github.com/iMMIQ/nir/releases) 下载 Linux x86_64 SDK 与 CLI 包，解压后在包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
+
+当前源码包含 v0.1.0 之后的改进。要使用作品配置、长内容阅读和自动预览，请按下文从源码构建配套 SDK；已发布的 v0.1.0 包尚不包含这些能力。
 
 ```sh
 ./novelc init my-story
@@ -24,7 +26,7 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 
 `init` 当前使用随 SDK 提供的测试工程模板，可在此基础上替换正文、逻辑和素材。从源码构建时，配套 CLI 与 SDK 位于 `dist/`。
 
-`dev` 使用正式播放器和 4173 端口；修改内容后重新运行构建并刷新页面。当前没有文件监听或热更新。`dev --scenario tests/scenarios/walk.toml` 验证已登记的场景用例，再从合法新游戏入口打开预览，不会跳过剧情前置操作。
+`dev` 使用正式播放器和 4173 端口；监听作者文件，构建成功后自动完整重载，失败时保留上次有效预览并显示诊断。重载从标题入口开始，未保存进度会丢失；不迁移旧发行会话。详见 [长内容与开发预览](docs/AUTHOR-READING.md)。`dev --scenario tests/scenarios/walk.toml` 验证已登记的场景用例，再从合法新游戏入口打开预览，不会跳过剧情前置操作。
 
 `game.lock` 固定 SDK 文件及配套 CLI 身份。显式更换 SDK 后运行 `resolve`；`--locked` 遇到漂移会报错。可以用 `--sdk /path/to/sdk` 或 `NIR_SDK` 指定 SDK，须使用该 SDK 配套的 `novelc`。
 

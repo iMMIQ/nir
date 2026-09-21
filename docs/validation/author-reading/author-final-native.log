@@ -1,0 +1,60 @@
+   Compiling nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+   Compiling nir-player v0.1.0 (/nir/crates/nir-player)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.74s
+     Running unittests src/lib.rs (target/debug/deps/nir_player-7de4c8f253c454ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/coordination.rs (target/debug/deps/coordination-bee41b104a0b54f8)
+
+running 27 tests
+test author_auto_delay_controls_reading_after_reveal_and_pauses ... ok
+test consecutive_rollbacks_keep_the_earlier_checkpoints ... ok
+test failed_preparation_cannot_be_committed_by_late_success ... ok
+test device_rebuild_does_not_restart_story ... ok
+test inbox_overflow_is_explicit_and_bounded ... ok
+test incompatible_restore_keeps_current_session ... ok
+test invalid_locale_does_not_replace_the_open_dialogue ... ok
+test external_pause_survives_new_game_and_token_outlives_player ... ok
+test many_events_cannot_multiply_the_story_work_budget ... ok
+test late_failure_does_not_overwrite_successful_save_status ... ok
+test device_loss_during_candidate_restore_keeps_the_candidate ... ok
+test menu_and_background_pause_owners_are_independent ... ok
+test replacing_preparation_emits_one_cancellation_and_ignores_its_terminal ... ok
+test preparation_diagnostic_keeps_identity_and_hides_internal_cause ... ok
+test same_reason_tokens_release_only_their_own_pause ... ok
+test save_diagnostic_retains_the_origin_session_after_replacement ... ok
+test save_job_survives_new_session ... ok
+test stale_asset_callbacks_cannot_commit ... ok
+test theme_components_preserve_semantics_gates_and_viewport_bounds ... ok
+test work_is_retained_and_terminal_events_have_admission_room ... ok
+test work_defaults_yield_to_player_preferences_and_survive_new_sessions ... ok
+test choice_input_in_the_deadline_pump_precedes_timeout ... ok
+test restore_is_candidate_then_paused_commit ... ok
+test history_allows_browsing_inside_a_long_entry ... ok
+test mixed_line_endings_and_styled_paragraphs_keep_original_reveal_offsets ... ok
+test long_dialogue_browses_only_revealed_text_and_preserves_it_on_reflow ... ok
+test measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_presentation-8ed2f92e4ba8d58f)
+
+running 1 test
+test scene_tests::group_order_and_nested_clip_are_composed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_player
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_presentation
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

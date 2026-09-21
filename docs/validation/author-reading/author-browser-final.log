@@ -1,0 +1,12 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:browser
+npm notice run playwright test tests/browser/authoring.spec.js --max-failures=1
+
+Running 2 tests using 1 worker
+
+(node:1395705) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  1 tests/browser/authoring.spec.js:62:1 › long author content remains readable across advance, input, reflow, restore and many choices (21.1s)
+  ✓  2 tests/browser/authoring.spec.js:155:1 › dev rebuild reloads valid content and retains the previous session on author errors (12.4s)
+
+  2 passed (38.8s)

@@ -34,3 +34,6 @@ error-storage = Storage operation failed. The current session is kept.
 error-render = The graphics device needs recovery.
 error-content = Content execution failed.
 error-host = Player operation failed.
+
+scroll-back = Page up
+scroll-forward = Page down

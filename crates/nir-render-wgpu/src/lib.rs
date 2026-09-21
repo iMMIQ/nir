@@ -482,24 +482,24 @@ impl Renderer {
                 (r.color[2] * 255.) as u8,
                 (r.color[3] * 255.) as u8,
             );
-            let bounds = TextBounds {
+            let mut bounds = TextBounds {
                 left: (r.x * dpr) as i32,
                 top: (r.y * dpr) as i32,
                 right: ((r.x + r.width) * dpr) as i32,
                 bottom: ((r.y + r.height) * dpr) as i32,
             };
+            if let Some([x, y, w, h]) = r.clip {
+                bounds.left = bounds.left.max((x * dpr) as i32);
+                bounds.top = bounds.top.max((y * dpr) as i32);
+                bounds.right = bounds.right.min(((x + w) * dpr) as i32);
+                bounds.bottom = bounds.bottom.min(((y + h) * dpr) as i32);
+            }
+            if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+                continue;
+            }
             if let Some(visible) = r.visible.filter(|_| !full) {
-                let offsets: Vec<usize> = std::iter::once(0)
-                    .chain(r.text.match_indices('\n').map(|(i, _)| i + 1))
-                    .collect();
-                let mut last_bottom = 0f32;
-                for run in b.layout_runs() {
-                    let off = *offsets.get(run.line_i).unwrap_or(&0);
-                    if run.glyphs.iter().any(|g| off + g.end <= visible) {
-                        last_bottom = last_bottom.max(run.line_top + run.line_height);
-                    }
-                }
-                let scroll = (last_bottom - r.height).max(0.);
+                let offsets = TextEngine::line_offsets(r);
+                let scroll = r.scroll;
                 for run in b.layout_runs() {
                     let off = *offsets.get(run.line_i).unwrap_or(&0);
                     let right = run
@@ -535,7 +535,7 @@ impl Renderer {
                 areas.push(TextArea {
                     buffer: b,
                     left: r.x * dpr,
-                    top: r.y * dpr,
+                    top: (r.y - r.scroll) * dpr,
                     scale: dpr,
                     bounds,
                     default_color: color,
