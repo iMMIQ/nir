@@ -215,6 +215,10 @@ pub enum CoreIntent {
 }
 #[derive(Debug, Clone)]
 pub struct CoreStep {
+    /// Instructions and clock boundaries consumed by this call.
+    pub work_used: u32,
+    /// Elapsed time the caller must resubmit after a budget yield.
+    pub remaining_time_us: u64,
     pub intents: Vec<CoreIntent>,
     pub waiting: bool,
     pub location: String,
@@ -225,6 +229,8 @@ pub struct Core {
     program: ValidatedProgram,
     state: Snapshot,
     intents: Vec<CoreIntent>,
+    work_remaining: u32,
+    remaining_time_us: u64,
 }
 impl Core {
     pub fn new(program: ValidatedProgram, release: String, locale: String) -> Result<Self> {
@@ -275,6 +281,8 @@ impl Core {
             program,
             state,
             intents: vec![],
+            work_remaining: 0,
+            remaining_time_us: 0,
         })
     }
     pub fn state(&self) -> &Snapshot {
@@ -462,13 +470,18 @@ impl Core {
     }
     pub fn step(&mut self, input: CoreInput, semantic_budget: u32) -> CoreStep {
         self.intents.clear();
+        let limit = semantic_budget.min(100_000);
+        self.work_remaining = limit;
+        self.remaining_time_us = 0;
         let changed = !matches!(input, CoreInput::None);
         if self.state.fault.is_none() && self.state.outcome.is_none() {
-            if let Err(e) = self.process(input).and_then(|_| self.run(semantic_budget)) {
+            if let Err(e) = self.process(input).and_then(|_| self.run()) {
                 self.state.fault = Some(e);
             }
         }
         CoreStep {
+            work_used: limit - self.work_remaining,
+            remaining_time_us: self.remaining_time_us,
             intents: std::mem::take(&mut self.intents),
             waiting: self.state.pending.is_some()
                 || self.state.waiting.is_some()
@@ -572,8 +585,8 @@ impl Core {
         }
         Ok(())
     }
-    fn run(&mut self, budget: u32) -> Result<()> {
-        for _ in 0..budget.min(100_000) {
+    fn run(&mut self) -> Result<()> {
+        while self.work_remaining > 0 {
             if self.state.pending.is_some()
                 || self.state.choice.is_some()
                 || self.state.outcome.is_some()
@@ -583,6 +596,7 @@ impl Core {
             if self.state.waiting.is_some() && !self.resolve_wait()? {
                 return Ok(());
             }
+            self.work_remaining -= 1;
             self.state.unsuspended_ops += 1;
             if self.state.unsuspended_ops > 1_000_000 {
                 return Err(self.error("E_FUEL", "non-suspending loop"));
@@ -1196,15 +1210,17 @@ impl Core {
             .0
             .checked_add(delta)
             .ok_or_else(|| self.error("E_TIME", "clock overflow"))?;
-        let mut turns = 0;
+        // Finish runnable logic at this instant before moving to the next deadline.
+        self.run()?;
         while self.state.tick_us.0 < end
             && self.state.pending.is_none()
             && self.state.outcome.is_none()
         {
-            turns += 1;
-            if turns > 100_000 {
-                return Err(self.error("E_LIMIT", "time event budget"));
+            if self.work_remaining == 0 {
+                self.remaining_time_us = end - self.state.tick_us.0;
+                break;
             }
+            self.work_remaining -= 1;
             let now = self.state.tick_us.0;
             let mut next = end;
             for t in self
@@ -1280,7 +1296,7 @@ impl Core {
                     }
                 }
             }
-            self.run(10_000)?;
+            self.run()?;
         }
         Ok(())
     }
@@ -1631,6 +1647,8 @@ impl Core {
             program,
             state: s,
             intents: vec![],
+            work_remaining: 0,
+            remaining_time_us: 0,
         };
         core.state.last_input = 0;
         // Restored interactions receive fresh identities, in addition to the host epoch change.

@@ -11,7 +11,7 @@ try {
     const raw=await fetchBytes(`releases/${channel.release}.json`);if(await hash(raw)!==channel.release)throw new Error('E_RELEASE_DIGEST');const release=JSON.parse(new TextDecoder().decode(raw));
     if(release.format!==1||!release.engine||!release.objects)throw new Error('E_RELEASE_SCHEMA');
     const objectUrl=(id)=>{const o=release.objects[id];if(!o||!(/^[0-9a-f]{64}$/).test(id)||!o.path.startsWith(`objects/${id}.`)||o.path.includes('..')||o.path.includes(':')||o.path.includes('\\'))throw new Error('E_OBJECT_REFERENCE');return new URL(o.path,base);};
-    const fetchObject=async(id)=>{const o=release.objects[id],url=objectUrl(id);const r=await fetch(url);if(!r.ok)throw new Error(`E_HTTP: ${r.status} ${id}`);const bytes=await r.arrayBuffer();if(bytes.byteLength!==o.bytes||await hash(bytes)!==id)throw new Error(`E_OBJECT_DIGEST: ${id}`);return bytes;};
+    const fetchObject=async(id,signal)=>{const o=release.objects[id],url=objectUrl(id);const r=await fetch(url,{signal});if(!r.ok)throw new Error(`E_HTTP: ${r.status} ${id}`);const bytes=await r.arrayBuffer();if(bytes.byteLength!==o.bytes||await hash(bytes)!==id)throw new Error(`E_OBJECT_DIGEST: ${id}`);return bytes;};
     // Small code objects are verified before import. Immutable URLs and same-origin policy
     // bind the subsequent browser import to the same publisher-controlled object graph.
     await Promise.all([fetchObject(release.engine.js),fetchObject(release.engine.host)]);

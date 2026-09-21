@@ -5,7 +5,13 @@ use nir_core::*;
 use nir_format::*;
 use nir_presentation::{ChoiceView, DialogueView, Screen, SlotView, UiModel};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod pause;
+pub use pause::PauseToken;
+use pause::Pauses;
+
+pub const EVENT_CAPACITY: usize = 256;
+const INPUT_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +30,9 @@ pub enum AppCommand {
         session: u32,
         device: u32,
         assets: Vec<String>,
+    },
+    CancelAssets {
+        request: u32,
     },
     PreparePresentation {
         request: u32,
@@ -132,6 +141,7 @@ struct Preparation {
     purpose: Purpose,
     job: PrepareJob,
     preflight: bool,
+    failed: bool,
 }
 pub struct Player {
     core: Core,
@@ -148,7 +158,10 @@ pub struct Player {
     pub skip: bool,
     pub profile: BTreeSet<String>,
     pub slots: Vec<SlotView>,
-    pauses: BTreeSet<String>,
+    pauses: Pauses,
+    audio_paused: bool,
+    inbox: VecDeque<(u32, AppEvent)>,
+    work_used: u32,
     prepare: Option<Preparation>,
     candidate: Option<Core>,
     device_resume: Option<Purpose>,
@@ -204,7 +217,10 @@ impl Player {
                     ..Default::default()
                 })
                 .collect(),
-            pauses: BTreeSet::new(),
+            pauses: Pauses::default(),
+            audio_paused: true,
+            inbox: VecDeque::new(),
+            work_used: 0,
             prepare: None,
             candidate: None,
             device_resume: None,
@@ -223,6 +239,15 @@ impl Player {
         p.begin_prepare(Purpose::Boot, 0, assets)?;
         Ok(p)
     }
+    pub fn acquire_pause(&self, reason: impl Into<String>) -> PauseToken {
+        self.pauses.acquire(reason.into())
+    }
+    pub fn work_used(&self) -> u32 {
+        self.work_used
+    }
+    pub fn pending_events(&self) -> usize {
+        self.inbox.len()
+    }
     pub fn core(&self) -> &Core {
         &self.core
     }
@@ -236,7 +261,9 @@ impl Player {
             .unwrap_or(0)
     }
     pub fn accepts(&self, request: u32) -> bool {
-        self.prepare.as_ref().is_some_and(|p| p.request == request)
+        self.prepare
+            .as_ref()
+            .is_some_and(|p| p.request == request && !p.failed)
     }
     pub fn memory_used(&self) -> u64 {
         self.ledger.used()
@@ -365,11 +392,13 @@ impl Player {
             &self.ledger,
         )?;
         let request = self.request;
+        self.cancel_preparation();
         self.prepare = Some(Preparation {
             request,
             purpose,
             job,
             preflight: false,
+            failed: false,
         });
         self.pauses.insert("prepare".into());
         self.commands.push(AppCommand::GetAssets {
@@ -380,8 +409,25 @@ impl Player {
         });
         Ok(())
     }
-    fn step(&mut self, input: CoreInput, budget: u32) -> Result<()> {
-        let output = self.core.step(input, budget);
+    fn cancel_preparation(&mut self) {
+        if let Some(p) = self.prepare.take() {
+            if !p.failed {
+                self.commands
+                    .push(AppCommand::CancelAssets { request: p.request });
+            }
+        }
+    }
+    fn step(&mut self, input: CoreInput, budget: &mut u32) -> Result<()> {
+        let output = self.core.step(input, *budget);
+        *budget -= output.work_used;
+        if output.remaining_time_us > 0 {
+            self.inbox.push_front((
+                self.generation.session,
+                AppEvent::Tick {
+                    delta_us: output.remaining_time_us,
+                },
+            ));
+        }
         for intent in output.intents {
             match intent {
                 CoreIntent::Prepare { activation, cue } => self.begin_prepare(
@@ -445,28 +491,54 @@ impl Player {
         Ok(())
     }
     pub fn pump(&mut self, events: Vec<AppEvent>, budget: u32) -> Vec<AppCommand> {
-        let before = self.paused();
-        // User actions are processed before elapsed time, including same-tick choice deadlines.
-        let mut events = events;
-        events.sort_by_key(|e| matches!(e, AppEvent::Tick { .. }));
+        // Admission leaves room for resource, audio and storage terminal events.
         for event in events {
-            if let Err(e) = self.event(event, budget) {
+            let input = matches!(event, AppEvent::Action { .. } | AppEvent::Tick { .. });
+            let limit = if input {
+                INPUT_CAPACITY
+            } else {
+                EVENT_CAPACITY
+            };
+            if self.inbox.len() >= limit {
+                self.error = Some("E_EVENT_QUEUE: event admission limit".into());
+                self.pauses.insert("queue-overflow".into());
+                continue;
+            }
+            self.inbox.push_back((self.generation.session, event));
+        }
+        // Stable partition across retained work, so a choice beats same-turn time.
+        self.inbox
+            .make_contiguous()
+            .sort_by_key(|(_, e)| matches!(e, AppEvent::Tick { .. }));
+        let mut remaining = budget.min(100_000);
+        let limit = remaining;
+        while remaining > 0 {
+            let Some((session, event)) = self.inbox.pop_front() else {
+                break;
+            };
+            remaining -= 1;
+            if matches!(event, AppEvent::Tick { .. }) && session != self.generation.session {
+                continue;
+            }
+            if let Err(e) = self.event(event, &mut remaining) {
                 self.status = e.to_string();
                 self.error = Some(e.to_string());
             }
         }
         if self.prepare.is_none() && self.screen == Screen::Story && self.pauses.is_empty() {
-            if let Err(e) = self.step(CoreInput::None, budget) {
+            if let Err(e) = self.step(CoreInput::None, &mut remaining) {
                 self.error = Some(e.to_string());
             }
         }
+        self.work_used = limit - remaining;
         let after = self.paused();
-        if before != after {
+        if self.audio_paused != after {
+            self.audio_paused = after;
             self.commands.push(AppCommand::AudioPause { paused: after });
         }
         std::mem::take(&mut self.commands)
     }
-    fn event(&mut self, e: AppEvent, budget: u32) -> Result<()> {
+    fn event(&mut self, e: AppEvent, budget: &mut u32) -> Result<()> {
         match e {
             AppEvent::Action {
                 action,
@@ -480,17 +552,22 @@ impl Player {
             }
             AppEvent::Tick { delta_us } => {
                 if self.needs_clock() {
+                    let before = self.core.state().tick_us.0;
                     self.step(
                         CoreInput::Time {
                             delta_us: delta_us.min(250_000),
                         },
                         budget,
                     )?;
-                    self.read_policy(delta_us, budget)?;
+                    self.read_policy(self.core.state().tick_us.0 - before, budget)?;
                 }
             }
             AppEvent::AssetReady { request, asset } => {
-                if let Some(p) = self.prepare.as_mut().filter(|p| p.request == request) {
+                if let Some(p) = self
+                    .prepare
+                    .as_mut()
+                    .filter(|p| p.request == request && !p.failed)
+                {
                     p.job.ready(&asset, self.generation);
                     if p.job.missing.is_empty() && !p.preflight {
                         p.preflight = true;
@@ -501,6 +578,8 @@ impl Player {
             }
             AppEvent::AssetFailed { request, message } => {
                 if self.accepts(request) {
+                    self.prepare.as_mut().unwrap().failed = true;
+                    self.commands.push(AppCommand::CancelAssets { request });
                     self.error = Some(message.clone());
                     if let Some(p) = &self.core.state().pending {
                         self.core.step(
@@ -566,8 +645,9 @@ impl Player {
                 }
             }
             AppEvent::SaveFailed { job, message } => {
-                self.save_jobs.remove(&job);
-                self.status = message;
+                if self.save_jobs.remove(&job).is_some() {
+                    self.status = message;
+                }
             }
             AppEvent::Slots(slots, revisions) => {
                 self.slots = slots;
@@ -587,7 +667,8 @@ impl Player {
             AppEvent::Profile(keys) => self.profile.extend(keys),
             AppEvent::DeviceLost => {
                 self.generation.device += 1;
-                self.device_resume = self.prepare.take().map(|p| p.purpose);
+                self.device_resume = self.prepare.as_ref().map(|p| p.purpose);
+                self.cancel_preparation();
                 self.pauses.insert("device".into());
                 self.commands.push(AppCommand::AudioPause { paused: true });
             }
@@ -602,7 +683,7 @@ impl Player {
         }
         Ok(())
     }
-    fn complete(&mut self, request: u32, budget: u32) -> Result<()> {
+    fn complete(&mut self, request: u32, budget: &mut u32) -> Result<()> {
         if !self.accepts(request) {
             return Ok(());
         }
@@ -693,7 +774,13 @@ impl Player {
         self.candidate = Some(candidate);
         Ok(())
     }
-    fn action(&mut self, a: UiAction, interaction: u32, sequence: u32, budget: u32) -> Result<()> {
+    fn action(
+        &mut self,
+        a: UiAction,
+        interaction: u32,
+        sequence: u32,
+        budget: &mut u32,
+    ) -> Result<()> {
         match a {
             UiAction::NewGame => {
                 if self.prepare.is_some() {
@@ -774,7 +861,7 @@ impl Player {
             }
             UiAction::Title => {
                 self.commands.push(AppCommand::AudioReset);
-                self.prepare = None;
+                self.cancel_preparation();
                 self.candidate = None;
                 self.pauses.retain(|r| r == "hidden");
                 self.screen = Screen::Title;
@@ -902,13 +989,14 @@ impl Player {
         });
     }
     fn restart_preparation(&mut self) -> Result<()> {
-        if let Some(prep) = self.prepare.take() {
+        if let Some(prep) = self.prepare.as_ref() {
+            let (purpose, activation) = (prep.purpose, prep.job.activation);
             let assets = self.retained_assets();
-            self.begin_prepare(prep.purpose, prep.job.activation, assets)?;
+            self.begin_prepare(purpose, activation, assets)?;
         }
         Ok(())
     }
-    fn read_policy(&mut self, delta: u64, budget: u32) -> Result<()> {
+    fn read_policy(&mut self, delta: u64, budget: &mut u32) -> Result<()> {
         if self.paused() || self.core.state().choice.is_some() {
             self.skip = false;
             return Ok(());
