@@ -1,7 +1,7 @@
 format = 1
 engine_api = "nir-player/0.1"
 capability_profile = "web-v1"
-sdk_digest = "0d061d874e85971948e39dd55a75c448cbae8250273cb55752a8ae2589e8c3cc"
+sdk_digest = "ca6c71ef32de23d022258f6007c251f99ed73ebd0d35e574511466ed42fd7173"
 
 [sdk]
 format = 1
@@ -11,7 +11,7 @@ compiler_version = "0.1.0"
 "THIRD-PARTY.txt" = "8a365f66b2b76c3c8e231024b095be78c980c8d1c5852849345772a1944e5848"
 "bootstrap.js" = "770745e4b7ff4ca1e26816da22638fb9e5a114ce18370040b37c43557a6db5de"
 "compiler.sha256" = "b350de0b618768632f8a36b8ecfa1e8b3c2943f22e8cd614fda37fec64eb59a5"
-"host.js" = "64176589d217aeabcc65662dc4d338552c8251ef6d7a51eefe885dde9739c54c"
+"host.js" = "43ce9fa388b4198ed3eb2a2abe871fc0f8da2e2d8cf0009d56247a74012dfdf8"
 "index.html" = "11b518cb7fbe928d023d394ff546ff4223a4461544678a1e669172a58c87ea34"
 "player_web.js" = "76cd7fa64366ad248a3b3dd0a200a9098fd013fab6ea74191e9305e7cc860de3"
 "player_web_bg.wasm" = "c2d8d6c7e0c28b68581598406ee4a4444d7d8fc837d6e73784e67a4febc417d9"

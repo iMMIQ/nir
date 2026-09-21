@@ -219,6 +219,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         if(disposed)return;
         try {
             engine.begin_turn();
+            checkDevice();if(disposed)return;
             const before=state(),elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
             inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')});if(disposed)return;flush();
             if(recovering){if(inbox.hasControl)wake();return;}
@@ -246,19 +247,17 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const onVisibility=()=>{const hidden=document.hidden;deliver(()=>engine.hidden(hidden),'control');};
     const onResize=()=>schedule();
     canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',()=>down=null);window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
-    const poll=setInterval(()=>{
+    function checkDevice(){
         if(disposed||recovering)return;
         const validation=engine.gpu_error();if(validation){fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
         if(!engine.device_lost())return;
-        deliver(()=>{
-            if(recovering)return;
-            recovering=true;metrics.deviceRecoveries++;engine.begin_recovery();
-            wasm.create_gpu('stage').then(gpu=>{
-                if(disposed){gpu.free();return;}
-                deliver(()=>{engine.replace_gpu(gpu);recovering=false;lastTime=performance.now();},'control');
-            },e=>{if(!disposed){fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}});
-        },'control');
-    },500);
+        recovering=true;metrics.deviceRecoveries++;engine.begin_recovery();
+        wasm.create_gpu('stage').then(gpu=>{
+            if(disposed){gpu.free();return;}
+            deliver(()=>{engine.replace_gpu(gpu);recovering=false;lastTime=performance.now();},'control');
+        },e=>{if(!disposed){fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}});
+    }
+    const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
     if(testMode)window.__nir={state,action,metrics,traces,rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     const savedPreferences=await read('preferences',namespace),profile=await read('profile',namespace);

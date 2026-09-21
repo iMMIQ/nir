@@ -139,7 +139,7 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
   // Playwright's normal context forces all tabs visible. Attach without its
   // default emulation overrides to exercise real browser visibility instead.
   const dir=await fs.mkdtemp(`${process.env.TMPDIR || '/tmp'}/nir-visibility-`);
-  const proc=spawn(process.env.CHROMIUM || '/usr/bin/chromium',['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu','--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
+  const proc=spawn(process.env.CHROMIUM || '/usr/bin/chromium',['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu',...(process.env.NIR_CHROME_ARGS || '').split(' ').filter(Boolean),'--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
   let browser;
   try {
     let port;
@@ -275,4 +275,24 @@ test('leaving preparation cancels its fetch and a new request still succeeds', a
   await act(page,{type:'new_game'});
   await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);
   expect((await state(page)).error).toBeNull();
+});
+
+
+test('an owner turn detects device loss before the idle watchdog',async({page})=>{
+  await page.addInitScript(()=>{
+    const interval=window.setInterval.bind(window);
+    window.setInterval=(fn,ms,...args)=>interval(fn,ms===500?60000:ms,...args);
+  });
+  await boot(page);await start(page);await act(page,{type:'menu'});
+  const before=await state(page);
+  await page.evaluate(async()=>{
+    window.__nir.loseDevice();
+    await new Promise(resolve=>setTimeout(resolve,0));
+    await window.__nir.hidden(true);
+  });
+  await page.waitForFunction(d=>window.__nir.state().device>d&&window.__nir.state().ready&&!window.__nir.state().loading,before.device,{timeout:15000});
+  const after=await state(page);
+  expect(after.position).toBe(before.position);expect(after.tick_us).toBe(before.tick_us);
+  expect(after.paused).toBe(true);expect(after.error).toBeNull();
+  expectPainted(await page.screenshot());
 });
