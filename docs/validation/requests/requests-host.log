@@ -1,0 +1,24 @@
+npm notice run nir-browser-tests@0.1.0 test:host
+npm notice run node --test tests/host/*.test.js
+✔ input overload leaves room for terminal completions (18.925162ms)
+✔ owner yields at item/time limits and never consumes reentrant production (4.530712ms)
+✔ inputs precede resource delivery and each turn admits one resource (2.378223ms)
+✔ recovery stops the current batch and still admits its control completion (1.715348ms)
+✔ cancelling a resource group releases bytes without dropping independent saves (1.467462ms)
+✔ shared fetch aborts only after its last consumer cancels (6.086374ms)
+✔ late old completion cannot remove a replacement fetch (4.590074ms)
+✔ resource admission is global and cancelled decoders hold their slot until settled (5.546404ms)
+✔ an active batch still occupies capacity and disposal settles its pending items (4.785896ms)
+✔ accepted jobs keep a terminal slot when unrelated traffic fills the inbox (10.749158ms)
+✔ reserved resource progress reuses its slot until completion or cancellation (3.973415ms)
+✔ device control has admission room beyond ordinary job reservations (15.235781ms)
+✔ shutdown settles queued progress and reserved terminals exactly once (5.411473ms)
+✔ seeded completion, cancellation and drain interleavings preserve the ledger (148.933974ms)
+ℹ tests 14
+ℹ suites 0
+ℹ pass 14
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 698.035595

@@ -1,14 +1,58 @@
 // Bounded owner inbox. Async producers only enqueue; they never enter Rust.
 export class OwnerInbox {
-    constructor(capacity=256, inputLimit=128) {
-        this.capacity=capacity; this.inputLimit=inputLimit; this.items=[]; this.batch=[]; this.draining=false; this.highWater=0;
+    constructor(capacity=256, inputLimit=128, controlReserve=Math.min(8,Math.floor(capacity/16))) {
+        this.capacity=capacity; this.inputLimit=inputLimit; this.controlReserve=controlReserve;
+        this.items=[]; this.batch=[]; this.draining=false; this.slots=new Set();
+        this.highWater=0; this.reservedHighWater=0; this.accepted=0; this.completed=0; this.cancelled=0;
     }
+    get length(){return this.items.length+this.batch.length;}
+    get used(){return this.slots.size+[...this.items,...this.batch].filter(item=>!item.slot).length;}
+    get hasInput(){return this.items.some(i=>i.kind==='input');}
+    get hasControl(){return this.items.some(i=>i.kind==='control');}
+    limit(kind){return kind==='control'?this.capacity:Math.min(this.capacity-this.controlReserve,kind==='input'?this.inputLimit:this.capacity);}
+    record(){this.highWater=Math.max(this.highWater,this.used);this.reservedHighWater=Math.max(this.reservedHighWater,this.slots.size);}
     push(run, kind='completion', cancel=()=>{}, group=null) {
-        const limit=kind==='input'?this.inputLimit:this.capacity;
-        if(this.length>=limit)return false;
-        this.items.push({run,kind,cancel,group});this.highWater=Math.max(this.highWater,this.length);return true;
+        if(this.used>=this.limit(kind))return false;
+        this.items.push({run,kind,cancel,group});this.record();return true;
     }
-    drain({limit=16, milliseconds=4, now=()=>performance.now(), controlsOnly=false,canRun=()=>true}={}) {
+    // Reserve before starting any asynchronous side effect. A queued item and its
+    // reservation count once; progress can reuse the slot until the unique terminal.
+    reserve(kind='completion',group=null) {
+        if(this.used>=this.limit(kind))return null;
+        const owner=this;
+        const slot={kind,group,state:'pending',item:null,
+            post(run,{terminal=true}={}) {
+                if(slot.state!=='pending')return Promise.resolve(false);
+                slot.state='queued';
+                return new Promise(resolve=>{
+                    const item={kind,group,slot,
+                        run(){
+                            slot.item=null;
+                            slot.state='running';
+                            try {
+                                const value=run(),done=typeof terminal==='function'?terminal(value):terminal;
+                                if(slot.state==='running'){
+                                    if(done){slot.state='completed';owner.slots.delete(slot);owner.completed++;}
+                                    else slot.state='pending';
+                                }
+                            } catch(e){slot.cancel();throw e;} finally {resolve(true);}
+                        },
+                        cancel(){resolve(false);}
+                    };
+                    slot.item=item;owner.items.push(item);owner.record();
+                });
+            },
+            cancel(){
+                if(!owner.slots.delete(slot))return false;
+                slot.state='cancelled';owner.cancelled++;
+                if(slot.item){owner.remove(slot.item);slot.item.cancel();slot.item=null;}
+                return true;
+            }
+        };
+        this.slots.add(slot);this.accepted++;this.record();return slot;
+    }
+    remove(item){for(const q of [this.items,this.batch]){const i=q.indexOf(item);if(i>=0)q.splice(i,1);}}
+    drain({limit=16,milliseconds=4,now=()=>performance.now(),controlsOnly=false,canRun=()=>true}={}) {
         if(this.draining)throw new Error('E_OWNER_REENTRY');
         this.draining=true;
         const priority={control:0,input:1,completion:2,resource:3};
@@ -23,14 +67,17 @@ export class OwnerInbox {
                 if(item.kind==='resource')resources++;
                 item.run();
             }
-        } finally { this.items.unshift(...batch.splice(0));this.draining=false; }
+        } finally {this.items.unshift(...batch.splice(0));this.draining=false;}
         return consumed;
     }
-    get length(){return this.items.length+this.batch.length;}
-    get hasInput(){return this.items.some(i=>i.kind==='input');}
-    get hasControl(){return this.items.some(i=>i.kind==='control');}
-    cancelGroup(group){for(const queue of [this.items,this.batch])for(let i=queue.length-1;i>=0;i--)if(queue[i].group===group)queue.splice(i,1)[0].cancel();}
-    clear(){for(const queue of [this.items,this.batch])for(const item of queue.splice(0))item.cancel();}
+    cancelGroup(group){
+        for(const slot of [...this.slots])if(slot.group===group)slot.cancel();
+        for(const queue of [this.items,this.batch])for(let i=queue.length-1;i>=0;i--)if(queue[i].group===group)queue.splice(i,1)[0].cancel();
+    }
+    clear(){
+        for(const slot of [...this.slots])slot.cancel();
+        for(const queue of [this.items,this.batch])for(const item of queue.splice(0))item.cancel();
+    }
 }
 
 // Global admission across preparation generations, including uncancellable decoders.
@@ -116,14 +163,47 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             wake();
         });
     }
+    function post(slot,fn,terminal=true){
+        if(disposed){slot.cancel();return Promise.resolve(false);}
+        const done=slot.post(()=>{try{return fn();}catch(e){if(slot.kind==='control')throw e;hostEvent('load_failed',String(e));return true;}},{terminal});wake();return done;
+    }
+    function request(work,success,failure,{kind='completion',group=null,replace=false}={}){
+        if(replace)inbox.cancelGroup(group);
+        const slot=inbox.reserve(kind,group);
+        if(!slot){failure(new Error('E_REQUEST_CAPACITY: no terminal slot'));return null;}
+        Promise.resolve().then(()=>{
+            if(slot.state==='cancelled')throw new Error('E_REQUEST_CANCELLED');
+            return work();
+        }).then(value=>post(slot,()=>success(value)),error=>post(slot,()=>failure(error)));
+        return slot;
+    }
     function unlock() {if(audio.state!=='running'){unlocked=audio.resume();unlocked.catch(e=>console.warn('Audio unlock failed',e));}else{unlocked=Promise.resolve();}}
-    function stopVoice(id) {const v=voices.get(id);if(!v)return;v.stopped=true;try{v.source?.stop();}catch{}v.source?.disconnect();v.gain?.disconnect();voices.delete(id);}
+    function stopVoice(id) {
+        const v=voices.get(id);if(!v)return;v.stopped=true;v.slot.cancel();
+        try{v.source?.stop();}catch{}v.source?.disconnect();v.gain?.disconnect();voices.delete(id);
+    }
     function playVoice(c) {
-        stopVoice(c.task);const buffer=buffers.get(c.asset);if(!buffer){deliver(()=>engine.audio_failed(c.task,c.session,'E_AUDIO_BUFFER'));return;}
-        const source=audio.createBufferSource(),gain=audio.createGain();source.buffer=buffer;source.loop=c.looped;gain.gain.value=preferences[`${c.bus}_volume`]??.5;source.connect(gain).connect(audio.destination);
-        const v={source,gain,bus:c.bus,asset:c.asset,stopped:false};voices.set(c.task,v);let offset=Number(c.position_us)/1e6;if(c.looped)offset%=buffer.duration;else offset=Math.min(offset,Math.max(0,buffer.duration-.001));
-        source.onended=()=>{if(!v.stopped&&!c.looped){voices.delete(c.task);deliver(()=>engine.audio_ended(c.task,c.session));}};
-        source.start(0,offset);metrics.audioStarts++;
+        stopVoice(c.task);
+        const failed=e=>engine.audio_failed(c.task,c.session,String(e));
+        const slot=inbox.reserve('completion',`audio:${c.session}:${c.task}`);
+        if(!slot){failed('E_REQUEST_CAPACITY');return;}
+        const buffer=buffers.get(c.asset);
+        if(!buffer){post(slot,()=>failed('E_AUDIO_BUFFER'));return;}
+        let v;
+        try {
+            const source=audio.createBufferSource(),gain=audio.createGain();source.buffer=buffer;source.loop=c.looped;
+            gain.gain.value=preferences[`${c.bus}_volume`]??.5;source.connect(gain).connect(audio.destination);
+            v={source,gain,slot,bus:c.bus,asset:c.asset,stopped:false};voices.set(c.task,v);
+            let offset=Number(c.position_us)/1e6;if(c.looped)offset%=buffer.duration;else offset=Math.min(offset,Math.max(0,buffer.duration-.001));
+            source.onended=()=>{if(!v.stopped&&!c.looped)post(slot,()=>{
+                if(voices.get(c.task)===v){voices.delete(c.task);source.disconnect();gain.disconnect();}
+                engine.audio_ended(c.task,c.session);
+            });};
+            source.start(0,offset);metrics.audioStarts++;
+        } catch(e){
+            if(v){v.stopped=true;v.source.disconnect();v.gain.disconnect();voices.delete(c.task);}
+            post(slot,()=>failed(e));
+        }
     }
     async function asset(id,signal) {
         const a=program.assets[id];if(!a)throw new Error(`E_ASSET: ${id}`);
@@ -141,49 +221,81 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         for(const id of bytesCache.keys())if(!objects.has(id))bytesCache.delete(id);
     }
     async function prepare(c) {
+        const terminal=inbox.reserve('completion',c.request);
+        if(!terminal){engine.resource_failed(c.request,'E_REQUEST_CAPACITY');return;}
         const controller=new AbortController(),signal=controller.signal;
         preparations.set(c.request,controller);
+        const failed=message=>{engine.resource_failed(c.request,String(message));controller.abort();};
         let next=0;
         async function worker(){while(next<c.assets.length&&!disposed&&!signal.aborted){
-            const id=c.assets[next++];
+            const id=c.assets[next++],slot=inbox.reserve('resource',c.request);
+            if(!slot){await post(terminal,()=>failed('E_REQUEST_CAPACITY'));return;}
             try {
                 await resourcePool.run(async()=>{
-                const bytes=await asset(id,signal);signal.throwIfAborted();
-                if(program.assets[id].kind==='audio'){
-                    if(!buffers.has(id)){
-                        if(!decodeJobs.has(id))decodeJobs.set(id,audio.decodeAudioData(bytes.slice(0)).finally(()=>decodeJobs.delete(id)));
-                        const buffer=await decodeJobs.get(id);signal.throwIfAborted();buffers.set(id,buffer);
+                    const bytes=await asset(id,signal);signal.throwIfAborted();
+                    if(program.assets[id].kind==='audio'){
+                        if(!buffers.has(id)){
+                            if(!decodeJobs.has(id))decodeJobs.set(id,audio.decodeAudioData(bytes.slice(0)).finally(()=>decodeJobs.delete(id)));
+                            const buffer=await decodeJobs.get(id);signal.throwIfAborted();buffers.set(id,buffer);
+                        }
+                        if(unlocked)await unlocked;
+                        signal.throwIfAborted();
+                        if(audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
                     }
-                    if(unlocked)await unlocked;
-                    signal.throwIfAborted();
-                    if(audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
-                }
-                // Backpressure: keep the worker occupied until its owner consumes the bytes.
-                let complete=false;
-                while(!complete&&!signal.aborted&&!disposed){
-                    await deliver(()=>{if(!signal.aborted){try{complete=engine.resource(c.request,id,new Uint8Array(bytes));}catch(e){engine.resource_failed(c.request,String(e));controller.abort();}}},'resource',c.request);
-                }
+                    let complete=false;
+                    while(!complete&&!signal.aborted&&!disposed&&slot.state==='pending'){
+                        await post(slot,()=>{
+                            if(signal.aborted)return true;
+                            try {complete=engine.resource(c.request,id,new Uint8Array(bytes));return complete;}
+                            catch(e){metrics.resourceFailures++;failed(e);return true;}
+                        },done=>done);
+                    }
                 },signal);
             }catch(e){
-                if(signal.aborted||disposed)return;
-                metrics.resourceFailures++;
-                await deliver(()=>engine.resource_failed(c.request,String(e)));
-                controller.abort();return;
-            }
+                if(!signal.aborted&&!disposed){metrics.resourceFailures++;await post(slot,()=>failed(e));}
+            } finally {if(signal.aborted||disposed)slot.cancel();}
         }}
-        try {await Promise.all(Array.from({length:Math.min(4,c.assets.length)},worker));}
-        finally {if(preparations.get(c.request)===controller)preparations.delete(c.request);}
+        try {
+            await Promise.all(Array.from({length:Math.min(4,c.assets.length)},worker));
+            if(!signal.aborted&&!disposed)await post(terminal,()=>{});
+            else terminal.cancel();
+        } finally {if(preparations.get(c.request)===controller)preparations.delete(c.request);}
     }
-    async function listSaves() {const rows=[];for(let slot=0;slot<3;slot++){const s=await read('saves',`${namespace}:${slot}`);if(s)rows.push({slot,revision:s.revision,label:s.label||`#${s.revision}`});}deliver(()=>hostEvent('slots',rows));}
-    async function save(c) {
-        try{await new Promise((resolve,reject)=>{const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(`${namespace}:${c.slot}`);let conflict=false;
+    function listSaves() {
+        return request(async()=>{
+            const rows=[];for(let slot=0;slot<3;slot++){const s=await read('saves',`${namespace}:${slot}`);if(s)rows.push({slot,revision:s.revision,label:s.label||`#${s.revision}`});}return rows;
+        },rows=>hostEvent('slots',rows),e=>hostEvent('load_failed',String(e)),{group:'slots',replace:true});
+    }
+    function save(c) {
+        return request(()=>new Promise((resolve,reject)=>{
+            const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(`${namespace}:${c.slot}`);let conflict=false;
             r.onsuccess=()=>{const current=r.result;if((current?.revision||0)!==c.expected_revision){conflict=true;tx.abort();return;}const record={...c.envelope,label:new Date().toLocaleString(),saved_at:Date.now()};store.put(record,`${namespace}:${c.slot}`);};
             tx.oncomplete=resolve;tx.onabort=()=>reject(new Error(conflict?'E_SAVE_CONFLICT: another tab changed this slot. Reopen the save menu.':`E_STORAGE: ${tx.error}`));tx.onerror=()=>{};
-        });deliver(()=>hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision}));}
-        catch(e){deliver(()=>hostEvent('save_failed',{job:c.job,message:String(e)}));}
+        }),()=>hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision}),
+            e=>hostEvent('save_failed',{job:c.job,message:String(e)}),{group:`save:${c.job}`});
     }
     const envelope=(record)=>{const {label,saved_at,...e}=record;return e;};
-    async function load(slot) {try{const s=await read('saves',`${namespace}:${slot}`);if(!s)throw new Error('E_SAVE_MISSING');deliver(()=>hostEvent('loaded',envelope(s)));}catch(e){deliver(()=>hostEvent('load_failed',String(e)));}}
+    function load(slot) {
+        const session=state().session;
+        return request(async()=>{const s=await read('saves',`${namespace}:${slot}`);if(!s)throw new Error('E_SAVE_MISSING');return envelope(s);},
+            value=>{if(state().session===session)hostEvent('loaded',value);},
+            e=>{if(state().session===session)hostEvent('load_failed',String(e));},{group:'load',replace:true});
+    }
+    function importSave(){
+        inbox.cancelGroup('load');const slot=inbox.reserve('completion','load'),session=state().session;
+        if(!slot){hostEvent('load_failed','E_REQUEST_CAPACITY');return;}
+        const input=document.createElement('input');input.type='file';input.accept='.json,application/json';
+        input.oncancel=()=>post(slot,()=>{});
+        input.onchange=async()=>{
+            if(slot.state==='cancelled')return;
+            try{
+                const f=input.files[0];if(!f){post(slot,()=>{});return;}
+                if(f.size>16*1024*1024)throw new Error('E_SAVE_LIMIT');
+                const data=await f.text();post(slot,()=>{if(state().session===session)hostEvent('loaded',data);});
+            }catch(e){post(slot,()=>{if(state().session===session)hostEvent('load_failed',String(e));});}
+        };
+        try{input.click();}catch(e){post(slot,()=>hostEvent('load_failed',String(e)));}
+    }
     async function mergeProfile(keys) {await new Promise((resolve,reject)=>{const tx=db.transaction('profile','readwrite'),store=tx.objectStore('profile'),r=store.get(namespace);r.onsuccess=()=>store.put([...new Set([...(r.result||[]),...keys])].sort(),namespace);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});}
     function flush() {if(disposed)return;for(const c of JSON.parse(engine.commands())){
         switch(c.type){
@@ -193,11 +305,11 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'audio_stop':stopVoice(c.task);break;
             case 'audio_reset':for(const id of [...voices.keys()])stopVoice(id);break;
             case 'audio_pause':audioPaused=c.paused;if(c.paused){audio.suspend().catch(()=>{});}else if(unlocked){audio.resume().catch(e=>console.warn(e));}break;
-            case 'save':save(c);break;case 'load':load(c.slot);break;case 'list_saves':listSaves().catch(e=>deliver(()=>hostEvent('load_failed',String(e))));break;
-            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;write('preferences',namespace,preferences).catch(e=>deliver(()=>hostEvent('load_failed',`E_PREFERENCES: ${e}`)));break;
-            case 'persist_profile':mergeProfile(c.keys).catch(e=>deliver(()=>hostEvent('load_failed',`E_PROFILE: ${e}`)));break;
+            case 'save':save(c);break;case 'load':load(c.slot);break;case 'list_saves':listSaves();break;
+            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;{const value=preferences;request(()=>write('preferences',namespace,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
+            case 'persist_profile':request(()=>mergeProfile(c.keys),()=>{},e=>hostEvent('load_failed',`E_PROFILE: ${e}`));break;
             case 'export':{const url=URL.createObjectURL(new Blob([c.json],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`${release.game_id}.nir-save.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);break;}
-            case 'import':{const input=document.createElement('input');input.type='file';input.accept='.json,application/json';input.onchange=async()=>{try{const f=input.files[0];if(!f)return;if(f.size>16*1024*1024)throw new Error('E_SAVE_LIMIT');const data=await f.text();deliver(()=>hostEvent('loaded',data));}catch(e){deliver(()=>hostEvent('load_failed',String(e)));}};input.click();break;}
+            case 'import':importSave();break;
             case 'trace':if(testMode){traces.push({event:c.event,at:c.at});if(traces.length>4096)traces.splice(0,traces.length-4096);}break;
             default:throw new Error(`E_HOST_PROTOCOL: ${c.type}`);
         }
@@ -207,7 +319,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         if(disposed||recovering)return Promise.resolve(false);
         unlock();if(a.type==='new_game'&&metrics.startInputMs===null)metrics.startInputMs=performance.now();
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
-        return deliver(()=>engine.action(JSON.stringify(a),context.interaction,seq,context.session),'input');
+        return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');engine.action(JSON.stringify(a),context.interaction,seq,context.session);},'input');
     }
     let semanticSignature='',announcement='';
     function semantics(view) {
@@ -221,7 +333,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             engine.begin_turn();
             checkDevice();if(disposed)return;
             const before=state(),elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
-            inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')});if(disposed)return;flush();
+            inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')&&(kind==='control'||engine.pending_events()<112)});if(disposed)return;flush();
             if(recovering){if(inbox.hasControl)wake();return;}
             const after=state();
             if(!document.hidden&&!before.paused&&before.screen==='Story'&&!after.paused&&before.session===after.session){
@@ -233,6 +345,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             const view=JSON.parse(engine.draw(width,height,dpr));flush();prune();semantics(view);const s=state();
             metrics.frames=s.frames;metrics.peakResidentBytes=Math.max(metrics.peakResidentBytes,s.resident_bytes);
             metrics.maxTurnUploadBytes=Math.max(metrics.maxTurnUploadBytes||0,s.turn_upload_bytes);metrics.uploadSteps=s.upload_steps;
+            metrics.activeRequests=inbox.slots.size;metrics.requestHighWater=inbox.reservedHighWater;metrics.acceptedRequests=inbox.accepted;metrics.completedRequests=inbox.completed;metrics.cancelledRequests=inbox.cancelled;
             metrics.inboxHighWater=inbox.highWater;metrics.maxTurnWork=Math.max(metrics.maxTurnWork||0,s.turn_work);
             if(view.ready){shell.hidden=true;if(metrics.titleMs===null)metrics.titleMs=performance.now()-metrics.boot;if(s.dialogue&&metrics.firstLineMs===null){metrics.firstLineMs=performance.now()-metrics.boot;metrics.firstLineAfterStartMs=performance.now()-metrics.startInputMs;}}
             if(inbox.length||engine.pending_events())wake();
@@ -252,18 +365,25 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         const validation=engine.gpu_error();if(validation){fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
         if(!engine.device_lost())return;
         recovering=true;metrics.deviceRecoveries++;engine.begin_recovery();
+        const recovery=inbox.reserve('control','device');
+        if(!recovery){fail('E_REQUEST_CAPACITY: device recovery');dispose();return;}
         wasm.create_gpu('stage').then(gpu=>{
-            if(disposed){gpu.free();return;}
-            deliver(()=>{engine.replace_gpu(gpu);recovering=false;lastTime=performance.now();},'control');
-        },e=>{if(!disposed){fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}});
+            if(disposed||recovery.state==='cancelled'){gpu.free();return;}
+            post(recovery,()=>{engine.replace_gpu(gpu);recovering=false;lastTime=performance.now();});
+        },e=>post(recovery,()=>{fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}));
     }
     const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
     if(testMode)window.__nir={state,action,metrics,traces,rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
-    const savedPreferences=await read('preferences',namespace),profile=await read('profile',namespace);
-    if(savedPreferences){preferences=savedPreferences;deliver(()=>hostEvent('preferences',preferences));}else{const langs=navigator.languages||[];const locale=langs.some(l=>l==='zh'||l==='zh-CN'||l==='zh-SG'||l==='zh-Hans')?'zh-Hans':langs.some(l=>l==='en'||l.startsWith('en-'))?'en':program.default_locale;deliver(()=>hostEvent('preferences',{locale,font_scale:1,bgm_volume:.3,voice_volume:.8,sfx_volume:.5,reduced_motion:matchMedia('(prefers-reduced-motion: reduce)').matches}));}
-    if(profile)deliver(()=>hostEvent('profile',profile));
-    wake();
+    request(()=>Promise.all([read('preferences',namespace),read('profile',namespace)]),([savedPreferences,profile])=>{
+        if(savedPreferences){preferences=savedPreferences;hostEvent('preferences',preferences);}
+        else{
+            const langs=navigator.languages||[];
+            const locale=langs.some(l=>l==='zh'||l==='zh-CN'||l==='zh-SG'||l==='zh-Hans')?'zh-Hans':langs.some(l=>l==='en'||l.startsWith('en-'))?'en':program.default_locale;
+            hostEvent('preferences',{locale,font_scale:1,bgm_volume:.3,voice_volume:.8,sfx_volume:.5,reduced_motion:matchMedia('(prefers-reduced-motion: reduce)').matches});
+        }
+        if(profile)hostEvent('profile',profile);
+    },e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
     function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
     window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>engine.hidden(true));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>engine.hidden(false));}});

@@ -1,0 +1,294 @@
+{
+  "adapter": {
+    "vendor": "google",
+    "architecture": "swiftshader",
+    "device": "",
+    "description": "",
+    "fallback": true
+  },
+  "metrics": {
+    "boot": 710.3999999985099,
+    "titleMs": 3243.7000000029802,
+    "firstLineMs": 5250.10000000149,
+    "resourceFailures": 0,
+    "frames": 89,
+    "audioStarts": 6,
+    "deviceRecoveries": 0,
+    "peakResidentBytes": 67160180,
+    "startInputMs": 5719.39999999851,
+    "firstLineAfterStartMs": 241.10000000149012,
+    "maxTurnUploadBytes": 2094080,
+    "uploadSteps": 8,
+    "activeRequests": 0,
+    "requestHighWater": 8,
+    "acceptedRequests": 138,
+    "completedRequests": 131,
+    "cancelledRequests": 7,
+    "inboxHighWater": 8,
+    "maxTurnWork": 12
+  },
+  "state": {
+    "adapter": "BrowserWebGpu / Other /  / ",
+    "choice": null,
+    "device": 1,
+    "dialogue": null,
+    "error": null,
+    "frames": 89,
+    "history_count": 7,
+    "interaction": 0,
+    "loading": false,
+    "locale": "zh-Hans",
+    "outcome": "read_letter",
+    "paused": false,
+    "pending_events": 0,
+    "position": "main/end_stay/1",
+    "ready": true,
+    "resident_bytes": 59732082,
+    "screen": "Ended",
+    "sequence": 33,
+    "session": 3,
+    "shapes": 32,
+    "status": "",
+    "tick_us": "1637100",
+    "transition": null,
+    "turn_upload_bytes": 0,
+    "turn_work": 0,
+    "upload_steps": 8,
+    "variables": {
+      "affection": {
+        "type": "i32",
+        "value": 0
+      }
+    }
+  },
+  "traces": [
+    {
+      "event": "activate:opening",
+      "at": "main/intro/0"
+    },
+    {
+      "event": "task:3:Finished",
+      "at": "main/intro/0"
+    },
+    {
+      "event": "activate:intro",
+      "at": "main/wait_intro/0"
+    },
+    {
+      "event": "task:7:Finished",
+      "at": "main/wait_intro/0"
+    },
+    {
+      "event": "activate:enter",
+      "at": "main/wait_enter/0"
+    },
+    {
+      "event": "task:9:Finished",
+      "at": "main/wait_enter/0"
+    },
+    {
+      "event": "activate:arrival",
+      "at": "main/wait_arrival/0"
+    },
+    {
+      "event": "task:12:Finished",
+      "at": "main/wait_arrival/0"
+    },
+    {
+      "event": "task:13:Cancelled",
+      "at": "main/letter/0"
+    },
+    {
+      "event": "activate:letter",
+      "at": "main/gate/0"
+    },
+    {
+      "event": "activate:bell",
+      "at": "main/wait_bell/0"
+    },
+    {
+      "event": "task:18:Finished",
+      "at": "main/wait_bell/0"
+    },
+    {
+      "event": "op:continue.letter",
+      "at": "main/continue/0"
+    },
+    {
+      "event": "task:16:Finished",
+      "at": "main/continue/1"
+    },
+    {
+      "event": "activate:after_gate",
+      "at": "main/wait_after/0"
+    },
+    {
+      "event": "task:21:Finished",
+      "at": "main/wait_after/0"
+    },
+    {
+      "event": "activate:question",
+      "at": "main/wait_question/0"
+    },
+    {
+      "event": "task:24:Finished",
+      "at": "main/wait_question/0"
+    },
+    {
+      "event": "choose:walk",
+      "at": "main/choose/0"
+    },
+    {
+      "event": "op:affection.walk",
+      "at": "main/walk_begin/0"
+    },
+    {
+      "event": "activate:river",
+      "at": "main/wait_river/0"
+    },
+    {
+      "event": "task:27:Finished",
+      "at": "main/wait_river/0"
+    },
+    {
+      "event": "activate:walk_line",
+      "at": "main/wait_walk/0"
+    },
+    {
+      "event": "task:30:Finished",
+      "at": "main/wait_walk/0"
+    },
+    {
+      "event": "activate:walk_end",
+      "at": "main/wait_walk_end/0"
+    },
+    {
+      "event": "task:33:Finished",
+      "at": "main/wait_walk_end/0"
+    },
+    {
+      "event": "op:unlock.walk",
+      "at": "main/end_walk/0"
+    },
+    {
+      "event": "task:4:Cancelled",
+      "at": "main/end_walk/1"
+    },
+    {
+      "event": "end:walk_home",
+      "at": "main/end_walk/1"
+    },
+    {
+      "event": "activate:opening",
+      "at": "main/intro/0"
+    },
+    {
+      "event": "task:3:Finished",
+      "at": "main/intro/0"
+    },
+    {
+      "event": "activate:intro",
+      "at": "main/wait_intro/0"
+    },
+    {
+      "event": "task:7:Finished",
+      "at": "main/wait_intro/0"
+    },
+    {
+      "event": "activate:enter",
+      "at": "main/wait_enter/0"
+    },
+    {
+      "event": "task:9:Finished",
+      "at": "main/wait_enter/0"
+    },
+    {
+      "event": "activate:arrival",
+      "at": "main/wait_arrival/0"
+    },
+    {
+      "event": "task:12:Finished",
+      "at": "main/wait_arrival/0"
+    },
+    {
+      "event": "task:13:Cancelled",
+      "at": "main/letter/0"
+    },
+    {
+      "event": "activate:letter",
+      "at": "main/gate/0"
+    },
+    {
+      "event": "activate:bell",
+      "at": "main/wait_bell/0"
+    },
+    {
+      "event": "task:18:Finished",
+      "at": "main/wait_bell/0"
+    },
+    {
+      "event": "op:continue.letter",
+      "at": "main/continue/0"
+    },
+    {
+      "event": "task:16:Finished",
+      "at": "main/continue/1"
+    },
+    {
+      "event": "activate:after_gate",
+      "at": "main/wait_after/0"
+    },
+    {
+      "event": "task:21:Finished",
+      "at": "main/wait_after/0"
+    },
+    {
+      "event": "activate:question",
+      "at": "main/wait_question/0"
+    },
+    {
+      "event": "task:24:Finished",
+      "at": "main/wait_question/0"
+    },
+    {
+      "event": "choose:stay",
+      "at": "main/choose/0"
+    },
+    {
+      "event": "activate:nod",
+      "at": "main/wait_nod/0"
+    },
+    {
+      "event": "task:27:Finished",
+      "at": "main/wait_nod/0"
+    },
+    {
+      "event": "activate:stay_line",
+      "at": "main/wait_stay/0"
+    },
+    {
+      "event": "task:30:Finished",
+      "at": "main/wait_stay/0"
+    },
+    {
+      "event": "activate:stay_end",
+      "at": "main/wait_stay_end/0"
+    },
+    {
+      "event": "task:33:Finished",
+      "at": "main/wait_stay_end/0"
+    },
+    {
+      "event": "op:unlock.stay",
+      "at": "main/end_stay/0"
+    },
+    {
+      "event": "task:4:Cancelled",
+      "at": "main/end_stay/1"
+    },
+    {
+      "event": "end:read_letter",
+      "at": "main/end_stay/1"
+    }
+  ]
+}

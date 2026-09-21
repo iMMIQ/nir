@@ -139,7 +139,7 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
   // Playwright's normal context forces all tabs visible. Attach without its
   // default emulation overrides to exercise real browser visibility instead.
   const dir=await fs.mkdtemp(`${process.env.TMPDIR || '/tmp'}/nir-visibility-`);
-  const proc=spawn(process.env.CHROMIUM || '/usr/bin/chromium',['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu',...(process.env.NIR_CHROME_ARGS || '').split(' ').filter(Boolean),'--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
+  const proc=spawn(process.env.CHROMIUM || '/usr/bin/chromium',['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu',...(process.env.NIR_CHROME_ARGS||'').split(' ').filter(Boolean),'--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
   let browser;
   try {
     let port;
@@ -164,10 +164,22 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
 
 test('actual device loss during a dissolve preserves progress', async ({ page }) => {
   await boot(page); await start(page);
+  // Observe before triggering the transition: remote-control round trips may
+  // otherwise miss its entire lifetime on a busy browser.
+  await page.evaluate(()=>{
+    window.__transitionPause=new Promise(resolve=>{
+      const observe=()=>{const t=window.__nir.state().transition;
+        if(t!==null&&t>0&&t<1)window.__nir.action({type:'menu'}).then(resolve);
+        else requestAnimationFrame(observe);
+      };
+      requestAnimationFrame(observe);
+    });
+  });
   await page.keyboard.press('Space'); await page.keyboard.press('Space');
-  // Queue the pause in the observation task, before another owner tick can
-  // finish the transition while Playwright makes a separate round trip.
-  await page.waitForFunction(()=>{const t=window.__nir.state().transition;if(t!==null&&t>0&&t<1){window.__nir.action({type:'menu'});return true;}return false;});
+  // Deliberately outlast the transition to verify that browser-side observation
+  // freezes it even when the test driver is late returning for the result.
+  await page.waitForTimeout(700);
+  expect(await page.evaluate(()=>window.__transitionPause)).toBe(true);
   await page.waitForFunction(()=>window.__nir.state().screen==='Menu');
   const before=await state(page);
   expect(before.transition).toBeGreaterThan(0);expect(before.transition).toBeLessThan(1);
@@ -279,6 +291,82 @@ test('leaving preparation cancels its fetch and a new request still succeeds', a
   await act(page,{type:'new_game'});
   await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);
   expect((await state(page)).error).toBeNull();
+});
+
+async function delaySaveTransactions(page) {
+  await page.addInitScript(()=>{
+    const original=IDBDatabase.prototype.transaction;
+    const complete=Object.getOwnPropertyDescriptor(IDBTransaction.prototype,'oncomplete');
+    window.__heldTransactions=[];
+    IDBDatabase.prototype.transaction=function(...args){
+      const tx=original.apply(this,args);
+      if(Array.from(tx.objectStoreNames).includes('saves'))Object.defineProperty(tx,'oncomplete',{
+        configurable:true,
+        get(){return complete.get.call(tx);},
+        set(fn){complete.set.call(tx,event=>{
+          const hold=tx.mode==='readwrite'?window.__holdSaveWrites:window.__holdSaveReads;
+          if(hold)window.__heldTransactions.push(()=>fn.call(tx,event));else fn.call(tx,event);
+        });}
+      });
+      return tx;
+    };
+  });
+}
+
+test('reserved save completion survives session replacement and duplicate traffic',async({page})=>{
+  await delaySaveTransactions(page);await boot(page);await start(page);
+  await page.evaluate(()=>window.__holdSaveWrites=true);
+  await act(page,{type:'save',slot:0});
+  await page.waitForFunction(()=>window.__heldTransactions.length>0);
+  const savedSession=(await state(page)).session;
+  await act(page,{type:'title'});
+  await page.waitForFunction(()=>!window.__nir.state().loading);
+  await page.evaluate(async()=>{
+    const s=window.__nir.state();
+    await Promise.all(Array.from({length:40},(_,i)=>window.__nir.rawAction({type:'advance'},s.interaction,s.sequence+i+1,s.session-1)));
+    window.__holdSaveWrites=false;
+    for(const complete of window.__heldTransactions.splice(0))complete();
+  });
+  await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
+  const current=await state(page);expect(current.session).toBeGreaterThan(savedSession);expect(current.screen).toBe('Title');expect(current.error).toBeNull();
+  await page.waitForFunction(()=>window.__nir.metrics.activeRequests===0);
+  const m=await page.evaluate(()=>window.__nir.metrics);
+  expect(m.acceptedRequests).toBe(m.completedRequests+m.cancelledRequests+m.activeRequests);
+});
+
+test('a delayed load cannot replace a newer session',async({page})=>{
+  await delaySaveTransactions(page);await boot(page);await start(page);
+  await act(page,{type:'save',slot:0});await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
+  await page.evaluate(()=>window.__holdSaveReads=true);
+  await act(page,{type:'load',slot:0});await page.waitForFunction(()=>window.__heldTransactions.length>0);
+  await act(page,{type:'title'});await page.waitForFunction(()=>!window.__nir.state().loading);
+  const title=await state(page);
+  await page.evaluate(()=>{window.__holdSaveReads=false;for(const complete of window.__heldTransactions.splice(0))complete();});
+  await page.waitForTimeout(150);
+  const after=await state(page);expect(after.screen).toBe('Title');expect(after.session).toBe(title.session);expect(after.error).toBeNull();
+  await page.waitForFunction(()=>window.__nir.metrics.activeRequests===0);
+});
+
+test('repeated preparation, pause and device replacement release all request slots',async({page})=>{
+  await boot(page);
+  for(let cycle=0;cycle<12;cycle++){
+    await act(page,{type:'new_game'});
+    await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);
+    await act(page,{type:'menu'});await page.evaluate(()=>window.__nir.hidden(true));
+    await act(page,{type:'close'});expect((await state(page)).paused).toBe(true);
+    await page.evaluate(()=>window.__nir.hidden(false));
+    if(cycle%4===3){
+      const old=(await state(page)).device;await page.evaluate(()=>window.__nir.loseDevice());
+      await page.waitForFunction(d=>window.__nir.state().device>d&&window.__nir.state().ready&&!window.__nir.state().loading,old);
+    }
+    await act(page,{type:'title'});
+    await page.waitForFunction(()=>!window.__nir.state().loading&&window.__nir.metrics.activeRequests===0);
+    const s=await state(page),m=await page.evaluate(()=>window.__nir.metrics);
+    expect(s.error).toBeNull();expect(s.screen).toBe('Title');
+    expect(m.acceptedRequests).toBe(m.completedRequests+m.cancelledRequests);
+    expect(m.inboxHighWater).toBeLessThanOrEqual(256);
+  }
+  await fs.writeFile('reports/request-lifecycle-metrics.json',JSON.stringify(await page.evaluate(()=>window.__nir.metrics),null,2));
 });
 
 
