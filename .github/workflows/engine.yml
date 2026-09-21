@@ -39,12 +39,15 @@ jobs:
           ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
           python3 scripts/verify_release.py dist/rain-letters-web
           python3 scripts/verify_sdk.py
+      - name: Install Chromium and system libraries
+        run: npx playwright install --with-deps chromium
       - name: Chromium software WebGPU regression
+        env:
+          NIR_CHROME_ARGS: --use-webgpu-adapter=swiftshader
         run: |
-          npx playwright install --with-deps chromium
           export CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:browser
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:browser -- --max-failures=1
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
