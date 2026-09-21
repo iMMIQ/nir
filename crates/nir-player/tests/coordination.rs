@@ -742,3 +742,187 @@ fn author_auto_delay_controls_reading_after_reveal_and_pauses() {
     }
     assert_ne!(p.current_interaction(), interaction);
 }
+
+fn reading_text() -> nir_presentation::TextEngine {
+    let mut engine = nir_presentation::TextEngine::default();
+    engine.add_font(
+        include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+    );
+    engine
+}
+#[test]
+fn long_dialogue_browses_only_revealed_text_and_preserves_it_on_reflow() {
+    use nir_presentation::{Messages, ReadingState};
+    let p = playing();
+    let mut m = p.model();
+    m.loading = false;
+    m.paused = false;
+    m.prefs.font_scale = 1.5;
+    m.prefs.locale = "en".into();
+    let full = "末班电车刚刚离开。雨后书简。\n".repeat(35);
+    m.dialogue.as_mut().unwrap().full_text = full.clone();
+    m.dialogue.as_mut().unwrap().visible_text = "末班电车刚刚离开。".into();
+    let mut text = reading_text();
+    let mut reading = ReadingState::default();
+    let messages = Messages::default();
+    let initial = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(initial.scrolls.is_empty());
+    reading.hold_dialogue();
+    m.dialogue.as_mut().unwrap().visible_text =
+        full.lines().take(10).collect::<Vec<_>>().join("\n");
+    m.dialogue.as_mut().unwrap().gate = true;
+    let first = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    let v = &first.scrolls[0];
+    assert_eq!(v.offset, 0.);
+    assert!(v.max > 100.);
+    let gated_max = v.max;
+    text.layout(&first);
+    for node in first
+        .semantics
+        .iter()
+        .filter(|n| matches!(n.action, UiAction::Scroll { .. }))
+    {
+        let run = first.texts.iter().find(|r| r.text == node.label).unwrap();
+        let key = nir_presentation::TextEngine::key(run);
+        let bottom = text.buffers[&key]
+            .layout_runs()
+            .map(|l| l.line_top + l.line_height)
+            .fold(0., f32::max);
+        assert!(bottom <= run.height, "page label must not be clipped");
+        assert!(node.rect[0] + node.rect[2] <= v.rect[0] + v.rect[2]);
+    }
+    assert!(first
+        .semantics
+        .iter()
+        .any(|s| matches!(s.action, UiAction::Advance) && !s.enabled));
+    assert!(reading.scroll(ScrollRegion::Dialogue, 1, &first));
+    let second = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(second.scrolls[0].offset > 0.);
+    let wider = reading.project(&m, (1, 2), 640., 800., &messages, &mut text);
+    assert!(wider.scrolls[0].offset > 0.);
+    assert!(wider.scrolls[0].offset <= wider.scrolls[0].max);
+    assert_eq!(wider.announcement, full);
+    m.dialogue.as_mut().unwrap().visible_text = full.clone();
+    let rest = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(rest.scrolls[0].max > gated_max * 2.);
+    assert_eq!(
+        rest.texts
+            .iter()
+            .find(|r| r.visible.is_some())
+            .unwrap()
+            .text,
+        full
+    );
+    // Returning to automatic reading follows the reveal frontier again.
+    m.auto = true;
+    let auto = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert_eq!(auto.scrolls[0].offset, auto.scrolls[0].max);
+    m.auto = false;
+    assert!(reading.scroll(ScrollRegion::Dialogue, -1, &auto));
+    let manual = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(manual.scrolls[0].offset < manual.scrolls[0].max);
+    // A restored/new instance follows its current reveal position, not the prior viewport.
+    let restored = reading.project(&m, (2, 3), 390., 844., &messages, &mut text);
+    assert_eq!(restored.scrolls[0].offset, restored.scrolls[0].max);
+}
+#[test]
+fn measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions() {
+    use nir_presentation::{ChoiceView, Messages, ReadingState};
+    let p = playing();
+    let mut m = p.model();
+    m.dialogue = None;
+    m.loading = false;
+    m.paused = false;
+    m.prefs.font_scale = 1.5;
+    m.choices = (0..24)
+        .map(|i| ChoiceView {
+            id: format!("option-{i}"),
+            label: if i == 3 {
+                "沿着河边，一起走回去。".repeat(80)
+            } else {
+                format!("{i} 沿着河边，一起走回去。留在车站，读完这封信。")
+            },
+            enabled: i != 7,
+        })
+        .collect();
+    let mut text = reading_text();
+    let mut reading = ReadingState::default();
+    let messages = Messages::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..160 {
+        let packet = reading.project(&m, (1, 3), 390., 600., &messages, &mut text);
+        assert!(packet.quads.len() < 20);
+        for node in &packet.semantics {
+            assert!(node.rect[1] >= 0. && node.rect[1] + node.rect[3] <= 600.);
+            if let UiAction::Choose { option } = &node.action {
+                seen.insert(option.clone());
+                assert_eq!(node.enabled, option != "option-7");
+                if node.enabled {
+                    assert_eq!(
+                        packet.hit(node.rect[0] + 2., node.rect[1] + 2.),
+                        Some(node.action.clone())
+                    );
+                }
+            }
+        }
+        let view = packet
+            .scrolls
+            .iter()
+            .find(|v| v.region == ScrollRegion::Choices)
+            .unwrap();
+        if view.offset >= view.max {
+            break;
+        }
+        reading.scroll(ScrollRegion::Choices, 1, &packet);
+    }
+    assert_eq!(seen.len(), 24);
+}
+#[test]
+fn history_allows_browsing_inside_a_long_entry() {
+    use nir_presentation::{Messages, ReadingState, Screen};
+    let p = playing();
+    let mut m = p.model();
+    m.screen = Screen::History;
+    m.loading = false;
+    m.history = vec![(String::new(), "雨后书简。\n".repeat(80))];
+    let mut text = reading_text();
+    let mut reading = ReadingState::default();
+    let messages = Messages::default();
+    let first = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert_eq!(first.scrolls[0].region, ScrollRegion::History);
+    assert_eq!(first.scrolls[0].offset, 0.);
+    reading.scroll(ScrollRegion::History, 1, &first);
+    let next = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(next.scrolls[0].offset > 0.);
+    m.history_offset = 3;
+    let older = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
+    assert!(older.scrolls.is_empty());
+}
+
+#[test]
+fn mixed_line_endings_and_styled_paragraphs_keep_original_reveal_offsets() {
+    use nir_presentation::{Messages, ReadingState, TextEngine};
+    let p = playing();
+    let mut m = p.model();
+    let full = "雨\r后\r\n书\n\r简\n末\u{2029}班".repeat(30);
+    let mut text = reading_text();
+    let messages = Messages::default();
+    for emphasis in [vec![], vec![(0, "雨".len())]] {
+        let d = m.dialogue.as_mut().unwrap();
+        d.full_text = full.clone();
+        d.visible_text = "雨\r后".into();
+        d.emphasis = emphasis;
+        let packet = ReadingState::default().project(&m, (1, 2), 390., 844., &messages, &mut text);
+        assert!(packet.scrolls.is_empty());
+        let run = packet.texts.iter().find(|r| r.visible.is_some()).unwrap();
+        let offsets = TextEngine::line_offsets(run);
+        let buffer = &text.buffers[&TextEngine::key(run)];
+        assert_eq!(buffer.lines.len(), offsets.len());
+        for (line, offset) in buffer.lines.iter().zip(offsets) {
+            assert!(full[offset..].starts_with(line.text()));
+        }
+        m.dialogue.as_mut().unwrap().visible_text = full.clone();
+        let packet = ReadingState::default().project(&m, (1, 2), 390., 844., &messages, &mut text);
+        assert!(packet.scrolls[0].max > 1000.);
+    }
+}

@@ -936,7 +936,18 @@ pub enum UiAction {
     Volume { bus: AudioBus, delta: f32 },
     ReducedMotion,
     HistoryPage { delta: i32 },
+    Scroll { region: ScrollRegion, delta: i32 },
     Export,
     Import,
     Retry,
+}
+
+/// Viewport navigation, never a VM instruction or a snapshot cursor.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollRegion {
+    Dialogue,
+    Choices,
+    History,
 }

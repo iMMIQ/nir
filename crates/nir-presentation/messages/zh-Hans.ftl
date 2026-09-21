@@ -34,3 +34,6 @@ error-storage = 存储操作失败，已保留当前会话。
 error-render = 图形设备需要恢复。
 error-content = 内容执行失败。
 error-host = 播放器操作失败。
+
+scroll-back = 上一页
+scroll-forward = 下一页

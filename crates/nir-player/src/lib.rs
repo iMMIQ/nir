@@ -1023,6 +1023,15 @@ impl Player {
                 self.status.clear();
                 self.step(CoreInput::None, budget)?;
             }
+            UiAction::Scroll { .. } => {
+                if interaction != self.current_interaction() {
+                    return Ok(());
+                }
+                // Browsing revealed text takes control back from automatic reading.
+                self.auto = false;
+                self.skip = false;
+                self.auto_elapsed = 0;
+            }
             UiAction::Advance => {
                 if self.screen == Screen::Story && !self.paused() {
                     self.auto_elapsed = 0;

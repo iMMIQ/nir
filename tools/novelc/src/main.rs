@@ -1,10 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nir_compiler::*;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
+mod preview;
+use preview::{dev, serve};
 #[derive(Parser)]
 #[command(version, about = "NIR content compiler and Web preview")]
 struct Cli {
@@ -192,69 +191,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 println!("Scenario verified from new_game; preview opens at its legal entry.");
             }
-            let out = cli.project.join("dist/full/web");
-            build(&cli.project, &sdk, &out, true)?;
-            serve(&out, port)?;
+            dev(&cli.project, &sdk, port)?;
         }
         Command::Serve { directory, port } => serve(&directory, port)?,
-    }
-    Ok(())
-}
-fn serve(directory: &Path, port: u16) -> Result<()> {
-    let root = fs::canonicalize(directory).context("E_SERVE: directory missing")?;
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| anyhow::anyhow!("E_LISTEN: {e}"))?;
-    println!(
-        "NIR preview: http://127.0.0.1:{port}/\nServing {}",
-        root.display()
-    );
-    for request in server.incoming_requests() {
-        let raw = request.url().split('?').next().unwrap_or("/");
-        let path = if raw == "/" {
-            "index.html"
-        } else {
-            raw.trim_start_matches('/')
-        };
-        let full = if raw.ends_with('/') && raw != "/" {
-            root.join(path).join("index.html")
-        } else {
-            root.join(path)
-        };
-        let safe =
-            !path.contains('%') && !path.contains('\\') && !path.split('/').any(|p| p == "..");
-        let resolved = if safe {
-            fs::canonicalize(&full).ok()
-        } else {
-            None
-        };
-        if let Some(file) = resolved.filter(|p| p.starts_with(&root) && p.is_file()) {
-            let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let mime = match ext {
-                "html" => "text/html; charset=utf-8",
-                "js" => "text/javascript; charset=utf-8",
-                "json" => "application/json",
-                "txt" => "text/plain; charset=utf-8",
-                "wasm" => "application/wasm",
-                "png" => "image/png",
-                "wav" => "audio/wav",
-                "otf" => "font/otf",
-                _ => "application/octet-stream",
-            };
-            let cache = if path
-                .split('/')
-                .any(|part| matches!(part, "objects" | "releases"))
-            {
-                "public, max-age=31536000, immutable"
-            } else {
-                "no-cache"
-            };
-            let mut r = tiny_http::Response::from_file(fs::File::open(file)?);
-            for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
-            let _ = request.respond(r);
-        } else {
-            let _ = request
-                .respond(tiny_http::Response::from_string("Not found").with_status_code(404));
-        }
     }
     Ok(())
 }

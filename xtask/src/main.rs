@@ -124,6 +124,8 @@ fn main() -> Result<()> {
                 "nir-player",
                 "-p",
                 "nir-compiler",
+                "-p",
+                "novelc",
             ]))?;
             run(Command::new("python3").arg("scripts/check_architecture.py"))?;
         }
