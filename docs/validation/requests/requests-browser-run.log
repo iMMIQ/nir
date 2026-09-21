@@ -1,0 +1,25 @@
+npm notice run nir-browser-tests@0.1.0 test:browser
+npm notice run playwright test
+
+Running 16 tests using 1 worker
+
+(node:952553) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 tests/browser/player.spec.js:32:1 › WebGPU canvas, Chinese layout, static sleep and both endings (16.5s)
+  ✓   2 tests/browser/player.spec.js:64:1 › save commit, refresh restore, locale boundary, history and rollback (8.1s)
+  ✓   3 tests/browser/player.spec.js:98:1 › independent pauses, viewport changes, touch and actual device recovery (4.4s)
+  ✓   4 tests/browser/player.spec.js:125:1 › required resource failure keeps scene and retry succeeds (2.4s)
+  ✓   5 tests/browser/player.spec.js:138:1 › real tab visibility freezes Story and resumes through visibilitychange (5.5s)
+  ✓   6 tests/browser/player.spec.js:165:1 › actual device loss during a dissolve preserves progress (4.9s)
+  ✓   7 tests/browser/player.spec.js:181:1 › corrupt WASM is rejected before instantiation (903ms)
+  ✓   8 tests/browser/player.spec.js:191:1 › save export/import and tamper rejection preserve independent preferences (2.8s)
+  ✓   9 tests/browser/player.spec.js:211:1 › final release boots below a URL subpath and uses correct HTTP types (2.1s)
+  ✓  10 tests/browser/player.spec.js:226:3 › touch input emulation › starts and advances by tapping the drawn canvas (2.1s)
+  ✓  11 tests/browser/player.spec.js:238:1 › owner inbox defers actions, drains bursts and keeps turn work bounded (2.3s)
+  ✓  12 tests/browser/player.spec.js:260:1 › leaving preparation cancels its fetch and a new request still succeeds (2.8s)
+  ✓  13 tests/browser/player.spec.js:300:1 › reserved save completion survives session replacement and duplicate traffic (3.0s)
+  ✓  14 tests/browser/player.spec.js:321:1 › a delayed load cannot replace a newer session (2.9s)
+  ✓  15 tests/browser/player.spec.js:334:1 › repeated preparation, pause and device replacement release all request slots (15.0s)
+  ✓  16 tests/browser/player.spec.js:357:1 › an owner turn detects device loss before the idle watchdog (3.4s)
+
+  16 passed (1.4m)

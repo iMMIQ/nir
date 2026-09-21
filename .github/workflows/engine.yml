@@ -44,7 +44,7 @@ jobs:
           npx playwright install --with-deps chromium
           export CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a npm run test:browser
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:browser
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

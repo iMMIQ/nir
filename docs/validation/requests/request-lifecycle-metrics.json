@@ -1,0 +1,21 @@
+{
+  "boot": 356.29999999701977,
+  "titleMs": 1110.2000000029802,
+  "firstLineMs": 1386.1000000014901,
+  "resourceFailures": 0,
+  "frames": 3,
+  "audioStarts": 15,
+  "deviceRecoveries": 3,
+  "peakResidentBytes": 58498435,
+  "startInputMs": 1643.3999999985099,
+  "firstLineAfterStartMs": 99,
+  "maxTurnUploadBytes": 2094080,
+  "uploadSteps": 2,
+  "activeRequests": 0,
+  "requestHighWater": 6,
+  "acceptedRequests": 170,
+  "completedRequests": 152,
+  "cancelledRequests": 18,
+  "inboxHighWater": 6,
+  "maxTurnWork": 10
+}

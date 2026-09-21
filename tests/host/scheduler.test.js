@@ -76,3 +76,50 @@ test('an active batch still occupies capacity and disposal settles its pending i
     q.drain({milliseconds:Infinity});assert.equal(q.length,0);assert.equal(q.highWater,4);
     assert.deepEqual(out,['cancelled','cancelled','cancelled']);
 });
+
+test('accepted jobs keep a terminal slot when unrelated traffic fills the inbox',async()=>{
+    const q=new OwnerInbox(8,8),out=[];
+    const saved=q.reserve(),loaded=q.reserve();
+    for(let n=0;n<6;n++)assert(q.push(()=>{},'input'));
+    assert.equal(q.push(()=>{}),false);assert.equal(q.reserve(),null);
+    const one=saved.post(()=>out.push('saved')),two=loaded.post(()=>out.push('failed'));
+    assert.equal(q.used,8);q.drain({limit:8,milliseconds:Infinity});
+    assert.deepEqual(out,['saved','failed']);assert.equal(await one,true);assert.equal(await two,true);
+    assert.equal(q.used,0);assert.equal(q.completed,2);
+});
+test('reserved resource progress reuses its slot until completion or cancellation',async()=>{
+    const q=new OwnerInbox(2,2),slot=q.reserve('resource',7),out=[];
+    const first=slot.post(()=>out.push('chunk'),{terminal:false});q.drain();assert(await first);
+    assert.equal(q.used,1);assert.equal(slot.state,'pending');
+    const last=slot.post(()=>out.push('complete'));assert.equal(await slot.post(()=>out.push('duplicate')),false);
+    q.cancelGroup(7);assert.equal(await last,false);assert.equal(await slot.post(()=>{}),false);
+    assert.deepEqual(out,['chunk']);assert.equal(q.cancelled,1);assert.equal(q.used,0);
+});
+test('device control has admission room beyond ordinary job reservations',async()=>{
+    const q=new OwnerInbox(16,8,2);
+    for(let n=0;n<14;n++)assert(q.reserve());
+    assert.equal(q.reserve(),null);const recovery=q.reserve('control');assert(recovery);
+    const done=recovery.post(()=>{},{});assert(q.push(()=>{},'control'));
+    q.drain({controlsOnly:true,milliseconds:Infinity});assert(await done);assert.equal(q.used,14);
+    q.clear();assert.equal(q.used,0);
+});
+test('shutdown settles queued progress and reserved terminals exactly once',async()=>{
+    const q=new OwnerInbox(),one=q.reserve(),two=q.reserve('resource');
+    const pending=two.post(()=>assert.fail('disposed'),{terminal:false});
+    q.clear();q.clear();assert.equal(await pending,false);assert.equal(await one.post(()=>{}),false);
+    assert.equal(q.accepted,2);assert.equal(q.cancelled,2);assert.equal(q.used,0);assert.equal(q.length,0);
+});
+test('seeded completion, cancellation and drain interleavings preserve the ledger',async()=>{
+    const q=new OwnerInbox(32,16,2),slots=[],seen=new Set();let seed=0x4e4952;
+    const rng=()=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return seed>>>0;};
+    for(let n=0;n<20000;n++){
+        const action=rng()%5;
+        if(action===0){const slot=q.reserve('completion');if(slot)slots.push(slot);}
+        else if(action===1&&slots.length){const i=rng()%slots.length;slots[i].post(()=>{assert(!seen.has(i));seen.add(i);});}
+        else if(action===2&&slots.length)slots[rng()%slots.length].cancel();
+        else if(action===3)q.push(()=>{},'input');
+        else q.drain({limit:1+rng()%8,milliseconds:Infinity});
+        assert(q.used<=32);assert.equal(q.accepted,q.completed+q.cancelled+q.slots.size);
+    }
+    q.clear();assert.equal(q.used,0);assert.equal(q.accepted,q.completed+q.cancelled);
+});
