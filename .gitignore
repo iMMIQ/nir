@@ -1,0 +1,20 @@
+/target/
+/dist/
+/reports/
+node_modules/
+**/.nir/
+**/dist/
+**/game.local.toml
+/test-results/
+/playwright-report/
+
+# Local state and credentials must not be published.
+**/reports/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store

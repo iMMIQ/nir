@@ -1,0 +1,22 @@
+[package]
+name = "nir-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-format = { workspace = true, features = ["schema"] }
+nir-core.workspace = true
+nir-content.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+anyhow.workspace = true
+image.workspace = true
+unicode-normalization = "0.1"
+ttf-parser = "0.25"
+schemars.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

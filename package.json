@@ -1,0 +1,14 @@
+{
+  "name": "nir-browser-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  },
+  "license": "LGPL-3.0-or-later"
+}

@@ -1,0 +1,131 @@
+{
+  "speaker.aki": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Aki"
+      }
+    ]
+  },
+  "intro": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The last train has gone. Rain folds the station lights into a letter that was never sent."
+      }
+    ]
+  },
+  "arrival": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "You came after all."
+      }
+    ]
+  },
+  "letter": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "I took a long time to write this letter."
+      },
+      {
+        "type": "gate",
+        "id": "bell"
+      },
+      {
+        "type": "text",
+        "id": "tail",
+        "text": "Will you take it?"
+      }
+    ]
+  },
+  "after_gate": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "A distant bell rings. Aki places the envelope in your hand."
+      }
+    ]
+  },
+  "question": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The rain is letting up. Where would you like to go?"
+      }
+    ]
+  },
+  "walk": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Walk home together along the river"
+      }
+    ]
+  },
+  "stay": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Stay at the station and read the letter"
+      }
+    ]
+  },
+  "walk_line": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Let’s take our time. Tonight, I want to walk the whole way with you."
+      }
+    ]
+  },
+  "walk_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The rain stops. At last, the words left unspoken have found a home."
+      }
+    ]
+  },
+  "stay_line": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Then I’ll stay here with you until the last word."
+      }
+    ]
+  },
+  "stay_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The ink is a little blurred. But this time, you know you won’t miss what it means."
+      }
+    ]
+  }
+}

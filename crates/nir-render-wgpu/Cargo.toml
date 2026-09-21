@@ -1,0 +1,13 @@
+[package]
+name = "nir-render-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-format.workspace = true
+nir-presentation.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+bytemuck.workspace = true
+image.workspace = true

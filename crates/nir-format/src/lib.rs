@@ -1,0 +1,670 @@
+//! Versioned, platform-independent wire contracts. Unknown semantic fields fail closed.
+#![forbid(unsafe_code)]
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const FORMAT_VERSION: u32 = 1;
+pub const CAPABILITIES: &[&str] = &[
+    "control.v1",
+    "stage.sprite.v1",
+    "stage.dissolve.v1",
+    "clip.scalar.v1",
+    "text.structured.v1",
+    "text.gate.v1",
+    "choice.v1",
+    "audio.buffer.v1",
+];
+pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TASKS: usize = 256;
+pub const MAX_FRAMES: usize = 64;
+pub const MAX_NODES: usize = 1024;
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Micros(pub u64);
+impl TryFrom<String> for Micros {
+    type Error = String;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("E_TIME: expected unsigned decimal string".into());
+        }
+        s.parse()
+            .map(Self)
+            .map_err(|_| "E_TIME: u64 overflow".into())
+    }
+}
+impl From<Micros> for String {
+    fn from(v: Micros) -> Self {
+        v.0.to_string()
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[error("{code} at {location}: {message}")]
+#[serde(deny_unknown_fields)]
+pub struct Diagnostic {
+    pub code: String,
+    pub location: String,
+    pub message: String,
+}
+impl Diagnostic {
+    pub fn new(code: &str, location: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            location: location.into(),
+            message: message.into(),
+        }
+    }
+}
+pub type Result<T> = std::result::Result<T, Diagnostic>;
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    Bool,
+    I32,
+    String,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Value {
+    Bool(bool),
+    I32(i32),
+    String(String),
+}
+impl Value {
+    pub fn ty(&self) -> ValueType {
+        match self {
+            Self::Bool(_) => ValueType::Bool,
+            Self::I32(_) => ValueType::I32,
+            Self::String(_) => ValueType::String,
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Expr {
+    Const {
+        value: Value,
+    },
+    Var {
+        name: String,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Not {
+        value: Box<Expr>,
+    },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    Concat,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Program {
+    pub format: u32,
+    pub game_id: String,
+    pub revision: String,
+    pub entry: String,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    pub stage: Stage,
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+    pub functions: BTreeMap<String, Function>,
+    #[serde(default)]
+    pub scenes: BTreeMap<String, Vec<Node>>,
+    #[serde(default)]
+    pub cues: BTreeMap<String, Cue>,
+    #[serde(default)]
+    pub choices: BTreeMap<String, Choice>,
+    #[serde(default)]
+    pub texts: BTreeMap<String, TextContract>,
+    #[serde(default)]
+    pub locales: BTreeMap<String, BTreeMap<String, TextDoc>>,
+    #[serde(default)]
+    pub assets: BTreeMap<String, Asset>,
+    pub default_locale: String,
+    #[serde(default)]
+    pub title_scene: Option<String>,
+    #[serde(default)]
+    pub theme: Theme,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stage {
+    pub width: u32,
+    pub height: u32,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Function {
+    #[serde(default)]
+    pub params: BTreeMap<String, ValueType>,
+    #[serde(default)]
+    pub locals: BTreeMap<String, ValueType>,
+    #[serde(default)]
+    pub returns: Option<ValueType>,
+    pub entry: String,
+    pub blocks: BTreeMap<String, Block>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Block {
+    #[serde(default)]
+    pub ops: Vec<Op>,
+    pub terminator: Terminator,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Op {
+    pub id: String,
+    pub operation: Operation,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Operation {
+    Assign {
+        target: String,
+        value: Expr,
+    },
+    Random {
+        target: String,
+        min: i32,
+        max: i32,
+    },
+    DraftPatch {
+        node: String,
+        property: Property,
+        value: f32,
+    },
+    TaskControl {
+        task: String,
+        action: TaskAction,
+    },
+    DialogueContinue {
+        task: String,
+    },
+    ProfileMerge {
+        key: String,
+    },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAction {
+    Cancel,
+    Finish,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Terminator {
+    Goto {
+        target: String,
+    },
+    Branch {
+        condition: Expr,
+        yes: String,
+        no: String,
+    },
+    Switch {
+        value: Expr,
+        cases: BTreeMap<String, String>,
+        default: String,
+    },
+    Call {
+        function: String,
+        #[serde(default)]
+        args: BTreeMap<String, Expr>,
+        next: String,
+        #[serde(default)]
+        result: Option<String>,
+    },
+    Return {
+        #[serde(default)]
+        value: Option<Expr>,
+    },
+    Activate {
+        cue: String,
+        next: String,
+    },
+    Await {
+        conditions: Vec<WaitCondition>,
+        next: String,
+        on_cancelled: String,
+        on_failed: String,
+    },
+    Interact {
+        choice: String,
+        branches: BTreeMap<String, String>,
+        on_empty: String,
+    },
+    End {
+        outcome: String,
+    },
+    Fault {
+        code: String,
+        message: String,
+    },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitCondition {
+    pub task: String,
+    pub milestone: Milestone,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(
+    tag = "type",
+    content = "id",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Milestone {
+    Started,
+    Finished,
+    Marker(String),
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cue {
+    pub effects: Vec<EffectDef>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectDef {
+    pub id: String,
+    pub scope: Scope,
+    pub effect: Effect,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Session,
+    Frame,
+    Scene,
+    Interaction,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Effect {
+    StagePresent {
+        scene: String,
+        #[serde(default)]
+        duration_us: Micros,
+    },
+    Clip {
+        node: String,
+        property: Property,
+        to: f32,
+        duration_us: Micros,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        easing: Easing,
+        #[serde(default)]
+        finish: FinishPolicy,
+        #[serde(default)]
+        cancel: CancelPolicy,
+    },
+    Dialogue {
+        text: String,
+        #[serde(default)]
+        speaker: String,
+        reveal_us: Micros,
+    },
+    Audio {
+        asset: String,
+        bus: AudioBus,
+        #[serde(default)]
+        looped: bool,
+    },
+    Delay {
+        duration_us: Micros,
+    },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioBus {
+    Bgm,
+    Voice,
+    Sfx,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Easing {
+    #[default]
+    Linear,
+    Smooth,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishPolicy {
+    #[default]
+    CommitEnd,
+    RemoveEffect,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelPolicy {
+    #[default]
+    CommitCurrent,
+    SettleEnd,
+    RestoreBase,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Property {
+    X,
+    Y,
+    Scale,
+    Opacity,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Node {
+    pub id: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub asset: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default = "one")]
+    pub scale: f32,
+    #[serde(default = "one")]
+    pub opacity: f32,
+    #[serde(default = "white")]
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub order: i32,
+    #[serde(default)]
+    pub clip: Option<[f32; 4]>,
+}
+fn one() -> f32 {
+    1.0
+}
+fn white() -> [f32; 4] {
+    [1.; 4]
+}
+impl Node {
+    pub fn get(&self, p: Property) -> f32 {
+        match p {
+            Property::X => self.x,
+            Property::Y => self.y,
+            Property::Scale => self.scale,
+            Property::Opacity => self.opacity,
+        }
+    }
+    pub fn set(&mut self, p: Property, v: f32) {
+        match p {
+            Property::X => self.x = v,
+            Property::Y => self.y = v,
+            Property::Scale => self.scale = v,
+            Property::Opacity => self.opacity = v,
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Choice {
+    pub options: Vec<ChoiceOption>,
+    #[serde(default)]
+    pub timeout_us: Option<Micros>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceOption {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub visible: Option<Expr>,
+    #[serde(default)]
+    pub enabled: Option<Expr>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextContract {
+    pub revision: u32,
+    #[serde(default)]
+    pub gates: Vec<String>,
+    #[serde(default)]
+    pub params: BTreeMap<String, ValueType>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextDoc {
+    pub revision: u32,
+    pub spans: Vec<Span>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Span {
+    Text {
+        id: String,
+        text: String,
+        #[serde(default)]
+        emphasis: bool,
+    },
+    Break {
+        id: String,
+    },
+    Param {
+        id: String,
+        name: String,
+    },
+    Gate {
+        id: String,
+    },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Asset {
+    pub kind: AssetKind,
+    pub object: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub duration_us: Micros,
+    #[serde(default)]
+    pub decoded_bytes: u64,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetKind {
+    Image,
+    Audio,
+    Font,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Theme {
+    pub background: [f32; 4],
+    pub panel: [f32; 4],
+    pub accent: [f32; 4],
+    pub text: [f32; 4],
+    pub muted: [f32; 4],
+}
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            background: [0.04, 0.075, 0.09, 1.],
+            panel: [0.06, 0.105, 0.12, 0.97],
+            accent: [0.83, 0.73, 0.48, 1.],
+            text: [0.93, 0.94, 0.88, 1.],
+            muted: [0.58, 0.69, 0.69, 1.],
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Executable {
+    pub format: u32,
+    pub program: Program,
+    pub addresses: Vec<Address>,
+    pub resume_map: BTreeMap<String, u32>,
+    pub semantic_cost_map: Vec<u32>,
+    pub activation_recipes: BTreeMap<String, BTreeSet<String>>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Address {
+    pub function: String,
+    pub block: String,
+    pub op: usize,
+    pub stable_id: String,
+}
+impl Address {
+    pub fn key(&self) -> String {
+        format!("{}/{}/{}", self.function, self.block, self.stable_id)
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseManifest {
+    pub format: u32,
+    pub game_id: String,
+    pub title: String,
+    pub version: String,
+    pub engine_build: String,
+    pub program: String,
+    pub objects: BTreeMap<String, Object>,
+    pub engine: EngineFiles,
+    #[serde(default)]
+    pub notices: Vec<String>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineFiles {
+    pub js: String,
+    pub wasm: String,
+    pub host: String,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Object {
+    pub path: String,
+    pub bytes: u64,
+    pub media_type: String,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preferences {
+    pub locale: String,
+    pub font_scale: f32,
+    pub bgm_volume: f32,
+    pub voice_volume: f32,
+    pub sfx_volume: f32,
+    pub reduced_motion: bool,
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            locale: "zh-Hans".into(),
+            font_scale: 1.,
+            bgm_volume: 0.3,
+            voice_volume: 0.8,
+            sfx_volume: 0.5,
+            reduced_motion: false,
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiAction {
+    NewGame,
+    Continue,
+    Advance,
+    Choose { option: String },
+    Menu,
+    Close,
+    Settings,
+    History,
+    Saves,
+    Save { slot: u32 },
+    Load { slot: u32 },
+    Rollback,
+    Title,
+    ToggleAuto,
+    ToggleSkip,
+    Locale { locale: String },
+    FontSize { delta: f32 },
+    Volume { bus: AudioBus, delta: f32 },
+    ReducedMotion,
+    HistoryPage { delta: i32 },
+    Export,
+    Import,
+    Retry,
+}

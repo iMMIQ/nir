@@ -1,0 +1,1128 @@
+{
+  "variables": {
+    "affection": {
+      "type": "i32",
+      "value": 0
+    }
+  },
+  "functions": {
+    "main": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "opening",
+            "next": "intro"
+          }
+        },
+        "intro": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "intro",
+            "next": "wait_intro"
+          }
+        },
+        "wait_intro": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "enter",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "enter": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "enter",
+            "next": "wait_enter"
+          }
+        },
+        "wait_enter": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "stage",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "arrival",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "arrival": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "arrival",
+            "next": "wait_arrival"
+          }
+        },
+        "wait_arrival": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "letter",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "letter": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "letter",
+            "next": "gate"
+          }
+        },
+        "gate": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "marker",
+                  "id": "bell"
+                }
+              }
+            ],
+            "next": "bell",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "bell": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "bell",
+            "next": "wait_bell"
+          }
+        },
+        "wait_bell": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "bell",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "continue",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "continue": {
+          "ops": [
+            {
+              "id": "continue.letter",
+              "operation": {
+                "type": "dialogue_continue",
+                "task": "line"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "after_gate",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "after_gate": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "after_gate",
+            "next": "wait_after"
+          }
+        },
+        "wait_after": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "question",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "question": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "question",
+            "next": "wait_question"
+          }
+        },
+        "wait_question": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "choose",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "choose": {
+          "ops": [],
+          "terminator": {
+            "type": "interact",
+            "choice": "route",
+            "branches": {
+              "walk": "walk_begin",
+              "stay": "stay_begin"
+            },
+            "on_empty": "failed"
+          }
+        },
+        "walk_begin": {
+          "ops": [
+            {
+              "id": "affection.walk",
+              "operation": {
+                "type": "assign",
+                "target": "affection",
+                "value": {
+                  "type": "binary",
+                  "op": "add",
+                  "left": {
+                    "type": "var",
+                    "name": "affection"
+                  },
+                  "right": {
+                    "type": "const",
+                    "value": {
+                      "type": "i32",
+                      "value": 1
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "terminator": {
+            "type": "activate",
+            "cue": "river",
+            "next": "wait_river"
+          }
+        },
+        "wait_river": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "stage",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "walk_line",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "walk_line": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "walk_line",
+            "next": "wait_walk"
+          }
+        },
+        "wait_walk": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "walk_end",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "walk_end": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "walk_end",
+            "next": "wait_walk_end"
+          }
+        },
+        "wait_walk_end": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "end_walk",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "end_walk": {
+          "ops": [
+            {
+              "id": "unlock.walk",
+              "operation": {
+                "type": "profile_merge",
+                "key": "ending.walk"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "end",
+            "outcome": "walk_home"
+          }
+        },
+        "stay_begin": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "nod",
+            "next": "wait_nod"
+          }
+        },
+        "wait_nod": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "nod",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "stay_line",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "stay_line": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "stay_line",
+            "next": "wait_stay"
+          }
+        },
+        "wait_stay": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "stay_end",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "stay_end": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "stay_end",
+            "next": "wait_stay_end"
+          }
+        },
+        "wait_stay_end": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "end_stay",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "end_stay": {
+          "ops": [
+            {
+              "id": "unlock.stay",
+              "operation": {
+                "type": "profile_merge",
+                "key": "ending.stay"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "end",
+            "outcome": "read_letter"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    }
+  },
+  "scenes": {
+    "station": [
+      {
+        "id": "background",
+        "asset": "bg.station",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "together": [
+      {
+        "id": "background",
+        "asset": "bg.station",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      },
+      {
+        "id": "aki",
+        "asset": "actor.aki",
+        "x": 850,
+        "y": 100,
+        "width": 290,
+        "height": 530,
+        "opacity": 1.0
+      }
+    ],
+    "river": [
+      {
+        "id": "background",
+        "asset": "bg.river",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      },
+      {
+        "id": "aki",
+        "asset": "actor.aki",
+        "x": 820,
+        "y": 100,
+        "width": 290,
+        "height": 530,
+        "opacity": 1.0
+      }
+    ]
+  },
+  "cues": {
+    "opening": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "station",
+            "duration_us": "0"
+          }
+        },
+        {
+          "id": "music",
+          "scope": "session",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.bgm",
+            "bus": "bgm",
+            "looped": true
+          }
+        }
+      ]
+    },
+    "enter": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "together",
+            "duration_us": "600000"
+          }
+        }
+      ]
+    },
+    "bell": {
+      "effects": [
+        {
+          "id": "bell",
+          "scope": "interaction",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.bell",
+            "bus": "sfx",
+            "looped": false
+          }
+        }
+      ]
+    },
+    "river": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "river",
+            "duration_us": "900000"
+          }
+        }
+      ]
+    },
+    "nod": {
+      "effects": [
+        {
+          "id": "nod",
+          "scope": "scene",
+          "effect": {
+            "type": "clip",
+            "node": "aki",
+            "property": "y",
+            "to": 112,
+            "duration_us": "350000",
+            "easing": "smooth"
+          }
+        }
+      ]
+    },
+    "intro": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "intro",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "arrival": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "arrival",
+            "speaker": "speaker.aki",
+            "reveal_us": "32000"
+          }
+        },
+        {
+          "id": "voice",
+          "scope": "interaction",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.voice",
+            "bus": "voice",
+            "looped": false
+          }
+        }
+      ]
+    },
+    "letter": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "letter",
+            "speaker": "speaker.aki",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "after_gate": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "after_gate",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "question": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "question",
+            "speaker": "speaker.aki",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "walk_line": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "walk_line",
+            "speaker": "speaker.aki",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "walk_end": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "walk_end",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "stay_line": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "stay_line",
+            "speaker": "speaker.aki",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "stay_end": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "stay_end",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    }
+  },
+  "choices": {
+    "route": {
+      "options": [
+        {
+          "id": "walk",
+          "text": "walk"
+        },
+        {
+          "id": "stay",
+          "text": "stay"
+        }
+      ]
+    }
+  },
+  "format": 1,
+  "game_id": "org.nir.rain-letters",
+  "revision": "fixture-v1",
+  "entry": "main",
+  "stage": {
+    "width": 1280,
+    "height": 720
+  },
+  "requires": [
+    "control.v1",
+    "text.gate.v1"
+  ],
+  "default_locale": "zh-Hans",
+  "texts": {
+    "speaker.aki": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "intro": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "arrival": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "letter": {
+      "revision": 1,
+      "gates": [
+        "bell"
+      ],
+      "params": {}
+    },
+    "after_gate": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "question": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "walk": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "stay": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "walk_line": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "walk_end": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "stay_line": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    },
+    "stay_end": {
+      "revision": 1,
+      "gates": [],
+      "params": {}
+    }
+  },
+  "locales": {
+    "zh-Hans": {
+      "speaker.aki": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "秋"
+          }
+        ]
+      },
+      "intro": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "末班电车刚刚离开。雨把站前的灯光，揉成一封迟迟没有寄出的信。"
+          }
+        ]
+      },
+      "arrival": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "你还是来了。"
+          }
+        ]
+      },
+      "letter": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "这封信，我写了很久。"
+          },
+          {
+            "type": "gate",
+            "id": "bell"
+          },
+          {
+            "type": "text",
+            "id": "tail",
+            "text": "你愿意收下吗？"
+          }
+        ]
+      },
+      "after_gate": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "远处的钟响了。秋把信封放进你的掌心。"
+          }
+        ]
+      },
+      "question": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "雨好像小了一些。接下来……你想去哪里？"
+          }
+        ]
+      },
+      "walk": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "沿着河边，一起走回去"
+          }
+        ]
+      },
+      "stay": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "留在车站，读完这封信"
+          }
+        ]
+      },
+      "walk_line": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "那就慢慢走吧。今天的路，我想和你一起走完。"
+          }
+        ]
+      },
+      "walk_end": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "雨停了。没有说出口的话，也终于有了归处。"
+          }
+        ]
+      },
+      "stay_line": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "那我就在这里，陪你读到最后。"
+          }
+        ]
+      },
+      "stay_end": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "纸上的字迹有些模糊。可你知道，这一次，你不会再错过。"
+          }
+        ]
+      }
+    },
+    "en": {
+      "speaker.aki": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "Aki"
+          }
+        ]
+      },
+      "intro": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "The last train has gone. Rain folds the station lights into a letter that was never sent."
+          }
+        ]
+      },
+      "arrival": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "You came after all."
+          }
+        ]
+      },
+      "letter": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "I took a long time to write this letter."
+          },
+          {
+            "type": "gate",
+            "id": "bell"
+          },
+          {
+            "type": "text",
+            "id": "tail",
+            "text": "Will you take it?"
+          }
+        ]
+      },
+      "after_gate": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "A distant bell rings. Aki places the envelope in your hand."
+          }
+        ]
+      },
+      "question": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "The rain is letting up. Where would you like to go?"
+          }
+        ]
+      },
+      "walk": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "Walk home together along the river"
+          }
+        ]
+      },
+      "stay": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "Stay at the station and read the letter"
+          }
+        ]
+      },
+      "walk_line": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "Let’s take our time. Tonight, I want to walk the whole way with you."
+          }
+        ]
+      },
+      "walk_end": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "The rain stops. At last, the words left unspoken have found a home."
+          }
+        ]
+      },
+      "stay_line": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "Then I’ll stay here with you until the last word."
+          }
+        ]
+      },
+      "stay_end": {
+        "revision": 1,
+        "spans": [
+          {
+            "type": "text",
+            "id": "body",
+            "text": "The ink is a little blurred. But this time, you know you won’t miss what it means."
+          }
+        ]
+      }
+    }
+  },
+  "assets": {
+    "bg.station": {
+      "kind": "image",
+      "object": "station",
+      "bytes": 1,
+      "width": 1280,
+      "height": 720
+    },
+    "bg.river": {
+      "kind": "image",
+      "object": "river",
+      "bytes": 1,
+      "width": 1280,
+      "height": 720
+    },
+    "actor.aki": {
+      "kind": "image",
+      "object": "aki",
+      "bytes": 1,
+      "width": 1280,
+      "height": 720
+    },
+    "audio.bgm": {
+      "kind": "audio",
+      "object": "bgm",
+      "bytes": 1,
+      "width": 0,
+      "height": 0
+    },
+    "audio.bell": {
+      "kind": "audio",
+      "object": "bell",
+      "bytes": 1,
+      "width": 0,
+      "height": 0
+    },
+    "audio.voice": {
+      "kind": "audio",
+      "object": "voice",
+      "bytes": 1,
+      "width": 0,
+      "height": 0
+    },
+    "font.reader": {
+      "kind": "font",
+      "object": "font",
+      "bytes": 1,
+      "width": 0,
+      "height": 0
+    }
+  }
+}

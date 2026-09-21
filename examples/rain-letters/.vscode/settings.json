@@ -1,0 +1,8 @@
+{
+  "json.schemas": [
+    {"fileMatch": ["/content/**/*.nir.json"], "url": "./schemas/fragment.schema.json"},
+    {"fileMatch": ["/content/**/texts/contracts.json"], "url": "./schemas/text-contracts.schema.json"},
+    {"fileMatch": ["/content/**/texts/zh-Hans.json", "/content/**/texts/en.json"], "url": "./schemas/texts.schema.json"},
+    {"fileMatch": ["/themes/**/tokens.json"], "url": "./schemas/theme.schema.json"}
+  ]
+}

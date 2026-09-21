@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Module",
+  "type": "object",
+  "properties": {
+    "exports": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "id": {
+      "type": "string"
+    },
+    "module_format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "text_bundles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "text_contracts": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "module_format",
+    "id",
+    "sources",
+    "text_contracts",
+    "exports",
+    "text_bundles"
+  ]
+}

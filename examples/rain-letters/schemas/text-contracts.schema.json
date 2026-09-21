@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Map_of_TextContract",
+  "type": "object",
+  "additionalProperties": {
+    "$ref": "#/$defs/TextContract"
+  },
+  "$defs": {
+    "TextContract": {
+      "type": "object",
+      "properties": {
+        "gates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ValueType"
+          },
+          "default": {}
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision"
+      ]
+    },
+    "ValueType": {
+      "type": "string",
+      "enum": [
+        "bool",
+        "i32",
+        "string"
+      ]
+    }
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GameManifest",
+  "type": "object",
+  "properties": {
+    "engine": {
+      "$ref": "#/$defs/Engine"
+    },
+    "game": {
+      "$ref": "#/$defs/Game"
+    },
+    "inputs": {
+      "$ref": "#/$defs/Inputs"
+    },
+    "project_format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "project_format",
+    "game",
+    "engine",
+    "stage",
+    "inputs"
+  ],
+  "$defs": {
+    "Engine": {
+      "type": "object",
+      "properties": {
+        "api": {
+          "type": "string"
+        },
+        "capability_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "api",
+        "capability_profile"
+      ]
+    },
+    "Game": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_locale": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "title_scene": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "slug",
+        "title",
+        "version",
+        "source_locale"
+      ]
+    },
+    "Inputs": {
+      "type": "object",
+      "properties": {
+        "asset_catalogs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notices": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "scenarios": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "theme": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "modules",
+        "asset_catalogs",
+        "theme"
+      ]
+    },
+    "Stage": {
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "width",
+        "height"
+      ]
+    }
+  }
+}

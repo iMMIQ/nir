@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Catalog",
+  "type": "object",
+  "properties": {
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssetSource"
+      }
+    },
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "assets"
+  ],
+  "$defs": {
+    "AssetKind": {
+      "type": "string",
+      "enum": [
+        "image",
+        "audio",
+        "font"
+      ]
+    },
+    "AssetSource": {
+      "type": "object",
+      "properties": {
+        "expected_size": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AssetKind"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "source",
+        "rights"
+      ]
+    }
+  }
+}

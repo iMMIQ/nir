@@ -1,0 +1,13 @@
+[package]
+name = "nir-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-format.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+unicode-segmentation.workspace = true

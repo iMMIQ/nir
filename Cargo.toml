@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+exclude = ["vendor/wgpu"]
+members = ["crates/*", "apps/player-web", "tools/novelc", "xtask"]
+default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LGPL-3.0-or-later"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+sha2 = "0.10"
+toml = "0.8"
+rand_chacha = { version = "0.3", features = ["serde1"] }
+rand_core = "0.6"
+unicode-segmentation = "=1.12.0"
+cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash"] }
+glyphon = "=0.9.0"
+wgpu = { version = "=25.0.2", default-features = false, features = ["webgpu", "wgsl"] }
+wasm-bindgen = "=0.2.100"
+wasm-bindgen-futures = "=0.4.50"
+js-sys = "=0.3.77"
+web-sys = "=0.3.77"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+fluent-bundle = "0.15"
+unic-langid = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+schemars = "1"
+nir-format = { path = "crates/nir-format" }
+nir-core = { path = "crates/nir-core" }
+nir-content = { path = "crates/nir-content" }
+nir-assets = { path = "crates/nir-assets" }
+nir-presentation = { path = "crates/nir-presentation" }
+nir-player = { path = "crates/nir-player" }
+nir-render-wgpu = { path = "crates/nir-render-wgpu" }
+nir-platform-web = { path = "crates/nir-platform-web" }
+nir-compiler = { path = "crates/nir-compiler" }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[patch.crates-io]
+wgpu = { path = "vendor/wgpu" }

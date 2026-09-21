@@ -1,0 +1,131 @@
+use anyhow::{bail, Context, Result};
+use std::{fs, path::Path, process::Command};
+fn run(cmd: &mut Command) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("starting {cmd:?}"))?;
+    if !status.success() {
+        bail!("command failed: {cmd:?}");
+    }
+    Ok(())
+}
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let e = entry?;
+        let name = e.file_name();
+        if ["dist", "reports", ".nir", "game.lock"]
+            .iter()
+            .any(|x| name == *x)
+        {
+            continue;
+        }
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &dst.join(name))?;
+        } else {
+            fs::copy(e.path(), dst.join(name))?;
+        }
+    }
+    Ok(())
+}
+fn main() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    std::env::set_current_dir(root)?;
+    fs::create_dir_all("target/tmp")?;
+    std::env::set_var("TMPDIR", root.join("target/tmp"));
+    match std::env::args().nth(1).as_deref() {
+        Some("sdk") => {
+            // Keep developer usernames and checkout locations out of distributed binaries.
+            // Use Cargo's encoded flags so paths containing spaces remain a single flag.
+            let mut flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+            for (from, to) in [
+                (
+                    std::env::var_os("HOME").map(std::path::PathBuf::from),
+                    "/build-home",
+                ),
+                (Some(root.to_path_buf()), "/nir"),
+            ] {
+                if let Some(from) = from {
+                    if !flags.is_empty() {
+                        flags.push('\x1f');
+                    }
+                    flags.push_str(&format!("--remap-path-prefix={}={to}", from.display()));
+                }
+            }
+            std::env::set_var("CARGO_ENCODED_RUSTFLAGS", flags);
+            run(Command::new("cargo").args([
+                "build",
+                "--locked",
+                "-p",
+                "player-web",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--release",
+            ]))?;
+            fs::create_dir_all("dist/sdk")?;
+            let bindgen = std::env::var_os("WASM_BINDGEN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    Path::new(&std::env::var_os("HOME").unwrap_or_default())
+                        .join(".cargo/bin/wasm-bindgen")
+                });
+            let version = Command::new(&bindgen)
+                .arg("--version")
+                .output()
+                .context("install wasm-bindgen-cli 0.2.100")?;
+            if !String::from_utf8_lossy(&version.stdout).contains("0.2.100") {
+                bail!("E_BINDGEN_VERSION: expected 0.2.100");
+            }
+            run(Command::new(bindgen).args([
+                "--target",
+                "web",
+                "--out-dir",
+                "dist/sdk",
+                "--no-typescript",
+                "target/wasm32-unknown-unknown/release/player_web.wasm",
+            ]))?;
+            for name in ["index.html", "bootstrap.js"] {
+                fs::copy(
+                    format!("apps/player-web/host/{name}"),
+                    format!("dist/sdk/{name}"),
+                )?;
+            }
+            fs::copy("crates/nir-platform-web/host.js", "dist/sdk/host.js")?;
+            run(Command::new("python3")
+                .args(["scripts/third_party.py", "dist/sdk/THIRD-PARTY.txt"]))?;
+            copy_dir(
+                Path::new("examples/rain-letters"),
+                Path::new("dist/sdk/template"),
+            )?;
+            run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
+            fs::copy("target/release/novelc", "dist/novelc")?;
+            run(Command::new("python3").args(["-c", "import hashlib,pathlib; pathlib.Path('dist/sdk/compiler.sha256').write_text(hashlib.sha256(pathlib.Path('dist/novelc').read_bytes()).hexdigest()+'\\n')"]))?;
+            run(Command::new("dist/novelc").args([
+                "schemas",
+                "--out",
+                "dist/sdk/template/schemas",
+            ]))?;
+            println!("SDK: dist/sdk; CLI: dist/novelc");
+        }
+        Some("check-architecture") => {
+            run(Command::new("python3").arg("scripts/check_architecture.py"))?
+        }
+        Some("test") => {
+            run(Command::new("cargo").args([
+                "test",
+                "--locked",
+                "-p",
+                "nir-core",
+                "-p",
+                "nir-content",
+                "-p",
+                "nir-assets",
+                "-p",
+                "nir-player",
+                "-p",
+                "nir-compiler",
+            ]))?;
+            run(Command::new("python3").arg("scripts/check_architecture.py"))?;
+        }
+        _ => println!("cargo xtask sdk | check-architecture | test"),
+    }
+    Ok(())
+}

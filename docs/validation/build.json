@@ -1,0 +1,26 @@
+{
+  "release": "c9e03ed6eb57c7cb96d47b673b3722278bcb36924a5463da5b79da06e214a143",
+  "game_id": "org.nir.rain-letters",
+  "total_bytes": 6676940,
+  "objects": 12,
+  "resources": [
+    "actor.aki",
+    "audio.bell",
+    "audio.bgm",
+    "audio.voice",
+    "bg.river",
+    "bg.station",
+    "font.reader"
+  ],
+  "excluded_resources": [],
+  "provenance": {
+    "actor.aki": "CC0-1.0",
+    "audio.bell": "CC0-1.0",
+    "audio.bgm": "CC0-1.0",
+    "audio.voice": "CC0-1.0",
+    "bg.river": "CC0-1.0",
+    "bg.station": "CC0-1.0",
+    "font.reader": "OFL-1.1"
+  },
+  "engine_build": "0e7cdafbfa3606b479add8db55b31e38dc89776a3704d574e1a244568eac6cba"
+}

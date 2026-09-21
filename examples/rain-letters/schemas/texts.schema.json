@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Map_of_TextDoc",
+  "type": "object",
+  "additionalProperties": {
+    "$ref": "#/$defs/TextDoc"
+  },
+  "$defs": {
+    "Span": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "emphasis": {
+              "type": "boolean",
+              "default": false
+            },
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "break"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "param"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "gate"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id"
+          ]
+        }
+      ]
+    },
+    "TextDoc": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Span"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "spans"
+      ]
+    }
+  }
+}

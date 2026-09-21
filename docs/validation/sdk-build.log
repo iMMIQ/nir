@@ -1,0 +1,216 @@
+   Compiling xtask v0.1.0 (/nir/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.45s
+     Running `target/debug/xtask sdk`
+   Compiling cfg-if v1.0.5
+   Compiling once_cell v1.21.4
+   Compiling serde_core v1.0.229
+   Compiling thiserror v2.0.20
+   Compiling bytemuck v1.25.2
+   Compiling wasm-bindgen v0.2.100
+   Compiling serde v1.0.229
+   Compiling zmij v1.0.23
+   Compiling smallvec v1.16.1
+   Compiling serde_json v1.0.151
+   Compiling tinystr v0.8.4
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling font-types v0.12.5
+   Compiling log v0.4.34
+   Compiling libm v0.2.16
+   Compiling slotmap v1.1.1
+   Compiling unic-langid-impl v0.9.6
+   Compiling generic-array v0.14.7
+   Compiling num-traits v0.2.19
+   Compiling typenum v1.20.1
+   Compiling rustc-hash v2.1.3
+   Compiling simd-adler32 v0.3.10
+   Compiling self_cell v1.3.0
+   Compiling unic-langid v0.9.6
+   Compiling thiserror v1.0.69
+   Compiling read-fonts v0.41.0
+   Compiling js-sys v0.3.77
+   Compiling unicode-ccc v0.2.0
+   Compiling rustc-hash v1.1.0
+   Compiling unicode-bidi-mirroring v0.2.0
+   Compiling unicode-segmentation v1.12.0
+   Compiling ttf-parser v0.20.0
+   Compiling yazi v0.2.1
+   Compiling unicode-script v0.5.8
+   Compiling memmap2 v0.9.11
+   Compiling bitflags v2.13.2
+   Compiling ttf-parser v0.21.1
+   Compiling tinyvec v1.13.3
+   Compiling zeno v0.3.3
+   Compiling adler2 v2.0.1
+   Compiling unicode-properties v0.1.4
+   Compiling zerocopy v0.8.57
+   Compiling crc32fast v1.5.2
+   Compiling parking_lot_core v0.9.12
+   Compiling type-map v0.5.1
+   Compiling rangemap v1.8.0
+   Compiling unicode-bidi v0.3.18
+   Compiling unicode-linebreak v0.1.5
+   Compiling nir-format v0.1.0 (/nir/crates/nir-format)
+   Compiling fontdb v0.16.2
+   Compiling scopeguard v1.2.0
+   Compiling sys-locale v0.3.2
+   Compiling smol_str v0.2.2
+   Compiling rustybuzz v0.14.1
+   Compiling lock_api v0.4.14
+   Compiling intl-memoizer v0.5.3
+   Compiling fluent-syntax v0.11.1
+   Compiling web-sys v0.3.77
+   Compiling miniz_oxide v0.9.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling intl_pluralrules v7.0.2
+   Compiling fluent-langneg v0.13.1
+   Compiling self_cell v0.10.3
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling fluent-bundle v0.15.3
+   Compiling flate2 v1.1.10
+   Compiling digest v0.10.7
+   Compiling parking_lot v0.12.5
+   Compiling wasm-bindgen-futures v0.4.50
+   Compiling wgpu v25.0.2 (/nir/vendor/wgpu)
+   Compiling miniz_oxide v0.8.9
+   Compiling skrifa v0.44.0
+   Compiling euclid v0.22.14
+   Compiling fdeflate v0.3.7
+   Compiling static_assertions v1.1.0
+   Compiling arrayvec v0.7.8
+   Compiling profiling v1.0.18
+   Compiling raw-window-handle v0.6.2
+   Compiling rand_core v0.6.4
+   Compiling pxfm v0.1.30
+   Compiling svg_fmt v0.4.5
+   Compiling etagere v0.2.15
+   Compiling ppv-lite86 v0.2.21
+   Compiling png v0.18.1
+   Compiling sha2 v0.10.9
+   Compiling rand_chacha v0.3.1
+   Compiling lru v0.12.5
+   Compiling byteorder-lite v0.1.0
+   Compiling nir-core v0.1.0 (/nir/crates/nir-core)
+   Compiling swash v0.2.10
+   Compiling moxcms v0.8.1
+   Compiling wgpu-types v25.0.0
+   Compiling cosmic-text v0.14.2
+warning: unused import: `vec`
+ --> vendor/wgpu/src/api/shader_module.rs:3:5
+  |
+3 |     vec,
+  |     ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+   Compiling image v0.25.10
+   Compiling nir-content v0.1.0 (/nir/crates/nir-content)
+   Compiling nir-assets v0.1.0 (/nir/crates/nir-assets)
+   Compiling nir-platform-web v0.1.0 (/nir/crates/nir-platform-web)
+   Compiling console_error_panic_hook v0.1.7
+   Compiling nir-player v0.1.0 (/nir/crates/nir-player)
+warning: unused import: `ToString`
+ --> vendor/wgpu/src/api/shader_module.rs:2:22
+  |
+2 |     string::{String, ToString as _},
+  |                      ^^^^^^^^
+
+   Compiling glyphon v0.9.0
+   Compiling nir-render-wgpu v0.1.0 (/nir/crates/nir-render-wgpu)
+warning: `wgpu` (lib) generated 2 warnings (run `cargo fix --lib -p wgpu` to apply 1 suggestion)
+   Compiling player-web v0.1.0 (/nir/apps/player-web)
+    Finished `release` profile [optimized] target(s) in 2m 57s
+Collected 203 package notices
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling cfg-if v1.0.5
+   Compiling version_check v0.9.5
+   Compiling zmij v1.0.23
+   Compiling ref-cast v1.0.27
+   Compiling typenum v1.20.1
+   Compiling simd-adler32 v0.3.10
+   Compiling serde_json v1.0.151
+   Compiling crc32fast v1.5.2
+   Compiling generic-array v0.14.7
+   Compiling itoa v1.0.18
+   Compiling thiserror v2.0.20
+   Compiling memchr v2.8.3
+   Compiling zerocopy v0.8.57
+   Compiling adler2 v2.0.1
+   Compiling autocfg v1.5.1
+   Compiling dyn-clone v1.0.20
+   Compiling miniz_oxide v0.9.1
+   Compiling hashbrown v0.17.1
+   Compiling num-traits v0.2.19
+   Compiling syn v3.0.6
+   Compiling utf8parse v0.2.2
+   Compiling equivalent v1.0.2
+   Compiling libc v0.2.189
+   Compiling anstyle-parse v1.0.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling flate2 v1.1.10
+   Compiling digest v0.10.7
+   Compiling indexmap v2.14.2
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling cpufeatures v0.2.17
+   Compiling winnow v0.7.15
+   Compiling anyhow v1.0.104
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling getrandom v0.4.3
+   Compiling bitflags v2.13.2
+   Compiling rand_core v0.6.4
+   Compiling toml_write v0.1.2
+   Compiling pxfm v0.1.30
+   Compiling png v0.18.1
+   Compiling anstream v1.0.0
+   Compiling sha2 v0.10.9
+   Compiling serde_derive_internals v0.30.0
+   Compiling bytemuck v1.25.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling heck v0.5.0
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.1
+   Compiling unicode-segmentation v1.12.0
+   Compiling tinyvec v1.13.3
+   Compiling byteorder-lite v0.1.0
+   Compiling clap_builder v4.6.7
+   Compiling unicode-normalization v0.1.25
+   Compiling ascii v1.1.0
+   Compiling log v0.4.34
+   Compiling ttf-parser v0.25.1
+   Compiling httpdate v1.0.3
+   Compiling chunked_transfer v1.5.0
+   Compiling uuid v1.26.1
+   Compiling tiny_http v0.12.0
+   Compiling serde_derive v1.0.229
+   Compiling ref-cast-impl v1.0.27
+   Compiling thiserror-impl v2.0.20
+   Compiling schemars_derive v1.2.2
+   Compiling moxcms v0.8.1
+   Compiling clap_derive v4.6.7
+   Compiling clap v4.6.7
+   Compiling schemars v1.2.2
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling rand_chacha v0.3.1
+   Compiling toml_edit v0.22.27
+   Compiling nir-format v0.1.0 (/nir/crates/nir-format)
+   Compiling image v0.25.10
+   Compiling toml v0.8.23
+   Compiling nir-core v0.1.0 (/nir/crates/nir-core)
+   Compiling nir-content v0.1.0 (/nir/crates/nir-content)
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+   Compiling novelc v0.1.0 (/nir/tools/novelc)
+    Finished `release` profile [optimized] target(s) in 2m 19s
+SDK: dist/sdk; CLI: dist/novelc

@@ -1,0 +1,8 @@
+[package]
+name = "nir-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-format.workspace = true

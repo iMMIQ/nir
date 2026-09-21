@@ -1,0 +1,13 @@
+[package]
+name = "nir-presentation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-format.workspace = true
+cosmic-text.workspace = true
+fluent-bundle.workspace = true
+unic-langid.workspace = true
+unicode-segmentation.workspace = true
+serde.workspace = true

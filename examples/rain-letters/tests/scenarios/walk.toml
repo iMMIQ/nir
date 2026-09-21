@@ -1,0 +1,13 @@
+format = 1
+id = "walk"
+entry = "main"
+text_locale = "zh-Hans"
+[[steps]]
+action = "await_choice"
+id = "route"
+[[steps]]
+action = "choose"
+option_id = "walk"
+[expect]
+outcome = "walk_home"
+affection = 1

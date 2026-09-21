@@ -1,0 +1,163 @@
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+   Compiling xtask v0.1.0 (/nir/xtask)
+   Compiling novelc v0.1.0 (/nir/tools/novelc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.98s
+     Running unittests src/lib.rs (target/debug/deps/nir_assets-951cdbcfb9528a75)
+
+running 2 tests
+test tests::joint_admission_and_drop ... ok
+test tests::stale_generation_not_ready ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_compiler-594ee1397422d35e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/project.rs (target/debug/deps/project-629f68a9d9177754)
+
+running 10 tests
+test rejects_lfs_pointer ... ok
+test rejects_duplicate_fragment_identity ... ok
+test rejects_path_escape ... ok
+test rejects_symlink_escape ... ok
+test unsupported_module_count_rejected ... ok
+test rejects_wrong_dimensions ... ok
+test runtime_rejects_missing_or_rewritten_index_and_recipe ... ok
+test missing_font_glyph_rejected ... ok
+test checks_and_scenarios ... ok
+test reproducible_release_lock_drift_and_corruption ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.10s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_content-570f56a197a20706)
+
+running 3 tests
+test tests::corrupted_bytes ... ok
+test tests::duplicate_keys_rejected ... ok
+test tests::script_not_guessed ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_core-f1c278d92db7acd1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-9fab55ef12650bf2)
+
+running 19 tests
+test infinite_bgm_wait_rejected ... ok
+test await_all_failure_takes_precedence_over_cancellation ... ok
+test clock_frozen_during_prepare ... ok
+test cancelled_wait_is_not_success ... ok
+test missing_gate_is_validation_error ... ok
+test checked_integer_overflow_faults ... ok
+test checked_fault_is_not_hoisted ... ok
+test pending_restore_does_not_repeat_assign ... ok
+test random_stream_restores_after_budget_boundary ... ok
+test snapshots_keep_current_text ... ok
+test restore_rejects_mismatched_release ... ok
+test stale_and_duplicate_choice ... ok
+test uninitialized_local_rejected ... ok
+test corrupt_choice_continuation_rejected ... ok
+test restore_animation_at_37_percent ... ok
+test deterministic_replay ... ok
+test language_does_not_change_route ... ok
+test two_routes ... ok
+test non_suspending_loop_yields_then_faults_with_location ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.44s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_format-cb733a796e6904e7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_player-7129cc4600f1af1e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/coordination.rs (target/debug/deps/coordination-0e773d855a1e102f)
+
+running 10 tests
+test device_loss_during_candidate_restore_keeps_the_candidate ... ok
+test invalid_locale_does_not_replace_the_open_dialogue ... ok
+test device_rebuild_does_not_restart_story ... ok
+test menu_and_background_pause_owners_are_independent ... ok
+test restore_is_candidate_then_paused_commit ... ok
+test incompatible_restore_keeps_current_session ... ok
+test consecutive_rollbacks_keep_the_earlier_checkpoints ... ok
+test stale_asset_callbacks_cannot_commit ... ok
+test save_job_survives_new_session ... ok
+test choice_input_in_the_deadline_pump_precedes_timeout ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_presentation-4b98a4637cddb4eb)
+
+running 1 test
+test scene_tests::group_order_and_nested_clip_are_composed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/novelc-aa3b768a1f3594b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-adbb3bad6580a989)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_assets
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_compiler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_content
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_format
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_player
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_presentation
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

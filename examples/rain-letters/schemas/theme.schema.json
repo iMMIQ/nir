@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Theme",
+  "type": "object",
+  "properties": {
+    "accent": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "format": "float"
+      },
+      "maxItems": 4,
+      "minItems": 4
+    },
+    "background": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "format": "float"
+      },
+      "maxItems": 4,
+      "minItems": 4
+    },
+    "muted": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "format": "float"
+      },
+      "maxItems": 4,
+      "minItems": 4
+    },
+    "panel": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "format": "float"
+      },
+      "maxItems": 4,
+      "minItems": 4
+    },
+    "text": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "format": "float"
+      },
+      "maxItems": 4,
+      "minItems": 4
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "background",
+    "panel",
+    "accent",
+    "text",
+    "muted"
+  ]
+}

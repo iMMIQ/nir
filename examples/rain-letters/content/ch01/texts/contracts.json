@@ -1,0 +1,64 @@
+{
+  "speaker.aki": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "intro": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "arrival": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "letter": {
+    "revision": 1,
+    "gates": [
+      "bell"
+    ],
+    "params": {}
+  },
+  "after_gate": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "question": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "walk": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "stay": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "walk_line": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "walk_end": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "stay_line": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "stay_end": {
+    "revision": 1,
+    "gates": [],
+    "params": {}
+  }
+}

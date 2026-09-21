@@ -1,0 +1,46 @@
+format = 1
+
+[[assets]]
+id = "bg.station"
+kind = "image"
+source = "source/station.png"
+rights = "CC0-1.0"
+expected_size = [1280, 720]
+
+[[assets]]
+id = "bg.river"
+kind = "image"
+source = "source/river.png"
+rights = "CC0-1.0"
+expected_size = [1280, 720]
+
+[[assets]]
+id = "actor.aki"
+kind = "image"
+source = "source/aki.png"
+rights = "CC0-1.0"
+expected_size = [290, 530]
+
+[[assets]]
+id = "audio.bgm"
+kind = "audio"
+source = "source/bgm.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.bell"
+kind = "audio"
+source = "source/bell.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.voice"
+kind = "audio"
+source = "source/voice.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "font.reader"
+kind = "font"
+source = "source/reader.otf"
+rights = "OFL-1.1"

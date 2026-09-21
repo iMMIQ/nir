@@ -1,0 +1,16 @@
+[package]
+name = "novelc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-compiler.workspace = true
+nir-content.workspace = true
+nir-format.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tiny_http = "0.12"
+uuid = { version = "1", features = ["v4"] }
