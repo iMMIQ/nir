@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Diagnostic",
+  "type": "object",
+  "properties": {
+    "code": {
+      "type": "string"
+    },
+    "details": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DiagnosticDetails"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "location": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "location",
+    "message"
+  ],
+  "$defs": {
+    "DiagnosticDetails": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "domain": {
+          "$ref": "#/$defs/ErrorDomain"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "type": "string"
+        },
+        "recovery": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Recovery"
+          }
+        },
+        "references": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "release": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "type": "string"
+        },
+        "task": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "operation",
+        "stage"
+      ]
+    },
+    "ErrorDomain": {
+      "type": "string",
+      "enum": [
+        "content",
+        "core",
+        "prepare",
+        "render",
+        "storage",
+        "host"
+      ]
+    },
+    "Recovery": {
+      "type": "string",
+      "enum": [
+        "retry",
+        "keep_current",
+        "reload",
+        "exit",
+        "fix_content"
+      ]
+    },
+    "SourceRef": {
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "One-based UTF-8 byte column, matching serde_json diagnostics.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "pointer": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "line",
+        "column",
+        "pointer"
+      ]
+    }
+  }
+}

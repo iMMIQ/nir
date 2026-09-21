@@ -28,8 +28,21 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     first = json.loads(channel.read_text())["release"]
     run("-p", "story", "build", "--locked")
     assert json.loads(channel.read_text())["release"] == first
+    fragment = root / "story/content/ch01/story.nir.json"
+    original = fragment.read_bytes()
+    content = json.loads(original)
+    first_scene = next(iter(content["scenes"].values()))
+    first_scene[0]["asset"] = "missing.test.resource"
+    fragment.write_text(json.dumps(content, indent=2))
+    report = json.loads(run("-p", "story", "--diagnostics", "json", "check", success=False))
+    assert report["format"] == 1 and report["diagnostic"]["code"] == "E_ASSET_TYPE"
+    detail = report["diagnostic"]["details"]
+    assert detail["source"]["file"] == "content/ch01/story.nir.json"
+    assert detail["source"]["pointer"].endswith("/0/asset") and detail["source"]["line"] > 1
+    assert "missing.test.resource" in detail["references"] and detail["hint"]
+    fragment.write_bytes(original)
     with (kit / "sdk/host.js").open("a") as f:
         f.write("\n// intentional SDK drift\n")
     error = run("-p", "story", "check", "--locked", success=False)
     assert "E_LOCK_DRIFT" in error, error
-    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False}, indent=2))
+    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True}, indent=2))

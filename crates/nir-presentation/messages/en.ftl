@@ -28,3 +28,9 @@ empty-slot = Empty slot
 saved = Saved in this browser
 saving = Saving…
 read-failed = Could not load
+
+error-prepare = Unable to prepare resources. The current scene is kept.
+error-storage = Storage operation failed. The current session is kept.
+error-render = The graphics device needs recovery.
+error-content = Content execution failed.
+error-host = Player operation failed.

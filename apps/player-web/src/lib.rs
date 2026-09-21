@@ -125,10 +125,18 @@ impl Engine {
         }
         match asset.kind {
             AssetKind::Image => {
+                if !self.renderer.image_started(request, &id) {
+                    let start = nir_platform_web::now_us();
+                    let result = self.renderer.prepare_image(request, &id, bytes);
+                    self.resource_stage("decode_allocate", request, &id, start, bytes.len());
+                    result.map_err(js)?;
+                }
+                let start = nir_platform_web::now_us();
                 let (complete, used) = self
                     .renderer
                     .upload_image_step(request, &id, bytes, self.upload_remaining)
                     .map_err(js)?;
+                self.resource_stage("upload_enqueued", request, &id, start, used);
                 self.upload_remaining -= used;
                 if !complete {
                     return Ok(false);
@@ -143,6 +151,26 @@ impl Engine {
         }
         self.pump(vec![AppEvent::AssetReady { request, asset: id }])?;
         Ok(true)
+    }
+    pub fn resource_fault(
+        &mut self,
+        request: u32,
+        asset: String,
+        code: String,
+        stage: String,
+        cause: String,
+    ) -> std::result::Result<(), JsValue> {
+        let mut d = Diagnostic::new(&code, self.player.core().location(), cause).classified(
+            ErrorDomain::Prepare,
+            "prepare",
+            &stage,
+            vec![Recovery::Retry, Recovery::KeepCurrent, Recovery::Exit],
+        );
+        d.details.as_mut().unwrap().references.push(asset);
+        self.pump(vec![AppEvent::AssetFault {
+            request,
+            diagnostic: Box::new(d),
+        }])
     }
     pub fn resource_failed(
         &mut self,
@@ -206,6 +234,7 @@ impl Engine {
                 ),
             },
             "load_failed" => AppEvent::LoadFailed(json),
+            "host_failed" => AppEvent::HostFailed(json),
             "slots" => {
                 let rows: Vec<serde_json::Value> =
                     nir_content::parse(json.as_bytes(), "slots").map_err(js)?;
@@ -244,9 +273,13 @@ impl Engine {
             "save_failed" => {
                 let v: serde_json::Value =
                     nir_content::parse(json.as_bytes(), "save_failed").map_err(js)?;
-                AppEvent::SaveFailed {
+                AppEvent::SaveFault {
                     job: v["job"].as_u64().unwrap_or(0) as u32,
-                    message: v["message"].as_str().unwrap_or("E_STORAGE").into(),
+                    diagnostic: Box::new(Diagnostic::new(
+                        v["code"].as_str().unwrap_or("E_STORAGE"),
+                        "save",
+                        v["message"].as_str().unwrap_or("E_STORAGE"),
+                    )),
                 }
             }
             _ => return Err(js("E_HOST_PROTOCOL: unknown event")),
@@ -295,7 +328,7 @@ impl Engine {
     }
     pub fn state(&self) -> String {
         let c = self.player.core();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
     }
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
@@ -318,6 +351,25 @@ impl Engine {
     }
 }
 impl Engine {
+    fn resource_stage(
+        &mut self,
+        stage: &str,
+        request: u32,
+        asset: &str,
+        start_us: Micros,
+        bytes: usize,
+    ) {
+        self.outbox.push(AppCommand::ResourceStage {
+            stage: stage.into(),
+            request,
+            asset: asset.into(),
+            session: self.player.generation.session,
+            device: self.player.generation.device,
+            start_us,
+            end_us: nir_platform_web::now_us(),
+            bytes,
+        });
+    }
     fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), JsValue> {
         let mut commands = self.player.pump(events, self.work_remaining);
         self.work_remaining -= self.player.work_used();
@@ -336,7 +388,10 @@ impl Engine {
                         self.height,
                         &self.messages,
                     );
-                    match self.renderer.prepare(&preview, self.dpr, true) {
+                    let start = nir_platform_web::now_us();
+                    let prepared = self.renderer.prepare(&preview, self.dpr, true);
+                    self.resource_stage("presentation_prepare", request, "", start, 0);
+                    match prepared {
                         Ok(()) => {
                             self.ready = true;
                             events.push(AppEvent::PresentationReady { request });

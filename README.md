@@ -6,7 +6,7 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 
 `examples/rain-letters/`（《雨后书简》）是随仓库提供的测试工程，用于验证引擎功能、运行两条剧情测试路线，以及演示作品工程格式。其简单图像和合成音频用于测试。
 
-这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md) 与 [请求生命周期进展](docs/REQUEST-LIFECYCLE.md)。
+这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 与 [诊断和性能测量](docs/DIAGNOSTICS.md)。
 
 ## 使用 SDK 创建作品
 

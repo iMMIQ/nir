@@ -12,6 +12,8 @@ struct Cli {
     project: PathBuf,
     #[arg(long, global = true)]
     sdk: Option<PathBuf>,
+    #[arg(long, global = true, value_parser = ["text", "json"], default_value = "text")]
+    diagnostics: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,13 +60,30 @@ enum Command {
     },
 }
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{e:#}");
+    let cli = Cli::parse();
+    let json = cli.diagnostics == "json";
+    if let Err(e) = run(cli) {
+        let d = diagnostic(&e);
+        if json {
+            eprintln!("{}", serde_json::json!({"format":1,"diagnostic":d}));
+        } else {
+            eprintln!("{d}");
+            if let Some(details) = &d.details {
+                if let Some(s) = &details.source {
+                    eprintln!("  {}:{}:{} {}", s.file, s.line, s.column, s.pointer);
+                }
+                for r in &details.references {
+                    eprintln!("  reference: {r}");
+                }
+                if let Some(h) = &details.hint {
+                    eprintln!("  action: {h}");
+                }
+            }
+        }
         std::process::exit(1);
     }
 }
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     let sdk = cli.sdk.unwrap_or_else(default_sdk);
     if matches!(
         &cli.command,

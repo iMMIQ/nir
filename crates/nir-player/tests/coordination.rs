@@ -377,7 +377,8 @@ fn work_is_retained_and_terminal_events_have_admission_room() {
     assert_eq!(p.pending_events(), 129);
     assert_eq!(p.work_used(), 0);
     p.pump(vec![], 2);
-    assert_eq!(p.status, "terminal");
+    assert_eq!(p.diagnostic.as_ref().unwrap().message, "terminal");
+    assert!(p.status.starts_with("E_STORAGE"));
     assert!(p.pending_events() > 0);
     assert!(p.work_used() <= 2);
     for _ in 0..200 {
@@ -462,7 +463,8 @@ fn failed_preparation_cannot_be_committed_by_late_success() {
     assert!(p.paused());
     assert!(p.is_loading());
     assert!(!p.accepts(request));
-    assert_eq!(p.error.as_deref(), Some("network failed"));
+    assert_eq!(p.diagnostic.as_ref().unwrap().message, "network failed");
+    assert!(p.error.as_ref().unwrap().starts_with("E_PREPARE"));
     let c = action(&mut p, UiAction::Retry);
     ready(&mut p, c);
     assert!(!p.is_loading());
@@ -532,4 +534,85 @@ fn many_events_cannot_multiply_the_story_work_budget() {
         assert!(p.core().state().unsuspended_ops - before <= 7);
         assert_eq!(p.work_used(), 7);
     }
+}
+
+#[test]
+fn preparation_diagnostic_keeps_identity_and_hides_internal_cause() {
+    let mut p = player();
+    let initial = p.pump(vec![], 1000);
+    let request = initial
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    let mut d = Diagnostic::new("E_RESOURCE_FETCH", "f/b/1", "secret URL or browser cause")
+        .classified(
+            ErrorDomain::Prepare,
+            "prepare",
+            "fetch",
+            vec![Recovery::Retry, Recovery::KeepCurrent],
+        );
+    d.details
+        .as_mut()
+        .unwrap()
+        .references
+        .push("asset.background".into());
+    let commands = p.pump(
+        vec![AppEvent::AssetFault {
+            request,
+            diagnostic: Box::new(d),
+        }],
+        1000,
+    );
+    let diagnostic = p.diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.details.as_ref().unwrap().request, Some(request));
+    assert_eq!(
+        diagnostic.details.as_ref().unwrap().session,
+        Some(p.generation.session)
+    );
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, AppCommand::Diagnostic { .. })));
+    assert!(!p.error.as_ref().unwrap().contains("secret"));
+    assert!(p.paused());
+    let late = p.pump(vec![AppEvent::PresentationReady { request }], 1000);
+    assert!(late.iter().any(
+        |c| matches!(c,AppCommand::Observation{stage,..} if stage=="stale_presentation_discarded")
+    ));
+    assert_eq!(p.diagnostic.as_ref().unwrap().code, "E_RESOURCE_FETCH");
+    p.pump(
+        vec![AppEvent::LoadFailed("independent storage error".into())],
+        100,
+    );
+    assert_eq!(p.diagnostic.as_ref().unwrap().code, "E_RESOURCE_FETCH");
+    assert!(p.model().fault_recovery.contains(&Recovery::Retry));
+}
+
+#[test]
+fn save_diagnostic_retains_the_origin_session_after_replacement() {
+    let mut p = playing();
+    let origin = p.generation.session;
+    let job = action(&mut p, UiAction::Save { slot: 0 })
+        .into_iter()
+        .find_map(|c| match c {
+            AppCommand::Save { job, .. } => Some(job),
+            _ => None,
+        })
+        .unwrap();
+    let commands = action(&mut p, UiAction::Title);
+    ready(&mut p, commands);
+    assert_ne!(p.generation.session, origin);
+    p.pump(
+        vec![AppEvent::SaveFailed {
+            job,
+            message: "quota".into(),
+        }],
+        100,
+    );
+    let d = p.diagnostic.as_ref().unwrap();
+    assert_eq!(d.details.as_ref().unwrap().session, Some(origin));
+    assert_eq!(d.details.as_ref().unwrap().request, Some(job));
+    assert!(p.error.is_none());
 }

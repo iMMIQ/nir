@@ -174,3 +174,74 @@ fn runtime_rejects_missing_or_rewritten_index_and_recipe() {
     e.addresses.pop();
     assert!(nir_content::validate_executable(&e).is_err());
 }
+
+#[test]
+fn source_diagnostic_locates_reference_without_changing_program_identity() {
+    let d = project();
+    let path = d.path().join("content/ch01/story.nir.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let (scene, nodes) = value["scenes"]
+        .as_object_mut()
+        .unwrap()
+        .iter_mut()
+        .next()
+        .unwrap();
+    let scene = scene.clone();
+    nodes[0]["asset"] = serde_json::json!("missing.private.test");
+    let text = serde_json::to_string_pretty(&value).unwrap();
+    fs::write(&path, &text).unwrap();
+    let error = load_project(d.path()).unwrap_err();
+    let diag = diagnostic(&error);
+    assert_eq!(diag.code, "E_ASSET_TYPE");
+    let details = diag.details.unwrap();
+    let source = details.source.unwrap();
+    assert_eq!(source.file, "content/ch01/story.nir.json");
+    assert_eq!(source.pointer, format!("/scenes/{scene}/0/asset"));
+    let line = text.lines().nth(source.line - 1).unwrap();
+    assert!(line[source.column - 1..].starts_with("\"missing.private.test\""));
+    assert!(details
+        .references
+        .contains(&"missing.private.test".to_string()));
+    assert!(details.hint.unwrap().contains("catalog"));
+    assert!(!serde_json::to_string(&diagnostic(&error))
+        .unwrap()
+        .contains(d.path().to_str().unwrap()));
+}
+#[test]
+fn strict_parse_reports_real_line_and_preserves_old_diagnostic_wire_format() {
+    let d = nir_content::parse::<nir_format::Program>(b"{\n \"bad\": ]", "story.json").unwrap_err();
+    let s = d.details.unwrap().source.unwrap();
+    assert_eq!(s.line, 2);
+    assert!(s.column > 1);
+    let old: nir_format::Diagnostic =
+        serde_json::from_str(r#"{"code":"E_TEST","location":"f/b/1","message":"cause"}"#).unwrap();
+    assert!(old.details.is_none());
+}
+
+#[test]
+fn template_font_covers_bundled_diagnostic_messages() {
+    let bytes = fs::read(source().join("assets/source/reader.otf")).unwrap();
+    let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+    for messages in [
+        include_str!("../../nir-presentation/messages/en.ftl"),
+        include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
+    ] {
+        for c in messages.chars().filter(|c| !c.is_whitespace()) {
+            assert!(face.glyph_index(c).is_some(), "missing UI glyph: {c}");
+        }
+    }
+}
+
+#[test]
+fn author_schema_error_retains_parser_position() {
+    let d = project();
+    let path = d.path().join("themes/rain/tokens.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["unsupported_core_field"] = serde_json::json!(true);
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let error = diagnostic(&load_project(d.path()).unwrap_err());
+    assert_eq!(error.code, "E_SCHEMA");
+    let source = error.details.unwrap().source.unwrap();
+    assert!(source.file.ends_with("themes/rain/tokens.json"));
+    assert!(source.line > 1 && source.column > 0);
+}

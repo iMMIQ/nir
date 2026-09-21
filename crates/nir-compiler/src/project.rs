@@ -133,14 +133,50 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     Ok(b)
 }
 fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    Ok(nir_content::parse(
-        &read(path)?,
-        &path.display().to_string(),
-    )?)
+    let bytes = read(path)?;
+    nir_content::parse(&bytes, &path.display().to_string()).map_err(|mut d| {
+        // Source-position reparsing belongs to author tools, never the WASM loader.
+        if d.code == "E_SCHEMA" {
+            if let Err(original) = serde_json::from_slice::<T>(&bytes) {
+                if let Some(details) = &mut d.details {
+                    details.source = Some(SourceRef {
+                        file: path.display().to_string(),
+                        line: original.line(),
+                        column: original.column(),
+                        pointer: String::new(),
+                    });
+                }
+            }
+        }
+        anyhow::Error::new(d)
+    })
 }
 fn toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    toml::from_str(std::str::from_utf8(&read(path)?)?)
-        .with_context(|| format!("E_TOML: {}", path.display()))
+    let bytes = read(path)?;
+    let text = std::str::from_utf8(&bytes)?;
+    toml::from_str(text).map_err(|e: toml::de::Error| {
+        let mut d = Diagnostic::new("E_TOML", path.display().to_string(), e.message()).classified(
+            ErrorDomain::Content,
+            "parse",
+            "toml",
+            vec![Recovery::FixContent],
+        );
+        if let Some(span) = e.span() {
+            let prefix = &bytes[..span.start];
+            d.details.as_mut().unwrap().source = Some(SourceRef {
+                file: path.display().to_string(),
+                line: prefix.iter().filter(|b| **b == b'\n').count() + 1,
+                column: prefix.len()
+                    - prefix
+                        .iter()
+                        .rposition(|b| *b == b'\n')
+                        .map_or(0, |p| p + 1)
+                    + 1,
+                pointer: String::new(),
+            });
+        }
+        anyhow::Error::new(d)
+    })
 }
 fn merge<T>(dest: &mut BTreeMap<String, T>, src: BTreeMap<String, T>, file: &Path) -> Result<()> {
     for (id, item) in src {
@@ -204,9 +240,11 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         title_scene: manifest.game.title_scene.clone(),
         theme: json(&relative(&root, &root, &manifest.inputs.theme)?)?,
     };
+    let mut sources = crate::diagnostics::SourceIndex::default();
     for source in &module.sources {
         let path = relative(&root, base, source)?;
         let f: Fragment = json(&path)?;
+        sources.fragment(&root, &path, &read(&path)?);
         if f.fragment_format != 1 {
             bail!("E_FRAGMENT: {}", path.display());
         }
@@ -298,7 +336,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     validate_font_coverage(&program, &media)?;
     // Revision depends on canonical source content, never local paths or iteration order.
     program.revision = nir_content::digest(&serde_json::to_vec(&program)?);
-    ValidatedProgram::new(program.clone())?;
+    ValidatedProgram::new(program.clone()).map_err(|d| sources.annotate(d))?;
     for source in &manifest.inputs.scenarios {
         relative(&root, &root, source)?;
     }
@@ -456,6 +494,7 @@ pub fn write_schemas(out: &Path) -> Result<()> {
         ),
         ("theme", schemars::schema_for!(Theme)),
         ("program", schemars::schema_for!(Program)),
+        ("diagnostic", schemars::schema_for!(Diagnostic)),
     ];
     for (name, schema) in schemas {
         fs::write(

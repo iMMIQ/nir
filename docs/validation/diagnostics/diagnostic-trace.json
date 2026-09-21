@@ -1,0 +1,1604 @@
+{
+  "format": 1,
+  "release": "26ac1a3f351e9cac61b317c0bc0e87dcdeb29de9fd2220339c968cd6628afdf2",
+  "engine": "c92c103d455a8d23b6e47173b3aaeef505dbe8693b337b9a71c33aa93bac8625",
+  "enabled": true,
+  "capacity": 4096,
+  "dropped": 0,
+  "events": [
+    {
+      "stage": "bootstrap_started",
+      "at_us": "357600",
+      "session": 1,
+      "device": 1,
+      "start_us": "90800",
+      "end_us": "90800"
+    },
+    {
+      "stage": "channel_ready",
+      "at_us": "357700",
+      "session": 1,
+      "device": 1,
+      "start_us": "106000",
+      "end_us": "106000"
+    },
+    {
+      "stage": "release_verified",
+      "at_us": "357900",
+      "session": 1,
+      "device": 1,
+      "start_us": "179400",
+      "end_us": "179400"
+    },
+    {
+      "stage": "wasm_verified",
+      "at_us": "358000",
+      "session": 1,
+      "device": 1,
+      "start_us": "296800",
+      "end_us": "296800"
+    },
+    {
+      "stage": "wasm_initialized",
+      "at_us": "358000",
+      "session": 1,
+      "device": 1,
+      "start_us": "356000",
+      "end_us": "356000"
+    },
+    {
+      "stage": "engine_created",
+      "at_us": "559600",
+      "session": 1,
+      "device": 1,
+      "start_us": "358200",
+      "end_us": "559600"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "576600",
+      "session": 1,
+      "device": 1,
+      "host_request": 1,
+      "kind": "completion"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "585300",
+      "session": 1,
+      "device": 1,
+      "host_request": 1,
+      "kind": "completion"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "587400",
+      "session": 1,
+      "device": 1,
+      "host_request": 2,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_requested",
+      "at_us": "587500",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "587800",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 3,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "588300",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 4,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "588300",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "588600",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 5,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "588600",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_cancelled",
+      "at_us": "590700",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_cancelled",
+      "at_us": "590800",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 3,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_cancelled",
+      "at_us": "590800",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 4,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_cancelled",
+      "at_us": "590800",
+      "session": 1,
+      "device": 1,
+      "request": 1,
+      "host_request": 5,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_requested",
+      "at_us": "591900",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "592000",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 6,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "592000",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 7,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "592000",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "592100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 8,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "592100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "594100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_started",
+      "at_us": "594200",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "594600",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_started",
+      "at_us": "594600",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "600000",
+      "session": 1,
+      "device": 1,
+      "host_request": 2,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_verified",
+      "at_us": "605400",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 155088,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "620100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "620300",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 8,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_verified",
+      "at_us": "640400",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 53063,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "decode_allocate",
+      "at_us": "1210000",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 53063,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "643700",
+      "end_us": "691400"
+    },
+    {
+      "stage": "upload_enqueued",
+      "at_us": "1210100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 2094080,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "691400",
+      "end_us": "1209600"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "1600700",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1600800",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 7,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "upload_enqueued",
+      "at_us": "1601100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 1592320,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "1211600",
+      "end_us": "1563600"
+    },
+    {
+      "stage": "presentation_prepare",
+      "at_us": "1601100",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "bytes": 0,
+      "asset": "",
+      "locale": "zh-Hans",
+      "start_us": "1565000",
+      "end_us": "1599900"
+    },
+    {
+      "stage": "lease_ready",
+      "at_us": "1601200",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "commit_started",
+      "at_us": "1601200",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_commit",
+      "at_us": "1601200",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "1610300",
+      "session": 1,
+      "device": 1,
+      "frames": 1,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1615700",
+      "session": 1,
+      "device": 1,
+      "request": 2,
+      "host_request": 6,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_received",
+      "at_us": "1870100",
+      "session": 1,
+      "device": 1,
+      "sequence": 1,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_dispatched",
+      "at_us": "1884100",
+      "session": 1,
+      "device": 1,
+      "origin_session": 1,
+      "sequence": 1,
+      "location": "main/start/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_requested",
+      "at_us": "1884200",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1884200",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 9,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1884300",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 10,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1884300",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1884500",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 11,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1884500",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1884500",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 12,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1884500",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "1888600",
+      "session": 2,
+      "device": 1,
+      "frames": 2,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1888600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_started",
+      "at_us": "1888700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1888700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "1888700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1888700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "1888700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "1890600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1890600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 11,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "upload_enqueued",
+      "at_us": "1890800",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "bytes": 0,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "1890600",
+      "end_us": "1890600"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "1896800",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1896800",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 12,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "fetch_verified",
+      "at_us": "1906600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "bytes": 384044,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "audio_decode_started",
+      "at_us": "1906600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_failed",
+      "at_us": "1913900",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "code": "E_AUDIO_DECODE",
+      "domain": "prepare",
+      "operation": "audio_decode"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1915300",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 10,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_cancelled",
+      "at_us": "1916600",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "host_request": 9,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "diagnostic",
+      "at_us": "1916700",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "asset": "audio.bgm",
+      "location": "main/start/0",
+      "code": "E_AUDIO_DECODE",
+      "domain": "prepare",
+      "operation": "prepare",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_failed",
+      "at_us": "1916800",
+      "session": 2,
+      "device": 1,
+      "request": 3,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "1944900",
+      "session": 2,
+      "device": 1,
+      "frames": 3,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_received",
+      "at_us": "1967400",
+      "session": 2,
+      "device": 1,
+      "sequence": 2,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_dispatched",
+      "at_us": "1968300",
+      "session": 2,
+      "device": 1,
+      "origin_session": 2,
+      "sequence": 2,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_requested",
+      "at_us": "1968300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1968400",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 13,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1968400",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 14,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1968400",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1968500",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 15,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1968500",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "1968500",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 16,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "1968500",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "1970300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "audio_decode_started",
+      "at_us": "1970600",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "1971500",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1971600",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 15,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "upload_enqueued",
+      "at_us": "1971700",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "bytes": 0,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "1971400",
+      "end_us": "1971500"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "1983300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "1983300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 16,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "audio_decode_ready",
+      "at_us": "2016900",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "2031800",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2031800",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 14,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "presentation_prepare",
+      "at_us": "2032000",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "bytes": 0,
+      "asset": "",
+      "locale": "zh-Hans",
+      "start_us": "2027900",
+      "end_us": "2028100"
+    },
+    {
+      "stage": "lease_ready",
+      "at_us": "2032100",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "commit_started",
+      "at_us": "2032100",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2032500",
+      "session": 2,
+      "device": 1,
+      "host_request": 17,
+      "task": 4,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_requested",
+      "at_us": "2033100",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "location": "main/intro/0",
+      "cue": "intro",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2033200",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 18,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2033200",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 19,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "2033200",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2033300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 20,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "2033300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2033300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 21,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_queued",
+      "at_us": "2033300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_commit",
+      "at_us": "2033300",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "location": "main/start/0",
+      "cue": "opening",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "frames": 4,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "resource_admitted",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "bytes_cache_hit",
+      "at_us": "2035300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "audio_decode_started",
+      "at_us": "2035400",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "audio_decode_ready",
+      "at_us": "2035400",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2035600",
+      "session": 2,
+      "device": 1,
+      "request": 4,
+      "host_request": 13,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "2035700",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2035700",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 20,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "upload_enqueued",
+      "at_us": "2035900",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "bytes": 0,
+      "asset": "bg.station",
+      "object": "fb861425052c469940147b43ea596e1141926f4df267830c8162d2fe508c34b8",
+      "locale": "zh-Hans",
+      "start_us": "2035700",
+      "end_us": "2035700"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "2040300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "font.reader",
+      "object": "f8fe7dde70a096569f3eb850323500177d9cd10431be28f9e66c3fb46e676f62"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2040300",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 21,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "ordered_use_ready",
+      "at_us": "2057000",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "asset": "audio.bgm",
+      "object": "16ad875fd8f4e75e3c6cfedb08321e5fa9e45aa933d7517ffc8b34c285e72e17"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2057100",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 19,
+      "kind": "resource",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "presentation_prepare",
+      "at_us": "2057500",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "bytes": 0,
+      "asset": "",
+      "locale": "zh-Hans",
+      "start_us": "2051800",
+      "end_us": "2056100"
+    },
+    {
+      "stage": "lease_ready",
+      "at_us": "2057500",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "location": "main/intro/0",
+      "cue": "intro",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "commit_started",
+      "at_us": "2057500",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "location": "main/intro/0",
+      "cue": "intro",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "prepare_commit",
+      "at_us": "2057500",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "location": "main/intro/0",
+      "cue": "intro",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2059900",
+      "session": 2,
+      "device": 1,
+      "frames": 5,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "first_line_submitted",
+      "at_us": "2060000",
+      "session": 2,
+      "device": 1,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2060600",
+      "session": 2,
+      "device": 1,
+      "request": 5,
+      "host_request": 18,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2080700",
+      "session": 2,
+      "device": 1,
+      "frames": 6,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2127700",
+      "session": 2,
+      "device": 1,
+      "frames": 7,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_received",
+      "at_us": "2139500",
+      "session": 2,
+      "device": 1,
+      "sequence": 3,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_dispatched",
+      "at_us": "2140200",
+      "session": 2,
+      "device": 1,
+      "origin_session": 2,
+      "sequence": 3,
+      "location": "main/wait_intro/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2140300",
+      "session": 2,
+      "device": 1,
+      "host_request": 22,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2158500",
+      "session": 2,
+      "device": 1,
+      "frames": 8,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2171500",
+      "session": 2,
+      "device": 1,
+      "host_request": 22,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_received",
+      "at_us": "2184700",
+      "session": 2,
+      "device": 1,
+      "sequence": 4,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_dispatched",
+      "at_us": "2187000",
+      "session": 2,
+      "device": 1,
+      "origin_session": 2,
+      "sequence": 4,
+      "location": "main/wait_intro/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "storage_started",
+      "at_us": "2195100",
+      "session": 2,
+      "device": 1,
+      "request": 6,
+      "operation": "save",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2195200",
+      "session": 2,
+      "device": 1,
+      "host_request": 23,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2199600",
+      "session": 2,
+      "device": 1,
+      "frames": 9,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "diagnostic",
+      "at_us": "2256400",
+      "session": 2,
+      "device": 1,
+      "request": 6,
+      "code": "E_STORAGE_QUOTA",
+      "domain": "storage",
+      "operation": "save"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2257300",
+      "session": 2,
+      "device": 1,
+      "host_request": 23,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "diagnostic",
+      "at_us": "2257500",
+      "session": 2,
+      "device": 1,
+      "request": 6,
+      "location": "save",
+      "code": "E_STORAGE_QUOTA",
+      "domain": "storage",
+      "operation": "save",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2274000",
+      "session": 2,
+      "device": 1,
+      "frames": 10,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_received",
+      "at_us": "2310200",
+      "session": 2,
+      "device": 1,
+      "sequence": 5,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "input_dispatched",
+      "at_us": "2311800",
+      "session": 2,
+      "device": 1,
+      "origin_session": 2,
+      "sequence": 5,
+      "location": "main/wait_intro/0",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "storage_started",
+      "at_us": "2312000",
+      "session": 2,
+      "device": 1,
+      "request": 7,
+      "operation": "save",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2312000",
+      "session": 2,
+      "device": 1,
+      "host_request": 24,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2314400",
+      "session": 2,
+      "device": 1,
+      "frames": 11,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "storage_committed",
+      "at_us": "2317600",
+      "session": 2,
+      "device": 1,
+      "request": 7,
+      "operation": "save"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2317900",
+      "session": 2,
+      "device": 1,
+      "host_request": 24,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_reserved",
+      "at_us": "2318200",
+      "session": 2,
+      "device": 1,
+      "host_request": 25,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2321300",
+      "session": 2,
+      "device": 1,
+      "frames": 12,
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "request_completed",
+      "at_us": "2336000",
+      "session": 2,
+      "device": 1,
+      "host_request": 25,
+      "kind": "completion",
+      "locale": "zh-Hans"
+    },
+    {
+      "stage": "render_submitted",
+      "at_us": "2347200",
+      "session": 2,
+      "device": 1,
+      "frames": 13,
+      "locale": "zh-Hans"
+    }
+  ],
+  "measurement": {
+    "clock": "performance.now; navigation origin",
+    "gpu_time": "unmeasured",
+    "physical_memory": "unmeasured"
+  }
+}

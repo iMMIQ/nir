@@ -1,6 +1,27 @@
+// Diagnostic-only ring: explicit fields, bounded storage, no narrative payloads.
+export class TraceRecorder {
+    constructor({capacity=4096,enabled=false,now=()=>performance.now()}={}) {
+        this.capacity=Math.max(1,Math.min(4096,Math.trunc(capacity)||4096));this.enabled=enabled;this.now=now;
+        this.rows=new Array(this.capacity);this.total=0;this.size=0;
+    }
+    record(stage,fields={}) {
+        if(!this.enabled)return;
+        const row={stage:String(stage).slice(0,64),at_us:String(Math.max(0,Math.round(this.now()*1000)))};
+        // Never copy message/cause/action/variables/snapshot/URL or arbitrary objects.
+        for(const key of ['session','device','request','host_request','task','origin_session','sequence','bytes','frames'])
+            if(Number.isSafeInteger(fields[key])&&fields[key]>=0)row[key]=fields[key];
+        for(const key of ['asset','object','location','cue','code','domain','operation','kind','outcome','locale'])
+            if(typeof fields[key]==='string')row[key]=fields[key].slice(0,192);
+        for(const key of ['start_us','end_us'])if(typeof fields[key]==='string'&&/^\d{1,20}$/.test(fields[key]))row[key]=fields[key];
+        this.rows[this.total%this.capacity]=row;this.total++;this.size=Math.min(this.size+1,this.capacity);
+    }
+    snapshot() { return {format:1,enabled:this.enabled,capacity:this.capacity,dropped:Math.max(0,this.total-this.size),events:Array.from({length:this.size},(_,i)=>({...this.rows[(this.total-this.size+i)%this.capacity]}))}; }
+}
+
 // Bounded owner inbox. Async producers only enqueue; they never enter Rust.
 export class OwnerInbox {
-    constructor(capacity=256, inputLimit=128, controlReserve=Math.min(8,Math.floor(capacity/16))) {
+    constructor(capacity=256, inputLimit=128, controlReserve=Math.min(8,Math.floor(capacity/16)), observe=()=>{},context=()=>({})) {
+        this.observe=observe;this.context=context;this.nextRequest=0;
         this.capacity=capacity; this.inputLimit=inputLimit; this.controlReserve=controlReserve;
         this.items=[]; this.batch=[]; this.draining=false; this.slots=new Set();
         this.highWater=0; this.reservedHighWater=0; this.accepted=0; this.completed=0; this.cancelled=0;
@@ -17,12 +38,13 @@ export class OwnerInbox {
     }
     // Reserve before starting any asynchronous side effect. A queued item and its
     // reservation count once; progress can reuse the slot until the unique terminal.
-    reserve(kind='completion',group=null) {
+    reserve(kind='completion',group=null,context={}) {
         if(this.used>=this.limit(kind))return null;
-        const owner=this;
+        const owner=this,host_request=++this.nextRequest,identity={...this.context(),...context};
+        const emit=stage=>owner.observe(stage,{...identity,host_request,kind,...(Number.isInteger(group)?{request:group}:{})});
         const slot={kind,group,state:'pending',item:null,
             post(run,{terminal=true}={}) {
-                if(slot.state!=='pending')return Promise.resolve(false);
+                if(slot.state!=='pending'){emit('callback_discarded');return Promise.resolve(false);}
                 slot.state='queued';
                 return new Promise(resolve=>{
                     const item={kind,group,slot,
@@ -32,7 +54,7 @@ export class OwnerInbox {
                             try {
                                 const value=run(),done=typeof terminal==='function'?terminal(value):terminal;
                                 if(slot.state==='running'){
-                                    if(done){slot.state='completed';owner.slots.delete(slot);owner.completed++;}
+                                    if(done){slot.state='completed';owner.slots.delete(slot);owner.completed++;emit('request_completed');}
                                     else slot.state='pending';
                                 }
                             } catch(e){slot.cancel();throw e;} finally {resolve(true);}
@@ -44,12 +66,12 @@ export class OwnerInbox {
             },
             cancel(){
                 if(!owner.slots.delete(slot))return false;
-                slot.state='cancelled';owner.cancelled++;
+                slot.state='cancelled';owner.cancelled++;emit('request_cancelled');
                 if(slot.item){owner.remove(slot.item);slot.item.cancel();slot.item=null;}
                 return true;
             }
         };
-        this.slots.add(slot);this.accepted++;this.record();return slot;
+        this.slots.add(slot);this.accepted++;this.record();emit('request_reserved');return slot;
     }
     remove(item){for(const q of [this.items,this.batch]){const i=q.indexOf(item);if(i>=0)q.splice(i,1);}}
     drain({limit=16,milliseconds=4,now=()=>performance.now(),controlsOnly=false,canRun=()=>true}={}) {
@@ -133,19 +155,26 @@ export class SharedRequests {
 }
 
 // Platform adapter only. Narrative, reading policy, visual UI and layout live in Rust.
-export async function start({wasm,release,releaseDigest,executable,fetchObject,fail}) {
+export async function start({wasm,release,releaseDigest,executable,fetchObject,fail,startupTrace=[]}) {
+    const params=new URL(location.href).searchParams;
+    const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
+    let traceContext={session:1,device:1};
+    const observe=(stage,fields={})=>trace.record(stage,{...traceContext,...fields});
+    for(const row of startupTrace)observe(row.stage,row);
     const canvas=document.querySelector('#stage'), shell=document.querySelector('#shell');
     const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null};
     const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=innerWidth,height=innerHeight;return {width,height,dpr};};
     let {width,height,dpr}=size();canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
+    const createStart=String(Math.round(performance.now()*1000));
     const engine=await wasm.Engine.create(executable,releaseDigest,release.title,'stage');
+    observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
     const program=JSON.parse(executable).program;
     document.title=release.title;
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
     const buffers=new Map(),voices=new Map(),bytesCache=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map();
     let preferences={bgm_volume:.3,voice_volume:.8,sfx_volume:.5}, raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
-    const inbox=new OwnerInbox(),resourcePool=new WorkPool();
+    const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
     let ownerTimer=null,pendingElapsed=0;
     const namespace=release.game_id+(location.hostname==='localhost'||location.hostname==='127.0.0.1'?':dev':'');
     const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('nir-player-v1',1);r.onupgradeneeded=()=>{for(const store of ['saves','preferences','profile'])if(!r.result.objectStoreNames.contains(store))r.result.createObjectStore(store);};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
@@ -157,7 +186,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     function deliver(fn,kind='completion',group=null) {
         if(disposed)return Promise.resolve(false);
         return new Promise(resolve=>{
-            if(!inbox.push(()=>{try{fn();resolve(true);}catch(e){console.error(e);hostEvent('load_failed',String(e));resolve(false);}},kind,()=>resolve(false),group)){
+            if(!inbox.push(()=>{try{fn();resolve(true);}catch(e){observe('diagnostic',{domain:'host',code:'E_HOST',operation:'dispatch'});hostEvent('host_failed',String(e));resolve(false);}},kind,()=>resolve(false),group)){
                 fail('E_EVENT_QUEUE: host inbox admission limit');resolve(false);dispose();return;
             }
             wake();
@@ -165,7 +194,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function post(slot,fn,terminal=true){
         if(disposed){slot.cancel();return Promise.resolve(false);}
-        const done=slot.post(()=>{try{return fn();}catch(e){if(slot.kind==='control')throw e;hostEvent('load_failed',String(e));return true;}},{terminal});wake();return done;
+        const done=slot.post(()=>{try{return fn();}catch(e){if(slot.kind==='control')throw e;observe('diagnostic',{domain:'host',code:'E_HOST',operation:'completion'});hostEvent('host_failed',String(e));return true;}},{terminal});wake();return done;
     }
     function request(work,success,failure,{kind='completion',group=null,replace=false}={}){
         if(replace)inbox.cancelGroup(group);
@@ -185,7 +214,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     function playVoice(c) {
         stopVoice(c.task);
         const failed=e=>engine.audio_failed(c.task,c.session,String(e));
-        const slot=inbox.reserve('completion',`audio:${c.session}:${c.task}`);
+        const slot=inbox.reserve('completion',`audio:${c.session}:${c.task}`,{session:c.session,task:c.task});
         if(!slot){failed('E_REQUEST_CAPACITY');return;}
         const buffer=buffers.get(c.asset);
         if(!buffer){post(slot,()=>failed('E_AUDIO_BUFFER'));return;}
@@ -205,11 +234,13 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             post(slot,()=>failed(e));
         }
     }
-    async function asset(id,signal) {
+    async function asset(id,signal,context) {
         const a=program.assets[id];if(!a)throw new Error(`E_ASSET: ${id}`);
         signal.throwIfAborted();
-        if(bytesCache.has(a.object))return bytesCache.get(a.object);
+        if(bytesCache.has(a.object)){observe('bytes_cache_hit',context);return bytesCache.get(a.object);}
+        observe('fetch_started',context);
         const bytes=await requests.get(a.object,signal);signal.throwIfAborted();
+        observe('fetch_verified',{...context,bytes:bytes.byteLength});
         bytesCache.set(a.object,bytes);return bytes;
     }
     function cancelPreparation(request) {inbox.cancelGroup(request);const controller=preparations.get(request);controller?.abort();preparations.delete(request);}
@@ -221,38 +252,47 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         for(const id of bytesCache.keys())if(!objects.has(id))bytesCache.delete(id);
     }
     async function prepare(c) {
-        const terminal=inbox.reserve('completion',c.request);
+        const terminal=inbox.reserve('completion',c.request,{session:c.session,device:c.device});
         if(!terminal){engine.resource_failed(c.request,'E_REQUEST_CAPACITY');return;}
         const controller=new AbortController(),signal=controller.signal;
         preparations.set(c.request,controller);
-        const failed=message=>{engine.resource_failed(c.request,String(message));controller.abort();};
+        const failed=(message,id='',stage='admission',code='E_PREPARE')=>{
+            observe('resource_failed',{request:c.request,session:c.session,device:c.device,asset:id,code,operation:stage,domain:'prepare'});
+            engine.resource_fault(c.request,id,code,stage,String(message));controller.abort();
+        };
         let next=0;
         async function worker(){while(next<c.assets.length&&!disposed&&!signal.aborted){
-            const id=c.assets[next++],slot=inbox.reserve('resource',c.request);
+            const id=c.assets[next++],slot=inbox.reserve('resource',c.request,{session:c.session,device:c.device});
             if(!slot){await post(terminal,()=>failed('E_REQUEST_CAPACITY'));return;}
+            let stage='fetch';const context={request:c.request,session:c.session,device:c.device,asset:id,object:program.assets[id]?.object};
+            observe('resource_queued',context);
             try {
                 await resourcePool.run(async()=>{
-                    const bytes=await asset(id,signal);signal.throwIfAborted();
+                    observe('resource_admitted',context);
+                    const bytes=await asset(id,signal,context);signal.throwIfAborted();
                     if(program.assets[id].kind==='audio'){
+                        stage='audio_decode';observe('audio_decode_started',context);
                         if(!buffers.has(id)){
                             if(!decodeJobs.has(id))decodeJobs.set(id,audio.decodeAudioData(bytes.slice(0)).finally(()=>decodeJobs.delete(id)));
                             const buffer=await decodeJobs.get(id);signal.throwIfAborted();buffers.set(id,buffer);
                         }
+                        observe('audio_decode_ready',context);
                         if(unlocked)await unlocked;
                         signal.throwIfAborted();
                         if(audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
                     }
+                    stage='decode_upload';
                     let complete=false;
                     while(!complete&&!signal.aborted&&!disposed&&slot.state==='pending'){
                         await post(slot,()=>{
                             if(signal.aborted)return true;
-                            try {complete=engine.resource(c.request,id,new Uint8Array(bytes));return complete;}
-                            catch(e){metrics.resourceFailures++;failed(e);return true;}
+                            try {complete=engine.resource(c.request,id,new Uint8Array(bytes));if(complete)observe('ordered_use_ready',context);return complete;}
+                            catch(e){metrics.resourceFailures++;failed(e,id,stage,'E_RESOURCE_DECODE_UPLOAD');return true;}
                         },done=>done);
                     }
                 },signal);
             }catch(e){
-                if(!signal.aborted&&!disposed){metrics.resourceFailures++;await post(slot,()=>failed(e));}
+                if(!signal.aborted&&!disposed){metrics.resourceFailures++;await post(slot,()=>failed(e,id,stage,typeof e?.code==='string'?e.code:stage==='fetch'?'E_RESOURCE_FETCH':'E_AUDIO_DECODE'));}
             } finally {if(signal.aborted||disposed)slot.cancel();}
         }}
         try {
@@ -267,12 +307,13 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         },rows=>hostEvent('slots',rows),e=>hostEvent('load_failed',String(e)),{group:'slots',replace:true});
     }
     function save(c) {
+        const context={request:c.job,session:state().session,operation:'save'};observe('storage_started',context);
         return request(()=>new Promise((resolve,reject)=>{
-            const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(`${namespace}:${c.slot}`);let conflict=false;
-            r.onsuccess=()=>{const current=r.result;if((current?.revision||0)!==c.expected_revision){conflict=true;tx.abort();return;}const record={...c.envelope,label:new Date().toLocaleString(),saved_at:Date.now()};store.put(record,`${namespace}:${c.slot}`);};
-            tx.oncomplete=resolve;tx.onabort=()=>reject(new Error(conflict?'E_SAVE_CONFLICT: another tab changed this slot. Reopen the save menu.':`E_STORAGE: ${tx.error}`));tx.onerror=()=>{};
-        }),()=>hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision}),
-            e=>hostEvent('save_failed',{job:c.job,message:String(e)}),{group:`save:${c.job}`});
+            const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(`${namespace}:${c.slot}`);let conflict=false,writeError=null;
+            r.onsuccess=()=>{try{const current=r.result;if((current?.revision||0)!==c.expected_revision){conflict=true;tx.abort();return;}const record={...c.envelope,label:new Date().toLocaleString(),saved_at:Date.now()};store.put(record,`${namespace}:${c.slot}`);}catch(e){writeError=e;tx.abort();}};
+            tx.oncomplete=resolve;tx.onabort=()=>reject(writeError||new Error(conflict?'E_SAVE_CONFLICT: another tab changed this slot. Reopen the save menu.':`E_STORAGE: ${tx.error}`));tx.onerror=()=>{};
+        }),()=>{observe('storage_committed',context);hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision});},
+            e=>{const code=e?.name==='QuotaExceededError'?'E_STORAGE_QUOTA':String(e).includes('E_SAVE_CONFLICT')?'E_SAVE_CONFLICT':'E_STORAGE';observe('diagnostic',{...context,domain:'storage',code});hostEvent('save_failed',{job:c.job,code,message:String(e)});},{group:`save:${c.job}`});
     }
     const envelope=(record)=>{const {label,saved_at,...e}=record;return e;};
     function load(slot) {
@@ -297,8 +338,13 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         try{input.click();}catch(e){post(slot,()=>hostEvent('load_failed',String(e)));}
     }
     async function mergeProfile(keys) {await new Promise((resolve,reject)=>{const tx=db.transaction('profile','readwrite'),store=tx.objectStore('profile'),r=store.get(namespace);r.onsuccess=()=>store.put([...new Set([...(r.result||[]),...keys])].sort(),namespace);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});}
-    function flush() {if(disposed)return;for(const c of JSON.parse(engine.commands())){
+    function flush() {if(disposed)return;
+        if(trace.enabled){const current=state();traceContext={session:current.session,device:current.device,locale:current.locale};}
+        for(const c of JSON.parse(engine.commands())){
         switch(c.type){
+            case 'observation':observe(c.stage,c);break;
+            case 'resource_stage':observe(c.stage,{...c,object:program.assets[c.asset]?.object});break;
+            case 'diagnostic':{const d=c.diagnostic;observe('diagnostic',{code:d.code,location:d.location,...d.details,asset:d.details?.references?.[0]});break;}
             case 'get_assets':prepare(c);break;
             case 'cancel_assets':cancelPreparation(c.request);break;
             case 'audio_start':playVoice(c);break;
@@ -317,6 +363,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     function state(){return JSON.parse(engine.state());}
     function action(a,context=state()) {
         if(disposed||recovering)return Promise.resolve(false);
+        observe('input_received',{sequence:sequence+1,session:context.session});
         unlock();if(a.type==='new_game'&&metrics.startInputMs===null)metrics.startInputMs=performance.now();
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
         return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');engine.action(JSON.stringify(a),context.interaction,seq,context.session);},'input');
@@ -332,7 +379,8 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         try {
             engine.begin_turn();
             checkDevice();if(disposed)return;
-            const before=state(),elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
+            const before=state();traceContext={session:before.session,device:before.device};
+            const elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
             inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')&&(kind==='control'||engine.pending_events()<112)});if(disposed)return;flush();
             if(recovering){if(inbox.hasControl)wake();return;}
             const after=state();
@@ -342,12 +390,14 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             }else{pendingElapsed=0;}
             engine.continue_turn();flush();
             const current=size();if(current.width!==width||current.height!==height||current.dpr!==dpr){({width,height,dpr}=current);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);}
+            const submitBefore=state().frames;
             const view=JSON.parse(engine.draw(width,height,dpr));flush();prune();semantics(view);const s=state();
+            if(s.frames!==submitBefore)observe('render_submitted',{session:s.session,device:s.device,frames:s.frames});
             metrics.frames=s.frames;metrics.peakResidentBytes=Math.max(metrics.peakResidentBytes,s.resident_bytes);
             metrics.maxTurnUploadBytes=Math.max(metrics.maxTurnUploadBytes||0,s.turn_upload_bytes);metrics.uploadSteps=s.upload_steps;
             metrics.activeRequests=inbox.slots.size;metrics.requestHighWater=inbox.reservedHighWater;metrics.acceptedRequests=inbox.accepted;metrics.completedRequests=inbox.completed;metrics.cancelledRequests=inbox.cancelled;
             metrics.inboxHighWater=inbox.highWater;metrics.maxTurnWork=Math.max(metrics.maxTurnWork||0,s.turn_work);
-            if(view.ready){shell.hidden=true;if(metrics.titleMs===null)metrics.titleMs=performance.now()-metrics.boot;if(s.dialogue&&metrics.firstLineMs===null){metrics.firstLineMs=performance.now()-metrics.boot;metrics.firstLineAfterStartMs=performance.now()-metrics.startInputMs;}}
+            if(view.ready){shell.hidden=true;if(metrics.titleMs===null)metrics.titleMs=performance.now()-metrics.boot;if(s.dialogue&&metrics.firstLineMs===null){metrics.firstLineMs=performance.now()-metrics.boot;metrics.firstLineAfterStartMs=performance.now()-metrics.startInputMs;metrics.navigationToFirstLineMs=performance.now();observe('first_line_submitted');}}
             if(inbox.length||engine.pending_events())wake();
             else if(engine.needs_clock()&&!document.hidden)schedule();
         }catch(e){fail(e);dispose();}
@@ -362,9 +412,9 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',()=>down=null);window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;
-        const validation=engine.gpu_error();if(validation){fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
+        const validation=engine.gpu_error();if(validation){observe('diagnostic',{domain:'render',code:'E_GPU_VALIDATION',operation:'render'});fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
         if(!engine.device_lost())return;
-        recovering=true;metrics.deviceRecoveries++;engine.begin_recovery();
+        recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;engine.begin_recovery();
         const recovery=inbox.reserve('control','device');
         if(!recovery){fail('E_REQUEST_CAPACITY: device recovery');dispose();return;}
         wasm.create_gpu('stage').then(gpu=>{
@@ -374,7 +424,9 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
-    if(testMode)window.__nir={state,action,metrics,traces,rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
+    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
+    if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
+    if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     request(()=>Promise.all([read('preferences',namespace),read('profile',namespace)]),([savedPreferences,profile])=>{
         if(savedPreferences){preferences=savedPreferences;hostEvent('preferences',preferences);}
         else{
