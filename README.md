@@ -1,39 +1,28 @@
-# NIR · 雨后书简
+# NIR 叙事引擎
 
-Rust / WASM / WebGPU 叙事引擎的可玩首版。示例包含简中、英文和两个结局。剧情推进、可视界面、文字排版和绘制均在 Rust 中；JavaScript 负责浏览器输入、文件获取、音频和本地存储。
+NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放器、作品开发工具 `novelc` 和可独立使用的 SDK。作者可以创建、检查、预览作品，并构建可部署到静态站点的发布目录；编辑作品无需重新编译引擎。
+
+引擎负责确定性剧情执行、场景演出、文字排版与揭示、声音协调、存读档、检查点回退、回看和语言设置。剧情推进、可视界面、文字排版和绘制均在 Rust 中；JavaScript 负责浏览器输入、文件获取、音频和本地存储。模块职责与依赖边界见 [架构说明](docs/ARCHITECTURE.md)。
+
+`examples/rain-letters/`（《雨后书简》）是随仓库提供的测试工程，用于验证引擎功能、运行两条剧情测试路线，以及演示作品工程格式。其简单图像和合成音频用于测试。
 
 这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，实际验证记录见 [验收报告](docs/TEST-REPORT.md)。
 
-## 直接体验
+## 使用 SDK 创建作品
 
-从 [GitHub Releases](https://github.com/iMMIQ/nir/releases) 下载配套 SDK、Linux CLI 和静态作品，或按下文从源码构建。在源码构建目录运行：
-
-```sh
-./dist/novelc serve dist/rain-letters-web
-```
-
-打开 `http://127.0.0.1:4173/`，使用启用 WebGPU 的桌面 Chromium。远程静态托管须使用 HTTPS。直接双击 HTML（`file://`）不能运行播放器。
-
-- 空格 / Enter：开始、显示整段、继续；Esc：菜单 / 返回。
-- 鼠标或触摸：点击对白区、选项和绘制的按钮。
-- Tab、方向键与 Enter：访问辅助语义按钮；可见焦点框对应画布按钮。
-- 菜单提供回看、检查点回退、设置和三个存档槽。读档和设备恢复后先暂停，按继续恢复。
-- 「已读快进」只推进已读正文，遇到未读段落或选项停止。自动阅读等待正文及当前语音完成。
-- 声音须首次点击/按键解锁。`voice.wav` 是合成测试声，不是真人配音。
-
-## 创建自己的作品
-
-将 `dist/novelc` 与整个 `dist/sdk/` 放在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
+从 [GitHub Releases](https://github.com/iMMIQ/nir/releases) 下载 Linux x86_64 SDK 与 CLI 包，解压后在包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
 
 ```sh
-./dist/novelc init /path/to/my-story
-./dist/novelc -p /path/to/my-story resolve
-./dist/novelc -p /path/to/my-story doctor
-./dist/novelc -p /path/to/my-story check --locked
-./dist/novelc -p /path/to/my-story test
-./dist/novelc -p /path/to/my-story dev
-./dist/novelc -p /path/to/my-story build --locked
+./novelc init my-story
+./novelc -p my-story resolve
+./novelc -p my-story doctor
+./novelc -p my-story check --locked
+./novelc -p my-story test
+./novelc -p my-story dev
+./novelc -p my-story build --locked
 ```
+
+`init` 当前使用随 SDK 提供的测试工程模板，可在此基础上替换正文、逻辑和素材。从源码构建时，配套 CLI 与 SDK 位于 `dist/`。
 
 `dev` 使用正式播放器和 4173 端口；修改内容后重新运行构建并刷新页面。当前没有文件监听或热更新。`dev --scenario tests/scenarios/walk.toml` 验证已登记的场景用例，再从合法新游戏入口打开预览，不会跳过剧情前置操作。
 
@@ -59,7 +48,19 @@ schemas/                       由 SDK 生成的 JSON Schema
 
 通过正文包编辑对话，保留稳定 ID、文本修订、参数和 Gate 顺序。新增中文字符时需要更新许可合适的字体；`check` 会拒绝缺字。调整逻辑时参考示例块与 [编写说明](docs/AUTHORING.md)。
 
-## 从源码构建
+## 运行测试工程
+
+下载包附带已构建的测试工程，在解压目录运行：
+
+```sh
+./novelc serve rain-letters-web
+```
+
+在源码构建目录则运行 `./dist/novelc serve dist/rain-letters-web`。打开 `http://127.0.0.1:4173/`，使用启用 WebGPU 的桌面 Chromium。远程静态托管须使用 HTTPS；直接双击 HTML（`file://`）不能运行播放器。
+
+测试工程覆盖简中与英文正文、选项分支、场景与音频、存读档及回退等功能。运行方式与输入操作见 [测试工程说明](examples/rain-letters/README.md)，测试证据见 [验收报告](docs/TEST-REPORT.md)。
+
+## 从源码构建引擎与 SDK
 
 固定工具链在 `rust-toolchain.toml`，依赖锁在 `Cargo.lock` 和 `package-lock.json`。需要 Rust/rustup、Python 3、Node.js（仅浏览器测试）及桌面 Chromium。
 
