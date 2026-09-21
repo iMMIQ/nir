@@ -28,3 +28,9 @@ empty-slot = 没有存档
 saved = 浏览器已保存
 saving = 正在保存…
 read-failed = 读取失败
+
+error-prepare = 资源准备失败，已保留当前场景。
+error-storage = 存储操作失败，已保留当前会话。
+error-render = 图形设备需要恢复。
+error-content = 内容执行失败。
+error-host = 播放器操作失败。

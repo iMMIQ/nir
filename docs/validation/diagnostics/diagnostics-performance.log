@@ -1,0 +1,12 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:performance
+npm notice run playwright test --config playwright.performance.config.js --max-failures=1
+
+Running 2 tests using 1 worker
+
+(node:1164019) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  1 tests/performance/baseline.spec.js:36:1 › navigation baseline with isolated browser caches and warm reloads (2.3m)
+  ✓  2 tests/performance/baseline.spec.js:50:1 › repeated save restore and device recovery resource trend (23.0s)
+
+  2 passed (2.7m)

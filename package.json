@@ -6,7 +6,8 @@
   "scripts": {
     "test:browser": "playwright test",
     "test:browser:headed": "playwright test --headed",
-    "test:host": "node --test tests/host/*.test.js"
+    "test:host": "node --test tests/host/*.test.js",
+    "test:performance": "playwright test --config playwright.performance.config.js"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

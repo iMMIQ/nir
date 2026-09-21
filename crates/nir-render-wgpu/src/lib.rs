@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use glyphon::{
     Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use nir_format::{Diagnostic, Result};
+use nir_format::{Diagnostic, ErrorDomain, Recovery, Result};
 use nir_presentation::{DrawPacket, TextEngine};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -61,7 +61,12 @@ pub struct Renderer {
     errors: Arc<Mutex<Vec<String>>>,
 }
 fn error(message: impl Into<String>) -> Diagnostic {
-    Diagnostic::new("E_RENDER", "wgpu", message)
+    Diagnostic::new("E_RENDER", "wgpu", message).classified(
+        ErrorDomain::Render,
+        "render",
+        "gpu",
+        vec![Recovery::Reload, Recovery::Exit],
+    )
 }
 fn linear(v: f32) -> f32 {
     if v <= 0.04045 {
@@ -317,31 +322,7 @@ impl Renderer {
         if self.has_image(id) {
             return Ok((true, 0));
         }
-        if !self.image_started(request, id) {
-            let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()
-                .map_err(|e| error(e.to_string()))?;
-            let (w, h) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
-            if w == 0 || h == 0 || w > 8192 || h > 8192 || w as u64 * h as u64 > 32 * 1024 * 1024 {
-                return Err(error("image dimensions exceed admission limit"));
-            }
-            let pixels = image::load_from_memory(bytes)
-                .map_err(|e| error(e.to_string()))?
-                .to_rgba8()
-                .into_raw();
-            let texture = self.allocate_texture(id, w, h);
-            self.uploads.insert(
-                id.into(),
-                ImageUpload {
-                    request,
-                    pixels,
-                    texture,
-                    width: w,
-                    height: h,
-                    row: 0,
-                },
-            );
-        }
+        self.prepare_image(request, id, bytes)?;
         let upload = self.uploads.get_mut(id).unwrap();
         let stride = upload.width as usize * 4;
         let rows = (budget / stride).min((upload.height - upload.row) as usize) as u32;
@@ -389,6 +370,35 @@ impl Renderer {
                 .insert(id.into(), self.uploads.remove(id).unwrap().texture);
         }
         Ok((complete, end - start))
+    }
+    /// Atomic PNG decoding and texture allocation; no pixel uploads occur here.
+    pub fn prepare_image(&mut self, request: u32, id: &str, bytes: &[u8]) -> Result<()> {
+        if !self.image_started(request, id) {
+            let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(|e| error(e.to_string()))?;
+            let (w, h) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
+            if w == 0 || h == 0 || w > 8192 || h > 8192 || w as u64 * h as u64 > 32 * 1024 * 1024 {
+                return Err(error("image dimensions exceed admission limit"));
+            }
+            let pixels = image::load_from_memory(bytes)
+                .map_err(|e| error(e.to_string()))?
+                .to_rgba8()
+                .into_raw();
+            let texture = self.allocate_texture(id, w, h);
+            self.uploads.insert(
+                id.into(),
+                ImageUpload {
+                    request,
+                    pixels,
+                    texture,
+                    width: w,
+                    height: h,
+                    row: 0,
+                },
+            );
+        }
+        Ok(())
     }
     fn allocate_texture(&self, id: &str, w: u32, h: u32) -> Texture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {

@@ -1,0 +1,29 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:host
+npm notice run node --test tests/host/*.test.js
+✔ trace ring is bounded, ordered and excludes private payloads (3.094152ms)
+✔ disabled trace does not read clock or retain records (1.118495ms)
+✔ request terminal trace identifies cancelled and duplicate callbacks (2.315524ms)
+✔ request observations retain origin epoch through a session replacement (0.470694ms)
+✔ input overload leaves room for terminal completions (4.095387ms)
+✔ owner yields at item/time limits and never consumes reentrant production (1.355035ms)
+✔ inputs precede resource delivery and each turn admits one resource (0.400391ms)
+✔ recovery stops the current batch and still admits its control completion (0.37775ms)
+✔ cancelling a resource group releases bytes without dropping independent saves (0.337122ms)
+✔ shared fetch aborts only after its last consumer cancels (1.295012ms)
+✔ late old completion cannot remove a replacement fetch (0.721249ms)
+✔ resource admission is global and cancelled decoders hold their slot until settled (0.888269ms)
+✔ an active batch still occupies capacity and disposal settles its pending items (0.58439ms)
+✔ accepted jobs keep a terminal slot when unrelated traffic fills the inbox (0.966025ms)
+✔ reserved resource progress reuses its slot until completion or cancellation (1.521475ms)
+✔ device control has admission room beyond ordinary job reservations (0.404603ms)
+✔ shutdown settles queued progress and reserved terminals exactly once (0.34842ms)
+✔ seeded completion, cancellation and drain interleavings preserve the ledger (24.570712ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 151.147764

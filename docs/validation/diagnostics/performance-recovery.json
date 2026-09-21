@@ -1,0 +1,248 @@
+{
+  "format": 1,
+  "browser": "153.0.8010.52",
+  "cycles": 30,
+  "physicalMemory": "unmeasured",
+  "rows": [
+    {
+      "cycle": 0,
+      "atMs": 1970.5,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 1,
+      "atMs": 2164.2999999970198,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 2,
+      "atMs": 2986.2999999970198,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 3,
+      "atMs": 3423.10000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 4,
+      "atMs": 3991.39999999851,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 5,
+      "atMs": 4552.70000000298,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 6,
+      "atMs": 5144.29999999702,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 7,
+      "atMs": 5738.20000000298,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 8,
+      "atMs": 6301.70000000298,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 1
+    },
+    {
+      "cycle": 9,
+      "atMs": 8867.20000000298,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 10,
+      "atMs": 9043,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 11,
+      "atMs": 9207,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 12,
+      "atMs": 9544.10000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 13,
+      "atMs": 10089.39999999851,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 14,
+      "atMs": 10776.5,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 15,
+      "atMs": 11406.79999999702,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 16,
+      "atMs": 12058,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 17,
+      "atMs": 12632.60000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 18,
+      "atMs": 13188.60000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 2
+    },
+    {
+      "cycle": 19,
+      "atMs": 15687.20000000298,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 20,
+      "atMs": 15900.5,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 21,
+      "atMs": 16344.79999999702,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 22,
+      "atMs": 16824.29999999702,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 23,
+      "atMs": 17499.29999999702,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 24,
+      "atMs": 18007.60000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 25,
+      "atMs": 18688.89999999851,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 26,
+      "atMs": 19141.60000000149,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 27,
+      "atMs": 19796.39999999851,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 28,
+      "atMs": 20266,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 3
+    },
+    {
+      "cycle": 29,
+      "atMs": 22354.5,
+      "wasmMemoryBytes": 9306112,
+      "estimatedResidentBytes": 57362055,
+      "activeRequests": 0,
+      "device": 4
+    }
+  ]
+}

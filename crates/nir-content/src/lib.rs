@@ -149,9 +149,29 @@ pub fn parse<T: DeserializeOwned>(bytes: &[u8], at: &str) -> Result<T> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(Diagnostic::new("E_LIMIT", at, "input exceeds 16 MiB"));
     }
-    let v: Strict =
-        serde_json::from_slice(bytes).map_err(|e| Diagnostic::new("E_JSON", at, e.to_string()))?;
-    serde_json::from_value(v.0).map_err(|e| Diagnostic::new("E_SCHEMA", at, e.to_string()))
+    let v: Strict = serde_json::from_slice(bytes).map_err(|e| {
+        let mut d = Diagnostic::new("E_JSON", at, e.to_string()).classified(
+            ErrorDomain::Content,
+            "parse",
+            "json",
+            vec![Recovery::FixContent],
+        );
+        d.details.as_mut().unwrap().source = Some(SourceRef {
+            file: at.into(),
+            line: e.line(),
+            column: e.column(),
+            pointer: String::new(),
+        });
+        d
+    })?;
+    serde_json::from_value(v.0).map_err(|e| {
+        Diagnostic::new("E_SCHEMA", at, e.to_string()).classified(
+            ErrorDomain::Content,
+            "parse",
+            "schema",
+            vec![Recovery::FixContent],
+        )
+    })
 }
 pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
     if r.format != 1 {

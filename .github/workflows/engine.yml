@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -53,6 +54,16 @@ jobs:
           export CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           mkdir -p target/tmp
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:browser -- --max-failures=1
+      - name: Navigation and recovery performance baseline
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
+        run: |
+          export CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:performance
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -215,6 +215,14 @@ fn validate(p: &Program) -> Result<()> {
         }
     }
     for (id, nodes) in &p.scenes {
+        let err = |code: &str, at: &str, message: &str| {
+            err(code, at, message).classified(
+                ErrorDomain::Content,
+                "scenes",
+                "validate",
+                vec![Recovery::FixContent],
+            )
+        };
         if nodes.len() > MAX_NODES {
             return Err(err("E_LIMIT", id, "too many nodes"));
         }
@@ -258,6 +266,14 @@ fn validate(p: &Program) -> Result<()> {
     }
     let mut task_defs: BTreeMap<&str, Vec<&Effect>> = BTreeMap::new();
     for (id, cue) in &p.cues {
+        let err = |code: &str, at: &str, message: &str| {
+            err(code, at, message).classified(
+                ErrorDomain::Content,
+                "cues",
+                "validate",
+                vec![Recovery::FixContent],
+            )
+        };
         if cue.effects.is_empty() || cue.effects.len() > MAX_TASKS {
             return Err(err("E_LIMIT", id, "invalid cue size"));
         }

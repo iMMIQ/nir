@@ -25,6 +25,30 @@ pub struct SaveEnvelope {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppCommand {
+    ResourceStage {
+        stage: String,
+        request: u32,
+        asset: String,
+        session: u32,
+        device: u32,
+        start_us: Micros,
+        end_us: Micros,
+        bytes: usize,
+    },
+    Observation {
+        origin_session: Option<u32>,
+        task: Option<u32>,
+        sequence: Option<u32>,
+        stage: String,
+        session: u32,
+        device: u32,
+        request: Option<u32>,
+        location: String,
+        cue: Option<String>,
+    },
+    Diagnostic {
+        diagnostic: Box<Diagnostic>,
+    },
     GetAssets {
         request: u32,
         session: u32,
@@ -96,6 +120,10 @@ pub enum AppEvent {
         request: u32,
         message: String,
     },
+    AssetFault {
+        request: u32,
+        diagnostic: Box<Diagnostic>,
+    },
     PresentationReady {
         request: u32,
     },
@@ -113,10 +141,15 @@ pub enum AppEvent {
         envelope: Box<SaveEnvelope>,
     },
     LoadFailed(String),
+    HostFailed(String),
     Saved {
         job: u32,
         slot: u32,
         revision: u32,
+    },
+    SaveFault {
+        job: u32,
+        diagnostic: Box<Diagnostic>,
     },
     SaveFailed {
         job: u32,
@@ -144,6 +177,7 @@ struct Preparation {
     failed: bool,
 }
 pub struct Player {
+    messages: nir_presentation::Messages,
     core: Core,
     validated: ValidatedProgram,
     pub title: String,
@@ -154,6 +188,7 @@ pub struct Player {
     pub generation: Generation,
     pub status: String,
     pub error: Option<String>,
+    pub diagnostic: Option<Diagnostic>,
     pub auto: bool,
     pub skip: bool,
     pub profile: BTreeSet<String>,
@@ -172,7 +207,7 @@ pub struct Player {
     commands: Vec<AppCommand>,
     checkpoints: Vec<Snapshot>,
     slot_revisions: BTreeMap<u32, u32>,
-    save_jobs: BTreeMap<u32, u32>,
+    save_jobs: BTreeMap<u32, (u32, u32)>,
     auto_elapsed: u64,
     history_offset: usize,
 }
@@ -189,6 +224,7 @@ impl Player {
                 + 32 * 1024 * 1024,
         )]))?;
         let mut p = Self {
+            messages: nir_presentation::Messages::default(),
             core,
             validated,
             title,
@@ -208,6 +244,7 @@ impl Player {
             },
             status: String::new(),
             error: None,
+            diagnostic: None,
             auto: false,
             skip: false,
             profile: BTreeSet::new(),
@@ -369,6 +406,56 @@ impl Player {
             })
             .collect()
     }
+    fn observe(&mut self, stage: &str, request: Option<u32>) {
+        self.observe_from(stage, request, None, None, None);
+    }
+    fn observe_from(
+        &mut self,
+        stage: &str,
+        request: Option<u32>,
+        origin_session: Option<u32>,
+        task: Option<u32>,
+        sequence: Option<u32>,
+    ) {
+        self.commands.push(AppCommand::Observation {
+            origin_session,
+            task,
+            sequence,
+            stage: stage.into(),
+            session: self.generation.session,
+            device: self.generation.device,
+            request,
+            location: self.core.location(),
+            cue: self.core.state().pending.as_ref().map(|p| p.cue.clone()),
+        });
+    }
+    fn report(&mut self, mut d: Diagnostic, blocking: bool) {
+        if d.details.is_none() {
+            d = d.classified(
+                ErrorDomain::Core,
+                "execute",
+                "core",
+                vec![Recovery::KeepCurrent, Recovery::Exit],
+            );
+        }
+        let details = d.details.as_mut().unwrap();
+        details.release = Some(self.release.clone());
+        details.session.get_or_insert(self.generation.session);
+        details.device = Some(self.generation.device);
+        let message = self.messages.diagnostic(&d, &self.preferences.locale);
+        self.status = message.clone();
+        if blocking {
+            self.error = Some(message);
+        }
+        if self.diagnostic.as_ref() != Some(&d) {
+            self.commands.push(AppCommand::Diagnostic {
+                diagnostic: Box::new(d.clone()),
+            });
+        }
+        if blocking || self.error.is_none() {
+            self.diagnostic = Some(d);
+        }
+    }
     fn begin_prepare(
         &mut self,
         purpose: Purpose,
@@ -401,6 +488,7 @@ impl Player {
             failed: false,
         });
         self.pauses.insert("prepare".into());
+        self.observe("prepare_requested", Some(request));
         self.commands.push(AppCommand::GetAssets {
             request,
             session: self.generation.session,
@@ -412,6 +500,7 @@ impl Player {
     fn cancel_preparation(&mut self) {
         if let Some(p) = self.prepare.take() {
             if !p.failed {
+                self.observe("prepare_cancelled", Some(p.request));
                 self.commands
                     .push(AppCommand::CancelAssets { request: p.request });
             }
@@ -480,7 +569,7 @@ impl Player {
             }
         }
         if let Some(e) = &self.core.state().fault {
-            self.error = Some(e.to_string());
+            self.report(e.clone(), true);
             self.pauses.insert("fault".into());
         }
         if self.core.state().outcome.is_some() {
@@ -500,7 +589,15 @@ impl Player {
                 EVENT_CAPACITY
             };
             if self.inbox.len() >= limit {
-                self.error = Some("E_EVENT_QUEUE: event admission limit".into());
+                self.report(
+                    Diagnostic::new("E_EVENT_QUEUE", "pump", "event admission limit").classified(
+                        ErrorDomain::Host,
+                        "admit",
+                        "queue",
+                        vec![Recovery::Exit],
+                    ),
+                    true,
+                );
                 self.pauses.insert("queue-overflow".into());
                 continue;
             }
@@ -518,16 +615,16 @@ impl Player {
             };
             remaining -= 1;
             if matches!(event, AppEvent::Tick { .. }) && session != self.generation.session {
+                self.observe("stale_tick_discarded", None);
                 continue;
             }
             if let Err(e) = self.event(event, &mut remaining) {
-                self.status = e.to_string();
-                self.error = Some(e.to_string());
+                self.report(e, true);
             }
         }
         if self.prepare.is_none() && self.screen == Screen::Story && self.pauses.is_empty() {
             if let Err(e) = self.step(CoreInput::None, &mut remaining) {
-                self.error = Some(e.to_string());
+                self.report(e, true);
             }
         }
         self.work_used = limit - remaining;
@@ -547,7 +644,22 @@ impl Player {
                 session,
             } => {
                 if session == self.generation.session {
+                    self.observe_from(
+                        "input_dispatched",
+                        None,
+                        Some(session),
+                        None,
+                        Some(sequence),
+                    );
                     self.action(action, interaction, sequence, budget)?;
+                } else {
+                    self.observe_from(
+                        "stale_input_discarded",
+                        None,
+                        Some(session),
+                        None,
+                        Some(sequence),
+                    );
                 }
             }
             AppEvent::Tick { delta_us } => {
@@ -563,6 +675,9 @@ impl Player {
                 }
             }
             AppEvent::AssetReady { request, asset } => {
+                if !self.accepts(request) {
+                    self.observe("stale_asset_discarded", Some(request));
+                }
                 if let Some(p) = self
                     .prepare
                     .as_mut()
@@ -577,21 +692,15 @@ impl Player {
                 }
             }
             AppEvent::AssetFailed { request, message } => {
-                if self.accepts(request) {
-                    self.prepare.as_mut().unwrap().failed = true;
-                    self.commands.push(AppCommand::CancelAssets { request });
-                    self.error = Some(message.clone());
-                    if let Some(p) = &self.core.state().pending {
-                        self.core.step(
-                            CoreInput::PreparationFailed {
-                                activation: p.id,
-                                message,
-                            },
-                            0,
-                        );
-                    }
-                }
+                self.asset_fault(
+                    request,
+                    Diagnostic::new("E_PREPARE", self.core.location(), message),
+                );
             }
+            AppEvent::AssetFault {
+                request,
+                diagnostic,
+            } => self.asset_fault(request, *diagnostic),
             AppEvent::PresentationReady { request } => self.complete(request, budget)?,
             AppEvent::AudioEnded { task, session } => {
                 if session == self.generation.session {
@@ -604,7 +713,24 @@ impl Player {
                 message,
             } => {
                 if session == self.generation.session {
+                    let mut d = Diagnostic::new("E_AUDIO", self.core.location(), &message)
+                        .classified(
+                            ErrorDomain::Host,
+                            "audio",
+                            "playback",
+                            vec![Recovery::KeepCurrent],
+                        );
+                    d.details.as_mut().unwrap().task = Some(task);
+                    self.report(d, false);
                     self.step(CoreInput::TaskFailed { task, message }, budget)?;
+                } else {
+                    self.observe_from(
+                        "stale_audio_discarded",
+                        None,
+                        Some(session),
+                        Some(task),
+                        None,
+                    );
                 }
             }
             AppEvent::Hidden(hidden) => {
@@ -625,15 +751,43 @@ impl Player {
                         "snapshot checksum",
                     ));
                 }
-                self.restore(envelope.snapshot)?;
+                self.restore(envelope.snapshot).map_err(|d| {
+                    d.classified(
+                        ErrorDomain::Storage,
+                        "load",
+                        "validate",
+                        vec![Recovery::KeepCurrent],
+                    )
+                })?;
             }
-            AppEvent::LoadFailed(m) => self.status = m,
+            AppEvent::HostFailed(m) => self.report(
+                Diagnostic::new("E_HOST", "dispatch", m).classified(
+                    ErrorDomain::Host,
+                    "dispatch",
+                    "owner",
+                    vec![Recovery::Reload],
+                ),
+                false,
+            ),
+            AppEvent::LoadFailed(m) => self.report(
+                Diagnostic::new("E_STORAGE", "load", m).classified(
+                    ErrorDomain::Storage,
+                    "load",
+                    "transaction",
+                    vec![Recovery::Retry, Recovery::KeepCurrent],
+                ),
+                false,
+            ),
             AppEvent::Saved {
                 job,
                 slot,
                 revision,
             } => {
-                if self.save_jobs.remove(&job) == Some(slot) {
+                if self
+                    .save_jobs
+                    .remove(&job)
+                    .is_some_and(|(saved_slot, _)| saved_slot == slot)
+                {
                     self.slot_revisions.insert(slot, revision);
                     self.status = if self.preferences.locale == "en" {
                         "Saved in this browser"
@@ -645,10 +799,9 @@ impl Player {
                 }
             }
             AppEvent::SaveFailed { job, message } => {
-                if self.save_jobs.remove(&job).is_some() {
-                    self.status = message;
-                }
+                self.save_fault(job, Diagnostic::new("E_STORAGE", "save", message))
             }
+            AppEvent::SaveFault { job, diagnostic } => self.save_fault(job, *diagnostic),
             AppEvent::Slots(slots, revisions) => {
                 self.slots = slots;
                 self.slot_revisions = revisions;
@@ -666,6 +819,7 @@ impl Player {
             }
             AppEvent::Profile(keys) => self.profile.extend(keys),
             AppEvent::DeviceLost => {
+                self.observe("device_lost", None);
                 self.generation.device += 1;
                 self.device_resume = self.prepare.as_ref().map(|p| p.purpose);
                 self.cancel_preparation();
@@ -673,6 +827,7 @@ impl Player {
                 self.commands.push(AppCommand::AudioPause { paused: true });
             }
             AppEvent::DeviceReady => {
+                self.observe("device_ready", None);
                 let purpose = match self.device_resume.take() {
                     Some(Purpose::Restore) => Purpose::Restore,
                     Some(Purpose::Rollback) => Purpose::Rollback,
@@ -683,8 +838,53 @@ impl Player {
         }
         Ok(())
     }
+    fn save_fault(&mut self, job: u32, d: Diagnostic) {
+        let Some((_, session)) = self.save_jobs.remove(&job) else {
+            self.observe("stale_save_failure_discarded", Some(job));
+            return;
+        };
+        let mut d = d.classified(
+            ErrorDomain::Storage,
+            "save",
+            "transaction",
+            vec![Recovery::KeepCurrent],
+        );
+        d.details.as_mut().unwrap().request = Some(job);
+        d.details.as_mut().unwrap().session = Some(session);
+        self.report(d, false);
+    }
+    fn asset_fault(&mut self, request: u32, mut d: Diagnostic) {
+        if !self.accepts(request) {
+            self.observe("stale_failure_discarded", Some(request));
+            return;
+        }
+        self.prepare.as_mut().unwrap().failed = true;
+        self.commands.push(AppCommand::CancelAssets { request });
+        if d.details.is_none() {
+            d = d.classified(
+                ErrorDomain::Prepare,
+                "prepare",
+                "resource",
+                vec![Recovery::Retry, Recovery::KeepCurrent, Recovery::Exit],
+            );
+        }
+        d.details.as_mut().unwrap().request = Some(request);
+        let message = self.messages.diagnostic(&d, &self.preferences.locale);
+        self.report(d, true);
+        self.observe("prepare_failed", Some(request));
+        if let Some(p) = &self.core.state().pending {
+            self.core.step(
+                CoreInput::PreparationFailed {
+                    activation: p.id,
+                    message,
+                },
+                0,
+            );
+        }
+    }
     fn complete(&mut self, request: u32, budget: &mut u32) -> Result<()> {
         if !self.accepts(request) {
+            self.observe("stale_presentation_discarded", Some(request));
             return Ok(());
         }
         let prep = self.prepare.take().unwrap();
@@ -697,9 +897,15 @@ impl Player {
                 "generation changed",
             ));
         }
+        self.observe("lease_ready", Some(request));
         self.pauses.remove("prepare");
         self.pauses.remove("device");
         self.error = None;
+        self.diagnostic = None;
+        let commit_location = self.core.location();
+        let commit_cue = self.core.state().pending.as_ref().map(|p| p.cue.clone());
+        let commit_generation = self.generation;
+        self.observe("commit_started", Some(request));
         match purpose {
             Purpose::Boot => {}
             Purpose::Activation => self.step(
@@ -741,6 +947,17 @@ impl Player {
         let active = self.ledger.reserve(&self.costs(&assets)?)?;
         self.active = Some(active);
         drop(lease);
+        self.commands.push(AppCommand::Observation {
+            origin_session: None,
+            task: None,
+            sequence: None,
+            stage: "prepare_commit".into(),
+            request: Some(request),
+            location: commit_location,
+            cue: commit_cue,
+            session: commit_generation.session,
+            device: commit_generation.device,
+        });
         Ok(())
     }
     fn restart_audio(&mut self) {
@@ -798,6 +1015,7 @@ impl Player {
                 self.pauses.retain(|r| r == "hidden");
                 self.checkpoints.clear();
                 self.error = None;
+                self.diagnostic = None;
                 self.status.clear();
                 self.step(CoreInput::None, budget)?;
             }
@@ -868,6 +1086,7 @@ impl Player {
                 self.return_screen = Screen::Title;
                 self.generation.session += 1;
                 self.error = None;
+                self.diagnostic = None;
                 self.status.clear();
                 self.begin_prepare(Purpose::Boot, 0, self.title_assets())?;
             }
@@ -915,7 +1134,10 @@ impl Player {
             UiAction::Save { slot } => {
                 if self.return_screen == Screen::Title
                     || slot > 2
-                    || self.save_jobs.values().any(|v| *v == slot)
+                    || self
+                        .save_jobs
+                        .values()
+                        .any(|(saved_slot, _)| *saved_slot == slot)
                 {
                     return Ok(());
                 }
@@ -931,7 +1153,7 @@ impl Player {
                 let revision = self.slot_revisions.get(&slot).copied().unwrap_or(0);
                 self.request += 1;
                 let job = self.request;
-                self.save_jobs.insert(job, slot);
+                self.save_jobs.insert(job, (slot, self.generation.session));
                 let envelope = SaveEnvelope {
                     format: 1,
                     slot,
@@ -1117,6 +1339,12 @@ impl Player {
             loading: self.is_loading(),
             status: self.status.clone(),
             fault: self.error.clone(),
+            fault_recovery: self
+                .diagnostic
+                .as_ref()
+                .and_then(|d| d.details.as_ref())
+                .map(|d| d.recovery.clone())
+                .unwrap_or_default(),
             auto: self.auto,
             skip: self.skip,
             outcome: c.state().outcome.clone(),

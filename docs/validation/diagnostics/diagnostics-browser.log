@@ -1,0 +1,28 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:browser
+npm notice run playwright test --max-failures=1
+
+Running 18 tests using 1 worker
+
+(node:1160242) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 tests/browser/player.spec.js:32:1 › WebGPU canvas, Chinese layout, static sleep and both endings (16.8s)
+  ✓   2 tests/browser/player.spec.js:64:1 › save commit, refresh restore, locale boundary, history and rollback (8.6s)
+  ✓   3 tests/browser/player.spec.js:98:1 › independent pauses, viewport changes, touch and actual device recovery (4.4s)
+  ✓   4 tests/browser/player.spec.js:125:1 › required resource failure keeps scene and retry succeeds (2.7s)
+  ✓   5 tests/browser/player.spec.js:138:1 › real tab visibility freezes Story and resumes through visibilitychange (4.9s)
+  ✓   6 tests/browser/player.spec.js:165:1 › actual device loss during a dissolve preserves progress (4.4s)
+  ✓   7 tests/browser/player.spec.js:197:1 › corrupt WASM is rejected before instantiation (871ms)
+  ✓   8 tests/browser/player.spec.js:207:1 › save export/import and tamper rejection preserve independent preferences (3.1s)
+  ✓   9 tests/browser/player.spec.js:227:1 › final release boots below a URL subpath and uses correct HTTP types (2.0s)
+  ✓  10 tests/browser/player.spec.js:242:3 › touch input emulation › starts and advances by tapping the drawn canvas (2.1s)
+  ✓  11 tests/browser/player.spec.js:254:1 › owner inbox defers actions, drains bursts and keeps turn work bounded (2.4s)
+  ✓  12 tests/browser/player.spec.js:276:1 › leaving preparation cancels its fetch and a new request still succeeds (3.3s)
+  ✓  13 tests/browser/player.spec.js:316:1 › reserved save completion survives session replacement and duplicate traffic (3.1s)
+  ✓  14 tests/browser/player.spec.js:337:1 › a delayed load cannot replace a newer session (3.2s)
+  ✓  15 tests/browser/player.spec.js:350:1 › repeated preparation, pause and device replacement release all request slots (16.0s)
+  ✓  16 tests/browser/player.spec.js:373:1 › an owner turn detects device loss before the idle watchdog (4.2s)
+  ✓  17 tests/browser/player.spec.js:396:1 › decode and quota failures provide correlated diagnostics and a private export (3.6s)
+  ✓  18 tests/browser/player.spec.js:429:1 › tracing on and off preserves deterministic story trace and outcome (13.4s)
+
+  18 passed (1.7m)

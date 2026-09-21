@@ -392,3 +392,52 @@ test('an owner turn detects device loss before the idle watchdog',async({page})=
   expect(after.paused).toBe(true);expect(after.error).toBeNull();
   expectPainted(await page.screenshot());
 });
+
+test('decode and quota failures provide correlated diagnostics and a private export',async({page})=>{
+  await page.addInitScript(()=>{
+    const decode=AudioContext.prototype.decodeAudioData;
+    let once=true;
+    AudioContext.prototype.decodeAudioData=function(...args){if(once){once=false;return Promise.reject(new Error('PRIVATE_AUDIO_SENTINEL'));}return decode.apply(this,args);};
+    const put=IDBObjectStore.prototype.put;
+    let quota=true;
+    IDBObjectStore.prototype.put=function(...args){if(this.name==='saves'&&quota){quota=false;throw new DOMException('PRIVATE_STORAGE_SENTINEL','QuotaExceededError');}return put.apply(this,args);};
+  });
+  await boot(page);await page.keyboard.press('Space');
+  await page.waitForFunction(()=>window.__nir.state().diagnostic?.code==='E_AUDIO_DECODE');
+  const failed=await state(page);
+  expect(failed.diagnostic.details.domain).toBe('prepare');
+  expect(failed.diagnostic.details.request).toBeGreaterThan(0);
+  expect(failed.error).not.toContain('PRIVATE_');
+  await act(page,{type:'retry'});
+  await page.waitForFunction(()=>window.__nir.state().dialogue&&!window.__nir.state().loading&&!window.__nir.state().error);
+  await act(page,{type:'saves'});await act(page,{type:'save',slot:0});
+  await page.waitForFunction(()=>window.__nir.state().diagnostic?.code==='E_STORAGE_QUOTA');
+  expect((await state(page)).status).not.toContain('PRIVATE_');
+  await act(page,{type:'save',slot:0});
+  await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
+  const report=await page.evaluate(()=>window.__nir.diagnostics());
+  const stages=new Set(report.events.map(e=>e.stage));
+  for(const name of ['bootstrap_started','wasm_initialized','input_received','prepare_requested','fetch_verified','decode_allocate','upload_enqueued','presentation_prepare','lease_ready','prepare_commit','render_submitted','diagnostic','storage_committed'])expect(stages.has(name),name).toBe(true);
+  expect(JSON.stringify(report)).not.toMatch(/PRIVATE_|snapshot|variables|visible_text/);
+  expect(report.events.find(e=>e.stage==='resource_failed'&&e.code==='E_AUDIO_DECODE').request).toBe(failed.diagnostic.details.request);
+  await fs.writeFile('reports/diagnostic-trace.json',JSON.stringify(report,null,2));
+  const download=page.waitForEvent('download');
+  await page.evaluate(()=>window.nirDiagnostics.download());
+  const artifact=await download;expect(artifact.suggestedFilename()).toBe('nir-diagnostics.json');
+});
+
+test('tracing on and off preserves deterministic story trace and outcome',async({page})=>{
+  const runs=[];
+  for(const enabled of [true,false]){
+    await page.goto(`/?test=1${enabled?'':'&trace=0'}`);
+    await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+    await start(page);
+    await advanceUntil(page,s=>!!s.choice);
+    await act(page,{type:'choose',option:'stay'});
+    const end=await advanceUntil(page,s=>!!s.outcome,'stay');
+    // Logical IDs/order are deterministic; wall-clock-derived Story times are not.
+    runs.push({outcome:end.outcome,variables:end.variables,trace:await page.evaluate(()=>window.__nir.traces)});
+    if(!enabled)expect(await page.evaluate(()=>window.__nir.diagnostics().events.length)).toBe(0);
+  }
+  expect(runs[1]).toEqual(runs[0]);
+});

@@ -54,6 +54,7 @@ pub struct UiModel {
     pub loading: bool,
     pub status: String,
     pub fault: Option<String>,
+    pub fault_recovery: Vec<Recovery>,
     pub auto: bool,
     pub skip: bool,
     pub outcome: Option<String>,
@@ -119,6 +120,16 @@ impl Default for Messages {
     }
 }
 impl Messages {
+    pub fn diagnostic(&self, diagnostic: &Diagnostic, locale: &str) -> String {
+        let key = match diagnostic.details.as_ref().map(|d| &d.domain) {
+            Some(ErrorDomain::Prepare) => "error-prepare",
+            Some(ErrorDomain::Storage) => "error-storage",
+            Some(ErrorDomain::Render) => "error-render",
+            Some(ErrorDomain::Core | ErrorDomain::Content) => "error-content",
+            _ => "error-host",
+        };
+        format!("{}: {}", diagnostic.code, self.text(locale, key))
+    }
     pub fn text(&self, locale: &str, id: &str) -> String {
         let b = if locale == "zh-Hans" {
             &self.zh
@@ -799,13 +810,15 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
             color: t.text,
             emphasis: vec![],
         });
-        p.button(
-            msg("retry"),
-            UiAction::Retry,
-            [margin + 20., height * 0.3 + 90., 140., 38.],
-            true,
-            t,
-        );
+        if m.fault_recovery.contains(&Recovery::Retry) {
+            p.button(
+                msg("retry"),
+                UiAction::Retry,
+                [margin + 20., height * 0.3 + 90., 140., 38.],
+                true,
+                t,
+            );
+        }
         p.button(
             msg("exit"),
             UiAction::Title,
