@@ -43,7 +43,12 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Chromium software WebGPU regression
         env:
-          NIR_CHROME_ARGS: --use-webgpu-adapter=swiftshader
+          # Keep WebGPU and the compositor on compatible software Vulkan paths.
+          # Force X11 so a developer's Wayland session cannot bypass Xvfb.
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
         run: |
           export CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           mkdir -p target/tmp
