@@ -1,0 +1,31 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:host
+npm notice run node --test tests/host/*.test.js
+✔ trace ring is bounded, ordered and excludes private payloads (9.162075ms)
+✔ disabled trace does not read clock or retain records (3.530905ms)
+✔ request terminal trace identifies cancelled and duplicate callbacks (8.178693ms)
+✔ request observations retain origin epoch through a session replacement (1.59272ms)
+✔ first visit inherits work defaults and supported browser language (6.115798ms)
+✔ system reduced motion supplements work defaults; explicit saved preferences win (0.768792ms)
+✔ input overload leaves room for terminal completions (16.523316ms)
+✔ owner yields at item/time limits and never consumes reentrant production (5.165377ms)
+✔ inputs precede resource delivery and each turn admits one resource (2.083107ms)
+✔ recovery stops the current batch and still admits its control completion (1.568806ms)
+✔ cancelling a resource group releases bytes without dropping independent saves (1.110292ms)
+✔ shared fetch aborts only after its last consumer cancels (5.828992ms)
+✔ late old completion cannot remove a replacement fetch (3.549888ms)
+✔ resource admission is global and cancelled decoders hold their slot until settled (3.378546ms)
+✔ an active batch still occupies capacity and disposal settles its pending items (4.465461ms)
+✔ accepted jobs keep a terminal slot when unrelated traffic fills the inbox (15.55666ms)
+✔ reserved resource progress reuses its slot until completion or cancellation (13.536618ms)
+✔ device control has admission room beyond ordinary job reservations (1.834616ms)
+✔ shutdown settles queued progress and reserved terminals exactly once (4.314344ms)
+✔ seeded completion, cancellation and drain interleavings preserve the ledger (120.67129ms)
+ℹ tests 20
+ℹ suites 0
+ℹ pass 20
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 571.306295

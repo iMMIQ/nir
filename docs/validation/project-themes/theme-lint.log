@@ -1,0 +1,4 @@
+    Checking nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+    Checking nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+    Checking nir-player v0.1.0 (/nir/crates/nir-player)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.80s

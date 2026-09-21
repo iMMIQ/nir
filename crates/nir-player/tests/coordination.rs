@@ -616,3 +616,129 @@ fn save_diagnostic_retains_the_origin_session_after_replacement() {
     assert_eq!(d.details.as_ref().unwrap().request, Some(job));
     assert!(p.error.is_none());
 }
+
+#[test]
+fn work_defaults_yield_to_player_preferences_and_survive_new_sessions() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.player.font_scale = 1.2;
+    program.player.bgm_volume = 0.1;
+    program.player.reduced_motion = true;
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    assert_eq!(p.preferences.font_scale, 1.2);
+    assert_eq!(p.preferences.bgm_volume, 0.1);
+    assert!(p.preferences.reduced_motion);
+    let saved = Preferences {
+        font_scale: 1.4,
+        bgm_volume: 0.7,
+        reduced_motion: false,
+        ..Default::default()
+    };
+    let commands = p.pump(vec![AppEvent::Preferences(saved)], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    assert_eq!(p.preferences.font_scale, 1.4);
+    assert_eq!(p.preferences.bgm_volume, 0.7);
+    assert!(!p.preferences.reduced_motion);
+}
+
+#[test]
+fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
+    use nir_presentation::{project, ChoiceView, Messages, Screen};
+    let p = playing();
+    let mut m = p.model();
+    m.screen = Screen::Story;
+    m.loading = false;
+    m.paused = false;
+    m.choices = vec![
+        ChoiceView {
+            id: "walk".into(),
+            label: "Walk".into(),
+            enabled: true,
+        },
+        ChoiceView {
+            id: "stay".into(),
+            label: "Stay".into(),
+            enabled: false,
+        },
+    ];
+    let messages = Messages::default();
+    for (width, height) in [(1280., 800.), (390., 844.), (844., 390.)] {
+        for component in [DialogueComponent::Bottom, DialogueComponent::Top] {
+            for choice in [ChoiceComponent::Standard, ChoiceComponent::Compact] {
+                m.theme.slots.dialogue = component;
+                m.theme.slots.choice = choice;
+                m.prefs.font_scale = 1.5;
+                m.dialogue.as_mut().unwrap().gate = true;
+                let packet = project(&m, width, height, &messages);
+                let advance = packet
+                    .semantics
+                    .iter()
+                    .find(|s| s.action == UiAction::Advance)
+                    .unwrap();
+                assert!(!advance.enabled);
+                assert!(packet
+                    .semantics
+                    .iter()
+                    .any(|s| s.action == UiAction::Menu && s.enabled));
+                let choices: Vec<_> = packet
+                    .semantics
+                    .iter()
+                    .filter(|s| matches!(s.action, UiAction::Choose { .. }))
+                    .collect();
+                assert_eq!(choices.len(), 2);
+                assert!(choices[0].enabled && !choices[1].enabled);
+                assert_eq!(
+                    packet.hit(choices[0].rect[0] + 2., choices[0].rect[1] + 2.),
+                    Some(UiAction::Choose {
+                        option: "walk".into()
+                    })
+                );
+                for s in &packet.semantics {
+                    assert!(
+                        s.rect[0] >= 0.
+                            && s.rect[1] >= 0.
+                            && s.rect[0] + s.rect[2] <= width
+                            && s.rect[1] + s.rect[3] <= height,
+                        "{:?}",
+                        s.rect
+                    );
+                }
+                let text = packet.texts.iter().find(|t| t.visible.is_some()).unwrap();
+                assert_eq!(text.size, (23. - if width < 650. { 4. } else { 0. }) * 1.5);
+            }
+        }
+    }
+}
+
+#[test]
+fn author_auto_delay_controls_reading_after_reveal_and_pauses() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.player.auto_delay_us = Micros(3_000_000);
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let c = p.pump(vec![], 1000);
+    ready(&mut p, c);
+    let c = action(&mut p, UiAction::NewGame);
+    ready(&mut p, c);
+    action(&mut p, UiAction::Advance);
+    let interaction = p.current_interaction();
+    assert!(p.core().dialogue().unwrap().1.awaiting_advance);
+    action(&mut p, UiAction::ToggleAuto);
+    for _ in 0..8 {
+        p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+    }
+    assert_eq!(p.current_interaction(), interaction);
+    action(&mut p, UiAction::Menu);
+    for _ in 0..20 {
+        p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+    }
+    assert_eq!(p.current_interaction(), interaction);
+    action(&mut p, UiAction::Close);
+    for _ in 0..16 {
+        let c = p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+        ready(&mut p, c);
+    }
+    assert_ne!(p.current_interaction(), interaction);
+}

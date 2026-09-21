@@ -1,60 +1,118 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Theme",
+  "title": "ThemeManifest",
   "type": "object",
   "properties": {
-    "accent": {
-      "type": "array",
-      "items": {
-        "type": "number",
-        "format": "float"
-      },
-      "maxItems": 4,
-      "minItems": 4
+    "base": {
+      "type": "string"
     },
-    "background": {
-      "type": "array",
-      "items": {
-        "type": "number",
-        "format": "float"
-      },
-      "maxItems": 4,
-      "minItems": 4
+    "choice": {
+      "$ref": "#/$defs/ChoiceProps",
+      "default": {
+        "item_height": 58.0,
+        "width": 520.0
+      }
     },
-    "muted": {
-      "type": "array",
-      "items": {
-        "type": "number",
-        "format": "float"
-      },
-      "maxItems": 4,
-      "minItems": 4
+    "dialogue": {
+      "$ref": "#/$defs/DialogueProps",
+      "default": {
+        "font_size": 23.0,
+        "height": 220.0,
+        "padding": 24.0
+      }
     },
-    "panel": {
-      "type": "array",
-      "items": {
-        "type": "number",
-        "format": "float"
-      },
-      "maxItems": 4,
-      "minItems": 4
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
     },
-    "text": {
-      "type": "array",
-      "items": {
-        "type": "number",
-        "format": "float"
-      },
-      "maxItems": 4,
-      "minItems": 4
+    "id": {
+      "type": "string"
+    },
+    "slots": {
+      "$ref": "#/$defs/ThemeSlots",
+      "default": {
+        "choice.main": "builtin.choice",
+        "dialogue.main": "builtin.dialogue"
+      }
+    },
+    "tokens": {
+      "type": "string"
     }
   },
   "additionalProperties": false,
   "required": [
-    "background",
-    "panel",
-    "accent",
-    "text",
-    "muted"
-  ]
+    "format",
+    "id",
+    "base",
+    "tokens"
+  ],
+  "$defs": {
+    "ChoiceComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.choice",
+        "builtin.choice.compact"
+      ]
+    },
+    "ChoiceProps": {
+      "type": "object",
+      "properties": {
+        "item_height": {
+          "type": "number",
+          "format": "float",
+          "default": 58.0
+        },
+        "width": {
+          "type": "number",
+          "format": "float",
+          "default": 520.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "DialogueComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.dialogue",
+        "builtin.dialogue.top"
+      ]
+    },
+    "DialogueProps": {
+      "type": "object",
+      "properties": {
+        "font_size": {
+          "type": "number",
+          "format": "float",
+          "default": 23.0
+        },
+        "height": {
+          "type": "number",
+          "format": "float",
+          "default": 220.0
+        },
+        "padding": {
+          "type": "number",
+          "format": "float",
+          "default": 24.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ThemeSlots": {
+      "description": "Closed component registry implemented by the locked player SDK. Components\nonly project state; their actions and focus semantics remain player-owned.",
+      "type": "object",
+      "properties": {
+        "choice.main": {
+          "$ref": "#/$defs/ChoiceComponent",
+          "default": "builtin.choice"
+        },
+        "dialogue.main": {
+          "$ref": "#/$defs/DialogueComponent",
+          "default": "builtin.dialogue"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

@@ -173,7 +173,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
     const buffers=new Map(),voices=new Map(),bytesCache=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map();
-    let preferences={bgm_volume:.3,voice_volume:.8,sfx_volume:.5}, raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
+    let preferences=JSON.parse(engine.state()).preferences, raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
     let ownerTimer=null,pendingElapsed=0;
     const namespace=release.game_id+(location.hostname==='localhost'||location.hostname==='127.0.0.1'?':dev':'');
@@ -352,6 +352,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'audio_reset':for(const id of [...voices.keys()])stopVoice(id);break;
             case 'audio_pause':audioPaused=c.paused;if(c.paused){audio.suspend().catch(()=>{});}else if(unlocked){audio.resume().catch(e=>console.warn(e));}break;
             case 'save':save(c);break;case 'load':load(c.slot);break;case 'list_saves':listSaves();break;
+            case 'apply_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`];break;
             case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;{const value=preferences;request(()=>write('preferences',namespace,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
             case 'persist_profile':request(()=>mergeProfile(c.keys),()=>{},e=>hostEvent('load_failed',`E_PROFILE: ${e}`));break;
             case 'export':{const url=URL.createObjectURL(new Blob([c.json],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`${release.game_id}.nir-save.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);break;}
@@ -428,15 +429,17 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     request(()=>Promise.all([read('preferences',namespace),read('profile',namespace)]),([savedPreferences,profile])=>{
-        if(savedPreferences){preferences=savedPreferences;hostEvent('preferences',preferences);}
-        else{
-            const langs=navigator.languages||[];
-            const locale=langs.some(l=>l==='zh'||l==='zh-CN'||l==='zh-SG'||l==='zh-Hans')?'zh-Hans':langs.some(l=>l==='en'||l.startsWith('en-'))?'en':program.default_locale;
-            hostEvent('preferences',{locale,font_scale:1,bgm_volume:.3,voice_volume:.8,sfx_volume:.5,reduced_motion:matchMedia('(prefers-reduced-motion: reduce)').matches});
-        }
+        hostEvent('preferences',initialPreferences(preferences,savedPreferences,program.locales,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
         if(profile)hostEvent('profile',profile);
     },e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
     function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
     window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>engine.hidden(true));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>engine.hidden(false));}});
+}
+
+// Author defaults < browser accessibility defaults < explicitly saved player settings.
+export function initialPreferences(defaults,saved,locales,languages,reducedMotion) {
+    if(saved)return {...defaults,...saved};
+    const locale=languages.some(l=>l==='zh'||l==='zh-CN'||l==='zh-SG'||l==='zh-Hans')?'zh-Hans':languages.some(l=>l==='en'||l.startsWith('en-'))?'en':defaults.locale;
+    return {...defaults,locale:locales[locale]?locale:defaults.locale,reduced_motion:defaults.reduced_motion||reducedMotion};
 }

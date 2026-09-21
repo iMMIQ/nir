@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlayerConfig",
+  "type": "object",
+  "properties": {
+    "defaults": {
+      "$ref": "#/$defs/PlayerDefaults",
+      "default": {
+        "auto_delay_us": "1200000",
+        "bgm_volume": 0.30000001192092896,
+        "font_scale": 1.0,
+        "reduced_motion": false,
+        "sfx_volume": 0.5,
+        "voice_volume": 0.800000011920929
+      }
+    },
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "Micros": {
+      "type": "string"
+    },
+    "PlayerDefaults": {
+      "type": "object",
+      "properties": {
+        "auto_delay_us": {
+          "$ref": "#/$defs/Micros",
+          "default": "1200000"
+        },
+        "bgm_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.30000001192092896
+        },
+        "font_scale": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "reduced_motion": {
+          "type": "boolean",
+          "default": false
+        },
+        "sfx_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.5
+        },
+        "voice_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.800000011920929
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

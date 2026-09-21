@@ -108,6 +108,7 @@ pub struct BuildReport {
     pub excluded_resources: Vec<String>,
     pub provenance: BTreeMap<String, String>,
     pub engine_build: String,
+    pub resolved_config: crate::ResolvedConfig,
 }
 pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildReport> {
     let p = load_project(root)?;
@@ -220,6 +221,7 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
             .filter(|(id, _)| roots.contains(id))
             .collect(),
         engine_build: lock.sdk_digest,
+        resolved_config: p.resolved_config,
     };
     let reports = root.join("reports");
     fs::create_dir_all(&reports)?;

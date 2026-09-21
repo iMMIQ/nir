@@ -9,12 +9,14 @@ title_scene = "station"
 [engine]
 api = "nir-player/0.1"
 capability_profile = "web-v1"
+runtime_preset = "web-standard"
 [stage]
 width = 1280
 height = 720
 [inputs]
 modules = ["content/ch01/module.toml"]
 asset_catalogs = ["assets/catalog.toml"]
-theme = "themes/rain/tokens.json"
+theme = "themes/rain/theme.toml"
+player = "config/player.toml"
 scenarios = ["tests/scenarios/walk.toml", "tests/scenarios/stay.toml"]
 notices = ["credits/README.md", "credits/FONT-LICENSE.txt"]

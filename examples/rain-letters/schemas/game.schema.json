@@ -38,6 +38,10 @@
         },
         "capability_profile": {
           "type": "string"
+        },
+        "runtime_preset": {
+          "type": "string",
+          "default": "web-standard"
         }
       },
       "additionalProperties": false,
@@ -102,6 +106,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "player": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "scenarios": {
           "type": "array",

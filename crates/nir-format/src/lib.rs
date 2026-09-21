@@ -245,6 +245,8 @@ pub struct Program {
     pub title_scene: Option<String>,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub player: PlayerDefaults,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,6 +635,12 @@ pub struct Theme {
     pub accent: [f32; 4],
     pub text: [f32; 4],
     pub muted: [f32; 4],
+    #[serde(default)]
+    pub slots: ThemeSlots,
+    #[serde(default)]
+    pub dialogue: DialogueProps,
+    #[serde(default)]
+    pub choice: ChoiceProps,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -642,8 +650,187 @@ impl Default for Theme {
             accent: [0.83, 0.73, 0.48, 1.],
             text: [0.93, 0.94, 0.88, 1.],
             muted: [0.58, 0.69, 0.69, 1.],
+            slots: ThemeSlots::default(),
+            dialogue: DialogueProps::default(),
+            choice: ChoiceProps::default(),
         }
     }
+}
+/// Closed component registry implemented by the locked player SDK. Components
+/// only project state; their actions and focus semantics remain player-owned.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeSlots {
+    #[serde(default, rename = "dialogue.main")]
+    pub dialogue: DialogueComponent,
+    #[serde(default, rename = "choice.main")]
+    pub choice: ChoiceComponent,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogueComponent {
+    #[default]
+    #[serde(rename = "builtin.dialogue")]
+    Bottom,
+    #[serde(rename = "builtin.dialogue.top")]
+    Top,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChoiceComponent {
+    #[default]
+    #[serde(rename = "builtin.choice")]
+    Standard,
+    #[serde(rename = "builtin.choice.compact")]
+    Compact,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DialogueProps {
+    pub height: f32,
+    pub padding: f32,
+    pub font_size: f32,
+}
+impl Default for DialogueProps {
+    fn default() -> Self {
+        Self {
+            height: 220.,
+            padding: 24.,
+            font_size: 23.,
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChoiceProps {
+    pub width: f32,
+    pub item_height: f32,
+}
+impl Default for ChoiceProps {
+    fn default() -> Self {
+        Self {
+            width: 520.,
+            item_height: 58.,
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlayerDefaults {
+    pub font_scale: f32,
+    pub bgm_volume: f32,
+    pub voice_volume: f32,
+    pub sfx_volume: f32,
+    pub reduced_motion: bool,
+    pub auto_delay_us: Micros,
+}
+impl Default for PlayerDefaults {
+    fn default() -> Self {
+        Self {
+            font_scale: 1.,
+            bgm_volume: 0.3,
+            voice_volume: 0.8,
+            sfx_volume: 0.5,
+            reduced_motion: false,
+            auto_delay_us: Micros(1_200_000),
+        }
+    }
+}
+impl PlayerDefaults {
+    pub fn preferences(&self, locale: String) -> Preferences {
+        Preferences {
+            locale,
+            font_scale: self.font_scale,
+            bgm_volume: self.bgm_volume,
+            voice_volume: self.voice_volume,
+            sfx_volume: self.sfx_volume,
+            reduced_motion: self.reduced_motion,
+        }
+    }
+}
+/// Also enforced at runtime: a hand-written executable cannot bypass author checks.
+pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> {
+    let range = |value: f32, lo: f32, hi: f32| value.is_finite() && (lo..=hi).contains(&value);
+    for (name, color) in [
+        ("background", theme.background),
+        ("panel", theme.panel),
+        ("accent", theme.accent),
+        ("text", theme.text),
+        ("muted", theme.muted),
+    ] {
+        if !color.iter().all(|v| range(*v, 0., 1.)) || color[3] < 0.5 {
+            return Err(Diagnostic::new(
+                "E_THEME_PROPS",
+                format!("theme.{name}"),
+                "RGBA must be finite in 0..1; alpha must be at least 0.5",
+            ));
+        }
+    }
+    let luminance = |c: [f32; 4]| {
+        let channel = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        channel(c[0]) * 0.2126 + channel(c[1]) * 0.7152 + channel(c[2]) * 0.0722
+    };
+    for (name, foreground, background) in [
+        ("text/panel", theme.text, theme.panel),
+        ("accent/background", theme.accent, theme.background),
+    ] {
+        let a = luminance(foreground);
+        let b = luminance(background);
+        if (a.max(b) + 0.05) / (a.min(b) + 0.05) < 4.5 {
+            return Err(Diagnostic::new(
+                "E_THEME_CONTRAST",
+                format!("theme.{name}"),
+                "base color contrast must be at least 4.5:1",
+            ));
+        }
+    }
+    for (name, value, lo, hi) in [
+        ("dialogue.height", theme.dialogue.height, 220., 320.),
+        ("dialogue.padding", theme.dialogue.padding, 12., 32.),
+        ("dialogue.font_size", theme.dialogue.font_size, 18., 28.),
+        ("choice.width", theme.choice.width, 360., 680.),
+        ("choice.item_height", theme.choice.item_height, 48., 72.),
+    ] {
+        if !range(value, lo, hi) {
+            return Err(Diagnostic::new(
+                "E_THEME_PROPS",
+                format!("theme.{name}"),
+                format!("expected {lo}..{hi}"),
+            ));
+        }
+    }
+    for (name, value, lo, hi) in [
+        ("font_scale", player.font_scale, 0.8, 1.5),
+        ("bgm_volume", player.bgm_volume, 0., 1.),
+        ("voice_volume", player.voice_volume, 0., 1.),
+        ("sfx_volume", player.sfx_volume, 0., 1.),
+    ] {
+        if !range(value, lo, hi) {
+            return Err(Diagnostic::new(
+                "E_PLAYER_CONFIG",
+                format!("player.{name}"),
+                format!("expected {lo}..{hi}"),
+            ));
+        }
+    }
+    if !(100_000..=30_000_000).contains(&player.auto_delay_us.0) {
+        return Err(Diagnostic::new(
+            "E_PLAYER_CONFIG",
+            "player.auto_delay_us",
+            "expected 100000..30000000 microseconds",
+        ));
+    }
+    Ok(())
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]

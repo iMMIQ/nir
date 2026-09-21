@@ -245,3 +245,156 @@ fn author_schema_error_retains_parser_position() {
     assert!(source.file.ends_with("themes/rain/tokens.json"));
     assert!(source.line > 1 && source.column > 0);
 }
+
+#[test]
+fn resolves_author_configuration_with_per_field_sources() {
+    let d = project();
+    fs::write(
+        d.path().join("config/player.toml"),
+        "format = 1\n[defaults]\nfont_scale = 1.2\nauto_delay_us = \"2500000\"\n",
+    )
+    .unwrap();
+    let p = load_project(d.path()).unwrap();
+    assert_eq!(p.program.player.font_scale, 1.2);
+    assert_eq!(p.program.player.auto_delay_us.0, 2_500_000);
+    assert_eq!(
+        p.resolved_config["player.font_scale"].source,
+        "config/player.toml#/defaults/font_scale"
+    );
+    assert_eq!(
+        p.resolved_config["player.bgm_volume"].source,
+        "builtin:web-standard"
+    );
+    assert_eq!(
+        p.resolved_config["theme.slots.dialogue.main"].value,
+        "builtin.dialogue"
+    );
+    assert_eq!(
+        p.resolved_config["theme.tokens.panel"].source,
+        "themes/rain/tokens.json#/panel"
+    );
+    let encoded = serde_json::to_string(&p.program).unwrap();
+    assert!(!encoded.contains("config/player.toml"));
+    assert!(!serde_json::to_string(&p.resolved_config)
+        .unwrap()
+        .contains(d.path().to_str().unwrap()));
+    // Local configuration cannot override work semantics or presentation defaults.
+    fs::write(
+        d.path().join("game.local.toml"),
+        "[defaults]\nfont_scale = 0.8\n",
+    )
+    .unwrap();
+    assert_eq!(
+        load_project(d.path()).unwrap().program.revision,
+        p.program.revision
+    );
+}
+
+#[test]
+fn rejects_unsupported_theme_contracts_and_unsafe_props() {
+    for (old, new, code) in [
+        ("builtin.reader", "custom.javascript", "E_THEME_CONTRACT"),
+        ("builtin.dialogue\"", "builtin.choice\"", "E_TOML"),
+        ("choice.main", "overlay.phone", "E_TOML"),
+        ("font_size = 23.0", "font_size = 0.0", "E_THEME_PROPS"),
+        ("height = 240.0", "height = nan", "E_THEME_PROPS"),
+        ("tokens.json", "../../../../tokens.json", "E_PATH"),
+        (
+            "padding = 24.0",
+            "padding = 24.0\nhide_menu = true",
+            "E_TOML",
+        ),
+    ] {
+        let d = project();
+        let path = d.path().join("themes/rain/theme.toml");
+        fs::write(&path, fs::read_to_string(&path).unwrap().replace(old, new)).unwrap();
+        let error = load_project(d.path()).unwrap_err().to_string();
+        assert!(error.contains(code), "{old} -> {new}: {error}");
+    }
+}
+
+#[test]
+fn rejects_unknown_runtime_and_player_overrides() {
+    for text in [
+        "format = 2",
+        "format = 1\n[defaults]\nbgm_volume = 2.0",
+        "format = 1\n[defaults]\nauto_delay_us = \"0\"",
+        "format = 1\n[defaults]\nrelease_gates = true",
+    ] {
+        let d = project();
+        fs::write(d.path().join("config/player.toml"), text).unwrap();
+        assert!(load_project(d.path()).is_err(), "accepted {text}");
+    }
+    let d = project();
+    let path = d.path().join("game.toml");
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("web-standard", "webgl-worker"),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_RUNTIME_PRESET"));
+}
+
+#[test]
+fn legacy_tokens_and_new_components_share_validation_at_runtime() {
+    let d = project();
+    let path = d.path().join("game.toml");
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("themes/rain/theme.toml", "themes/rain/tokens.json"),
+    )
+    .unwrap();
+    let mut p = load_project(d.path()).unwrap().program;
+    let mut invisible = p.clone();
+    invisible.theme.text = invisible.theme.panel;
+    assert_eq!(
+        nir_core::ValidatedProgram::new(invisible).unwrap_err().code,
+        "E_THEME_CONTRAST"
+    );
+    assert_eq!(
+        p.theme.slots.dialogue,
+        nir_format::DialogueComponent::Bottom
+    );
+    p.theme.dialogue.font_size = f32::INFINITY;
+    assert_eq!(
+        nir_core::ValidatedProgram::new(p).unwrap_err().code,
+        "E_THEME_PROPS"
+    );
+}
+
+#[test]
+fn theme_edit_changes_release_without_changing_locked_sdk() {
+    let d = project();
+    let sdk = test_sdk();
+    let lock = resolve(d.path(), sdk.path()).unwrap();
+    let before = build(d.path(), sdk.path(), &d.path().join("dist/a"), true).unwrap();
+    let path = d.path().join("themes/rain/theme.toml");
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("builtin.dialogue\"", "builtin.dialogue.top\"")
+            .replace("builtin.choice\"", "builtin.choice.compact\""),
+    )
+    .unwrap();
+    let after = build(d.path(), sdk.path(), &d.path().join("dist/b"), true).unwrap();
+    assert_ne!(before.release, after.release);
+    assert_eq!(before.engine_build, after.engine_build);
+    assert_eq!(
+        lock,
+        check_lock(&load_project(d.path()).unwrap(), sdk.path()).unwrap()
+    );
+    assert_eq!(
+        after.release,
+        build(d.path(), sdk.path(), &d.path().join("dist/c"), true)
+            .unwrap()
+            .release
+    );
+}

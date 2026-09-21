@@ -89,6 +89,9 @@ pub enum AppCommand {
         json: String,
     },
     Import,
+    ApplyPreferences {
+        preferences: Preferences,
+    },
     PersistPreferences {
         preferences: Preferences,
     },
@@ -223,6 +226,7 @@ impl Player {
                 + 8 * 1024 * 1024
                 + 32 * 1024 * 1024,
         )]))?;
+        let preferences = validated.program().player.preferences(locale);
         let mut p = Self {
             messages: nir_presentation::Messages::default(),
             core,
@@ -231,10 +235,7 @@ impl Player {
             release,
             screen: Screen::Title,
             return_screen: Screen::Title,
-            preferences: Preferences {
-                locale,
-                ..Default::default()
-            },
+            preferences,
             generation: Generation {
                 session: 1,
                 device: 1,
@@ -816,6 +817,9 @@ impl Player {
                 p.sfx_volume = finite_clamp(p.sfx_volume, 0., 1., 0.5);
                 self.preferences = p;
                 self.core.set_locale(&self.preferences.locale)?;
+                self.commands.push(AppCommand::ApplyPreferences {
+                    preferences: self.preferences.clone(),
+                });
             }
             AppEvent::Profile(keys) => self.profile.extend(keys),
             AppEvent::DeviceLost => {
@@ -1254,7 +1258,8 @@ impl Player {
                         }
                     )
             });
-            let delay = 1_200_000 + (d.full_text().chars().count() as u64 * 20_000);
+            let delay = self.core.program().player.auto_delay_us.0
+                + (d.full_text().chars().count() as u64 * 20_000);
             if !voice && self.auto_elapsed >= delay {
                 let token = d.interaction;
                 self.auto_elapsed = 0;

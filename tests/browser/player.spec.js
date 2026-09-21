@@ -441,3 +441,55 @@ test('tracing on and off preserves deterministic story trace and outcome',async(
   }
   expect(runs[1]).toEqual(runs[0]);
 });
+
+test('author theme and player defaults run on the unchanged SDK and keep saved preferences',async({page})=>{
+  const {execFile}=await import('node:child_process');
+  const {promisify}=await import('node:util');
+  const run=promisify(execFile);
+  const dir=await fs.mkdtemp('target/tmp/theme-contract-');
+  const project=`${dir}/story`;
+  await run('dist/novelc',['init',project]);
+  const theme=`${project}/themes/rain/theme.toml`;
+  await fs.writeFile(theme,(await fs.readFile(theme,'utf8')).replace('builtin.dialogue"','builtin.dialogue.top"').replace('builtin.choice"','builtin.choice.compact"').replace('height = 240.0','height = 260.0'));
+  await fs.writeFile(`${project}/config/player.toml`,'format = 1\n[defaults]\nfont_scale = 1.2\nbgm_volume = 0.12\nreduced_motion = true\n');
+  await run('dist/novelc',['-p',project,'resolve']);
+  const lock=await fs.readFile(`${project}/game.lock`,'utf8');
+  await run('dist/novelc',['-p',project,'build','--locked','--out','dist/theme-contract-web']);
+  expect(await fs.readFile(`${project}/game.lock`,'utf8')).toBe(lock);
+  const resolved=JSON.parse((await run('dist/novelc',['-p',project,'config'])).stdout);
+  expect(resolved['theme.slots.dialogue.main'].value).toBe('builtin.dialogue.top');
+  await page.goto('http://127.0.0.1:4174/theme-contract-web/?test=1');
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+  expect((await state(page)).preferences.font_scale).toBeCloseTo(1.2);
+  expect((await state(page)).preferences.bgm_volume).toBeCloseTo(.12);
+  expect((await state(page)).preferences.reduced_motion).toBe(true);
+  await start(page);await page.keyboard.press('Space');
+  const advance=page.locator('#actions button').filter({hasText:'继续阅读'});
+  await advance.focus();
+  expect(await page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.top))).toBe(64);
+  expectPainted(await page.screenshot({path:'reports/theme-top-dialogue.png'}));
+  await act(page,{type:'settings'});await act(page,{type:'font_size',delta:.1});
+  await act(page,{type:'title'}); // Looping BGM legitimately owns a terminal slot until stopped.
+  await page.waitForFunction(()=>window.__nir.metrics.activeRequests===0);
+  await page.reload();
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading&&window.__nir.metrics.activeRequests===0);
+  expect((await state(page)).preferences.font_scale).toBeCloseTo(1.3);
+  await start(page);
+  await advanceUntil(page,s=>!!s.choice);
+  await page.setViewportSize({width:390,height:844});
+  // Both components keep their original labels, stable option IDs and keyboard focus.
+  const buttons=page.locator('#actions button');
+  const options=(await state(page)).choice.options;
+  const chosen=buttons.filter({hasText:options[0].label});
+  await chosen.focus();
+  await expect.poll(()=>page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.width))).toBe(350);
+  const firstY=await page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.top));
+  await buttons.filter({hasText:options[1].label}).focus();
+  expect(await page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.top))).toBe(firstY+64);
+  await chosen.focus();
+  expectPainted(await page.screenshot({path:'reports/theme-compact-choice.png'}));
+  await chosen.press('Enter');
+  const end=await advanceUntil(page,s=>!!s.outcome,'walk');
+  expect(end.outcome).toBe('walk_home');
+  await fs.rm(dir,{recursive:true,force:true});
+});

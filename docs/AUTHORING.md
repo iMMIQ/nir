@@ -2,6 +2,8 @@
 
 先用 `novelc init` 复制可玩的双语模板。`game.toml` 只登记作品输入；本地输出放在 `.nir/`、`dist/`、`reports/`。程序拒绝未识别字段，扩展能力不能靠加一个任意 JSON 字段启用。
 
+作品默认偏好与对白、选项主题在独立文件配置；用 `novelc config` 查看最终值和逐字段来源，格式与限制见 [作品配置和主题契约](PROJECT-THEMES.md)。
+
 ## 从一句对白开始
 
 示例的 `intro` 文本由 `texts/contracts.json` 约定修订、参数和 Gate，两个语言包分别提供同一文本 ID 的 `TextDoc`。结构包含 `text`、`break`、`param`、`gate` span；每个 span 都有稳定 ID，揭示完成时锁存同名 Marker。`gate` 会阻止跨越，需剧情中的 `DialogueContinue` 明确继续。
