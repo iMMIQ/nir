@@ -164,10 +164,22 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
 
 test('actual device loss during a dissolve preserves progress', async ({ page }) => {
   await boot(page); await start(page);
+  // Observe before triggering the transition: remote-control round trips may
+  // otherwise miss its entire lifetime on a busy browser.
+  await page.evaluate(()=>{
+    window.__transitionPause=new Promise(resolve=>{
+      const observe=()=>{const t=window.__nir.state().transition;
+        if(t!==null&&t>0&&t<1)window.__nir.action({type:'menu'}).then(resolve);
+        else requestAnimationFrame(observe);
+      };
+      requestAnimationFrame(observe);
+    });
+  });
   await page.keyboard.press('Space'); await page.keyboard.press('Space');
-  // Queue the pause in the observation task, before another owner tick can
-  // finish the transition while Playwright makes a separate round trip.
-  await page.waitForFunction(()=>{const t=window.__nir.state().transition;if(t!==null&&t>0&&t<1){window.__nir.action({type:'menu'});return true;}return false;});
+  // Deliberately outlast the transition to verify that browser-side observation
+  // freezes it even when the test driver is late returning for the result.
+  await page.waitForTimeout(700);
+  expect(await page.evaluate(()=>window.__transitionPause)).toBe(true);
   await page.waitForFunction(()=>window.__nir.state().screen==='Menu');
   const before=await state(page);
   expect(before.transition).toBeGreaterThan(0);expect(before.transition).toBeLessThan(1);
