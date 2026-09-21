@@ -86,12 +86,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 16526,
+                  "duration": 36114,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:52:27.942Z",
+                  "startTime": "2026-09-21T03:10:29.045Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -120,12 +120,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 8084,
+                  "duration": 17886,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:52:45.382Z",
+                  "startTime": "2026-09-21T03:11:06.683Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -154,12 +154,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 4366,
+                  "duration": 9637,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:52:53.492Z",
+                  "startTime": "2026-09-21T03:11:24.673Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -188,12 +188,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2413,
+                  "duration": 5756,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:52:57.901Z",
+                  "startTime": "2026-09-21T03:11:34.369Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -222,12 +222,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 5482,
+                  "duration": 11464,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:00.365Z",
+                  "startTime": "2026-09-21T03:11:40.228Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -256,12 +256,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 4864,
+                  "duration": 12090,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:05.872Z",
+                  "startTime": "2026-09-21T03:11:51.836Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -290,12 +290,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 903,
+                  "duration": 3861,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:10.762Z",
+                  "startTime": "2026-09-21T03:12:04.064Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -305,7 +305,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-633736271873a86da855",
           "file": "player.spec.js",
-          "line": 181,
+          "line": 185,
           "column": 1
         },
         {
@@ -324,12 +324,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2831,
+                  "duration": 13051,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:11.688Z",
+                  "startTime": "2026-09-21T03:12:08.083Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -339,7 +339,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-ed23416c564d121b9086",
           "file": "player.spec.js",
-          "line": 191,
+          "line": 195,
           "column": 1
         },
         {
@@ -358,12 +358,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2094,
+                  "duration": 7747,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:14.553Z",
+                  "startTime": "2026-09-21T03:12:21.348Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -373,7 +373,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-fce951e9606983ca46c8",
           "file": "player.spec.js",
-          "line": 211,
+          "line": 215,
           "column": 1
         },
         {
@@ -392,12 +392,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2301,
+                  "duration": 11310,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:18.788Z",
+                  "startTime": "2026-09-21T03:12:37.559Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -407,7 +407,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-2ccfc2c2c3e39f04a026",
           "file": "player.spec.js",
-          "line": 238,
+          "line": 242,
           "column": 1
         },
         {
@@ -426,12 +426,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2840,
+                  "duration": 10791,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:21.112Z",
+                  "startTime": "2026-09-21T03:12:49.055Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -441,7 +441,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-a9337cdc399ef1910ba7",
           "file": "player.spec.js",
-          "line": 260,
+          "line": 264,
           "column": 1
         },
         {
@@ -460,12 +460,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2962,
+                  "duration": 10371,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:23.997Z",
+                  "startTime": "2026-09-21T03:13:00.003Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -475,7 +475,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-f6bbf56503c915da9161",
           "file": "player.spec.js",
-          "line": 300,
+          "line": 304,
           "column": 1
         },
         {
@@ -494,12 +494,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 2941,
+                  "duration": 8159,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:26.991Z",
+                  "startTime": "2026-09-21T03:13:10.740Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -509,7 +509,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-62a3509566c80b1b8921",
           "file": "player.spec.js",
-          "line": 321,
+          "line": 325,
           "column": 1
         },
         {
@@ -528,12 +528,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 14976,
+                  "duration": 35340,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:29.961Z",
+                  "startTime": "2026-09-21T03:13:19.086Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -543,7 +543,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-dc63f289c3f96fa85e27",
           "file": "player.spec.js",
-          "line": 334,
+          "line": 338,
           "column": 1
         },
         {
@@ -562,12 +562,12 @@
                   "workerIndex": 0,
                   "parallelIndex": 0,
                   "status": "passed",
-                  "duration": 3420,
+                  "duration": 8433,
                   "errors": [],
                   "stdout": [],
                   "stderr": [],
                   "retry": 0,
-                  "startTime": "2026-09-21T02:53:44.966Z",
+                  "startTime": "2026-09-21T03:13:54.561Z",
                   "annotations": [],
                   "attachments": []
                 }
@@ -577,7 +577,7 @@
           ],
           "id": "a8883517b0c7e43a1aac-8c1ac1d5e4d3e72c643c",
           "file": "player.spec.js",
-          "line": 357,
+          "line": 361,
           "column": 1
         }
       ],
@@ -585,7 +585,7 @@
         {
           "title": "touch input emulation",
           "file": "player.spec.js",
-          "line": 224,
+          "line": 228,
           "column": 6,
           "specs": [
             {
@@ -604,12 +604,12 @@
                       "workerIndex": 0,
                       "parallelIndex": 0,
                       "status": "passed",
-                      "duration": 2087,
+                      "duration": 7894,
                       "errors": [],
                       "stdout": [],
                       "stderr": [],
                       "retry": 0,
-                      "startTime": "2026-09-21T02:53:16.677Z",
+                      "startTime": "2026-09-21T03:12:29.353Z",
                       "annotations": [],
                       "attachments": []
                     }
@@ -619,7 +619,7 @@
               ],
               "id": "a8883517b0c7e43a1aac-a13039b29232b0f24596",
               "file": "player.spec.js",
-              "line": 226,
+              "line": 230,
               "column": 3
             }
           ]
@@ -629,8 +629,8 @@
   ],
   "errors": [],
   "stats": {
-    "startTime": "2026-09-21T02:52:26.690Z",
-    "duration": 81882.33399999999,
+    "startTime": "2026-09-21T03:10:26.991Z",
+    "duration": 216553.391,
     "expected": 16,
     "skipped": 0,
     "unexpected": 0,

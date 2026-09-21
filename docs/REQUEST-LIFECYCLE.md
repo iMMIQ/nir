@@ -16,7 +16,7 @@
 
 宿主测试覆盖满容量下的已接纳回执、控制保留容量、分片进度、取消与重复回调、关闭时结算，并用固定种子进行 20,000 次事件交错，逐步断言容量上限及 `accepted = completed + cancelled + active`。
 
-浏览器测试延迟 IndexedDB 事务通知，以真实事务模拟旧回执；同时反复执行准备、暂停、设备恢复、返回标题，检查活动槽归零。设备恢复回归延后空闲巡检，单独验证 owner 能先发现失效设备。
+浏览器测试延迟 IndexedDB 事务通知，以真实事务模拟旧回执；同时反复执行准备、暂停、设备恢复、返回标题，检查活动槽归零。设备恢复回归延后空闲巡检，单独验证 owner 能先发现失效设备。转场用例在观察到中途状态的同一浏览器任务内请求暂停，并断言基线进度严格位于 0 与 1 之间，避免远程控制往返期间转场已经结束。
 
 测试日期：2026-09-21。最终静态发行身份 `3922d0e53cd627c40e1913420ff3129f7007d346f561a215722eb1ae1b630539`，12 个对象，共 6,735,067 字节。SDK 身份 `64bdf15bd475f8ca5639fa9e8a40610797cabe1d492ecc94b51a2acd547ef707`。
 
@@ -24,14 +24,14 @@
 |---|---|
 | 原生测试、依赖边界 | 55 项通过 |
 | 宿主测试 | 14 项通过，含固定种子 20,000 次交错 |
-| 真实浏览器 | 16 项通过；0 失败、跳过或 flaky；81.9 秒 |
+| 真实浏览器 | 16 项通过；0 失败、跳过或 flaky；216.6 秒 |
 | 格式、原生/WASM lint | 通过，第三方 wgpu 原有 unused-import 警告仍在 |
 | 独立 SDK、锁漂移、重复构建 | 通过；相同输入生成同一发行 |
 | 发布对象完整性 | 通过 |
 
-浏览器为 Chromium 153.0.8010.12，在 1920×1080 虚拟屏幕内以有窗口模式运行。适配器为 SwiftShader 软件 WebGPU，测试实际 WASM、中文画布像素与设备销毁恢复，未验证物理 GPU。
+浏览器为 Chromium 153.0.8010.12，在 1920×1080 虚拟屏幕内以有窗口模式运行。通过 `--use-webgpu-adapter=swiftshader` 显式选择 SwiftShader 软件 WebGPU，测试实际 WASM、中文画布像素与设备销毁恢复，未验证物理 GPU。
 
-12 轮交错运行包含 3 次设备重建，累计接纳 170 个请求：152 个完成、18 个取消、0 个残留；无资源失败，最大同时预留 6 个槽。该运行的恢复后帧数与上传计数是当前设备计数，不能解释为跨设备总数。独立两路线运行预留峰值为 8，首个开始输入到首句 137 ms，单轮图像上传峰值 2,094,080 字节，准入估算资源峰值 67,160,180 字节。这些均为单次测量，不是 P95 或真实物理内存峰值。
+12 轮交错运行包含 3 次设备重建，累计接纳 170 个请求：152 个完成、18 个取消、0 个残留；无资源失败，最大同时预留 6 个槽。该运行的恢复后帧数与上传计数是当前设备计数，不能解释为跨设备总数。独立两路线运行预留峰值为 8，首个开始输入到首句 272.9 ms，单轮图像上传峰值 2,094,080 字节，准入估算资源峰值 67,160,180 字节。本次回归期间还运行了独立图形配置探针；这些均为单次开发环境测量，不是独占设备性能基准、P95 或真实物理内存峰值。
 
 证据：[原生](validation/requests/requests-native.log)、[宿主](validation/requests/requests-host.log)、[lint](validation/requests/requests-lint.log)、[浏览器结果](validation/requests/browser-results.json)、[浏览器日志](validation/requests/requests-browser-run.log)、[交错账本](validation/requests/request-lifecycle-metrics.json)、[两路线测量](validation/requests/browser-metrics.json)、[SDK](validation/requests/requests-sdk.log)、[对象校验](validation/requests/requests-release.json)。GitHub 远程运行结果以 PR 检查为准。
 
