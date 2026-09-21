@@ -29,6 +29,8 @@ enum Command {
         template: String,
     },
     Resolve,
+    /// Print effective author configuration and the source of each field.
+    Config,
     Doctor,
     Check {
         #[arg(long)]
@@ -117,6 +119,10 @@ fn run(cli: Cli) -> Result<()> {
                 path.display(),
                 path.display()
             );
+        }
+        Command::Config => {
+            let p = load_project(&cli.project)?;
+            println!("{}", serde_json::to_string_pretty(&p.resolved_config)?);
         }
         Command::Resolve => {
             let l = resolve(&cli.project, &sdk)?;

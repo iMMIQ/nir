@@ -1,0 +1,151 @@
+{
+  "engine.api": {
+    "value": "nir-player/0.1",
+    "source": "game.toml#/engine/api"
+  },
+  "engine.capability_profile": {
+    "value": "web-v1",
+    "source": "game.toml#/engine/capability_profile"
+  },
+  "engine.runtime_preset": {
+    "value": "web-standard",
+    "source": "game.toml#/engine/runtime_preset"
+  },
+  "game.id": {
+    "value": "org.nir.rain-letters",
+    "source": "game.toml#/game/id"
+  },
+  "game.slug": {
+    "value": "rain-letters",
+    "source": "game.toml#/game/slug"
+  },
+  "game.source_locale": {
+    "value": "zh-Hans",
+    "source": "game.toml#/game/source_locale"
+  },
+  "game.title": {
+    "value": "雨后书简 · Rain Letters",
+    "source": "game.toml#/game/title"
+  },
+  "game.title_scene": {
+    "value": "station",
+    "source": "game.toml#/game/title_scene"
+  },
+  "game.version": {
+    "value": "0.1.0",
+    "source": "game.toml#/game/version"
+  },
+  "player.auto_delay_us": {
+    "value": "1200000",
+    "source": "config/player.toml#/defaults/auto_delay_us"
+  },
+  "player.bgm_volume": {
+    "value": 0.30000001192092896,
+    "source": "config/player.toml#/defaults/bgm_volume"
+  },
+  "player.font_scale": {
+    "value": 1.0,
+    "source": "config/player.toml#/defaults/font_scale"
+  },
+  "player.reduced_motion": {
+    "value": false,
+    "source": "config/player.toml#/defaults/reduced_motion"
+  },
+  "player.sfx_volume": {
+    "value": 0.5,
+    "source": "config/player.toml#/defaults/sfx_volume"
+  },
+  "player.voice_volume": {
+    "value": 0.800000011920929,
+    "source": "config/player.toml#/defaults/voice_volume"
+  },
+  "stage.height": {
+    "value": 720,
+    "source": "game.toml#/stage/height"
+  },
+  "stage.width": {
+    "value": 1280,
+    "source": "game.toml#/stage/width"
+  },
+  "theme.base": {
+    "value": "builtin.reader",
+    "source": "themes/rain/theme.toml#/base"
+  },
+  "theme.choice.item_height": {
+    "value": 58.0,
+    "source": "themes/rain/theme.toml#/choice/item_height"
+  },
+  "theme.choice.width": {
+    "value": 520.0,
+    "source": "themes/rain/theme.toml#/choice/width"
+  },
+  "theme.dialogue.font_size": {
+    "value": 23.0,
+    "source": "themes/rain/theme.toml#/dialogue/font_size"
+  },
+  "theme.dialogue.height": {
+    "value": 240.0,
+    "source": "themes/rain/theme.toml#/dialogue/height"
+  },
+  "theme.dialogue.padding": {
+    "value": 24.0,
+    "source": "themes/rain/theme.toml#/dialogue/padding"
+  },
+  "theme.id": {
+    "value": "theme.rain",
+    "source": "themes/rain/theme.toml#/id"
+  },
+  "theme.slots.choice.main": {
+    "value": "builtin.choice",
+    "source": "themes/rain/theme.toml#/slots/choice.main"
+  },
+  "theme.slots.dialogue.main": {
+    "value": "builtin.dialogue",
+    "source": "themes/rain/theme.toml#/slots/dialogue.main"
+  },
+  "theme.tokens.accent": {
+    "value": [
+      0.8299999833106995,
+      0.7300000190734863,
+      0.47999998927116394,
+      1.0
+    ],
+    "source": "themes/rain/tokens.json#/accent"
+  },
+  "theme.tokens.background": {
+    "value": [
+      0.03999999910593033,
+      0.07500000298023224,
+      0.09000000357627869,
+      1.0
+    ],
+    "source": "themes/rain/tokens.json#/background"
+  },
+  "theme.tokens.muted": {
+    "value": [
+      0.5799999833106995,
+      0.6899999976158142,
+      0.6899999976158142,
+      1.0
+    ],
+    "source": "themes/rain/tokens.json#/muted"
+  },
+  "theme.tokens.panel": {
+    "value": [
+      0.05999999865889549,
+      0.10499999672174454,
+      0.11999999731779099,
+      0.9700000286102295
+    ],
+    "source": "themes/rain/tokens.json#/panel"
+  },
+  "theme.tokens.text": {
+    "value": [
+      0.9300000071525574,
+      0.9399999976158142,
+      0.8799999952316284,
+      1.0
+    ],
+    "source": "themes/rain/tokens.json#/text"
+  }
+}

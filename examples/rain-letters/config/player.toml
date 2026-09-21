@@ -1,0 +1,9 @@
+format = 1
+
+[defaults]
+font_scale = 1.0
+bgm_volume = 0.3
+voice_volume = 0.8
+sfx_volume = 0.5
+reduced_motion = false
+auto_delay_us = "1200000"

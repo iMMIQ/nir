@@ -6,7 +6,7 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 
 `examples/rain-letters/`（《雨后书简》）是随仓库提供的测试工程，用于验证引擎功能、运行两条剧情测试路线，以及演示作品工程格式。其简单图像和合成音频用于测试。
 
-这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 与 [诊断和性能测量](docs/DIAGNOSTICS.md)。
+这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 、[诊断和性能测量](docs/DIAGNOSTICS.md) 与 [作品配置和主题契约](docs/PROJECT-THEMES.md)。
 
 ## 使用 SDK 创建作品
 
@@ -40,11 +40,15 @@ content/ch01/story.nir.json     变量、函数、块、Cue、场景、选项
 content/ch01/texts/             文本契约及 zh-Hans / en 正文
 assets/catalog.toml            资源身份、路径、类型、权利信息
 assets/source/                 PNG、PCM16 WAV、OTF 字体
+config/player.toml             作品默认字号、音量、减少动态与自动等待
+themes/rain/theme.toml          主题与对白/选项组件绑定
 themes/rain/tokens.json         颜色主题
 tests/scenarios/               按逻辑 ID 驱动的剧情用例
 credits/                       素材许可
 schemas/                       由 SDK 生成的 JSON Schema
 ```
+
+本分支构建的 SDK 支持 `novelc -p my-story config` 查看配置值和来源；主题及默认设置编辑说明见 [作品配置](docs/PROJECT-THEMES.md)。已发布的旧版 SDK 不会自动获得新增能力。
 
 通过正文包编辑对话，保留稳定 ID、文本修订、参数和 Gate 顺序。新增中文字符时需要更新许可合适的字体；`check` 会拒绝缺字。调整逻辑时参考示例块与 [编写说明](docs/AUTHORING.md)。
 

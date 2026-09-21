@@ -129,6 +129,7 @@ fn term_exprs(t: &Terminator) -> Vec<&Expr> {
     }
 }
 fn validate(p: &Program) -> Result<()> {
+    validate_ui_config(&p.theme, &p.player)?;
     if p.format != FORMAT_VERSION {
         return Err(err("E_VERSION", "program", "unsupported semantic version"));
     }

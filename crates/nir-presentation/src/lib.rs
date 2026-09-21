@@ -173,14 +173,7 @@ impl DrawPacket {
         active: bool,
         theme: &Theme,
     ) {
-        self.rect(
-            r,
-            if active {
-                theme.accent
-            } else {
-                [0.13, 0.19, 0.20, 0.98]
-            },
-        );
+        self.rect(r, if active { theme.accent } else { theme.panel });
         self.text(
             label.clone(),
             r[0] + 16.,
@@ -365,11 +358,7 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                 t.text,
             );
             p.text(
-                if m.prefs.locale == "zh-Hans" {
-                    "RAIN LETTERS   /   雨夜里的一个选择"
-                } else {
-                    "A LETTER. A RAINY NIGHT. A CHOICE."
-                },
+                "NIR / VISUAL NOVEL",
                 margin,
                 y + 110.,
                 width - margin * 2.,
@@ -425,31 +414,37 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
         Screen::Story => {
             if let Some(d) = &m.dialogue {
                 let h = if narrow {
-                    (height * 0.40).clamp(230., 330.)
+                    (height * 0.40).max(t.dialogue.height).min(330.)
                 } else {
-                    220.
+                    t.dialogue.height
+                }
+                .min((height - 88.).max(80.));
+                let top = match t.slots.dialogue {
+                    DialogueComponent::Bottom => height - h - margin * 0.6,
+                    DialogueComponent::Top => 64.,
                 };
-                let top = height - h - margin * 0.6;
+                let padding = t.dialogue.padding;
                 p.rect([margin, top, width - margin * 2., h], t.panel);
                 p.rect([margin, top, 3., h], t.accent);
                 if !d.speaker.is_empty() {
                     p.text(
                         &d.speaker,
-                        margin + 24.,
+                        margin + padding,
                         top + 18.,
-                        width - margin * 2. - 48.,
+                        width - margin * 2. - padding * 2.,
                         16.,
                         t.accent,
                     );
                 }
                 let ty = top + if d.speaker.is_empty() { 24. } else { 52. };
-                let size = if narrow { 19. } else { 23. } * m.prefs.font_scale;
+                let size =
+                    (t.dialogue.font_size - if narrow { 4. } else { 0. }) * m.prefs.font_scale;
                 p.texts.push(TextRun {
                     text: d.full_text.clone(),
                     visible: Some(d.visible_text.len()),
-                    x: margin + 24.,
+                    x: margin + padding,
                     y: ty,
-                    width: width - margin * 2. - 48.,
+                    width: width - margin * 2. - padding * 2.,
                     height: (top + h - 43. - ty).max(30.),
                     size,
                     color: t.text,
@@ -479,10 +474,15 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                 });
             }
             if !m.choices.is_empty() {
-                let w = if narrow { width - 40. } else { 520. };
-                let h = m.choices.len() as f32 * 72. + 32.;
+                let w = t.choice.width.min((width - 40.).max(80.));
+                let gap = match t.slots.choice {
+                    ChoiceComponent::Standard => 14.,
+                    ChoiceComponent::Compact => 6.,
+                };
+                let row = t.choice.item_height + gap;
+                let h = m.choices.len() as f32 * row + 32.;
                 let x = (width - w) / 2.;
-                let y = (height - h) / 2. - 40.;
+                let y = ((height - h) / 2. - 40.).max(80.);
                 p.rect([x - 12., y - 16., w + 24., h], t.panel);
                 for (i, c) in m.choices.iter().enumerate() {
                     p.button(
@@ -490,7 +490,7 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
                         UiAction::Choose {
                             option: c.id.clone(),
                         },
-                        [x, y + i as f32 * 72., w, 58.],
+                        [x, y + i as f32 * row, w, t.choice.item_height],
                         false,
                         t,
                     );

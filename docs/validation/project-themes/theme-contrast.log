@@ -1,0 +1,11 @@
+   Compiling image v0.25.10
+   Compiling tempfile v3.27.0
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.17s
+     Running tests/project.rs (target/debug/deps/project-13a58919763bc789)
+
+running 1 test
+test legacy_tokens_and_new_components_share_validation_at_runtime ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.90s
+

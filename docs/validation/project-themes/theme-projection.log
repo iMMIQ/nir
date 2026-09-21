@@ -1,0 +1,10 @@
+   Compiling nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+   Compiling nir-player v0.1.0 (/nir/crates/nir-player)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.50s
+     Running tests/coordination.rs (target/debug/deps/coordination-bee41b104a0b54f8)
+
+running 1 test
+test theme_components_preserve_semantics_gates_and_viewport_bounds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.01s
+

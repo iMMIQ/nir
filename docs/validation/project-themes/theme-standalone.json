@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "commands": [
+    "init",
+    "resolve",
+    "doctor",
+    "check --locked",
+    "test",
+    "build --locked"
+  ],
+  "repeat_build_same_release": true,
+  "sdk_drift_rejected": true,
+  "cargo_on_path": false,
+  "structured_source_diagnostic": true,
+  "author_theme_edit_without_engine_rebuild": true,
+  "resolved_configuration": true
+}

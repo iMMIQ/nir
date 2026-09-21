@@ -28,6 +28,15 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     first = json.loads(channel.read_text())["release"]
     run("-p", "story", "build", "--locked")
     assert json.loads(channel.read_text())["release"] == first
+    config = json.loads(run("-p", "story", "config"))
+    assert config["theme.slots.dialogue.main"]["value"] == "builtin.dialogue"
+    theme = root / "story/themes/rain/theme.toml"
+    original_theme = theme.read_text()
+    theme.write_text(original_theme.replace('builtin.dialogue"', 'builtin.dialogue.top"'))
+    run("-p", "story", "check", "--locked")
+    run("-p", "story", "build", "--locked")
+    assert json.loads(channel.read_text())["release"] != first
+    theme.write_text(original_theme)
     fragment = root / "story/content/ch01/story.nir.json"
     original = fragment.read_bytes()
     content = json.loads(original)
@@ -45,4 +54,4 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
         f.write("\n// intentional SDK drift\n")
     error = run("-p", "story", "check", "--locked", success=False)
     assert "E_LOCK_DRIFT" in error, error
-    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True}, indent=2))
+    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True, "author_theme_edit_without_engine_rebuild": True, "resolved_configuration": True}, indent=2))

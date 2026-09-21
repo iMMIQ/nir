@@ -34,6 +34,11 @@ pub struct Game {
 pub struct Engine {
     pub api: String,
     pub capability_profile: String,
+    #[serde(default = "runtime_preset")]
+    pub runtime_preset: String,
+}
+fn runtime_preset() -> String {
+    "web-standard".into()
 }
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +46,8 @@ pub struct Inputs {
     pub modules: Vec<String>,
     pub asset_catalogs: Vec<String>,
     pub theme: String,
+    #[serde(default)]
+    pub player: Option<String>,
     #[serde(default)]
     pub scenarios: Vec<String>,
     #[serde(default)]
@@ -94,6 +101,7 @@ pub struct LoadedProject {
     pub program: Program,
     pub media: BTreeMap<String, Vec<u8>>,
     pub provenance: BTreeMap<String, String>,
+    pub resolved_config: crate::ResolvedConfig,
 }
 pub fn relative(root: &Path, base: &Path, name: &str) -> Result<PathBuf> {
     let name_path = Path::new(name);
@@ -132,7 +140,7 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(b)
 }
-fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = read(path)?;
     nir_content::parse(&bytes, &path.display().to_string()).map_err(|mut d| {
         // Source-position reparsing belongs to author tools, never the WASM loader.
@@ -151,7 +159,7 @@ fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         anyhow::Error::new(d)
     })
 }
-fn toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = read(path)?;
     let text = std::str::from_utf8(&bytes)?;
     toml::from_str(text).map_err(|e: toml::de::Error| {
@@ -221,6 +229,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .get("start")
         .ok_or_else(|| anyhow!("E_EXPORT: missing start export"))?
         .clone();
+    let (theme, player, resolved_config) = crate::config::resolve_config(&root, &manifest)?;
     let mut program = Program {
         format: 1,
         game_id: manifest.game.id.clone(),
@@ -238,7 +247,8 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         assets: BTreeMap::new(),
         default_locale: manifest.game.source_locale.clone(),
         title_scene: manifest.game.title_scene.clone(),
-        theme: json(&relative(&root, &root, &manifest.inputs.theme)?)?,
+        theme,
+        player,
     };
     let mut sources = crate::diagnostics::SourceIndex::default();
     for source in &module.sources {
@@ -346,6 +356,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         program,
         media,
         provenance,
+        resolved_config,
     })
 }
 fn wav_info(b: &[u8]) -> Result<(u64, u64)> {
@@ -492,7 +503,9 @@ pub fn write_schemas(out: &Path) -> Result<()> {
             "text-contracts",
             schemars::schema_for!(BTreeMap<String,TextContract>),
         ),
-        ("theme", schemars::schema_for!(Theme)),
+        ("theme", schemars::schema_for!(crate::ThemeManifest)),
+        ("theme-tokens", schemars::schema_for!(crate::ThemeTokens)),
+        ("player", schemars::schema_for!(crate::PlayerConfig)),
         ("program", schemars::schema_for!(Program)),
         ("diagnostic", schemars::schema_for!(Diagnostic)),
     ];

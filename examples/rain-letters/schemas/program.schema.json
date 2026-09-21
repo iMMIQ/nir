@@ -54,6 +54,17 @@
       },
       "default": {}
     },
+    "player": {
+      "$ref": "#/$defs/PlayerDefaults",
+      "default": {
+        "auto_delay_us": "1200000",
+        "bgm_volume": 0.30000001192092896,
+        "font_scale": 1.0,
+        "reduced_motion": false,
+        "sfx_volume": 0.5,
+        "voice_volume": 0.800000011920929
+      }
+    },
     "requires": {
       "type": "array",
       "default": [],
@@ -99,6 +110,15 @@
           0.09000000357627869,
           1.0
         ],
+        "choice": {
+          "item_height": 58.0,
+          "width": 520.0
+        },
+        "dialogue": {
+          "font_size": 23.0,
+          "height": 220.0,
+          "padding": 24.0
+        },
         "muted": [
           0.5799999833106995,
           0.6899999976158142,
@@ -111,6 +131,10 @@
           0.11999999731779099,
           0.9700000286102295
         ],
+        "slots": {
+          "choice.main": "builtin.choice",
+          "dialogue.main": "builtin.dialogue"
+        },
         "text": [
           0.9300000071525574,
           0.9399999976158142,
@@ -284,6 +308,13 @@
         "options"
       ]
     },
+    "ChoiceComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.choice",
+        "builtin.choice.compact"
+      ]
+    },
     "ChoiceOption": {
       "type": "object",
       "properties": {
@@ -322,6 +353,22 @@
         "text"
       ]
     },
+    "ChoiceProps": {
+      "type": "object",
+      "properties": {
+        "item_height": {
+          "type": "number",
+          "format": "float",
+          "default": 58.0
+        },
+        "width": {
+          "type": "number",
+          "format": "float",
+          "default": 520.0
+        }
+      },
+      "additionalProperties": false
+    },
     "Cue": {
       "type": "object",
       "properties": {
@@ -336,6 +383,34 @@
       "required": [
         "effects"
       ]
+    },
+    "DialogueComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.dialogue",
+        "builtin.dialogue.top"
+      ]
+    },
+    "DialogueProps": {
+      "type": "object",
+      "properties": {
+        "font_size": {
+          "type": "number",
+          "format": "float",
+          "default": 23.0
+        },
+        "height": {
+          "type": "number",
+          "format": "float",
+          "default": 220.0
+        },
+        "padding": {
+          "type": "number",
+          "format": "float",
+          "default": 24.0
+        }
+      },
+      "additionalProperties": false
     },
     "Easing": {
       "type": "string",
@@ -921,6 +996,40 @@
         }
       ]
     },
+    "PlayerDefaults": {
+      "type": "object",
+      "properties": {
+        "auto_delay_us": {
+          "$ref": "#/$defs/Micros",
+          "default": "1200000"
+        },
+        "bgm_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.30000001192092896
+        },
+        "font_scale": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "reduced_motion": {
+          "type": "boolean",
+          "default": false
+        },
+        "sfx_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.5
+        },
+        "voice_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.800000011920929
+        }
+      },
+      "additionalProperties": false
+    },
     "Property": {
       "type": "string",
       "enum": [
@@ -1372,6 +1481,21 @@
           "maxItems": 4,
           "minItems": 4
         },
+        "choice": {
+          "$ref": "#/$defs/ChoiceProps",
+          "default": {
+            "item_height": 58.0,
+            "width": 520.0
+          }
+        },
+        "dialogue": {
+          "$ref": "#/$defs/DialogueProps",
+          "default": {
+            "font_size": 23.0,
+            "height": 220.0,
+            "padding": 24.0
+          }
+        },
         "muted": {
           "type": "array",
           "items": {
@@ -1389,6 +1513,13 @@
           },
           "maxItems": 4,
           "minItems": 4
+        },
+        "slots": {
+          "$ref": "#/$defs/ThemeSlots",
+          "default": {
+            "choice.main": "builtin.choice",
+            "dialogue.main": "builtin.dialogue"
+          }
         },
         "text": {
           "type": "array",
@@ -1408,6 +1539,21 @@
         "text",
         "muted"
       ]
+    },
+    "ThemeSlots": {
+      "description": "Closed component registry implemented by the locked player SDK. Components\nonly project state; their actions and focus semantics remain player-owned.",
+      "type": "object",
+      "properties": {
+        "choice.main": {
+          "$ref": "#/$defs/ChoiceComponent",
+          "default": "builtin.choice"
+        },
+        "dialogue.main": {
+          "$ref": "#/$defs/DialogueComponent",
+          "default": "builtin.dialogue"
+        }
+      },
+      "additionalProperties": false
     },
     "Value": {
       "oneOf": [
