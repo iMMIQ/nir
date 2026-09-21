@@ -448,7 +448,7 @@ test('author theme and player defaults run on the unchanged SDK and keep saved p
   const run=promisify(execFile);
   const dir=await fs.mkdtemp('target/tmp/theme-contract-');
   const project=`${dir}/story`;
-  await run('dist/novelc',['init',project]);
+  await run('dist/novelc',['init',project,'--template','web-basic']);
   const theme=`${project}/themes/rain/theme.toml`;
   await fs.writeFile(theme,(await fs.readFile(theme,'utf8')).replace('builtin.dialogue"','builtin.dialogue.top"').replace('builtin.choice"','builtin.choice.compact"').replace('height = 240.0','height = 260.0'));
   await fs.writeFile(`${project}/config/player.toml`,'format = 1\n[defaults]\nfont_scale = 1.2\nbgm_volume = 0.12\nreduced_motion = true\n');

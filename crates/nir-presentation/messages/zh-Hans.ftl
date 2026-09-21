@@ -37,3 +37,14 @@ error-host = 播放器操作失败。
 
 scroll-back = 上一页
 scroll-forward = 下一页
+
+language-zh = 简体中文
+language-en = English
+decrease = −
+increase = +
+history-back = ←
+history-forward = →
+title-hint = SPACE  →  READ     ·     ESC  →  MENU
+advance-hint = SPACE / ↗
+gate-hint = …
+reveal-hint = · · ·

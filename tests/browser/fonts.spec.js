@@ -1,0 +1,73 @@
+import {test, expect} from '@playwright/test';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {execFile, spawn} from 'node:child_process';
+import {promisify} from 'node:util';
+import {expectPainted} from './pixels.js';
+const run=promisify(execFile), cli=path.resolve('dist/novelc');
+const state=p=>p.evaluate(()=>window.__nir.state());
+const act=(p,a)=>p.evaluate(a=>window.__nir.action(a),a);
+const ready=p=>p.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+async function line(page) {
+  await page.keyboard.press('Space');
+  await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);
+  await act(page,{type:'advance'});
+}
+let root;
+test.beforeAll(async()=>{await fs.mkdir('target/tmp',{recursive:true});root=await fs.mkdtemp(path.resolve('target/tmp/fonts-'));});
+test.afterAll(async()=>{await fs.rm(root,{recursive:true,force:true});});
+test('default author template renders new Chinese with compiled fonts and both routes',async({page})=>{
+  const story=`${root}/minimal`;
+  await run(cli,['init',story]);await run(cli,['-p',story,'resolve']);
+  const file=`${story}/content/main/texts/zh-Hans.json`;
+  const texts=JSON.parse(await fs.readFile(file,'utf8'));texts.intro.spans[0].text='春夏秋冬，雪山与鲸鱼。'+texts.intro.spans[0].text;
+  await fs.writeFile(file,JSON.stringify(texts,null,2));
+  await run(cli,['-p',story,'build','--locked','--out',path.resolve('dist/font-author-web')]);
+  const report=JSON.parse(await fs.readFile(`${story}/reports/build.json`,'utf8'));
+  await fs.copyFile(`${story}/reports/build.json`,'reports/fonts-author-build.json');
+  expect(report.fonts['font.reader'].output_bytes).toBeLessThan(report.fonts['font.reader'].source_bytes/20);
+  await page.goto('http://127.0.0.1:4174/font-author-web/?test=1');await ready(page);await line(page);
+  expect((await state(page)).dialogue.visible).toContain('雪山与鲸鱼');
+  expect((await state(page)).error).toBeNull();
+  expectPainted(await page.screenshot({path:'reports/fonts-chinese.png'}));
+  await act(page,{type:'saves'});await act(page,{type:'save',slot:0});
+  await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
+  await page.reload();await ready(page);await act(page,{type:'saves'});await act(page,{type:'load',slot:0});
+  await page.waitForFunction(()=>window.__nir.state().paused&&!window.__nir.state().loading&&!!window.__nir.state().dialogue);
+  expect((await state(page)).dialogue.visible).toContain('雪山与鲸鱼');
+  await act(page,{type:'continue'});await act(page,{type:'advance'});
+  await page.waitForFunction(()=>!!window.__nir.state().choice);await act(page,{type:'choose',option:'garden'});
+  await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='garden_end');
+  await act(page,{type:'advance'});await act(page,{type:'advance'});
+  await expect.poll(async()=>(await state(page)).outcome).toBe('garden');
+  await act(page,{type:'settings'});await act(page,{type:'locale',locale:'en'});await act(page,{type:'close'});
+  await act(page,{type:'new_game'});await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='intro');
+  await act(page,{type:'advance'});expect((await state(page)).dialogue.locale).toBe('en');
+  await page.setViewportSize({width:390,height:600});
+  expectPainted(await page.screenshot({path:'reports/fonts-english.png'}));
+  await act(page,{type:'advance'});await page.waitForFunction(()=>!!window.__nir.state().choice);
+  await act(page,{type:'choose',option:'home'});await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='home_end');
+  await act(page,{type:'advance'});await act(page,{type:'advance'});
+  await expect.poll(async()=>(await state(page)).outcome).toBe('home');
+});
+test('font preparation follows dev edits and a missing glyph preserves the last release',async({page,request})=>{
+  const story=`${root}/preview`;await run(cli,['init',story]);await run(cli,['-p',story,'resolve']);
+  const proc=spawn(cli,['-p',story,'dev','--port','4175'],{stdio:'ignore'}), url='http://127.0.0.1:4175';
+  const status=async()=>{try{return await(await request.get(`${url}/__nir_dev/status`)).json();}catch{return null;}};
+  try {
+    await expect.poll(async()=>!!(await status())?.release,{timeout:30000}).toBe(true);
+    await page.goto(`${url}/?test=1`);await ready(page);await line(page);
+    const before=await state(page), release=(await status()).release;
+    const file=`${story}/content/main/texts/zh-Hans.json`, original=await fs.readFile(file,'utf8');
+    await fs.writeFile(file,original.replace('春天','🐈'));
+    await expect.poll(async()=>(await status())?.error||'',{timeout:15000}).toContain('E_FONT_COVERAGE');
+    expect((await status()).release).toBe(release);expect((await state(page)).dialogue).toEqual(before.dialogue);
+    await expect(page.locator('#nir-dev-status')).toBeVisible();
+    await fs.writeFile(file,original.replace('春天','鲸鱼'));
+    await expect.poll(async()=>(await status())?.release,{timeout:15000}).not.toBe(release);
+    await page.waitForFunction(()=>window.__nir?.state().screen==='Title'&&window.__nir.state().ready);
+    await line(page);expect((await state(page)).dialogue.visible).toContain('鲸鱼');
+    await expect(page.locator('#nir-dev-status')).toBeHidden();
+    expectPainted(await page.screenshot({path:'reports/fonts-preview.png'}));
+  } finally {if(proc.exitCode===null&&proc.signalCode===null){const done=new Promise(r=>proc.once('exit',r));proc.kill('SIGTERM');await done;}}
+});

@@ -422,7 +422,7 @@ fn project_measured(
             );
             if !narrow {
                 p.text(
-                    "SPACE  →  READ     ·     ESC  →  MENU",
+                    msg("title-hint"),
                     width - 365.,
                     height - 34.,
                     330.,
@@ -476,13 +476,13 @@ fn project_measured(
                 p.announcement = d.full_text.clone();
                 p.dialogue_hint = Some(p.texts.len());
                 p.text(
-                    if d.gate {
-                        "…"
+                    msg(if d.gate {
+                        "gate-hint"
                     } else if d.ready {
-                        "SPACE / ↗"
+                        "advance-hint"
                     } else {
-                        "· · ·"
-                    },
+                        "reveal-hint"
+                    }),
                     width - margin - 130.,
                     top + h - 33.,
                     110.,
@@ -658,7 +658,7 @@ fn project_measured(
                     let yy = y + 74.;
                     p.text(msg("language"), x, yy, w, 16., t.muted);
                     p.button(
-                        "简体中文".into(),
+                        msg("language-zh"),
                         UiAction::Locale {
                             locale: "zh-Hans".into(),
                         },
@@ -667,7 +667,7 @@ fn project_measured(
                         t,
                     );
                     p.button(
-                        "English".into(),
+                        msg("language-en"),
                         UiAction::Locale {
                             locale: "en".into(),
                         },
@@ -684,14 +684,14 @@ fn project_measured(
                         t.text,
                     );
                     p.button(
-                        "−".into(),
+                        msg("decrease"),
                         UiAction::FontSize { delta: -0.1 },
                         [x + w - 128., yy + 86., 58., 38.],
                         false,
                         t,
                     );
                     p.button(
-                        "+".into(),
+                        msg("increase"),
                         UiAction::FontSize { delta: 0.1 },
                         [x + w - 58., yy + 86., 58., 38.],
                         false,
@@ -715,14 +715,14 @@ fn project_measured(
                             t.text,
                         );
                         p.button(
-                            "−".into(),
+                            msg("decrease"),
                             UiAction::Volume { bus, delta: -0.1 },
                             [x + w - 128., ry - 7., 58., 38.],
                             false,
                             t,
                         );
                         p.button(
-                            "+".into(),
+                            msg("increase"),
                             UiAction::Volume { bus, delta: 0.1 },
                             [x + w - 58., ry - 7., 58., 38.],
                             false,
@@ -825,14 +825,14 @@ fn project_measured(
                         region: Some(ScrollRegion::History),
                     });
                     p.button(
-                        "←".into(),
+                        msg("history-back"),
                         UiAction::HistoryPage { delta: 3 },
                         [x, height - 135., 70., 40.],
                         false,
                         t,
                     );
                     p.button(
-                        "→".into(),
+                        msg("history-forward"),
                         UiAction::HistoryPage { delta: -3 },
                         [x + 82., height - 135., 70., 40.],
                         false,

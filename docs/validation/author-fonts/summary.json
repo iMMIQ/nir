@@ -1,0 +1,14 @@
+{
+  "developer_path_in_cli": false,
+  "master_sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+  "native_tests": 82,
+  "browser_tests": {
+    "startTime": "2026-09-21T09:33:31.555Z",
+    "duration": 150600.556,
+    "expected": 23,
+    "skipped": 0,
+    "unexpected": 0,
+    "flaky": 0
+  },
+  "sdk_digest": "166b438ce4ab2fc7d75eb41350b66e3cf2f875a28db5d0d53eeefff34ff9456c"
+}

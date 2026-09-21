@@ -1,0 +1,52 @@
+{
+  "intro": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Flowers bloom on campus in spring. Where will you go today?"
+      }
+    ]
+  },
+  "garden": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Walk in the garden"
+      }
+    ]
+  },
+  "home": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Go home and read"
+      }
+    ]
+  },
+  "garden_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Sunlight rests on the petals. A new story begins here."
+      }
+    ]
+  },
+  "home_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "You open a book, and another journey begins."
+      }
+    ]
+  }
+}

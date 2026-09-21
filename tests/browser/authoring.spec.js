@@ -33,7 +33,7 @@ let root;
 test.beforeAll(async () => {
   await fs.mkdir('target/tmp', {recursive:true});
   root = await fs.mkdtemp(path.resolve('target/tmp/author-reading-'));
-  await run(cli, ['init', `${root}/story`]);
+  await run(cli, ['init', `${root}/story`, '--template', 'web-basic']);
   const story = `${root}/story`;
   for (const locale of ['zh-Hans', 'en']) {
     const file = `${story}/content/ch01/texts/${locale}.json`;
@@ -154,7 +154,7 @@ test('long author content remains readable across advance, input, reflow, restor
 
 test('dev rebuild reloads valid content and retains the previous session on author errors', async ({page,request}) => {
   const story = `${root}/dev-story`;
-  await run(cli,['init',story]); await run(cli,['-p',story,'resolve']);
+  await run(cli,['init',story,'--template','web-basic']); await run(cli,['-p',story,'resolve']);
   const lock = await fs.readFile(`${story}/game.lock`,'utf8');
   const proc = spawn(cli,['-p',story,'dev','--port','4175'],{stdio:'ignore'});
   const url='http://127.0.0.1:4175';

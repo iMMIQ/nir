@@ -29,6 +29,8 @@ for p in sorted((packages[key] for key in seen), key=lambda p: (p["name"], p["ve
         extra = directory / p["license_file"]
         if extra not in paths:
             paths.append(extra)
+    if p["name"] == "hb-subset":
+        paths.append(directory / "harfbuzz/COPYING")
     for path in paths:
         chunks.append(path.read_text(errors="replace"))
 Path(sys.argv[1]).write_text("\n".join(chunks))

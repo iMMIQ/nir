@@ -37,3 +37,14 @@ error-host = Player operation failed.
 
 scroll-back = Page up
 scroll-forward = Page down
+
+language-zh = 简体中文
+language-en = English
+decrease = −
+increase = +
+history-back = ←
+history-forward = →
+title-hint = SPACE  →  READ     ·     ESC  →  MENU
+advance-hint = SPACE / ↗
+gate-hint = …
+reveal-hint = · · ·

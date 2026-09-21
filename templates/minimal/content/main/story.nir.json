@@ -1,0 +1,184 @@
+{
+  "fragment_format": 1,
+  "functions": {
+    "main": {
+      "entry": "intro",
+      "blocks": {
+        "intro": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "intro",
+            "next": "wait_intro"
+          }
+        },
+        "wait_intro": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "choose",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "garden_end": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "garden_end",
+            "next": "wait_garden_end"
+          }
+        },
+        "wait_garden_end": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "end_garden",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "home_end": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "home_end",
+            "next": "wait_home_end"
+          }
+        },
+        "wait_home_end": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "end_home",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "choose": {
+          "ops": [],
+          "terminator": {
+            "type": "interact",
+            "choice": "route",
+            "branches": {
+              "garden": "garden_end",
+              "home": "home_end"
+            },
+            "on_empty": "cancelled"
+          }
+        },
+        "end_garden": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "garden"
+          }
+        },
+        "end_home": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "home"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "cancelled"
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_STORY_TASK",
+            "message": "Story task failed"
+          }
+        }
+      }
+    }
+  },
+  "cues": {
+    "intro": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "intro",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "garden_end": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "garden_end",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    },
+    "home_end": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "home_end",
+            "speaker": "",
+            "reveal_us": "32000"
+          }
+        }
+      ]
+    }
+  },
+  "choices": {
+    "route": {
+      "options": [
+        {
+          "id": "garden",
+          "text": "garden"
+        },
+        {
+          "id": "home",
+          "text": "home"
+        }
+      ]
+    }
+  }
+}

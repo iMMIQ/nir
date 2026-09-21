@@ -1,0 +1,12 @@
+format = 1
+id = "home"
+entry = "main"
+text_locale = "en"
+[[steps]]
+action = "await_choice"
+id = "route"
+[[steps]]
+action = "choose"
+option_id = "home"
+[expect]
+outcome = "home"

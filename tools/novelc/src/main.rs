@@ -24,7 +24,7 @@ enum Command {
     },
     Init {
         path: PathBuf,
-        #[arg(long, default_value = "web-basic")]
+        #[arg(long, default_value = "minimal")]
         template: String,
     },
     Resolve,
@@ -105,13 +105,11 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Schemas { out } => write_schemas(&out)?,
         Command::Init { path, template } => {
-            if template != "web-basic" {
-                bail!("E_TEMPLATE: only web-basic is supported");
-            }
-            init(
+            init_template(
                 &path,
                 &sdk,
                 &format!("org.nir.game.{}", uuid::Uuid::new_v4()),
+                &template,
             )?;
             println!(
                 "Created {}\nNext: novelc -p {} resolve",

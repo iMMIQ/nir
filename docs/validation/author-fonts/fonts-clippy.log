@@ -1,0 +1,5 @@
+    Checking nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+    Checking nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+    Checking nir-player v0.1.0 (/nir/crates/nir-player)
+    Checking novelc v0.1.0 (/nir/tools/novelc)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.81s

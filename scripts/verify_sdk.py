@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
         p = subprocess.run([str(kit / "novelc"), *args], cwd=root, env=env, text=True, capture_output=True)
         assert (p.returncode == 0) == success, p.stdout + p.stderr
         return p.stdout + p.stderr
-    run("init", "story")
+    run("init", "story", "--template", "web-basic")
     for cmd in [("resolve",), ("doctor",), ("check", "--locked"), ("test",), ("build", "--locked")]:
         run("-p", "story", *cmd)
     channel = root / "story/dist/full/web/channels/stable.json"
@@ -50,8 +50,28 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     assert detail["source"]["pointer"].endswith("/0/asset") and detail["source"]["line"] > 1
     assert "missing.test.resource" in detail["references"] and detail["hint"]
     fragment.write_bytes(original)
+    # The default is an independent author project with its own master font.
+    env["PATH"] = ""  # even Python and system font tools are unavailable to the CLI
+    run("init", "minimal")
+    for cmd in [("resolve",), ("check", "--locked"), ("test",), ("build", "--locked")]:
+        run("-p", "minimal", *cmd)
+    report = json.loads((root / "minimal/reports/build.json").read_text())
+    font = report["fonts"]["font.reader"]
+    assert font["output_bytes"] < font["source_bytes"] / 20
+    assert font["cache_hit"]
+    first_font = font["object"]
+    text = root / "minimal/content/main/texts/zh-Hans.json"
+    text.write_text(text.read_text().replace("春天", "鲸鱼"))
+    run("-p", "minimal", "build", "--locked")
+    report = json.loads((root / "minimal/reports/build.json").read_text())
+    assert report["fonts"]["font.reader"]["object"] != first_font
+    assert not report["fonts"]["font.reader"]["cache_hit"]
+    changed = report["release"]
+    shutil.rmtree(root / "minimal/.nir")
+    run("-p", "minimal", "build", "--locked")
+    assert json.loads((root / "minimal/reports/build.json").read_text())["release"] == changed
     with (kit / "sdk/host.js").open("a") as f:
         f.write("\n// intentional SDK drift\n")
     error = run("-p", "story", "check", "--locked", success=False)
     assert "E_LOCK_DRIFT" in error, error
-    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True, "author_theme_edit_without_engine_rebuild": True, "resolved_configuration": True}, indent=2))
+    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True, "author_theme_edit_without_engine_rebuild": True, "resolved_configuration": True, "minimal_template": True, "new_chinese_without_external_font_tools": True, "minimal_cli_path_empty": True, "clean_cache_reproducible": True}, indent=2))

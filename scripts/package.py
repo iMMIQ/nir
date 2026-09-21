@@ -46,7 +46,7 @@ for name in selected:
 ./novelc -p my-story build --locked
 ```
 
-init 当前使用随 SDK 提供的测试工程模板，可替换正文、逻辑和素材。novelc 和 sdk 必须配套保留。最终作品默认输出到 my-story/dist/full/web，可完整上传至 HTTPS 静态站点，保留 NOTICE.txt。
+init 默认创建带母版字体的独立最小作品；CLI 自动编译运行字体。使用 init --template web-basic 可创建功能回归工程。novelc 和 sdk 必须配套保留。最终作品默认输出到 my-story/dist/full/web，可完整上传至 HTTPS 静态站点，保留 NOTICE.txt。
 
 运行附带的测试工程：
 
