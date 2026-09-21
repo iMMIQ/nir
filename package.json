@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "test:browser": "playwright test",
-    "test:browser:headed": "playwright test --headed"
+    "test:browser:headed": "playwright test --headed",
+    "test:host": "node --test tests/host/*.test.js"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

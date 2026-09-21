@@ -509,3 +509,67 @@ fn checked_integer_overflow_faults() {
     assert_eq!(c.state().fault.as_ref().unwrap().code, "E_ARITHMETIC");
     assert_eq!(c.state().variables["affection"], Value::I32(0));
 }
+
+#[test]
+fn elapsed_time_and_logic_share_one_budget() {
+    let mut p = program();
+    let f = p.functions.get_mut("main").unwrap();
+    let b = f.blocks.get_mut(&f.entry).unwrap();
+    b.ops.clear();
+    b.terminator = Terminator::Goto {
+        target: f.entry.clone(),
+    };
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "budget".into(),
+        "en".into(),
+    )
+    .unwrap();
+    let output = c.step(CoreInput::Time { delta_us: 250_000 }, 7);
+    assert_eq!(output.work_used, 7);
+    assert_eq!(c.state().unsuspended_ops, 7);
+    assert_eq!(c.state().tick_us.0, 0);
+    assert_eq!(output.remaining_time_us, 250_000);
+    assert!(c.state().fault.is_none());
+}
+
+#[test]
+fn clock_slices_preserve_reveal_and_complete_snapshot() {
+    let mut whole = core();
+    for _ in 0..8 {
+        let input = whole
+            .state()
+            .pending
+            .as_ref()
+            .map(|p| CoreInput::Prepared { activation: p.id })
+            .unwrap_or(CoreInput::None);
+        whole.step(input, 1000);
+        if whole.dialogue().is_some() {
+            break;
+        }
+    }
+    assert!(whole.dialogue().is_some());
+    let mut sliced = whole.clone();
+    whole.step(CoreInput::Time { delta_us: 250_000 }, 1000);
+    let mut remaining = 250_000;
+    let mut turns = 0;
+    while remaining > 0 {
+        let out = sliced.step(
+            CoreInput::Time {
+                delta_us: remaining,
+            },
+            1,
+        );
+        assert!(out.work_used <= 1);
+        remaining = out.remaining_time_us;
+        turns += 1;
+        assert!(turns < 1000);
+    }
+    // If the last clock boundary used the final unit, runnable logic is next-turn work.
+    sliced.step(CoreInput::None, 1000);
+    assert_eq!(
+        serde_json::to_value(whole.snapshot()).unwrap(),
+        serde_json::to_value(sliced.snapshot()).unwrap()
+    );
+    assert!(turns > 1);
+}

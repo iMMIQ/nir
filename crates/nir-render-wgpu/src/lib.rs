@@ -25,6 +25,14 @@ struct Texture {
     bind: wgpu::BindGroup,
     _texture: wgpu::Texture,
 }
+struct ImageUpload {
+    request: u32,
+    pixels: Vec<u8>,
+    texture: Texture,
+    width: u32,
+    height: u32,
+    row: u32,
+}
 pub struct Renderer {
     _instance: wgpu::Instance,
     pub device: wgpu::Device,
@@ -38,6 +46,8 @@ pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: BTreeMap<String, Texture>,
+    uploads: BTreeMap<String, ImageUpload>,
+    pub upload_steps: u64,
     vertices: wgpu::Buffer,
     capacity: usize,
     pub text: TextEngine,
@@ -248,6 +258,8 @@ impl Renderer {
             layout,
             sampler,
             textures: BTreeMap::new(),
+            uploads: BTreeMap::new(),
+            upload_steps: 0,
             vertices,
             capacity,
             text: TextEngine::default(),
@@ -287,40 +299,105 @@ impl Renderer {
     pub fn has_image(&self, id: &str) -> bool {
         self.textures.contains_key(id)
     }
-    pub fn upload_image(&mut self, id: &str, bytes: &[u8]) -> Result<()> {
+    pub fn image_started(&self, request: u32, id: &str) -> bool {
+        self.has_image(id) || self.uploads.get(id).is_some_and(|u| u.request == request)
+    }
+    pub fn cancel_upload(&mut self, request: u32) {
+        self.uploads.retain(|_, upload| upload.request != request);
+    }
+    /// PNG decoding is atomic; pixel conversion and GPU writes yield by row budget.
+    /// A partially uploaded texture never enters the drawable texture map.
+    pub fn upload_image_step(
+        &mut self,
+        request: u32,
+        id: &str,
+        bytes: &[u8],
+        budget: usize,
+    ) -> Result<(bool, usize)> {
         if self.has_image(id) {
-            return Ok(());
+            return Ok((true, 0));
         }
-        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .map_err(|e| error(e.to_string()))?;
-        let (w, h) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
-        if w > 8192 || h > 8192 || w as u64 * h as u64 > 32 * 1024 * 1024 {
-            return Err(error("image dimensions exceed admission limit"));
+        if !self.image_started(request, id) {
+            let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(|e| error(e.to_string()))?;
+            let (w, h) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
+            if w == 0 || h == 0 || w > 8192 || h > 8192 || w as u64 * h as u64 > 32 * 1024 * 1024 {
+                return Err(error("image dimensions exceed admission limit"));
+            }
+            let pixels = image::load_from_memory(bytes)
+                .map_err(|e| error(e.to_string()))?
+                .to_rgba8()
+                .into_raw();
+            let texture = self.allocate_texture(id, w, h);
+            self.uploads.insert(
+                id.into(),
+                ImageUpload {
+                    request,
+                    pixels,
+                    texture,
+                    width: w,
+                    height: h,
+                    row: 0,
+                },
+            );
         }
-        let mut image = image::load_from_memory(bytes)
-            .map_err(|e| error(e.to_string()))?
-            .to_rgba8();
-        for pixel in image.pixels_mut() {
+        let upload = self.uploads.get_mut(id).unwrap();
+        let stride = upload.width as usize * 4;
+        let rows = (budget / stride).min((upload.height - upload.row) as usize) as u32;
+        if rows == 0 {
+            return Ok((false, 0));
+        }
+        let start = upload.row as usize * stride;
+        let end = start + rows as usize * stride;
+        for pixel in upload.pixels[start..end].chunks_exact_mut(4) {
             let a = pixel[3] as f32 / 255.;
-            for k in 0..3 {
-                pixel[k] = (srgb(linear(pixel[k] as f32 / 255.) * a) * 255.)
+            for channel in &mut pixel[..3] {
+                *channel = (srgb(linear(*channel as f32 / 255.) * a) * 255.)
                     .round()
                     .clamp(0., 255.) as u8;
             }
         }
-        self.upload_rgba(id, w, h, image.as_raw());
-        Ok(())
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &upload.texture._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: upload.row,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &upload.pixels[start..end],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(upload.width * 4),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: upload.width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        upload.row += rows;
+        self.upload_steps += 1;
+        let complete = upload.row == upload.height;
+        if complete {
+            self.textures
+                .insert(id.into(), self.uploads.remove(id).unwrap().texture);
+        }
+        Ok((complete, end - start))
     }
-    fn upload_rgba(&mut self, id: &str, w: u32, h: u32, bytes: &[u8]) {
-        let size = wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        };
+    fn allocate_texture(&self, id: &str, w: u32, h: u32) -> Texture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(id),
-            size,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -328,21 +405,6 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            size,
-        );
         let view = texture.create_view(&Default::default());
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(id),
@@ -358,15 +420,36 @@ impl Renderer {
                 },
             ],
         });
-        self.textures.insert(
-            id.into(),
-            Texture {
-                bind,
-                _texture: texture,
+        Texture {
+            bind,
+            _texture: texture,
+        }
+    }
+    fn upload_rgba(&mut self, id: &str, w: u32, h: u32, bytes: &[u8]) {
+        let texture = self.allocate_texture(id, w, h);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
             },
         );
+        self.textures.insert(id.into(), texture);
     }
     pub fn retain(&mut self, ids: &BTreeSet<String>) {
+        self.uploads.retain(|id, _| ids.contains(id));
         self.textures
             .retain(|id, _| id.is_empty() || ids.contains(id));
     }

@@ -234,3 +234,45 @@ test.describe('touch input emulation',()=>{
     await page.screenshot({path:'reports/touch-dialogue.png'});
   });
 });
+
+test('owner inbox defers actions, drains bursts and keeps turn work bounded', async ({ page }) => {
+  await boot(page); await start(page);
+  const result=await page.evaluate(async()=>{
+    const before=window.__nir.state().screen;
+    const pending=window.__nir.action({type:'menu'});
+    const immediate=window.__nir.state().screen;
+    await pending;
+    const after=window.__nir.state().screen;
+    const s=window.__nir.state();
+    await Promise.all(Array.from({length:40},(_,i)=>window.__nir.rawAction({type:'advance'},s.interaction-1,s.sequence+i+1,s.session)));
+    return {before,immediate,after,state:window.__nir.state(),metrics:window.__nir.metrics};
+  });
+  expect(result.before).toBe('Story');expect(result.immediate).toBe('Story');expect(result.after).toBe('Menu');
+  expect(result.state.error).toBeNull();expect(result.state.pending_events).toBe(0);
+  expect(result.metrics.inboxHighWater).toBeGreaterThanOrEqual(40);
+  expect(result.metrics.inboxHighWater).toBeLessThanOrEqual(256);
+  expect(result.metrics.maxTurnWork).toBeLessThanOrEqual(10000);
+  expect(result.metrics.maxTurnUploadBytes).toBeGreaterThan(0);
+  expect(result.metrics.maxTurnUploadBytes).toBeLessThanOrEqual(2*1024*1024);
+  expect(result.metrics.uploadSteps).toBeGreaterThan(1);
+});
+
+test('leaving preparation cancels its fetch and a new request still succeeds', async ({ page }) => {
+  await boot(page);
+  let intercepted=false,release;
+  const gate=new Promise(resolve=>release=resolve);
+  const cancelled=[];page.on('requestfailed',request=>{if(request.url().endsWith('.wav'))cancelled.push(request.url());});
+  await page.route('**/objects/*.wav',async route=>{
+    if(!intercepted){intercepted=true;await gate;}
+    await route.continue().catch(()=>{});
+  });
+  await page.keyboard.press('Space');
+  await expect.poll(()=>intercepted).toBe(true);
+  await act(page,{type:'title'});
+  await page.waitForFunction(()=>window.__nir.state().screen==='Title'&&!window.__nir.state().loading);
+  await expect.poll(()=>cancelled.length).toBeGreaterThan(0);
+  release();
+  await act(page,{type:'new_game'});
+  await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);
+  expect((await state(page)).error).toBeNull();
+});

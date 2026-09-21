@@ -1,0 +1,24 @@
+    Checking nir-core v0.1.0 (/nir/crates/nir-core)
+    Checking nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+    Checking nir-player v0.1.0 (/nir/crates/nir-player)
+    Checking novelc v0.1.0 (/nir/tools/novelc)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.49s
+warning: unused import: `vec`
+ --> vendor/wgpu/src/api/shader_module.rs:3:5
+  |
+3 |     vec,
+  |     ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ToString`
+ --> vendor/wgpu/src/api/shader_module.rs:2:22
+  |
+2 |     string::{String, ToString as _},
+  |                      ^^^^^^^^
+
+    Checking nir-core v0.1.0 (/nir/crates/nir-core)
+warning: `wgpu` (lib) generated 2 warnings (run `cargo clippy --fix --lib -p wgpu -- -D warnings` to apply 1 suggestion)
+    Checking nir-player v0.1.0 (/nir/crates/nir-player)
+    Checking player-web v0.1.0 (/nir/apps/player-web)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.21s

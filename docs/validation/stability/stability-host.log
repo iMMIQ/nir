@@ -1,0 +1,17 @@
+✔ input overload leaves room for terminal completions (24.615376ms)
+✔ owner yields at item/time limits and never consumes reentrant production (4.316382ms)
+✔ inputs precede resource delivery and each turn admits one resource (1.594237ms)
+✔ recovery stops the current batch and still admits its control completion (1.999108ms)
+✔ cancelling a resource group releases bytes without dropping independent saves (1.402487ms)
+✔ shared fetch aborts only after its last consumer cancels (4.187062ms)
+✔ late old completion cannot remove a replacement fetch (2.546127ms)
+✔ resource admission is global and cancelled decoders hold their slot until settled (2.780678ms)
+✔ an active batch still occupies capacity and disposal settles its pending items (1.406729ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 442.412912

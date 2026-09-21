@@ -96,7 +96,9 @@ fn main() -> Result<()> {
                 Path::new("dist/sdk/template"),
             )?;
             run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
-            fs::copy("target/release/novelc", "dist/novelc")?;
+            // A preview server may still be executing the previous CLI inode.
+            fs::copy("target/release/novelc", "dist/novelc.next")?;
+            fs::rename("dist/novelc.next", "dist/novelc")?;
             run(Command::new("python3").args(["-c", "import hashlib,pathlib; pathlib.Path('dist/sdk/compiler.sha256').write_text(hashlib.sha256(pathlib.Path('dist/novelc').read_bytes()).hexdigest()+'\\n')"]))?;
             run(Command::new("dist/novelc").args([
                 "schemas",

@@ -266,6 +266,11 @@ fn invalid_locale_does_not_replace_the_open_dialogue() {
 
 #[test]
 fn choice_input_in_the_deadline_pump_precedes_timeout() {
+    for budget in [2, 1000] {
+        choice_at_deadline(budget);
+    }
+}
+fn choice_at_deadline(budget: u32) {
     let mut program: Program =
         serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
     let choice = program.choices.get_mut("route").unwrap();
@@ -316,9 +321,215 @@ fn choice_input_in_the_deadline_pump_precedes_timeout() {
                 session: p.generation.session,
             },
         ],
-        1000,
+        budget,
     );
     ready(&mut p, c);
+    for _ in 0..20 {
+        let c = p.pump(vec![], budget);
+        assert!(p.work_used() <= budget);
+        ready(&mut p, c);
+        if p.core().state().variables["affection"] == Value::I32(1) {
+            break;
+        }
+    }
     assert_eq!(p.core().state().variables["affection"], Value::I32(1));
     assert!(p.error.is_none(), "{:?}", p.error);
+}
+
+#[test]
+fn same_reason_tokens_release_only_their_own_pause() {
+    let mut p = playing();
+    let one = p.acquire_pause("plugin");
+    let two = p.acquire_pause("plugin");
+    assert!(p
+        .pump(vec![], 10)
+        .iter()
+        .any(|c| matches!(c, AppCommand::AudioPause { paused: true })));
+    drop(one);
+    action(&mut p, UiAction::Menu);
+    action(&mut p, UiAction::Close);
+    assert!(p.paused());
+    drop(two);
+    assert!(p
+        .pump(vec![], 10)
+        .iter()
+        .any(|c| matches!(c, AppCommand::AudioPause { paused: false })));
+    assert!(!p.paused());
+}
+
+#[test]
+fn external_pause_survives_new_game_and_token_outlives_player() {
+    let mut p = playing();
+    let token = p.acquire_pause("host");
+    let c = action(&mut p, UiAction::NewGame);
+    ready(&mut p, c);
+    assert!(p.paused());
+    drop(p);
+    drop(token);
+}
+
+#[test]
+fn work_is_retained_and_terminal_events_have_admission_room() {
+    let mut p = playing();
+    let mut events = vec![AppEvent::Tick { delta_us: 1 }; 128];
+    events.push(AppEvent::LoadFailed("terminal".into()));
+    p.pump(events, 0);
+    assert_eq!(p.pending_events(), 129);
+    assert_eq!(p.work_used(), 0);
+    p.pump(vec![], 2);
+    assert_eq!(p.status, "terminal");
+    assert!(p.pending_events() > 0);
+    assert!(p.work_used() <= 2);
+    for _ in 0..200 {
+        p.pump(vec![], 4);
+        assert!(p.work_used() <= 4);
+    }
+    assert_eq!(p.pending_events(), 0);
+}
+
+#[test]
+fn inbox_overflow_is_explicit_and_bounded() {
+    let mut p = playing();
+    p.pump(
+        vec![AppEvent::LoadFailed("late".into()); EVENT_CAPACITY + 10],
+        0,
+    );
+    assert_eq!(p.pending_events(), EVENT_CAPACITY);
+    assert!(p.error.as_ref().unwrap().starts_with("E_EVENT_QUEUE"));
+    assert!(p.paused());
+}
+
+#[test]
+fn replacing_preparation_emits_one_cancellation_and_ignores_its_terminal() {
+    let mut p = player();
+    let commands = p.pump(vec![], 100);
+    let old = commands
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    p.viewport_changed().unwrap();
+    let commands = p.pump(
+        vec![AppEvent::AssetFailed {
+            request: old,
+            message: "old failure".into(),
+        }],
+        100,
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| matches!(c, AppCommand::CancelAssets { request } if *request == old))
+            .count(),
+        1
+    );
+    assert!(p.error.is_none());
+    ready(&mut p, commands);
+    assert!(!p.is_loading());
+}
+
+#[test]
+fn failed_preparation_cannot_be_committed_by_late_success() {
+    let mut p = player();
+    let c = p.pump(vec![], 100);
+    let (request, assets) = c
+        .into_iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets {
+                request, assets, ..
+            } => Some((request, assets)),
+            _ => None,
+        })
+        .unwrap();
+    let c = p.pump(
+        vec![AppEvent::AssetFailed {
+            request,
+            message: "network failed".into(),
+        }],
+        100,
+    );
+    assert!(c
+        .iter()
+        .any(|c| matches!(c, AppCommand::CancelAssets { request: r } if *r == request)));
+    let mut events: Vec<_> = assets
+        .into_iter()
+        .map(|asset| AppEvent::AssetReady { request, asset })
+        .collect();
+    events.push(AppEvent::PresentationReady { request });
+    p.pump(events, 100);
+    assert!(p.paused());
+    assert!(p.is_loading());
+    assert!(!p.accepts(request));
+    assert_eq!(p.error.as_deref(), Some("network failed"));
+    let c = action(&mut p, UiAction::Retry);
+    ready(&mut p, c);
+    assert!(!p.is_loading());
+    assert!(p.error.is_none());
+}
+
+#[test]
+fn late_failure_does_not_overwrite_successful_save_status() {
+    let mut p = playing();
+    let c = action(&mut p, UiAction::Save { slot: 0 });
+    let job = c
+        .into_iter()
+        .find_map(|c| match c {
+            AppCommand::Save { job, .. } => Some(job),
+            _ => None,
+        })
+        .unwrap();
+    p.pump(
+        vec![AppEvent::Saved {
+            job,
+            slot: 0,
+            revision: 1,
+        }],
+        100,
+    );
+    let status = p.status.clone();
+    p.pump(
+        vec![AppEvent::SaveFailed {
+            job,
+            message: "duplicate".into(),
+        }],
+        100,
+    );
+    assert_eq!(p.status, status);
+}
+
+#[test]
+fn many_events_cannot_multiply_the_story_work_budget() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    let f = program.functions.get_mut("main").unwrap();
+    let b = f.blocks.get_mut(&f.entry).unwrap();
+    b.ops.clear();
+    b.terminator = Terminator::Goto {
+        target: f.entry.clone(),
+    };
+    let mut p = Player::new(program, "loop".into(), "Test".into()).unwrap();
+    let c = p.pump(vec![], 100);
+    ready(&mut p, c);
+    let events = vec![
+        AppEvent::Action {
+            action: UiAction::NewGame,
+            interaction: 0,
+            sequence: 1,
+            session: p.generation.session,
+        },
+        AppEvent::Tick { delta_us: 100 },
+        AppEvent::Tick { delta_us: 100 },
+    ];
+    p.pump(events, 7);
+    assert_eq!(p.work_used(), 7);
+    assert_eq!(p.core().state().unsuspended_ops, 6);
+    assert!(p.pending_events() > 0);
+    for _ in 0..10 {
+        let before = p.core().state().unsuspended_ops;
+        p.pump(vec![], 7);
+        assert!(p.core().state().unsuspended_ops - before <= 7);
+        assert_eq!(p.work_used(), 7);
+    }
 }

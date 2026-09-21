@@ -46,6 +46,8 @@ pub struct Engine {
     dpr: f32,
     ready: bool,
     signature: String,
+    work_remaining: u32,
+    upload_remaining: usize,
 }
 #[wasm_bindgen]
 impl Engine {
@@ -73,9 +75,22 @@ impl Engine {
             dpr: 1.,
             ready: false,
             signature: String::new(),
+            work_remaining: 10_000,
+            upload_remaining: 2 * 1024 * 1024,
         };
         e.pump(vec![])?;
         Ok(e)
+    }
+    /// Called once by the host owner task, never by individual completions.
+    pub fn begin_turn(&mut self) {
+        self.work_remaining = 10_000;
+        self.upload_remaining = 2 * 1024 * 1024;
+    }
+    pub fn continue_turn(&mut self) -> std::result::Result<(), JsValue> {
+        self.pump(vec![])
+    }
+    pub fn pending_events(&self) -> usize {
+        self.player.pending_events()
     }
     pub fn commands(&mut self) -> String {
         serde_json::to_string(&std::mem::take(&mut self.outbox)).unwrap()
@@ -91,9 +106,9 @@ impl Engine {
         request: u32,
         id: String,
         bytes: &[u8],
-    ) -> std::result::Result<(), JsValue> {
+    ) -> std::result::Result<bool, JsValue> {
         if !self.player.accepts(request) {
-            return Ok(());
+            return Ok(true);
         }
         let asset = self
             .player
@@ -105,9 +120,20 @@ impl Engine {
         if bytes.len() as u64 != asset.bytes {
             return Err(js("E_ASSET_SIZE: object length mismatch"));
         }
-        nir_content::verify(bytes, &asset.object).map_err(js)?;
+        if asset.kind != AssetKind::Image || !self.renderer.image_started(request, &id) {
+            nir_content::verify(bytes, &asset.object).map_err(js)?;
+        }
         match asset.kind {
-            AssetKind::Image => self.renderer.upload_image(&id, bytes).map_err(js)?,
+            AssetKind::Image => {
+                let (complete, used) = self
+                    .renderer
+                    .upload_image_step(request, &id, bytes, self.upload_remaining)
+                    .map_err(js)?;
+                self.upload_remaining -= used;
+                if !complete {
+                    return Ok(false);
+                }
+            }
             AssetKind::Font => {
                 if self.fonts.insert(id.clone()) {
                     self.renderer.text.add_font(bytes.to_vec());
@@ -115,7 +141,8 @@ impl Engine {
             }
             AssetKind::Audio => {}
         }
-        self.pump(vec![AppEvent::AssetReady { request, asset: id }])
+        self.pump(vec![AppEvent::AssetReady { request, asset: id }])?;
+        Ok(true)
     }
     pub fn resource_failed(
         &mut self,
@@ -268,7 +295,7 @@ impl Engine {
     }
     pub fn state(&self) -> String {
         let c = self.player.core();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"adapter":self.renderer.adapter_info}).to_string()
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
     }
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
@@ -292,7 +319,8 @@ impl Engine {
 }
 impl Engine {
     fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), JsValue> {
-        let mut commands = self.player.pump(events, 10_000);
+        let mut commands = self.player.pump(events, self.work_remaining);
+        self.work_remaining -= self.player.work_used();
         let mut rounds = 0;
         while !commands.is_empty() {
             rounds += 1;
@@ -319,13 +347,17 @@ impl Engine {
                         }),
                     }
                 } else {
+                    if let AppCommand::CancelAssets { request } = &command {
+                        self.renderer.cancel_upload(*request);
+                    }
                     self.outbox.push(command);
                 }
             }
             if events.is_empty() {
                 break;
             }
-            commands = self.player.pump(events, 10_000);
+            commands = self.player.pump(events, self.work_remaining);
+            self.work_remaining -= self.player.work_used();
         }
         Ok(())
     }
