@@ -286,12 +286,16 @@ test('an owner turn detects device loss before the idle watchdog',async({page})=
   await page.addInitScript(()=>{
     const interval=window.setInterval.bind(window);
     window.setInterval=(fn,ms,...args)=>interval(fn,ms===500?60000:ms,...args);
+    const destroy=GPUDevice.prototype.destroy;
+    GPUDevice.prototype.destroy=function(){window.__deviceLoss=this.lost;return destroy.call(this);};
   });
   await boot(page);await start(page);await act(page,{type:'menu'});
   const before=await state(page);
   await page.evaluate(async()=>{
     window.__nir.loseDevice();
-    await new Promise(resolve=>setTimeout(resolve,0));
+    // Device destruction crosses the GPU process boundary; a timer turn does
+    // not guarantee that the registered loss callback has run yet.
+    await window.__deviceLoss;
     await window.__nir.hidden(true);
   });
   await page.waitForFunction(d=>window.__nir.state().device>d&&window.__nir.state().ready&&!window.__nir.state().loading,before.device,{timeout:15000});
