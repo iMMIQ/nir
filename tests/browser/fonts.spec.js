@@ -22,6 +22,8 @@ test('default author template renders new Chinese with compiled fonts and both r
   const file=`${story}/content/main/texts/zh-Hans.json`;
   const texts=JSON.parse(await fs.readFile(file,'utf8'));texts.intro.spans[0].text='春夏秋冬，雪山与鲸鱼。'+texts.intro.spans[0].text;
   await fs.writeFile(file,JSON.stringify(texts,null,2));
+  await run(cli,['-p',story,'text','update','--id','intro','--meaning','preserve']);
+  await run(cli,['-p',story,'text','review','--id','intro','--locale','en']);
   await run(cli,['-p',story,'build','--locked','--out',path.resolve('dist/font-author-web')]);
   const report=JSON.parse(await fs.readFile(`${story}/reports/build.json`,'utf8'));
   await fs.copyFile(`${story}/reports/build.json`,'reports/fonts-author-build.json');
@@ -60,10 +62,15 @@ test('font preparation follows dev edits and a missing glyph preserves the last 
     const before=await state(page), release=(await status()).release;
     const file=`${story}/content/main/texts/zh-Hans.json`, original=await fs.readFile(file,'utf8');
     await fs.writeFile(file,original.replace('春天','🐈'));
+    await run(cli,['-p',story,'text','update','--id','intro','--meaning','preserve']);
+    await run(cli,['-p',story,'text','review','--id','intro','--locale','en']);
     await expect.poll(async()=>(await status())?.error||'',{timeout:15000}).toContain('E_FONT_COVERAGE');
     expect((await status()).release).toBe(release);expect((await state(page)).dialogue).toEqual(before.dialogue);
     await expect(page.locator('#nir-dev-status')).toBeVisible();
-    await fs.writeFile(file,original.replace('春天','鲸鱼'));
+    const current=await fs.readFile(file,'utf8');
+    await fs.writeFile(file,current.replace('🐈','鲸鱼'));
+    await run(cli,['-p',story,'text','update','--id','intro','--meaning','preserve']);
+    await run(cli,['-p',story,'text','review','--id','intro','--locale','en']);
     await expect.poll(async()=>(await status())?.release,{timeout:15000}).not.toBe(release);
     await page.waitForFunction(()=>window.__nir?.state().screen==='Title'&&window.__nir.state().ready);
     await line(page);expect((await state(page)).dialogue.visible).toContain('鲸鱼');

@@ -1,9 +1,12 @@
-module_format = 1
 id = "main"
+module_format = 1
 sources = ["story.nir.json"]
 text_contracts = "texts/contracts.json"
+text_revisions = "texts/revisions.json"
+
 [exports]
 start = "main"
+
 [text_bundles]
-zh-Hans = "texts/zh-Hans.json"
 en = "texts/en.json"
+zh-Hans = "texts/zh-Hans.json"

@@ -1241,7 +1241,7 @@ impl Player {
         };
         let read = self
             .profile
-            .contains(&format!("read:{}:{}", d.text_id, d.revision));
+            .contains(&format!("read:{}:{}", d.text_id, d.meaning_revision));
         if self.skip && !read {
             self.skip = false;
         }

@@ -1,0 +1,18 @@
+   Compiling nir-format v0.1.0 (/nir/crates/nir-format)
+   Compiling nir-core v0.1.0 (/nir/crates/nir-core)
+   Compiling nir-content v0.1.0 (/nir/crates/nir-content)
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.52s
+     Running tests/texts.rs (target/debug/deps/texts-aab817d4daffa68a)
+
+running 8 tests
+test forged_manual_versions_and_overflow_never_partially_write ... ok
+test transaction_recovery_is_explicit_and_preserves_concurrent_edits ... ok
+test report_collects_missing_extra_and_unknown_fields_fail_closed ... ok
+test new_text_and_explicit_meaning_bump_without_byte_changes ... ok
+test semantic_contract_changes_force_bump_and_reject_gate_and_parameter_mismatch ... ok
+test migration_preserves_source_ids_and_meaning_and_requires_a_new_destination ... ok
+test copy_edit_requires_source_update_then_explicit_translation_review ... ok
+test runtime_rechecks_digests_and_semantic_read_identity_survives_copy_edits ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.96s

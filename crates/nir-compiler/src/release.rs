@@ -250,9 +250,17 @@ pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
     for e in entries {
         let ty = e.file_type()?;
         let name = e.file_name();
-        if ["dist", "reports", ".nir", "game.lock"]
-            .iter()
-            .any(|v| name == *v)
+        if [
+            "dist",
+            "reports",
+            ".nir",
+            "game.lock",
+            ".git",
+            "target",
+            "node_modules",
+        ]
+        .iter()
+        .any(|v| name == *v)
         {
             continue;
         }

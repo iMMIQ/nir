@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TextRevisions",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "source_locale": {
+      "type": "string"
+    },
+    "texts": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RevisionRecord"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "source_locale",
+    "texts"
+  ],
+  "$defs": {
+    "RevisionRecord": {
+      "type": "object",
+      "properties": {
+        "contract_digest": {
+          "type": "string"
+        },
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "meaning_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reviewed": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "shape_digest": {
+          "type": "string"
+        },
+        "source_digest": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "contract_revision",
+        "meaning_revision",
+        "source_digest",
+        "contract_digest",
+        "shape_digest",
+        "reviewed"
+      ]
+    }
+  }
+}

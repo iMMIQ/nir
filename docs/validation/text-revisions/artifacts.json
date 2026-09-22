@@ -1,0 +1,18 @@
+{
+  "sdk_digest": "ebfa48555ffd6073a16aaae33380b25765b1143ace714f0eadbced64854f2df1",
+  "executable_format": 1,
+  "program_format": 1,
+  "capability": "text.revisions.v1",
+  "development_policy": "breaking changes within v1; exact release saves only",
+  "legacy_project_migrated_to_separate_directory": true,
+  "legacy_project_left_in_old_format": true,
+  "migration_preserves_game_id": true,
+  "intro_contract": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+    "gates": [],
+    "params": {}
+  }
+}

@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 1;
 pub const CAPABILITIES: &[&str] = &[
     "control.v1",
     "stage.sprite.v1",
     "stage.dissolve.v1",
     "clip.scalar.v1",
     "text.structured.v1",
+    "text.revisions.v1",
     "text.gate.v1",
     "choice.v1",
     "audio.buffer.v1",
@@ -568,7 +570,10 @@ pub struct ChoiceOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextContract {
-    pub revision: u32,
+    pub source_revision: u32,
+    pub contract_revision: u32,
+    pub meaning_revision: u32,
+    pub contract_digest: String,
     #[serde(default)]
     pub gates: Vec<String>,
     #[serde(default)]
@@ -578,7 +583,9 @@ pub struct TextContract {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextDoc {
-    pub revision: u32,
+    pub source_revision: u32,
+    pub contract_revision: u32,
+    pub contract_digest: String,
     pub spans: Vec<Span>,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -950,4 +957,64 @@ pub enum ScrollRegion {
     Dialogue,
     Choices,
     History,
+}
+
+/// Canonical semantic text contract identity. Source copy edits do not change it.
+pub fn text_contract_digest(c: &TextContract) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&(
+        1u32,
+        c.contract_revision,
+        c.meaning_revision,
+        &c.params,
+        &c.gates,
+    ))
+    .expect("text contract serialization");
+    format!("{:x}", Sha256::digest(bytes))
+}
+/// Shape rules shared by author checks and the runtime loader.
+pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut gates = Vec::new();
+    let mut params = BTreeSet::new();
+    for span in spans {
+        let sid = match span {
+            Span::Text { id, text, .. } => {
+                if text.len() > 128 * 1024 {
+                    return Err(Diagnostic::new("E_LIMIT", id, "text too long"));
+                }
+                id
+            }
+            Span::Break { id } => id,
+            Span::Gate { id } => {
+                gates.push(id.clone());
+                id
+            }
+            Span::Param { id, name } => {
+                if !c.params.contains_key(name) {
+                    return Err(Diagnostic::new("E_TEXT_PARAM", id, name));
+                }
+                params.insert(name.clone());
+                id
+            }
+        };
+        if sid.is_empty() || !ids.insert(sid) {
+            return Err(Diagnostic::new(
+                "E_DUPLICATE",
+                id,
+                "empty or duplicate span identity",
+            ));
+        }
+    }
+    if gates != c.gates {
+        return Err(Diagnostic::new("E_GATE", id, "gate order/count mismatch"));
+    }
+    if params != c.params.keys().cloned().collect() {
+        return Err(Diagnostic::new(
+            "E_TEXT_PARAM",
+            id,
+            "parameter coverage mismatch",
+        ));
+    }
+    Ok(())
 }

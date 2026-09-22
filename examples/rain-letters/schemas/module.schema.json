@@ -31,6 +31,13 @@
     },
     "text_contracts": {
       "type": "string"
+    },
+    "text_revisions": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
     }
   },
   "additionalProperties": false,

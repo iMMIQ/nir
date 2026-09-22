@@ -1,17 +1,37 @@
 {
-  "intro": {
-    "revision": 1
-  },
   "garden": {
-    "revision": 1
-  },
-  "home": {
-    "revision": 1
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
   },
   "garden_end": {
-    "revision": 1
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "home": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
   },
   "home_end": {
-    "revision": 1
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
   }
 }

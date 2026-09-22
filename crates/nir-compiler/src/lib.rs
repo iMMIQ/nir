@@ -13,3 +13,9 @@ pub use config::{PlayerConfig, ResolvedConfig, ResolvedField, ThemeManifest, The
 
 mod fonts;
 pub use fonts::{FontMode, FontRecipe, FontReport, FONT_TOOL};
+
+mod texts;
+pub use texts::{
+    text_migrate, text_recover, text_review, text_status, text_update, AuthorTextContract,
+    AuthorTextDoc, TextRevisions,
+};

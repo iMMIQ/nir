@@ -1,0 +1,138 @@
+{
+  "format": 1,
+  "source_locale": "zh-Hans",
+  "texts": {
+    "after_gate": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "395247c87587ed2cbdf1f6486327ed7e0f8daef413a8bf4b50c4729d40021be1",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "2c25c8f1e84c37cb687bf9b252fda5420788fe0c36bd8c5c1b3449a89baf9a62"
+      }
+    },
+    "arrival": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "d1af21bba144f9004ad615205fe7c578e4d298a6ee1b76dfc614a36ae4c34342",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "44f82cedefbd34e9ae0cdfd339d1ae4107cbf5739b659110685648791e194d16"
+      }
+    },
+    "intro": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "a7b15effd432acbff1a84063ec0f1ac412869b2e49d5778420ae2d54cd930338",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "6e26282134889338eec0d524c3476394315e3b11750ca2e08718ba2ff2acfc74"
+      }
+    },
+    "letter": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "dcf3446ab45eee552b0efa10eff7efdd2e96bb84f0a5512e97cc454b70d86e6d",
+      "contract_digest": "5bfc4a6fdb00fcbe0dbc4bbcc501d818fa5abdbd669adf28287eaa2eecdebf74",
+      "shape_digest": "a65e5eeac77630f3aae935981bacfa692318deb1a532f6cabf9e57c7e8f2463f",
+      "reviewed": {
+        "en": "77c52fde4883a0fcc349194f3bf6264f3016e313ddb7d1a39746bc5622e3b1cc"
+      }
+    },
+    "question": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "8f38668ea883e7698aa4aebbc729c0987dda9a32d7364da202bf96c29f6f4cea",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "1ed6846021f236b0eb093fa36c62d50d7fb5be9914a5911051f76243fa886083"
+      }
+    },
+    "speaker.aki": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "da301bfce130b5201f4f75b36452aa1701080524c33e77a33542652cf1febb41",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "f7030c8a8a16f8ae11718cc973e923be3d754a3b0ad8abc9833f89d98991d3df"
+      }
+    },
+    "stay": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "c1be2c7aff56019bddad1902615d5a07c6bbbeaa72b0e068a150459ec46b5278",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "656f95bb1b79b0024fee08edfe06ecd5a603d38d49fe2c30a8ba1549deaec36b"
+      }
+    },
+    "stay_end": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "38f02719f7535ac43770688f770c259eaeb6829dcfc7c3560b507ac682f5b5ef",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "513fd24363062e231a3ee24d54e5251df017d00e115f7a313ec215ddc4954797"
+      }
+    },
+    "stay_line": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "c981f7b311b149e617f11424e5b6bae730d5157ae353c7135d92976e6179bc79",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "518664ee28365a4fd3eadf7d28f72d2fd3755f5e52661f3e9e87e7125e24280e"
+      }
+    },
+    "walk": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "fd685602f90d19c09f74274a2df6613fe02d7a370033f1ed3a38b1d3dfb5fdc9",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "4a0e184e9eb8159f0db62a236581a8c1a7158081319eaae7195236621adfa261"
+      }
+    },
+    "walk_end": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "22c66ffeb1e21ca5674a403e8fb2d4d82c9d24f8346afd0679097d4ec12f639e",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "13ea18eca93cb3bd8f59129145320e1ab24e124abba7c7e974d36d0170bb93a4"
+      }
+    },
+    "walk_line": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "cc3dc598929c28c797c8663c9a2ddddd45c1b589f22edabde41c1ff1925f1dd8",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "3fe7627f2916f36e6e6851ee320c07f282adb86d085fcc5ea909ebe9b8e5654a"
+      }
+    }
+  }
+}

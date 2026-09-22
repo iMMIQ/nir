@@ -37,7 +37,7 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
         .flat_map(|f| f.blocks.values())
         .map(|b| b.ops.len() + 1)
         .sum();
-    if e.format != 1
+    if e.format != FORMAT_VERSION
         || e.addresses.len() != expected
         || e.resume_map.len() != expected
         || e.semantic_cost_map.len() != expected

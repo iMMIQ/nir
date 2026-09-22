@@ -43,6 +43,10 @@ test.beforeAll(async () => {
     texts.walk.spans[0].text = texts.walk.spans[0].text.repeat(16);
     await fs.writeFile(file, JSON.stringify(texts, null, 2));
   }
+  for(const id of ['intro','letter','walk']) {
+    await run(cli,['-p',story,'text','update','--id',id,'--meaning','preserve']);
+    await run(cli,['-p',story,'text','review','--id',id,'--locale','en']);
+  }
   const file = `${story}/content/ch01/story.nir.json`;
   const fragment = JSON.parse(await fs.readFile(file, 'utf8'));
   fragment.choices.route.options = Array.from({length:24}, (_, i) => ({
@@ -175,6 +179,8 @@ test('dev rebuild reloads valid content and retains the previous session on auth
     expectPainted(await page.screenshot({path:'reports/author-preview-error.png'}));
     texts.intro.spans[0].text='雨后书简。'+texts.intro.spans[0].text;
     await fs.writeFile(file,JSON.stringify(texts,null,2));
+    await run(cli,['-p',story,'text','update','--id','intro','--meaning','preserve']);
+    await run(cli,['-p',story,'text','review','--id','intro','--locale','en']);
     await expect.poll(async()=>(await status())?.release).not.toBe(release);
     await page.waitForFunction(()=>window.__nir?.state().ready && window.__nir.state().screen==='Title');
     await expect(page.locator('#nir-dev-status')).toBeHidden();

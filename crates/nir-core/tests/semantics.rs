@@ -573,3 +573,53 @@ fn clock_slices_preserve_reveal_and_complete_snapshot() {
     );
     assert!(turns > 1);
 }
+
+#[test]
+fn revision_identity_is_frozen_during_preparation_and_validated_on_restore() {
+    let mut c = core();
+    c.step(CoreInput::None, 1000);
+    let activation = c.state().pending.as_ref().unwrap().id;
+    c.step(CoreInput::Prepared { activation }, 1000);
+    let pending = c.state().pending.as_ref().unwrap();
+    let frozen = pending.dialogues["line"].clone();
+    assert_eq!(frozen.source_revision, 1);
+    assert_eq!(frozen.meaning_revision, 1);
+    assert_eq!(
+        frozen.contract_digest,
+        c.program().texts["intro"].contract_digest
+    );
+    c.set_locale("en").unwrap();
+    let snapshot = c.snapshot();
+    assert_eq!(snapshot.format, 1);
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    let dialogue = legacy["pending"]["dialogues"]["line"]
+        .as_object_mut()
+        .unwrap();
+    for field in ["source_revision", "meaning_revision", "contract_digest"] {
+        dialogue.remove(field);
+    }
+    dialogue.insert("revision".into(), serde_json::json!(1));
+    assert!(serde_json::from_value::<nir_core::Snapshot>(legacy).is_err());
+    let validated = ValidatedProgram::new(c.program().clone()).unwrap();
+    let mut restored = Core::restore(validated.clone(), snapshot.clone(), "test-release").unwrap();
+    let activation = restored.state().pending.as_ref().unwrap().id;
+    restored.step(CoreInput::Prepared { activation }, 1000);
+    let d = restored.dialogue().unwrap().1;
+    assert_eq!(d.locale, "zh-Hans");
+    assert_eq!(d.contract_digest, frozen.contract_digest);
+    assert_eq!(restored.state().history[0].source_revision, 1);
+    let mut corrupt = snapshot.clone();
+    corrupt
+        .pending
+        .as_mut()
+        .unwrap()
+        .dialogues
+        .get_mut("line")
+        .unwrap()
+        .source_revision += 1;
+    assert!(Core::restore(validated.clone(), corrupt, "test-release").is_err());
+    let mut corrupt = restored.snapshot();
+    corrupt.history[0].contract_digest = "bad".into();
+    assert!(Core::restore(validated.clone(), corrupt, "test-release").is_err());
+    assert!(Core::restore(validated, snapshot, "another-release").is_err());
+}

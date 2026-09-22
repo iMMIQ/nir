@@ -1,0 +1,25 @@
+{
+  "format": 1,
+  "source_locale": "zh-Hans",
+  "texts": 5,
+  "locales": 2,
+  "ready": false,
+  "issues": [
+    {
+      "code": "E_TRANSLATION_STALE",
+      "text_id": "intro",
+      "locale": "en",
+      "file": "content/main/texts/en.json",
+      "pointer": "/intro",
+      "message": "expected source 2 / contract 1, found source 1 / contract 1"
+    },
+    {
+      "code": "E_TRANSLATION_UNREVIEWED",
+      "text_id": "intro",
+      "locale": "en",
+      "file": "content/main/texts/en.json",
+      "pointer": "/intro",
+      "message": "translation needs explicit text review against the current source"
+    }
+  ]
+}

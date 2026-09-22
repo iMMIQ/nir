@@ -38,7 +38,9 @@ pub struct FrozenSpan {
 #[serde(deny_unknown_fields)]
 pub struct Dialogue {
     pub text_id: String,
-    pub revision: u32,
+    pub meaning_revision: u32,
+    pub source_revision: u32,
+    pub contract_digest: String,
     pub locale: String,
     pub speaker: String,
     pub spans: Vec<FrozenSpan>,
@@ -125,7 +127,9 @@ pub struct Waiting {
 #[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
     pub text_id: String,
-    pub revision: u32,
+    pub meaning_revision: u32,
+    pub source_revision: u32,
+    pub contract_digest: String,
     pub locale: String,
     pub speaker: String,
     pub text: String,
@@ -253,7 +257,7 @@ impl Core {
             result: None,
         };
         let state = Snapshot {
-            format: 1,
+            format: SNAPSHOT_VERSION,
             game_id: p.game_id.clone(),
             revision: p.revision.clone(),
             release,
@@ -783,7 +787,9 @@ impl Core {
                     if let Effect::Dialogue { text, speaker, .. } = &def.effect {
                         let d = Dialogue {
                             text_id: text.clone(),
-                            revision: self.program().texts[text].revision,
+                            meaning_revision: self.program().texts[text].meaning_revision,
+                            source_revision: self.program().texts[text].source_revision,
+                            contract_digest: self.program().texts[text].contract_digest.clone(),
                             locale: self.state.locale.clone(),
                             speaker: if speaker.is_empty() {
                                 String::new()
@@ -1010,7 +1016,9 @@ impl Core {
             if let Some(d) = &dialogue {
                 self.state.history.push(HistoryEntry {
                     text_id: d.text_id.clone(),
-                    revision: d.revision,
+                    meaning_revision: d.meaning_revision,
+                    source_revision: d.source_revision,
+                    contract_digest: d.contract_digest.clone(),
                     locale: d.locale.clone(),
                     speaker: d.speaker.clone(),
                     text: d.full_text(),
@@ -1159,7 +1167,7 @@ impl Core {
         if status == TaskState::Finished {
             if let Some(d) = &t.dialogue {
                 self.intents.push(CoreIntent::ProfileMerge {
-                    key: format!("read:{}:{}", d.text_id, d.revision),
+                    key: format!("read:{}:{}", d.text_id, d.meaning_revision),
                 });
             }
         }
@@ -1386,7 +1394,7 @@ impl Core {
     pub fn restore(program: ValidatedProgram, s: Snapshot, release: &str) -> Result<Self> {
         let fail = |msg: &str| Diagnostic::new("E_SNAPSHOT", "restore", msg);
         let p = program.program();
-        if s.format != 1
+        if s.format != SNAPSHOT_VERSION
             || s.game_id != p.game_id
             || s.revision != p.revision
             || s.release != release
@@ -1410,6 +1418,19 @@ impl Core {
                 .any(|(k, v)| s.variables.get(k).map(Value::ty) != Some(v.ty()))
         {
             return Err(fail("variable layout"));
+        }
+        for h in &s.history {
+            let c = p
+                .texts
+                .get(&h.text_id)
+                .ok_or_else(|| fail("unknown history text"))?;
+            if h.meaning_revision != c.meaning_revision
+                || h.source_revision != c.source_revision
+                || h.contract_digest != c.contract_digest
+                || !p.locales.contains_key(&h.locale)
+            {
+                return Err(fail("history text identity"));
+            }
         }
         let mut instances = BTreeSet::new();
         for f in &s.frames {
@@ -1695,7 +1716,9 @@ fn validate_dialogue(d: &Dialogue, p: &Program, tick: Micros, next_id: u32) -> R
         .get(&d.locale)
         .and_then(|l| l.get(&d.text_id))
         .ok_or_else(|| fail("missing locale"))?;
-    if d.revision != contract.revision
+    if d.meaning_revision != contract.meaning_revision
+        || d.source_revision != contract.source_revision
+        || d.contract_digest != contract.contract_digest
         || d.interaction >= next_id
         || d.spans.len() != doc.spans.len()
         || d.span > d.spans.len()

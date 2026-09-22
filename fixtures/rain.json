@@ -743,107 +743,149 @@
   },
   "requires": [
     "control.v1",
-    "text.gate.v1"
+    "text.gate.v1",
+    "text.revisions.v1"
   ],
   "default_locale": "zh-Hans",
   "texts": {
     "speaker.aki": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "intro": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "arrival": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "letter": {
-      "revision": 1,
       "gates": [
         "bell"
       ],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "5bfc4a6fdb00fcbe0dbc4bbcc501d818fa5abdbd669adf28287eaa2eecdebf74"
     },
     "after_gate": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "question": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "walk": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "stay": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "walk_line": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "walk_end": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "stay_line": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     },
     "stay_end": {
-      "revision": 1,
       "gates": [],
-      "params": {}
+      "params": {},
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
     }
   },
   "locales": {
     "zh-Hans": {
       "speaker.aki": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "秋"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "intro": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "末班电车刚刚离开。雨把站前的灯光，揉成一封迟迟没有寄出的信。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "arrival": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "你还是来了。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "letter": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
@@ -859,122 +901,146 @@
             "id": "tail",
             "text": "你愿意收下吗？"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "5bfc4a6fdb00fcbe0dbc4bbcc501d818fa5abdbd669adf28287eaa2eecdebf74"
       },
       "after_gate": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "远处的钟响了。秋把信封放进你的掌心。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "question": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "雨好像小了一些。接下来……你想去哪里？"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "沿着河边，一起走回去"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "留在车站，读完这封信"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk_line": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "那就慢慢走吧。今天的路，我想和你一起走完。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk_end": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "雨停了。没有说出口的话，也终于有了归处。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay_line": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "那我就在这里，陪你读到最后。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay_end": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "纸上的字迹有些模糊。可你知道，这一次，你不会再错过。"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       }
     },
     "en": {
       "speaker.aki": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "Aki"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "intro": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "The last train has gone. Rain folds the station lights into a letter that was never sent."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "arrival": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "You came after all."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "letter": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
@@ -990,87 +1056,106 @@
             "id": "tail",
             "text": "Will you take it?"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "5bfc4a6fdb00fcbe0dbc4bbcc501d818fa5abdbd669adf28287eaa2eecdebf74"
       },
       "after_gate": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "A distant bell rings. Aki places the envelope in your hand."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "question": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "The rain is letting up. Where would you like to go?"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "Walk home together along the river"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "Stay at the station and read the letter"
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk_line": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "Let’s take our time. Tonight, I want to walk the whole way with you."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "walk_end": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "The rain stops. At last, the words left unspoken have found a home."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay_line": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "Then I’ll stay here with you until the last word."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       },
       "stay_end": {
-        "revision": 1,
         "spans": [
           {
             "type": "text",
             "id": "body",
             "text": "The ink is a little blurred. But this time, you know you won’t miss what it means."
           }
-        ]
+        ],
+        "source_revision": 1,
+        "contract_revision": 1,
+        "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d"
       }
     }
   },

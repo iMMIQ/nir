@@ -55,13 +55,15 @@ pub struct Inputs {
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Module {
+pub(crate) struct Module {
     module_format: u32,
     id: String,
     sources: Vec<String>,
-    text_contracts: String,
+    pub(crate) text_contracts: String,
+    #[serde(default)]
+    pub(crate) text_revisions: Option<String>,
     exports: BTreeMap<String, String>,
-    text_bundles: BTreeMap<String, String>,
+    pub(crate) text_bundles: BTreeMap<String, String>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -234,8 +236,9 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .ok_or_else(|| anyhow!("E_EXPORT: missing start export"))?
         .clone();
     let (theme, player, resolved_config) = crate::config::resolve_config(&root, &manifest)?;
+    let texts = crate::texts::compiled_texts(&root)?;
     let mut program = Program {
-        format: 1,
+        format: FORMAT_VERSION,
         game_id: manifest.game.id.clone(),
         revision: String::new(),
         entry,
@@ -246,8 +249,8 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         scenes: BTreeMap::new(),
         cues: BTreeMap::new(),
         choices: BTreeMap::new(),
-        texts: json(&relative(&root, base, &module.text_contracts)?)?,
-        locales: BTreeMap::new(),
+        texts: texts.contracts,
+        locales: texts.locales,
         assets: BTreeMap::new(),
         default_locale: manifest.game.source_locale.clone(),
         title_scene: manifest.game.title_scene.clone(),
@@ -267,11 +270,6 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         merge(&mut program.scenes, f.scenes, &path)?;
         merge(&mut program.cues, f.cues, &path)?;
         merge(&mut program.choices, f.choices, &path)?;
-    }
-    for (locale, path) in &module.text_bundles {
-        program
-            .locales
-            .insert(locale.clone(), json(&relative(&root, base, path)?)?);
     }
     let characters = crate::fonts::characters(&program, &manifest.game.title)?;
     let mut fonts = BTreeMap::new();
@@ -459,7 +457,7 @@ pub fn compile(p: &Program) -> Result<Executable> {
         .map(|c| (c.clone(), nir_content::cue_assets(p, c)))
         .collect();
     let e = Executable {
-        format: 1,
+        format: FORMAT_VERSION,
         program: p.clone(),
         addresses,
         resume_map,
@@ -492,10 +490,17 @@ pub fn write_schemas(out: &Path) -> Result<()> {
         ("module", schemars::schema_for!(Module)),
         ("fragment", schemars::schema_for!(Fragment)),
         ("assets", schemars::schema_for!(Catalog)),
-        ("texts", schemars::schema_for!(BTreeMap<String,TextDoc>)),
+        (
+            "texts",
+            schemars::schema_for!(BTreeMap<String,crate::AuthorTextDoc>),
+        ),
         (
             "text-contracts",
-            schemars::schema_for!(BTreeMap<String,TextContract>),
+            schemars::schema_for!(BTreeMap<String,crate::AuthorTextContract>),
+        ),
+        (
+            "text-revisions",
+            schemars::schema_for!(crate::TextRevisions),
         ),
         ("theme", schemars::schema_for!(crate::ThemeManifest)),
         ("theme-tokens", schemars::schema_for!(crate::ThemeTokens)),

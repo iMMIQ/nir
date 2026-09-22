@@ -200,3 +200,22 @@ pub fn diagnostic(error: &anyhow::Error) -> Diagnostic {
         vec![Recovery::FixContent],
     )
 }
+
+pub(crate) fn text_source(file: &str, pointer: &str, bytes: &[u8]) -> SourceRef {
+    // Index the same validated bytes; a concurrent author edit must not reach the scanner.
+    let mut offsets = BTreeMap::new();
+    scan(bytes, &mut 0, String::new(), &mut offsets);
+    let offset = offsets.get(pointer).copied().unwrap_or(0);
+    let prefix = &bytes[..offset];
+    SourceRef {
+        file: file.into(),
+        line: 1 + prefix.iter().filter(|b| **b == b'\n').count(),
+        column: offset
+            - prefix
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |p| p + 1)
+            + 1,
+        pointer: pointer.into(),
+    }
+}

@@ -6,7 +6,8 @@
 2. 编辑 `content/main/texts/zh-Hans.json` 和 `en.json` 的 `text`。两种语言保留相同的文本 ID、修订、参数与 Gate 契约。
 3. 编辑 `content/main/story.nir.json` 的函数块、Cue 和选择；新增文本时同步更新 `texts/contracts.json`。
 4. 用 `theme/theme.toml` 和 `tokens.json` 调整内置 UI。PNG 和 PCM16 WAV 可登记到 `assets/catalog.toml` 后从剧情引用。
-5. 执行 `novelc -p . resolve`，然后 `check --locked`、`test`、`dev` 或 `build --locked`。
+5. 修改源文后运行 `novelc -p . text update --id intro --meaning preserve`（含义或契约变化用 `bump`），检查并修改英文后运行 `novelc -p . text review --id intro --locale en`。用 `text status` 查看所有待复核项，`texts/revisions.json` 纳入版本管理。
+6. 执行 `novelc -p . resolve`，然后 `check --locked`、`test`、`dev` 或 `build --locked`。
 
 默认字体配置使用 Noto Sans CJK SC 的完整母版，CLI 自动收集双语正文、界面、标题与已知字符串常量，生成运行子集。新增中文通常只需编辑正文。源字体不支持的字符会报 `E_FONT_COVERAGE`，需补充有许可的字体。动态预留字符填写 `assets.font.extra_characters`；`mode = "full"` 保留源字体全部字符，会显著增加下载和内存占用。
 

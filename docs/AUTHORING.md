@@ -6,7 +6,7 @@
 
 ## 从一句对白开始
 
-示例的 `intro` 文本由 `texts/contracts.json` 约定修订、参数和 Gate，两个语言包分别提供同一文本 ID 的 `TextDoc`。结构包含 `text`、`break`、`param`、`gate` span；每个 span 都有稳定 ID，揭示完成时锁存同名 Marker。`gate` 会阻止跨越，需剧情中的 `DialogueContinue` 明确继续。
+示例的 `intro` 文本由 `texts/contracts.json` 约定源/契约/语义修订、参数和 Gate，两个语言包分别提供同一文本 ID 的 `TextDoc`。结构包含 `text`、`break`、`param`、`gate` span；每个 span 都有稳定 ID，揭示完成时锁存同名 Marker。`gate` 会阻止跨越，需剧情中的 `DialogueContinue` 明确继续。
 
 Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末尾 `activate` 准备并开启 Cue，下一个块的 `await` 等待 `finished` 或某个 Marker。示例 `letter → gate → bell → resume_letter` 展示了 Gate、音效等待与继续正文。
 
@@ -21,11 +21,13 @@ Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末
 ## 身份与翻译
 
 - 函数、块、操作、Cue、场景、任务、选项、正文与 span 均使用可读稳定 ID。
-- 翻译不可改变参数集合与类型、Gate 次序及正文 revision。
+- 翻译不可改变参数集合与类型、Gate 次序。修改源文后运行 `text update --id <id> --meaning preserve|bump`，逐语言检查后运行 `text review --id <id> --locale en`；`text status` 汇总缺失、过期和未复核项。
 - 切换语言只改变未来实例；已经打开的对白、选项、历史不重新翻译。
 - 改动剧情后重新构建会产生新的发行身份；本首版拒绝把旧发行存档带入新发行。
 - 声明新图片时填写实际尺寸。素材路径相对 catalog；路径必须留在工程根内。
 - 最小模板从母版自动裁剪新增字符；字体配置、覆盖、动态预留和许可见 [字体编译](AUTHOR-FONTS.md)。
+
+修订、迁移、已读身份和中断恢复的完整说明见 [文本修订与翻译维护](TEXT-REVISIONS.md)。
 
 `schemas/*.schema.json` 用于编辑器提示；`check` 还执行跨文件引用、类型、确定赋值、资源实际解码、字体覆盖与翻译契约检查，不能只用 JSON Schema 代替。
 
