@@ -1,41 +1,49 @@
 {
-  "speaker.aki": {
-    "revision": 1,
+  "after_gate": {
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "Aki"
-      }
-    ]
-  },
-  "intro": {
-    "revision": 1,
-    "spans": [
-      {
-        "type": "text",
-        "id": "body",
-        "text": "The last train has gone. Rain folds the station lights into a letter that was never sent."
+        "text": "A distant bell rings. Aki places the envelope in your hand.",
+        "emphasis": false
       }
     ]
   },
   "arrival": {
-    "revision": 1,
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "You came after all."
+        "text": "You came after all.",
+        "emphasis": false
+      }
+    ]
+  },
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The last train has gone. Rain folds the station lights into a letter that was never sent.",
+        "emphasis": false
       }
     ]
   },
   "letter": {
-    "revision": 1,
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "I took a long time to write this letter."
+        "text": "I took a long time to write this letter.",
+        "emphasis": false
       },
       {
         "type": "gate",
@@ -44,87 +52,104 @@
       {
         "type": "text",
         "id": "tail",
-        "text": "Will you take it?"
-      }
-    ]
-  },
-  "after_gate": {
-    "revision": 1,
-    "spans": [
-      {
-        "type": "text",
-        "id": "body",
-        "text": "A distant bell rings. Aki places the envelope in your hand."
+        "text": "Will you take it?",
+        "emphasis": false
       }
     ]
   },
   "question": {
-    "revision": 1,
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "The rain is letting up. Where would you like to go?"
+        "text": "The rain is letting up. Where would you like to go?",
+        "emphasis": false
       }
     ]
   },
-  "walk": {
-    "revision": 1,
+  "speaker.aki": {
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "Walk home together along the river"
+        "text": "Aki",
+        "emphasis": false
       }
     ]
   },
   "stay": {
-    "revision": 1,
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "Stay at the station and read the letter"
-      }
-    ]
-  },
-  "walk_line": {
-    "revision": 1,
-    "spans": [
-      {
-        "type": "text",
-        "id": "body",
-        "text": "Let’s take our time. Tonight, I want to walk the whole way with you."
-      }
-    ]
-  },
-  "walk_end": {
-    "revision": 1,
-    "spans": [
-      {
-        "type": "text",
-        "id": "body",
-        "text": "The rain stops. At last, the words left unspoken have found a home."
-      }
-    ]
-  },
-  "stay_line": {
-    "revision": 1,
-    "spans": [
-      {
-        "type": "text",
-        "id": "body",
-        "text": "Then I’ll stay here with you until the last word."
+        "text": "Stay at the station and read the letter",
+        "emphasis": false
       }
     ]
   },
   "stay_end": {
-    "revision": 1,
+    "source_revision": 1,
+    "contract_revision": 1,
     "spans": [
       {
         "type": "text",
         "id": "body",
-        "text": "The ink is a little blurred. But this time, you know you won’t miss what it means."
+        "text": "The ink is a little blurred. But this time, you know you won’t miss what it means.",
+        "emphasis": false
+      }
+    ]
+  },
+  "stay_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Then I’ll stay here with you until the last word.",
+        "emphasis": false
+      }
+    ]
+  },
+  "walk": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Walk home together along the river",
+        "emphasis": false
+      }
+    ]
+  },
+  "walk_end": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The rain stops. At last, the words left unspoken have found a home.",
+        "emphasis": false
+      }
+    ]
+  },
+  "walk_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Let’s take our time. Tonight, I want to walk the whole way with you.",
+        "emphasis": false
       }
     ]
   }

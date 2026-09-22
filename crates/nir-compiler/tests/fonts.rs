@@ -72,6 +72,8 @@ fn subset_cache_reproducibility_corruption_and_new_characters() {
     }
     assert!(font.glyph_index('鲸').is_none());
     replace(p.path(), "content/main/texts/zh-Hans.json", "春天", "鲸鱼");
+    text_update(p.path(), "intro", false).unwrap();
+    text_review(p.path(), "intro", "en").unwrap();
     let changed = load_project(p.path()).unwrap();
     assert!(!changed.fonts["font.reader"].cache_hit);
     assert_ne!(r.object, changed.fonts["font.reader"].object);
@@ -176,6 +178,9 @@ fn rejects_invalid_recipe_font_face_license_and_cache_paths() {
     ] {
         let p = project();
         replace(p.path(), name, from, to);
+        if name.ends_with("en.json") {
+            text_review(p.path(), "intro", "en").unwrap();
+        }
         let e = format!("{:#}", load_project(p.path()).unwrap_err());
         assert!(e.contains(code), "{e}");
     }

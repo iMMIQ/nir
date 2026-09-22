@@ -62,6 +62,12 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     first_font = font["object"]
     text = root / "minimal/content/main/texts/zh-Hans.json"
     text.write_text(text.read_text().replace("春天", "鲸鱼"))
+    status=json.loads(run("-p", "minimal", "text", "status", "--json"))
+    assert not status["ready"] and any(i["code"]=="E_TEXT_SOURCE_CHANGED" for i in status["issues"])
+    assert "E_TEXT_SOURCE_CHANGED" in run("-p", "minimal", "build", "--locked", success=False)
+    run("-p", "minimal", "text", "update", "--id", "intro", "--meaning", "preserve")
+    assert "E_TRANSLATION_STALE" in run("-p", "minimal", "build", "--locked", success=False)
+    run("-p", "minimal", "text", "review", "--id", "intro", "--locale", "en")
     run("-p", "minimal", "build", "--locked")
     report = json.loads((root / "minimal/reports/build.json").read_text())
     assert report["fonts"]["font.reader"]["object"] != first_font
@@ -74,4 +80,4 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
         f.write("\n// intentional SDK drift\n")
     error = run("-p", "story", "check", "--locked", success=False)
     assert "E_LOCK_DRIFT" in error, error
-    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True, "author_theme_edit_without_engine_rebuild": True, "resolved_configuration": True, "minimal_template": True, "new_chinese_without_external_font_tools": True, "minimal_cli_path_empty": True, "clean_cache_reproducible": True}, indent=2))
+    print(json.dumps({"status": "PASS", "commands": ["init", "resolve", "doctor", "check --locked", "test", "build --locked"], "repeat_build_same_release": True, "sdk_drift_rejected": True, "cargo_on_path": False, "structured_source_diagnostic": True, "author_theme_edit_without_engine_rebuild": True, "resolved_configuration": True, "minimal_template": True, "new_chinese_without_external_font_tools": True, "minimal_cli_path_empty": True, "clean_cache_reproducible": True, "source_change_and_translation_review": True}, indent=2))

@@ -64,6 +64,11 @@ fn fingerprint(root: &Path) -> Result<String> {
     }
     let mut text = String::new();
     walk(root, root, &mut text)?;
+    // Caches remain ignored, but finishing/recovering a text transaction must
+    // retry a candidate rejected while the journal was present.
+    if root.join(".nir/text-transaction.json").try_exists()? {
+        text.push_str("text-transaction:pending\n");
+    }
     Ok(nir_content::digest(text.as_bytes()))
 }
 fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
@@ -284,6 +289,11 @@ mod tests {
             fs::create_dir(t.0.join(dir)).unwrap();
             fs::write(t.0.join(dir).join("generated"), "new").unwrap();
         }
+        assert_eq!(a, fingerprint(&t.0).unwrap());
+        let journal = t.0.join(".nir/text-transaction.json");
+        fs::write(&journal, "[]").unwrap();
+        assert_ne!(a, fingerprint(&t.0).unwrap());
+        fs::remove_file(journal).unwrap();
         assert_eq!(a, fingerprint(&t.0).unwrap());
         fs::write(t.0.join("story.json"), "new and longer").unwrap();
         let b = fingerprint(&t.0).unwrap();

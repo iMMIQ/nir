@@ -168,38 +168,17 @@ fn validate(p: &Program) -> Result<()> {
             let d = texts
                 .get(id)
                 .ok_or_else(|| err("E_TRANSLATION", locale, id))?;
-            if d.revision != c.revision {
+            if c.source_revision == 0
+                || c.contract_revision == 0
+                || c.meaning_revision == 0
+                || c.contract_digest != text_contract_digest(c)
+                || d.source_revision != c.source_revision
+                || d.contract_revision != c.contract_revision
+                || d.contract_digest != c.contract_digest
+            {
                 return Err(err("E_TEXT_REVISION", id, locale));
             }
-            let mut ids = BTreeSet::new();
-            let mut gates = vec![];
-            for span in &d.spans {
-                let sid = match span {
-                    Span::Text { id, text, .. } => {
-                        if text.len() > 128 * 1024 {
-                            return Err(err("E_LIMIT", id, "text too long"));
-                        }
-                        id
-                    }
-                    Span::Break { id } => id,
-                    Span::Gate { id } => {
-                        gates.push(id.clone());
-                        id
-                    }
-                    Span::Param { id, name } => {
-                        if !c.params.contains_key(name) {
-                            return Err(err("E_TEXT_PARAM", id, name));
-                        }
-                        id
-                    }
-                };
-                if !ids.insert(sid) {
-                    return Err(err("E_DUPLICATE", id, "span identity"));
-                }
-            }
-            if gates != c.gates {
-                return Err(err("E_GATE", id, "gate order/count mismatch"));
-            }
+            validate_text_spans(id, c, &d.spans)?;
             for (param, ty) in &c.params {
                 if p.variables.get(param).map(Value::ty) != Some(*ty) {
                     return Err(err("E_TEXT_PARAM", id, param));

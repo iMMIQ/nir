@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproducible original demo and test fixtures. No third-party game assets."""
 from pathlib import Path
-import json, math, wave, struct, shutil, random
+import json, math, wave, struct, shutil, random, hashlib
 from PIL import Image, ImageDraw, ImageFilter
 from fontTools.ttLib import TTFont
 from fontTools import subset
@@ -34,10 +34,10 @@ lines={
  'stay_line':('那我就在这里，陪你读到最后。','Then I’ll stay here with you until the last word.'),
  'stay_end':('纸上的字迹有些模糊。可你知道，这一次，你不会再错过。','The ink is a little blurred. But this time, you know you won’t miss what it means.'),
 }
-contracts={k:{'revision':1,'gates':['bell'] if k=='letter' else [],'params':{}} for k in lines}
+contracts={k:{'source_revision':1,'contract_revision':1,'meaning_revision':1,'gates':['bell'] if k=='letter' else [],'params':{}} for k in lines}
 locales={}
 for i,loc in enumerate(['zh-Hans','en']):
- texts={k:{'revision':1,'spans':[{'type':'text','id':'body','text':v[i]}]+([{'type':'gate','id':'bell'},{'type':'text','id':'tail','text':'你愿意收下吗？' if i==0 else 'Will you take it?'}] if k=='letter' else [])} for k,v in lines.items()}
+ texts={k:{'source_revision':1,'contract_revision':1,'spans':[{'type':'text','id':'body','text':v[i],'emphasis':False}]+([{'type':'gate','id':'bell'},{'type':'text','id':'tail','text':'你愿意收下吗？' if i==0 else 'Will you take it?','emphasis':False}] if k=='letter' else [])} for k,v in lines.items()}
  locales[loc]=texts;dump(out/f'content/ch01/texts/{loc}.json',texts)
 dump(out/'content/ch01/texts/contracts.json',contracts)
 scenes={'station':[node('background','bg.station',0,0,1280,720)],'together':[node('background','bg.station',0,0,1280,720),node('aki','actor.aki',850,100,290,530,opacity=1.)],'river':[node('background','bg.river',0,0,1280,720),node('aki','actor.aki',820,100,290,530,opacity=1.)]}
@@ -97,6 +97,7 @@ notices = ["credits/README.md", "credits/FONT-LICENSE.txt"]
 id = "ch01"
 sources = ["story.nir.json"]
 text_contracts = "texts/contracts.json"
+text_revisions = "texts/revisions.json"
 [exports]
 start = "main"
 [text_bundles]
@@ -178,5 +179,13 @@ for id,kind,file in [('bg.station','image','station.png'),('bg.river','image','r
  if kind=='image':s+='expected_size = ['+(', '.join(str(n) for n in Image.open(out/f'assets/source/{file}').size))+']\n'
  assets.append(s)
 (out/'assets/catalog.toml').write_text('format = 1\n\n'+'\n'.join(assets))
-program={k:v for k,v in fragment.items() if k!='fragment_format'};program.update(format=1,game_id='org.nir.rain-letters',revision='fixture-v1',entry='main',stage={'width':1280,'height':720},requires=['control.v1','text.gate.v1'],default_locale='zh-Hans',texts=contracts,locales=locales,assets={id:{'kind':kind,'object':file,'bytes':1,'width':1280 if kind=='image' else 0,'height':720 if kind=='image' else 0} for id,kind,file in [('bg.station','image','station'),('bg.river','image','river'),('actor.aki','image','aki'),('audio.bgm','audio','bgm'),('audio.bell','audio','bell'),('audio.voice','audio','voice'),('font.reader','font','font')]})
+program={k:v for k,v in fragment.items() if k!='fragment_format'};program.update(format=1,game_id='org.nir.rain-letters',revision='fixture-v1',entry='main',stage={'width':1280,'height':720},requires=['control.v1','text.gate.v1','text.revisions.v1'],default_locale='zh-Hans',texts=contracts,locales=locales,assets={id:{'kind':kind,'object':file,'bytes':1,'width':1280 if kind=='image' else 0,'height':720 if kind=='image' else 0} for id,kind,file in [('bg.station','image','station'),('bg.river','image','river'),('actor.aki','image','aki'),('audio.bgm','audio','bgm'),('audio.bell','audio','bell'),('audio.voice','audio','voice'),('font.reader','font','font')]})
+def digest(value):return hashlib.sha256(json.dumps(value,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+ledger={'format':1,'source_locale':'zh-Hans','texts':{}}
+for key,c in contracts.items():
+ contract_digest=digest([1,c['contract_revision'],c['meaning_revision'],c['params'],c['gates']])
+ ledger['texts'][key]={'source_revision':1,'contract_revision':1,'meaning_revision':1,'source_digest':digest(locales['zh-Hans'][key]['spans']),'contract_digest':contract_digest,'shape_digest':digest([c['params'],c['gates']]),'reviewed':{'en':digest(locales['en'][key])}}
+ c['contract_digest']=contract_digest
+ for docs in locales.values():docs[key]['contract_digest']=contract_digest
+dump(out/'content/ch01/texts/revisions.json',ledger)
 dump(ROOT/'fixtures/rain.json',program)

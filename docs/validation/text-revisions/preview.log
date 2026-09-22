@@ -1,0 +1,10 @@
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+   Compiling novelc v0.1.0 (/nir/tools/novelc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.91s
+     Running unittests src/main.rs (target/debug/deps/novelc-c93d626176502e67)
+
+running 2 tests
+test preview::tests::watcher_detects_edits_deletions_and_ignores_its_output ... ok
+test preview::tests::preview_promotion_rejects_corruption_before_changing_channel ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s

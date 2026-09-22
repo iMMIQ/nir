@@ -94,6 +94,7 @@ fn missing_font_glyph_rejected() {
         .unwrap()
         .replace("You came after all.", "You came after all. 🐈");
     fs::write(path, s).unwrap();
+    text_review(d.path(), "arrival", "en").unwrap();
     assert!(load_project(d.path())
         .unwrap_err()
         .to_string()

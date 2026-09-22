@@ -1414,12 +1414,25 @@
     "TextContract": {
       "type": "object",
       "properties": {
+        "contract_digest": {
+          "type": "string"
+        },
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "gates": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "meaning_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
         "params": {
           "type": "object",
@@ -1428,7 +1441,7 @@
           },
           "default": {}
         },
-        "revision": {
+        "source_revision": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -1436,13 +1449,24 @@
       },
       "additionalProperties": false,
       "required": [
-        "revision"
+        "source_revision",
+        "contract_revision",
+        "meaning_revision",
+        "contract_digest"
       ]
     },
     "TextDoc": {
       "type": "object",
       "properties": {
-        "revision": {
+        "contract_digest": {
+          "type": "string"
+        },
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_revision": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -1456,7 +1480,9 @@
       },
       "additionalProperties": false,
       "required": [
-        "revision",
+        "source_revision",
+        "contract_revision",
+        "contract_digest",
         "spans"
       ]
     },

@@ -1,11 +1,38 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Map_of_TextDoc",
+  "title": "Map_of_AuthorTextDoc",
   "type": "object",
   "additionalProperties": {
-    "$ref": "#/$defs/TextDoc"
+    "$ref": "#/$defs/AuthorTextDoc"
   },
   "$defs": {
+    "AuthorTextDoc": {
+      "type": "object",
+      "properties": {
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Span"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "contract_revision",
+        "spans"
+      ]
+    },
     "Span": {
       "oneOf": [
         {
@@ -88,27 +115,6 @@
             "id"
           ]
         }
-      ]
-    },
-    "TextDoc": {
-      "type": "object",
-      "properties": {
-        "revision": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Span"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "revision",
-        "spans"
       ]
     }
   }

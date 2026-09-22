@@ -28,6 +28,11 @@ enum Command {
         template: String,
     },
     Resolve,
+    /// Track source revisions and explicitly review translations.
+    Text {
+        #[command(subcommand)]
+        command: TextCommand,
+    },
     /// Print effective author configuration and the source of each field.
     Config,
     Doctor,
@@ -59,6 +64,30 @@ enum Command {
         #[arg(long, default_value_t = 4173)]
         port: u16,
     },
+}
+#[derive(Subcommand)]
+enum TextCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_parser=["preserve","bump"])]
+        meaning: String,
+    },
+    Review {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        locale: String,
+    },
+    Migrate {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Recover,
 }
 fn main() {
     let cli = Cli::parse();
@@ -104,6 +133,52 @@ fn run(cli: Cli) -> Result<()> {
     }
     match cli.command {
         Command::Schemas { out } => write_schemas(&out)?,
+        Command::Text { command } => match command {
+            TextCommand::Status { json } => {
+                let report = text_status(&cli.project)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "{} texts / {} locales / {}",
+                        report.texts,
+                        report.locales,
+                        if report.ready {
+                            "ready"
+                        } else {
+                            "needs review"
+                        }
+                    );
+                    for issue in report.issues {
+                        println!(
+                            "{} {} [{}] {}#{}: {}",
+                            issue.code,
+                            issue.text_id,
+                            issue.locale,
+                            issue.file,
+                            issue.pointer,
+                            issue.message
+                        );
+                    }
+                }
+            }
+            TextCommand::Update { id, meaning } => {
+                text_update(&cli.project, &id, meaning == "bump")?;
+                println!("Recorded source {id}; review translations explicitly");
+            }
+            TextCommand::Review { id, locale } => {
+                text_review(&cli.project, &id, &locale)?;
+                println!("Reviewed {locale}/{id}");
+            }
+            TextCommand::Migrate { out } => {
+                text_migrate(&cli.project, &out)?;
+                println!("Migrated to {}; legacy texts imported as the initial review baseline. Use the new SDK and resolve; old saves are not migrated.",out.display());
+            }
+            TextCommand::Recover => {
+                text_recover(&cli.project)?;
+                println!("Text transaction rolled back");
+            }
+        },
         Command::Init { path, template } => {
             init_template(
                 &path,

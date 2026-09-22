@@ -1,20 +1,30 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Map_of_TextContract",
+  "title": "Map_of_AuthorTextContract",
   "type": "object",
   "additionalProperties": {
-    "$ref": "#/$defs/TextContract"
+    "$ref": "#/$defs/AuthorTextContract"
   },
   "$defs": {
-    "TextContract": {
+    "AuthorTextContract": {
       "type": "object",
       "properties": {
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "gates": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "meaning_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
         "params": {
           "type": "object",
@@ -23,7 +33,7 @@
           },
           "default": {}
         },
-        "revision": {
+        "source_revision": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -31,7 +41,9 @@
       },
       "additionalProperties": false,
       "required": [
-        "revision"
+        "source_revision",
+        "contract_revision",
+        "meaning_revision"
       ]
     },
     "ValueType": {

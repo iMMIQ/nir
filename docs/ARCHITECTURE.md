@@ -105,3 +105,9 @@ PauseToken 为不可复制的独立所有权对象，Drop 只释放本持有人�
 字体派生由 `nir-compiler` 完成，HarfBuzz 静态链接到 `novelc`，不进入 Core、Player 或 WASM。编译器直接嵌入 UI 的 Fluent 源数据用于字符覆盖，不依赖呈现库或 GPU。`assets.font` 选择静态 face、subset/full 和预留字符；完整母版属于作者输入，Program 只记录生成字体的对象身份。生成前补齐 Unicode 规范等价字符，生成时保留 OpenType 布局闭包，生成后检查覆盖。
 
 内容缓存封装校验和并原子写入 `.nir/cache/fonts`；缓存状态不进入 Program/Release 身份。许可文本自动作为发行通知收集，来源和编译报告留在作者侧。这是字体专用流水线，不代表 NIR-0004 的通用 Artifact DAG、跨项目缓存或 NIR-0003 的逐语言 FontPlan 已实现。细节见 [作者字体说明](AUTHOR-FONTS.md)。
+
+## 文本修订边界
+
+作者文本整数版本与 checked-in revisions.json 由 nir-compiler 校验；更新和人工复核只在 CLI 发生。研发阶段在 v1 上破坏性迭代，运行 Program/Executable 保持版本 1，包含生成的 contract_digest；nir-format 提供平台无关的契约摘要编码及 span 契约检查，Core 独立验证它们。哈希仅依赖 SHA-256/序列化，不引入文件系统、编译器或宿主。
+
+Snapshot 保持版本 1，但使用新结构，冻结对白/历史的源、语义、契约身份，Profile 已读键按 MeaningRevision。来源路径、人工确认摘要和修订事务日志不进入运行包。精确发行兼容仍然成立；源工程迁移不等于存档迁移。详见 [文本修订](TEXT-REVISIONS.md)。
