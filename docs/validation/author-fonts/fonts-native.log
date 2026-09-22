@@ -1,0 +1,182 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running `target/debug/xtask test`
+   Compiling nir-compiler v0.1.0 (/nir/crates/nir-compiler)
+   Compiling nir-presentation v0.1.0 (/nir/crates/nir-presentation)
+   Compiling nir-player v0.1.0 (/nir/crates/nir-player)
+   Compiling novelc v0.1.0 (/nir/tools/novelc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.25s
+     Running unittests src/lib.rs (target/debug/deps/nir_assets-951cdbcfb9528a75)
+
+running 2 tests
+test tests::joint_admission_and_drop ... ok
+test tests::stale_generation_not_ready ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_compiler-8da84f3f1f4f1aae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fonts.rs (target/debug/deps/fonts-78281f48a32a8bab)
+
+running 7 tests
+test subset_preserves_shaping_positions_and_outlines ... ok
+test rejects_invalid_recipe_font_face_license_and_cache_paths ... ok
+test minimal_routes_and_independent_initialization ... ok
+test release_contains_generated_font_and_license_not_master_or_cache ... ok
+test truetype_collection_face_extraction_and_unsupported_tables ... ok
+test subset_cache_reproducibility_corruption_and_new_characters ... ok
+test title_literals_reserved_chars_full_mode_and_coverage_errors ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.09s
+
+     Running tests/project.rs (target/debug/deps/project-15be0e168480f1d5)
+
+running 19 tests
+test author_schema_error_retains_parser_position ... ok
+test rejects_duplicate_fragment_identity ... ok
+test rejects_path_escape ... ok
+test rejects_unknown_runtime_and_player_overrides ... ok
+test rejects_symlink_escape ... ok
+test rejects_lfs_pointer ... ok
+test rejects_wrong_dimensions ... ok
+test rejects_unsupported_theme_contracts_and_unsafe_props ... ok
+test strict_parse_reports_real_line_and_preserves_old_diagnostic_wire_format ... ok
+test template_font_covers_bundled_diagnostic_messages ... ok
+test legacy_tokens_and_new_components_share_validation_at_runtime ... ok
+test missing_font_glyph_rejected ... ok
+test unsupported_module_count_rejected ... ok
+test runtime_rejects_missing_or_rewritten_index_and_recipe ... ok
+test source_diagnostic_locates_reference_without_changing_program_identity ... ok
+test checks_and_scenarios ... ok
+test resolves_author_configuration_with_per_field_sources ... ok
+test theme_edit_changes_release_without_changing_locked_sdk ... ok
+test reproducible_release_lock_drift_and_corruption ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.17s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_content-570f56a197a20706)
+
+running 3 tests
+test tests::script_not_guessed ... ok
+test tests::duplicate_keys_rejected ... ok
+test tests::corrupted_bytes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_core-f1c278d92db7acd1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-9fab55ef12650bf2)
+
+running 21 tests
+test await_all_failure_takes_precedence_over_cancellation ... ok
+test clock_slices_preserve_reveal_and_complete_snapshot ... ok
+test cancelled_wait_is_not_success ... ok
+test checked_integer_overflow_faults ... ok
+test elapsed_time_and_logic_share_one_budget ... ok
+test clock_frozen_during_prepare ... ok
+test infinite_bgm_wait_rejected ... ok
+test random_stream_restores_after_budget_boundary ... ok
+test corrupt_choice_continuation_rejected ... ok
+test missing_gate_is_validation_error ... ok
+test checked_fault_is_not_hoisted ... ok
+test deterministic_replay ... ok
+test restore_rejects_mismatched_release ... ok
+test restore_animation_at_37_percent ... ok
+test snapshots_keep_current_text ... ok
+test uninitialized_local_rejected ... ok
+test stale_and_duplicate_choice ... ok
+test pending_restore_does_not_repeat_assign ... ok
+test two_routes ... ok
+test language_does_not_change_route ... ok
+test non_suspending_loop_yields_then_faults_with_location ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running unittests src/lib.rs (target/debug/deps/nir_player-4cf1edf553a61b07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/coordination.rs (target/debug/deps/coordination-c9eae91c95559da3)
+
+running 27 tests
+test device_rebuild_does_not_restart_story ... ok
+test failed_preparation_cannot_be_committed_by_late_success ... ok
+test author_auto_delay_controls_reading_after_reveal_and_pauses ... ok
+test consecutive_rollbacks_keep_the_earlier_checkpoints ... ok
+test device_loss_during_candidate_restore_keeps_the_candidate ... ok
+test external_pause_survives_new_game_and_token_outlives_player ... ok
+test inbox_overflow_is_explicit_and_bounded ... ok
+test many_events_cannot_multiply_the_story_work_budget ... ok
+test invalid_locale_does_not_replace_the_open_dialogue ... ok
+test late_failure_does_not_overwrite_successful_save_status ... ok
+test incompatible_restore_keeps_current_session ... ok
+test replacing_preparation_emits_one_cancellation_and_ignores_its_terminal ... ok
+test menu_and_background_pause_owners_are_independent ... ok
+test preparation_diagnostic_keeps_identity_and_hides_internal_cause ... ok
+test same_reason_tokens_release_only_their_own_pause ... ok
+test restore_is_candidate_then_paused_commit ... ok
+test save_diagnostic_retains_the_origin_session_after_replacement ... ok
+test stale_asset_callbacks_cannot_commit ... ok
+test theme_components_preserve_semantics_gates_and_viewport_bounds ... ok
+test save_job_survives_new_session ... ok
+test work_defaults_yield_to_player_preferences_and_survive_new_sessions ... ok
+test work_is_retained_and_terminal_events_have_admission_room ... ok
+test choice_input_in_the_deadline_pump_precedes_timeout ... ok
+test history_allows_browsing_inside_a_long_entry ... ok
+test mixed_line_endings_and_styled_paragraphs_keep_original_reveal_offsets ... ok
+test long_dialogue_browses_only_revealed_text_and_preserves_it_on_reflow ... ok
+test measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+
+     Running unittests src/main.rs (target/debug/deps/novelc-7acf78366342e0ec)
+
+running 2 tests
+test preview::tests::watcher_detects_edits_deletions_and_ignores_its_output ... ok
+test preview::tests::preview_promotion_rejects_corruption_before_changing_channel ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+   Doc-tests nir_assets
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_compiler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_content
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nir_player
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+PASS actual dependency graph: 12 packages, wgpu {'25.0.2'}

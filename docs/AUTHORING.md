@@ -1,6 +1,6 @@
 # 编写与维护作品
 
-先用 `novelc init` 复制可玩的双语模板。`game.toml` 只登记作品输入；本地输出放在 `.nir/`、`dist/`、`reports/`。程序拒绝未识别字段，扩展能力不能靠加一个任意 JSON 字段启用。
+先用 `novelc init my-story` 创建独立的最小双语作品；需要场景/声音/Gate 范例时用 `--template web-basic`。`game.toml` 只登记作品输入；本地输出放在 `.nir/`、`dist/`、`reports/`。程序拒绝未识别字段，扩展能力不能靠加一个任意 JSON 字段启用。
 
 作品默认偏好与对白、选项主题在独立文件配置；用 `novelc config` 查看最终值和逐字段来源，格式与限制见 [作品配置和主题契约](PROJECT-THEMES.md)。
 
@@ -25,13 +25,13 @@ Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末
 - 切换语言只改变未来实例；已经打开的对白、选项、历史不重新翻译。
 - 改动剧情后重新构建会产生新的发行身份；本首版拒绝把旧发行存档带入新发行。
 - 声明新图片时填写实际尺寸。素材路径相对 catalog；路径必须留在工程根内。
-- 新增中文时使用覆盖新增字形的 OFL 等合法字体；校验器会报告缺字。
+- 最小模板从母版自动裁剪新增字符；字体配置、覆盖、动态预留和许可见 [字体编译](AUTHOR-FONTS.md)。
 
 `schemas/*.schema.json` 用于编辑器提示；`check` 还执行跨文件引用、类型、确定赋值、资源实际解码、字体覆盖与翻译契约检查，不能只用 JSON Schema 代替。
 
 ## 场景用例
 
-用例位于 `tests/scenarios/*.toml`，登记在 `game.toml`。`await_choice` 驱动正式 Core 到指定选择，`choose` 使用 OptionId，结尾检查 outcome 和 affection 等变量。示例有 `walk` 与 `stay` 两条路径。用例从合法新游戏入口运行，不任意拼造快照。
+用例位于 `tests/scenarios/*.toml`，登记在 `game.toml`。`await_choice` 驱动正式 Core 到指定选择，`choose` 使用 OptionId，结尾检查 outcome 和类型化的 `expect.variables`；旧 affection 断言兼容。示例有 `walk` 与 `stay` 两条路径。用例从合法新游戏入口运行，不任意拼造快照。
 
 ## 排查错误
 

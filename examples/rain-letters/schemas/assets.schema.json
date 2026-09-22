@@ -46,6 +46,17 @@
           "maxItems": 2,
           "minItems": 2
         },
+        "font": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FontRecipe"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "id": {
           "type": "string"
         },
@@ -65,6 +76,41 @@
         "kind",
         "source",
         "rights"
+      ]
+    },
+    "FontMode": {
+      "type": "string",
+      "enum": [
+        "subset",
+        "full"
+      ]
+    },
+    "FontRecipe": {
+      "type": "object",
+      "properties": {
+        "extra_characters": {
+          "type": "string",
+          "default": ""
+        },
+        "face_index": {
+          "description": "Zero-based face in an OTF/TTF/TTC source. Output always contains one face.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "license": {
+          "description": "Relative to the asset catalog, with the same containment rules as source.",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/FontMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "license"
       ]
     }
   }

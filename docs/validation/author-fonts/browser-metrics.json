@@ -1,0 +1,31 @@
+{
+  "adapter": {
+    "vendor": "google",
+    "architecture": "swiftshader",
+    "device": "",
+    "description": "",
+    "fallback": true
+  },
+  "metrics": {
+    "boot": 316.29999999701977,
+    "titleMs": 1161.800000011921,
+    "firstLineMs": 2421.7000000029802,
+    "resourceFailures": 0,
+    "frames": 94,
+    "audioStarts": 6,
+    "deviceRecoveries": 0,
+    "peakResidentBytes": 67176404,
+    "startInputMs": 2587.4000000059605,
+    "firstLineAfterStartMs": 150.59999999403954,
+    "maxTurnUploadBytes": 2094080,
+    "uploadSteps": 8,
+    "activeRequests": 0,
+    "requestHighWater": 8,
+    "acceptedRequests": 138,
+    "completedRequests": 131,
+    "cancelledRequests": 7,
+    "inboxHighWater": 8,
+    "maxTurnWork": 12,
+    "navigationToFirstLineMs": 2738
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "intro": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "春天的校园里，花开了。今天要去哪里？"
+      }
+    ]
+  },
+  "garden": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "去花园散步"
+      }
+    ]
+  },
+  "home": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "回家读书"
+      }
+    ]
+  },
+  "garden_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "阳光落在花瓣上。新的故事从这里开始。"
+      }
+    ]
+  },
+  "home_end": {
+    "revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "翻开书页，另一段旅程开始了。"
+      }
+    ]
+  }
+}

@@ -24,7 +24,10 @@ enum Step {
 #[serde(deny_unknown_fields)]
 struct Expect {
     outcome: String,
-    affection: i32,
+    #[serde(default)]
+    affection: Option<i32>,
+    #[serde(default)]
+    variables: std::collections::BTreeMap<String, Value>,
 }
 pub fn test_project(root: &Path) -> Result<Vec<String>> {
     let p = load_project(root)?;
@@ -88,7 +91,13 @@ pub fn test_project(root: &Path) -> Result<Vec<String>> {
             }
         }
         if core.state().outcome.as_deref() != Some(&s.expect.outcome)
-            || core.state().variables.get("affection") != Some(&Value::I32(s.expect.affection))
+            || s.expect
+                .affection
+                .is_some_and(|v| core.state().variables.get("affection") != Some(&Value::I32(v)))
+            || s.expect
+                .variables
+                .iter()
+                .any(|(id, value)| core.state().variables.get(id) != Some(value))
             || cursor != s.steps.len()
         {
             bail!("E_SCENARIO: {} expectation failed", s.id);

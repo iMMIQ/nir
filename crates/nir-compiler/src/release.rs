@@ -109,6 +109,7 @@ pub struct BuildReport {
     pub provenance: BTreeMap<String, String>,
     pub engine_build: String,
     pub resolved_config: crate::ResolvedConfig,
+    pub fonts: BTreeMap<String, crate::FontReport>,
 }
 pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildReport> {
     let p = load_project(root)?;
@@ -129,7 +130,8 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         let (ext, mime) = match a.kind {
             AssetKind::Image => ("png", "image/png"),
             AssetKind::Audio => ("wav", "audio/wav"),
-            AssetKind::Font => ("otf", "font/otf"),
+            AssetKind::Font if p.media[id].starts_with(b"OTTO") => ("otf", "font/otf"),
+            AssetKind::Font => ("ttf", "font/ttf"),
         };
         object(out, &mut objects, &p.media[id], ext, mime)?;
     }
@@ -168,6 +170,11 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         let path = crate::relative(&p.root, &p.root, name)?;
         notices.push_str(&format!("\n\n=== {name} ===\n"));
         notices.push_str(&fs::read_to_string(path)?);
+    }
+    for (id, license) in &p.font_notices {
+        if roots.contains(id) {
+            notices.push_str(&format!("\n\n=== Font {id} ===\n{license}"));
+        }
     }
     let notice = object(
         out,
@@ -222,6 +229,11 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
             .collect(),
         engine_build: lock.sdk_digest,
         resolved_config: p.resolved_config,
+        fonts: p
+            .fonts
+            .into_iter()
+            .filter(|(id, _)| roots.contains(id))
+            .collect(),
     };
     let reports = root.join("reports");
     fs::create_dir_all(&reports)?;
@@ -256,10 +268,18 @@ pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 pub fn init(dest: &Path, sdk: &Path, id: &str) -> Result<()> {
+    init_template(dest, sdk, id, "minimal")
+}
+pub fn init_template(dest: &Path, sdk: &Path, id: &str, template: &str) -> Result<()> {
+    let directory = match template {
+        "web-basic" => "template",
+        "minimal" => "templates/minimal",
+        _ => bail!("E_TEMPLATE: expected minimal or web-basic"),
+    };
     if dest.exists() {
         bail!("E_EXISTS: destination already exists");
     }
-    let source = sdk.join("template");
+    let source = sdk.join(directory);
     if !source.is_dir() {
         bail!("E_TEMPLATE: build the SDK template first");
     }

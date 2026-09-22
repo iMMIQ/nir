@@ -23,7 +23,7 @@ for id in workspace:
  if name in ['nir-format','nir-core','nir-content','nir-assets','nir-presentation']:
   bad=names & {'wgpu','web-sys','wasm-bindgen','nir-player','nir-compiler'}
   if bad:errors.append(f'{name} leaks {bad}')
- if name=='player-web' and 'nir-compiler' in names:errors.append('compiler linked into player')
+ if name=='player-web' and names & {'nir-compiler', 'hb-subset', 'bindgen'}:errors.append('compiler linked into player')
 wgpus={packages[x]['version'] for x in packages if packages[x]['name']=='wgpu'}
 if len(wgpus)>1:errors.append(f'multiple wgpu versions: {wgpus}')
 if errors:raise SystemExit('\n'.join(errors))

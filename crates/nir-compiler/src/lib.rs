@@ -10,3 +10,6 @@ pub use scenario::*;
 
 mod config;
 pub use config::{PlayerConfig, ResolvedConfig, ResolvedField, ThemeManifest, ThemeTokens};
+
+mod fonts;
+pub use fonts::{FontMode, FontRecipe, FontReport, FONT_TOOL};

@@ -1,0 +1,11 @@
+format = 1
+[[assets]]
+id = "font.reader"
+kind = "font"
+source = "fonts/NotoSansCJKsc-Regular.otf"
+rights = "OFL-1.1; Noto Sans CJK SC 2.004; see fonts/SOURCE.md"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/OFL.txt"

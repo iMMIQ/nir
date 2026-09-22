@@ -20,6 +20,8 @@ The full LGPL v3 text is in [LICENSE](LICENSE); the incorporated GPL v3 text is 
 
 - Original NIR engine, CLI, build scripts, tests, and documentation: LGPL-3.0-or-later.
 - Original example graphics and generated audio: CC0-1.0, as stated in the example credits.
+- Original `templates/minimal` story and configuration: CC0-1.0 (see its NOTICE.md).
+- Full Noto template font and ABeeZee compiler test font: OFL-1.1; see their adjacent OFL.txt and SOURCE.md.
 - Noto font subset: SIL Open Font License 1.1; see `examples/rain-letters/credits/FONT-LICENSE.txt`.
 - `vendor/wgpu` and other dependencies retain their upstream licenses and notices.
   See `vendor/README.md` and the SDK's generated `THIRD-PARTY.txt`.

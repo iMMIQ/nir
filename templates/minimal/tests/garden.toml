@@ -1,0 +1,12 @@
+format = 1
+id = "garden"
+entry = "main"
+text_locale = "zh-Hans"
+[[steps]]
+action = "await_choice"
+id = "route"
+[[steps]]
+action = "choose"
+option_id = "garden"
+[expect]
+outcome = "garden"

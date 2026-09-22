@@ -93,6 +93,8 @@ struct AssetSource {
     rights: String,
     #[serde(default)]
     expected_size: Option<[u32; 2]>,
+    #[serde(default)]
+    font: Option<crate::FontRecipe>,
 }
 #[derive(Debug)]
 pub struct LoadedProject {
@@ -102,6 +104,8 @@ pub struct LoadedProject {
     pub media: BTreeMap<String, Vec<u8>>,
     pub provenance: BTreeMap<String, String>,
     pub resolved_config: crate::ResolvedConfig,
+    pub fonts: BTreeMap<String, crate::FontReport>,
+    pub font_notices: BTreeMap<String, String>,
 }
 pub fn relative(root: &Path, base: &Path, name: &str) -> Result<PathBuf> {
     let name_path = Path::new(name);
@@ -269,6 +273,9 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             .locales
             .insert(locale.clone(), json(&relative(&root, base, path)?)?);
     }
+    let characters = crate::fonts::characters(&program, &manifest.game.title)?;
+    let mut fonts = BTreeMap::new();
+    let mut font_notices = BTreeMap::new();
     let mut media = BTreeMap::new();
     let mut provenance = BTreeMap::new();
     let mut normalized = BTreeMap::new();
@@ -293,7 +300,27 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                     bail!("E_PATH_COLLISION: {old} / {local}");
                 }
             }
-            let bytes = read(&source_path)?;
+            let mut bytes = read(&source_path)?;
+            if let Some(recipe) = &source.font {
+                if source.kind != AssetKind::Font {
+                    bail!("E_FONT_RECIPE: font recipe requires kind = font");
+                }
+                let license_path = relative(&root, path.parent().unwrap(), &recipe.license)?;
+                let license = String::from_utf8(read(&license_path)?)
+                    .context("E_FONT_LICENSE: expected UTF-8 license")?;
+                if license.trim().is_empty() {
+                    bail!("E_FONT_LICENSE: empty license for {}", source.id);
+                }
+                let (prepared, mut report) =
+                    crate::fonts::prepare(&root, &bytes, recipe, &characters)
+                        .with_context(|| format!("font {} ({local})", source.id))?;
+                report.source = local.clone();
+                report.license = license_path.strip_prefix(&root)?.to_string_lossy().into();
+                report.license_digest = nir_content::digest(license.as_bytes());
+                font_notices.insert(source.id.clone(), license);
+                fonts.insert(source.id.clone(), report);
+                bytes = prepared;
+            }
             let mut asset = Asset {
                 kind: source.kind,
                 object: nir_content::digest(&bytes),
@@ -343,7 +370,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             bail!("E_SCENE: title scene {title}");
         }
     }
-    validate_font_coverage(&program, &media)?;
+    crate::fonts::coverage(&program, &media, &characters)?;
     // Revision depends on canonical source content, never local paths or iteration order.
     program.revision = nir_content::digest(&serde_json::to_vec(&program)?);
     ValidatedProgram::new(program.clone()).map_err(|d| sources.annotate(d))?;
@@ -357,6 +384,8 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         media,
         provenance,
         resolved_config,
+        fonts,
+        font_notices,
     })
 }
 fn wav_info(b: &[u8]) -> Result<(u64, u64)> {
@@ -399,41 +428,6 @@ fn wav_info(b: &[u8]) -> Result<(u64, u64)> {
         frames * 1_000_000 / rate as u64,
         frames * channels as u64 * 4,
     ))
-}
-fn validate_font_coverage(p: &Program, media: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-    let fonts: Vec<_> = p
-        .assets
-        .iter()
-        .filter(|(_, a)| a.kind == AssetKind::Font)
-        .filter_map(|(id, _)| ttf_parser::Face::parse(&media[id], 0).ok())
-        .collect();
-    if fonts.is_empty() {
-        bail!("E_FONT: register a font asset");
-    }
-    let mut chars = BTreeSet::new();
-    for docs in p.locales.values() {
-        for d in docs.values() {
-            for span in &d.spans {
-                if let Span::Text { text, .. } = span {
-                    chars.extend(text.chars());
-                }
-            }
-        }
-    }
-    for v in p.variables.values() {
-        if let Value::String(s) = v {
-            chars.extend(s.chars());
-        }
-    }
-    let missing: Vec<_> = chars
-        .into_iter()
-        .filter(|c| !c.is_whitespace() && !fonts.iter().any(|f| f.glyph_index(*c).is_some()))
-        .take(12)
-        .collect();
-    if !missing.is_empty() {
-        bail!("E_FONT_COVERAGE: missing glyphs {missing:?}; add an appropriately licensed font");
-    }
-    Ok(())
 }
 pub fn compile(p: &Program) -> Result<Executable> {
     ValidatedProgram::new(p.clone())?;

@@ -51,6 +51,16 @@ fn main() -> Result<()> {
                 }
             }
             std::env::set_var("CARGO_ENCODED_RUSTFLAGS", flags);
+            // Bundled native subsetter must also omit developer build paths.
+            let mut cxx = std::env::var("CXXFLAGS").unwrap_or_default();
+            if let Some(home) = std::env::var_os("HOME") {
+                cxx.push_str(&format!(
+                    " -ffile-prefix-map={}=/build-home",
+                    Path::new(&home).display()
+                ));
+            }
+            cxx.push_str(&format!(" -ffile-prefix-map={}=/nir", root.display()));
+            std::env::set_var("CXXFLAGS", cxx);
             run(Command::new("cargo").args([
                 "build",
                 "--locked",
@@ -95,6 +105,10 @@ fn main() -> Result<()> {
                 Path::new("examples/rain-letters"),
                 Path::new("dist/sdk/template"),
             )?;
+            copy_dir(
+                Path::new("templates/minimal"),
+                Path::new("dist/sdk/templates/minimal"),
+            )?;
             run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
             // A preview server may still be executing the previous CLI inode.
             fs::copy("target/release/novelc", "dist/novelc.next")?;
@@ -104,6 +118,11 @@ fn main() -> Result<()> {
                 "schemas",
                 "--out",
                 "dist/sdk/template/schemas",
+            ]))?;
+            run(Command::new("dist/novelc").args([
+                "schemas",
+                "--out",
+                "dist/sdk/templates/minimal/schemas",
             ]))?;
             println!("SDK: dist/sdk; CLI: dist/novelc");
         }
