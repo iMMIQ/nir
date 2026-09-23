@@ -104,7 +104,7 @@ PauseToken 为不可复制的独立所有权对象，Drop 只释放本持有人�
 
 字体派生由 `nir-compiler` 完成，HarfBuzz 静态链接到 `novelc`，不进入 Core、Player 或 WASM。编译器直接嵌入 UI 的 Fluent 源数据用于字符覆盖，不依赖呈现库或 GPU。`assets.font` 选择静态 face、subset/full 和预留字符；完整母版属于作者输入，Program 只记录生成字体的对象身份。生成前补齐 Unicode 规范等价字符，生成时保留 OpenType 布局闭包，生成后检查覆盖。
 
-内容缓存封装校验和并原子写入 `.nir/cache/fonts`；缓存状态不进入 Program/Release 身份。许可文本自动作为发行通知收集，来源和编译报告留在作者侧。这是字体专用流水线，不代表 NIR-0004 的通用 Artifact DAG、跨项目缓存或 NIR-0003 的逐语言 FontPlan 已实现。细节见 [作者字体说明](AUTHOR-FONTS.md)。
+内容缓存封装校验和并原子写入 `.nir/cache/fonts`；缓存状态不进入 Program/Release 身份。许可文本自动作为发行通知收集，来源和编译报告留在作者侧。现已实现简中/英文 UI 与正文的有序 FontPlan，以及共享字体字集去重；这仍是字体专用流水线，不代表 NIR-0004 的通用 Artifact DAG、跨项目缓存、章节增量字体或其他文字系统认证已实现。细节见[作者字体说明](AUTHOR-FONTS.md)与[语言/字体计划](LOCALE-FONTS.md)。
 
 ## 文本修订边界
 

@@ -7,7 +7,14 @@ import {expectPainted} from './pixels.js';
 const run=promisify(execFile), cli=path.resolve('dist/novelc');
 const state=p=>p.evaluate(()=>window.__nir.state());
 const act=(p,a)=>p.evaluate(a=>window.__nir.action(a),a);
-const ready=p=>p.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+const ready=async p=>{
+  const handle=await p.waitForFunction(()=>{
+    if(!window.__nir)return false;
+    try{const s=window.__nir.state();return s.ready&&!s.loading?true:false;}
+    catch(error){return `Engine state failed: ${error}; ${document.querySelector('#shell-message')?.textContent||''}`;}
+  });
+  const result=await handle.jsonValue();if(result!==true)throw new Error(result);
+};
 async function start(page){await page.keyboard.press('Space');await page.waitForFunction(()=>window.__nir.state().dialogue?.ready&&!window.__nir.state().loading);}
 let root;
 test.beforeAll(async()=>{await fs.mkdir('target/tmp',{recursive:true});root=await fs.mkdtemp(path.resolve('target/tmp/text-revisions-'));});
@@ -44,7 +51,7 @@ test('dev preserves a session until source revision and translation review both 
     await expect.poll(async()=>(await status())?.release).not.toBe(release);
     await page.waitForFunction(()=>window.__nir?.state().ready&&window.__nir.state().screen==='Title');
     await start(page);expect((await state(page)).dialogue.visible).toBe('春天的花开了。');
-    await act(page,{type:'settings'});await act(page,{type:'locale',locale:'en'});await act(page,{type:'close'});
+    await act(page,{type:'settings'});await act(page,{type:'text_locale',locale:'en'});await act(page,{type:'close'});
     expect((await state(page)).dialogue.locale).toBe('zh-Hans');
     await act(page,{type:'saves'});await act(page,{type:'save',slot:0});await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
     await page.reload();await ready(page);await act(page,{type:'saves'});await act(page,{type:'load',slot:0});

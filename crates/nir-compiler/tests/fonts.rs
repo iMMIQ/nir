@@ -311,6 +311,12 @@ fn truetype_collection_face_extraction_and_unsupported_tables() {
     let file = p.path().join("assets/catalog.toml");
     let catalog = fs::read_to_string(&file).unwrap();
     fs::write(&file,format!("{catalog}\n[[assets]]\nid=\"font.latin\"\nkind=\"font\"\nsource=\"latin.ttc\"\nrights=\"OFL-1.1\"\n[assets.font]\nmode=\"subset\"\nlicense=\"latin-license.txt\"\nextra_characters=\"á\"\n")).unwrap();
+    let locales = p.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap().replace(
+        "en = [\"font.reader\"]",
+        "en = [\"font.latin\", \"font.reader\"]",
+    );
+    fs::write(locales, config).unwrap();
     let a = load_project(p.path()).unwrap();
     let font = &a.media["font.latin"];
     assert_eq!(&font[..4], b"\0\x01\0\0");

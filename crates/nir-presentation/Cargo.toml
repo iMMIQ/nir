@@ -10,4 +10,5 @@ cosmic-text.workspace = true
 fluent-bundle.workspace = true
 unic-langid.workspace = true
 unicode-segmentation.workspace = true
+unicode-script = "=0.5.8"
 serde.workspace = true

@@ -1,0 +1,4 @@
+Content: valid (8 assets, 2 locales)
+SDK: <workspace>/dist/sdk (7 files)
+Runtime: desktop WebGPU; PCM WAV; zh-Hans/en
+Preview: http://127.0.0.1:4173

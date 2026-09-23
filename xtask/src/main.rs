@@ -109,6 +109,18 @@ fn main() -> Result<()> {
                 Path::new("templates/minimal"),
                 Path::new("dist/sdk/templates/minimal"),
             )?;
+            for template in ["dist/sdk/template", "dist/sdk/templates/minimal"] {
+                let docs = Path::new(template).join("docs");
+                fs::create_dir_all(&docs)?;
+                for name in [
+                    "AUTHOR-FONTS.md",
+                    "LOCALE-FONTS.md",
+                    "TEXT-REVISIONS.md",
+                    "PROJECT-THEMES.md",
+                ] {
+                    fs::copy(Path::new("docs").join(name), docs.join(name))?;
+                }
+            }
             run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
             // A preview server may still be executing the previous CLI inode.
             fs::copy("target/release/novelc", "dist/novelc.next")?;

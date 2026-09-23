@@ -7,6 +7,65 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::Path};
 
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocaleManifest {
+    pub format: u32,
+    pub default_ui: String,
+    pub default_text: String,
+    pub ui: BTreeMap<String, Vec<String>>,
+    pub text: BTreeMap<String, Vec<String>>,
+}
+impl LocaleManifest {
+    pub fn resolve(&self) -> Result<LocaleConfig> {
+        let valid = |locale: &str| matches!(locale, "zh-Hans" | "en");
+        if self.format != 1
+            || !valid(&self.default_ui)
+            || !valid(&self.default_text)
+            || self.ui.is_empty()
+            || self.text.is_empty()
+            || self
+                .ui
+                .keys()
+                .chain(self.text.keys())
+                .any(|locale| !valid(locale))
+        {
+            bail!("E_LOCALE_CONFIG: expected format 1 and supported zh-Hans/en locale identifiers");
+        }
+        for (surface, plans) in [("ui", &self.ui), ("text", &self.text)] {
+            for (locale, fonts) in plans {
+                if fonts.is_empty()
+                    || fonts.iter().any(|font| font.trim().is_empty())
+                    || fonts
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != fonts.len()
+                {
+                    bail!("E_FONT_PLAN: {surface}.{locale} needs an ordered, nonempty list of unique font asset IDs");
+                }
+            }
+        }
+        if !self.ui.contains_key(&self.default_ui) || !self.text.contains_key(&self.default_text) {
+            bail!("E_LOCALE_DEFAULT: defaults must name supported locales");
+        }
+        Ok(LocaleConfig {
+            default_ui: self.default_ui.clone(),
+            default_text: self.default_text.clone(),
+            ui: self
+                .ui
+                .iter()
+                .map(|(l, f)| (l.clone(), LocaleFontPlan::new(f.clone())))
+                .collect(),
+            text: self
+                .text
+                .iter()
+                .map(|(l, f)| (l.clone(), LocaleFontPlan::new(f.clone())))
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeManifest {

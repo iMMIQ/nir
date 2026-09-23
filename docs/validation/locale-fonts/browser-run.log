@@ -1,0 +1,35 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:browser
+npm notice run playwright test
+
+Running 25 tests using 1 worker
+
+(node:302258) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 tests/browser/authoring.spec.js:66:1 › long author content remains readable across advance, input, reflow, restore and many choices (11.2s)
+  ✓   2 tests/browser/authoring.spec.js:159:1 › dev rebuild reloads valid content and retains the previous session on author errors (7.8s)
+  ✓   3 tests/browser/fonts.spec.js:19:1 › default author template renders new Chinese with compiled fonts and both routes (4.6s)
+  ✓   4 tests/browser/fonts.spec.js:55:1 › font preparation follows dev edits and a missing glyph preserves the last release (5.9s)
+  ✓   5 tests/browser/player.spec.js:36:1 › WebGPU canvas, Chinese layout, static sleep and both endings (15.6s)
+  ✓   6 tests/browser/player.spec.js:68:1 › save commit, refresh restore, locale boundary, history and rollback (7.8s)
+  ✓   7 tests/browser/player.spec.js:102:1 › UI and story locales are independent and use their own font plans (7.9s)
+  ✓   8 tests/browser/player.spec.js:150:1 › independent pauses, viewport changes, touch and actual device recovery (4.3s)
+  ✓   9 tests/browser/player.spec.js:177:1 › required resource failure keeps scene and retry succeeds (2.5s)
+  ✓  10 tests/browser/player.spec.js:190:1 › real tab visibility freezes Story and resumes through visibilitychange (5.5s)
+  ✓  11 tests/browser/player.spec.js:222:1 › actual device loss during a dissolve preserves progress (5.1s)
+  ✓  12 tests/browser/player.spec.js:254:1 › corrupt WASM is rejected before instantiation (1.4s)
+  ✓  13 tests/browser/player.spec.js:264:1 › save export/import and tamper rejection preserve independent preferences (3.8s)
+  ✓  14 tests/browser/player.spec.js:285:1 › final release boots below a URL subpath and uses correct HTTP types (2.4s)
+  ✓  15 tests/browser/player.spec.js:300:3 › touch input emulation › starts and advances by tapping the drawn canvas (2.3s)
+  ✓  16 tests/browser/player.spec.js:312:1 › owner inbox defers actions, drains bursts and keeps turn work bounded (2.5s)
+  ✓  17 tests/browser/player.spec.js:334:1 › leaving preparation cancels its fetch and a new request still succeeds (2.9s)
+  ✓  18 tests/browser/player.spec.js:374:1 › reserved save completion survives session replacement and duplicate traffic (2.9s)
+  ✓  19 tests/browser/player.spec.js:395:1 › a delayed load cannot replace a newer session (3.0s)
+  ✓  20 tests/browser/player.spec.js:408:1 › repeated preparation, pause and device replacement release all request slots (14.5s)
+  ✓  21 tests/browser/player.spec.js:431:1 › an owner turn detects device loss before the idle watchdog (3.5s)
+  ✓  22 tests/browser/player.spec.js:454:1 › decode and quota failures provide correlated diagnostics and a private export (3.1s)
+  ✓  23 tests/browser/player.spec.js:487:1 › tracing on and off preserves deterministic story trace and outcome (13.2s)
+  ✓  24 tests/browser/player.spec.js:503:1 › author theme and player defaults run on the unchanged SDK and keep saved preferences (10.8s)
+  ✓  25 tests/browser/texts.spec.js:22:1 › dev preserves a session until source revision and translation review both complete (13.4s)
+
+  25 passed (2.7m)

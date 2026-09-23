@@ -6,7 +6,7 @@
 
 “部分”表示有工作实现但未覆盖设计的完整契约；“未实现”表示当前没有对应能力；“未验证”不等于没有实现。文档明示后置或条件评估的能力单独说明，不将它们统称为 V1 必须完成项。不提供没有统一验收权重的完成百分比。
 
-本文保留 v0.1.0 基线结论；后续修复与验证见 [引擎稳定性进展](ENGINE-STABILITY.md)、[请求生命周期](REQUEST-LIFECYCLE.md) 、[结构化诊断及测量](DIAGNOSTICS.md) 、[作品配置和主题契约](PROJECT-THEMES.md) 与 [作者阅读与预览](AUTHOR-READING.md)。下表不能直接作为当前分支的未完成清单。
+本文保留 v0.1.0 基线结论；后续修复与验证见 [引擎稳定性进展](ENGINE-STABILITY.md)、[请求生命周期](REQUEST-LIFECYCLE.md)、[结构化诊断及测量](DIAGNOSTICS.md)、[作品配置和主题契约](PROJECT-THEMES.md)、[作者阅读与预览](AUTHOR-READING.md)及[独立语言上下文与字体计划](LOCALE-FONTS.md)。下表不能直接作为当前分支的未完成清单；NIR-0003 中的基础 UI/正文独立选择与简中/英文 FontPlan 已在后续阶段实现，语音/格式区域、多文字系统和独立语言包仍未完成。
 
 ## 总体判断
 

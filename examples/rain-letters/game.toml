@@ -18,5 +18,6 @@ modules = ["content/ch01/module.toml"]
 asset_catalogs = ["assets/catalog.toml"]
 theme = "themes/rain/theme.toml"
 player = "config/player.toml"
+locales = "config/locales.toml"
 scenarios = ["tests/scenarios/walk.toml", "tests/scenarios/stay.toml"]
-notices = ["credits/README.md", "credits/FONT-LICENSE.txt"]
+notices = ["credits/README.md", "credits/FONT-LICENSE.txt", "assets/fonts/ABeeZee-OFL.txt", "assets/fonts/ABeeZee-SOURCE.md", "assets/fonts/Noto-OFL.txt"]

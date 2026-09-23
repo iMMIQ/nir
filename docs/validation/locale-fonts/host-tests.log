@@ -1,0 +1,33 @@
+npm warn Unknown user config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm notice run nir-browser-tests@0.1.0 test:host
+npm notice run node --test tests/host/*.test.js
+✔ trace ring is bounded, ordered and excludes private payloads (5.059261ms)
+✔ disabled trace does not read clock or retain records (1.740364ms)
+✔ request terminal trace identifies cancelled and duplicate callbacks (3.964472ms)
+✔ request observations retain origin epoch through a session replacement (0.866718ms)
+✔ first visit inherits work defaults and supported browser language (4.952ms)
+✔ UI and text browser matches are negotiated independently (0.576738ms)
+✔ system reduced motion supplements work defaults; explicit saved preferences win (2.762176ms)
+✔ legacy one-locale preference migrates to both independent preferences (0.566793ms)
+✔ input overload leaves room for terminal completions (7.314285ms)
+✔ owner yields at item/time limits and never consumes reentrant production (2.235184ms)
+✔ inputs precede resource delivery and each turn admits one resource (1.043429ms)
+✔ recovery stops the current batch and still admits its control completion (0.605731ms)
+✔ cancelling a resource group releases bytes without dropping independent saves (0.673527ms)
+✔ shared fetch aborts only after its last consumer cancels (2.836802ms)
+✔ late old completion cannot remove a replacement fetch (1.800703ms)
+✔ resource admission is global and cancelled decoders hold their slot until settled (1.669753ms)
+✔ an active batch still occupies capacity and disposal settles its pending items (1.637452ms)
+✔ accepted jobs keep a terminal slot when unrelated traffic fills the inbox (1.495882ms)
+✔ reserved resource progress reuses its slot until completion or cancellation (0.852195ms)
+✔ device control has admission room beyond ordinary job reservations (0.793828ms)
+✔ shutdown settles queued progress and reserved terminals exactly once (0.46577ms)
+✔ seeded completion, cancellation and drain interleavings preserve the ledger (37.965543ms)
+ℹ tests 22
+ℹ suites 0
+ℹ pass 22
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 225.364666

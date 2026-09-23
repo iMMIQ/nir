@@ -47,6 +47,8 @@ pub struct Inputs {
     pub asset_catalogs: Vec<String>,
     pub theme: String,
     #[serde(default)]
+    pub locales: Option<String>,
+    #[serde(default)]
     pub player: Option<String>,
     #[serde(default)]
     pub scenarios: Vec<String>,
@@ -224,6 +226,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     {
         bail!("E_SLUG: expected lowercase ASCII slug");
     }
+    let locale_path = manifest.inputs.locales.as_deref().ok_or_else(|| {
+        anyhow!("E_LOCALE_CONFIG: add inputs.locales = \"config/locales.toml\" and define UI/text font plans")
+    }).and_then(|name| relative(&root, &root, name))?;
+    let locale_manifest: crate::LocaleManifest = toml_file(&locale_path)?;
+    let locale_config = locale_manifest.resolve()?;
+    if locale_config.default_text != manifest.game.source_locale {
+        bail!("E_LOCALE_DEFAULT: game.source_locale must match config/locales.toml default_text");
+    }
     let module_path = relative(&root, &root, &manifest.inputs.modules[0])?;
     let module: Module = toml_file(&module_path)?;
     let base = module_path.parent().unwrap();
@@ -251,6 +261,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         choices: BTreeMap::new(),
         texts: texts.contracts,
         locales: texts.locales,
+        locale_config: locale_config.clone(),
         assets: BTreeMap::new(),
         default_locale: manifest.game.source_locale.clone(),
         title_scene: manifest.game.title_scene.clone(),
@@ -271,7 +282,29 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         merge(&mut program.cues, f.cues, &path)?;
         merge(&mut program.choices, f.choices, &path)?;
     }
-    let characters = crate::fonts::characters(&program, &manifest.game.title)?;
+    if locale_config.text.keys().collect::<BTreeSet<_>>()
+        != program.locales.keys().collect::<BTreeSet<_>>()
+    {
+        bail!("E_TRANSLATION: config/locales.toml text plans must exactly match complete text bundles");
+    }
+    let character_sets = crate::fonts::characters_by_plan(&program, &manifest.game.title)?;
+    let mut font_characters: BTreeMap<String, BTreeSet<char>> = BTreeMap::new();
+    for (plans, sets) in [
+        (&locale_config.ui, &character_sets.ui),
+        (&locale_config.text, &character_sets.text),
+    ] {
+        for (locale, plan) in plans {
+            let chars = sets
+                .get(locale)
+                .ok_or_else(|| anyhow!("E_LOCALE_CONFIG: no character set for {locale}"))?;
+            for font in &plan.fonts {
+                font_characters
+                    .entry(font.clone())
+                    .or_default()
+                    .extend(chars);
+            }
+        }
+    }
     let mut fonts = BTreeMap::new();
     let mut font_notices = BTreeMap::new();
     let mut media = BTreeMap::new();
@@ -309,9 +342,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 if license.trim().is_empty() {
                     bail!("E_FONT_LICENSE: empty license for {}", source.id);
                 }
-                let (prepared, mut report) =
-                    crate::fonts::prepare(&root, &bytes, recipe, &characters)
-                        .with_context(|| format!("font {} ({local})", source.id))?;
+                let chars = font_characters.get(&source.id).ok_or_else(|| {
+                    anyhow!(
+                        "E_FONT_PLAN_UNUSED: font {} is not referenced by a UI or text locale",
+                        source.id
+                    )
+                })?;
+                let (prepared, mut report) = crate::fonts::prepare(&root, &bytes, recipe, chars)
+                    .with_context(|| format!("font {} ({local})", source.id))?;
                 report.source = local.clone();
                 report.license = license_path.strip_prefix(&root)?.to_string_lossy().into();
                 report.license_digest = nir_content::digest(license.as_bytes());
@@ -368,7 +406,20 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             bail!("E_SCENE: title scene {title}");
         }
     }
-    crate::fonts::coverage(&program, &media, &characters)?;
+    let asset_objects: BTreeMap<_, _> = program
+        .assets
+        .iter()
+        .map(|(id, asset)| (id.clone(), asset.object.clone()))
+        .collect();
+    for plan in program
+        .locale_config
+        .ui
+        .values_mut()
+        .chain(program.locale_config.text.values_mut())
+    {
+        plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &asset_objects);
+    }
+    crate::fonts::coverage_by_plan(&program, &media, &character_sets)?;
     // Revision depends on canonical source content, never local paths or iteration order.
     program.revision = nir_content::digest(&serde_json::to_vec(&program)?);
     ValidatedProgram::new(program.clone()).map_err(|d| sources.annotate(d))?;
@@ -505,6 +556,7 @@ pub fn write_schemas(out: &Path) -> Result<()> {
         ("theme", schemars::schema_for!(crate::ThemeManifest)),
         ("theme-tokens", schemars::schema_for!(crate::ThemeTokens)),
         ("player", schemars::schema_for!(crate::PlayerConfig)),
+        ("locales", schemars::schema_for!(crate::LocaleManifest)),
         ("program", schemars::schema_for!(Program)),
         ("diagnostic", schemars::schema_for!(Diagnostic)),
     ];

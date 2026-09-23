@@ -952,6 +952,7 @@ dependencies = [
  "nir-format",
  "serde",
  "unic-langid",
+ "unicode-script",
  "unicode-segmentation",
 ]
 

@@ -156,6 +156,52 @@ fn validate(p: &Program) -> Result<()> {
     if !p.locales.contains_key(&p.default_locale) {
         return Err(err("E_LOCALE", "program", "missing default locale"));
     }
+    let config = &p.locale_config;
+    let asset_objects: BTreeMap<_, _> = p
+        .assets
+        .iter()
+        .map(|(id, asset)| (id.clone(), asset.object.clone()))
+        .collect();
+    if config.default_ui != "zh-Hans" && config.default_ui != "en"
+        || config.default_text != p.default_locale
+        || !config.ui.contains_key(&config.default_ui)
+        || !config.text.contains_key(&config.default_text)
+        || config.ui.is_empty()
+        || config.text.keys().collect::<BTreeSet<_>>() != p.locales.keys().collect::<BTreeSet<_>>()
+        || config
+            .ui
+            .keys()
+            .any(|locale| locale != "zh-Hans" && locale != "en")
+    {
+        return Err(err(
+            "E_LOCALE_CONFIG",
+            "program.locale_config",
+            "invalid defaults or supported locale sets",
+        ));
+    }
+    for (surface, plans) in [("ui", &config.ui), ("text", &config.text)] {
+        for (locale, plan) in plans {
+            if plan.fonts.is_empty()
+                || plan.digest != LocaleFontPlan::digest_for(&plan.fonts, &asset_objects)
+                || plan.fonts.iter().collect::<BTreeSet<_>>().len() != plan.fonts.len()
+            {
+                return Err(err(
+                    "E_FONT_PLAN",
+                    locale,
+                    "font plans must be nonempty, unique and have a valid digest",
+                ));
+            }
+            for font in &plan.fonts {
+                if p.assets.get(font).map(|asset| asset.kind) != Some(AssetKind::Font) {
+                    return Err(err(
+                        "E_FONT_PLAN",
+                        &format!("{surface}.{locale}"),
+                        &format!("unknown font asset {font}"),
+                    ));
+                }
+            }
+        }
+    }
     for (locale, texts) in &p.locales {
         if locale != "zh-Hans" && locale != "en" {
             return Err(err(

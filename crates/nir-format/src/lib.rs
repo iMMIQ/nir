@@ -240,6 +240,9 @@ pub struct Program {
     pub texts: BTreeMap<String, TextContract>,
     #[serde(default)]
     pub locales: BTreeMap<String, BTreeMap<String, TextDoc>>,
+    /// Explicit, per-surface language and ordered font plans. This is part of
+    /// the executable identity; older executables without it are rejected.
+    pub locale_config: LocaleConfig,
     #[serde(default)]
     pub assets: BTreeMap<String, Asset>,
     pub default_locale: String,
@@ -249,6 +252,57 @@ pub struct Program {
     pub theme: Theme,
     #[serde(default)]
     pub player: PlayerDefaults,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocaleFontPlan {
+    pub fonts: Vec<String>,
+    pub digest: String,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocaleConfig {
+    pub default_ui: String,
+    pub default_text: String,
+    pub ui: BTreeMap<String, LocaleFontPlan>,
+    pub text: BTreeMap<String, LocaleFontPlan>,
+}
+
+impl LocaleFontPlan {
+    pub fn new(fonts: Vec<String>) -> Self {
+        let digest = Self::digest_for(&fonts, &BTreeMap::new());
+        Self { fonts, digest }
+    }
+    pub fn digest_for(fonts: &[String], objects: &BTreeMap<String, String>) -> String {
+        use sha2::{Digest, Sha256};
+        let identities: Vec<_> = fonts.iter().map(|font| (font, objects.get(font))).collect();
+        let bytes = serde_json::to_vec(&(1u32, &identities)).expect("font plan is serializable");
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        digest
+    }
+}
+
+impl Default for LocaleConfig {
+    fn default() -> Self {
+        let ui: BTreeMap<String, LocaleFontPlan> = ["zh-Hans", "en"]
+            .into_iter()
+            .map(|locale| (locale.into(), LocaleFontPlan::new(vec![])))
+            .collect();
+        let text = ui.clone();
+        Self {
+            default_ui: "zh-Hans".into(),
+            default_text: "zh-Hans".into(),
+            ui,
+            text,
+        }
+    }
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,9 +802,10 @@ impl Default for PlayerDefaults {
     }
 }
 impl PlayerDefaults {
-    pub fn preferences(&self, locale: String) -> Preferences {
+    pub fn preferences(&self, ui_locale: String, text_locale: String) -> Preferences {
         Preferences {
-            locale,
+            ui_locale,
+            text_locale,
             font_scale: self.font_scale,
             bgm_volume: self.bgm_volume,
             voice_volume: self.voice_volume,
@@ -899,7 +954,8 @@ pub struct Object {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
-    pub locale: String,
+    pub ui_locale: String,
+    pub text_locale: String,
     pub font_scale: f32,
     pub bgm_volume: f32,
     pub voice_volume: f32,
@@ -909,7 +965,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            locale: "zh-Hans".into(),
+            ui_locale: "zh-Hans".into(),
+            text_locale: "zh-Hans".into(),
             font_scale: 1.,
             bgm_volume: 0.3,
             voice_volume: 0.8,
@@ -938,7 +995,10 @@ pub enum UiAction {
     Title,
     ToggleAuto,
     ToggleSkip,
-    Locale { locale: String },
+    UiLocale { locale: String },
+    TextLocale { locale: String },
+    LocaleRetry,
+    LocaleCancel,
     FontSize { delta: f32 },
     Volume { bus: AudioBus, delta: f32 },
     ReducedMotion,

@@ -1,0 +1,11 @@
+format = 1
+default_ui = "zh-Hans"
+default_text = "zh-Hans"
+
+[ui]
+zh-Hans = ["font.reader"]
+en = ["font.reader"]
+
+[text]
+zh-Hans = ["font.reader"]
+en = ["font.reader"]

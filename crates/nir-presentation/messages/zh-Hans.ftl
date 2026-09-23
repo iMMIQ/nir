@@ -40,6 +40,13 @@ scroll-forward = 下一页
 
 language-zh = 简体中文
 language-en = English
+ui-language = 界面语言
+text-language = 正文语言
+language-active = 当前生效
+language-pending = 正在准备语言与字体……
+language-failed = 语言准备失败
+language-cancel = 保留当前语言
+language-applied = 语言与字体已生效
 decrease = −
 increase = +
 history-back = ←

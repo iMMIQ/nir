@@ -182,11 +182,17 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const read=(store,key)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readonly');const r=tx.objectStore(store).get(key);let value;r.onsuccess=()=>{value=r.result;};tx.oncomplete=()=>resolve(value);tx.onabort=tx.onerror=()=>reject(tx.error||r.error);});
     const write=(store,key,value)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(value,key);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});
     function hostEvent(kind,value) {engine.host_event(kind,typeof value==='string'?value:JSON.stringify(value));}
+    function reportHostFailure(error,operation) {
+        observe('diagnostic',{domain:'host',code:'E_HOST',operation});
+        // A thrown WASM call may still own its mutable Engine borrow until this
+        // callback returns. Report the failure in a later owner turn.
+        queueMicrotask(()=>{if(!disposed)deliver(()=>hostEvent('host_failed',String(error)),'control');});
+    }
     function wake() {if(disposed||ownerTimer!==null)return;ownerTimer=setTimeout(()=>{ownerTimer=null;frame(performance.now());},0);}
     function deliver(fn,kind='completion',group=null) {
         if(disposed)return Promise.resolve(false);
         return new Promise(resolve=>{
-            if(!inbox.push(()=>{try{fn();resolve(true);}catch(e){observe('diagnostic',{domain:'host',code:'E_HOST',operation:'dispatch'});hostEvent('host_failed',String(e));resolve(false);}},kind,()=>resolve(false),group)){
+            if(!inbox.push(()=>{try{fn();resolve(true);}catch(e){reportHostFailure(e,'dispatch');resolve(false);}},kind,()=>resolve(false),group)){
                 fail('E_EVENT_QUEUE: host inbox admission limit');resolve(false);dispose();return;
             }
             wake();
@@ -194,7 +200,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function post(slot,fn,terminal=true){
         if(disposed){slot.cancel();return Promise.resolve(false);}
-        const done=slot.post(()=>{try{return fn();}catch(e){if(slot.kind==='control')throw e;observe('diagnostic',{domain:'host',code:'E_HOST',operation:'completion'});hostEvent('host_failed',String(e));return true;}},{terminal});wake();return done;
+        const done=slot.post(()=>{try{return fn();}catch(e){if(slot.kind==='control')throw e;reportHostFailure(e,'completion');return true;}},{terminal});wake();return done;
     }
     function request(work,success,failure,{kind='completion',group=null,replace=false}={}){
         if(replace)inbox.cancelGroup(group);
@@ -369,11 +375,11 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
         return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');engine.action(JSON.stringify(a),context.interaction,seq,context.session);},'input');
     }
-    let semanticSignature='',announcement='';
+    let semanticSignature='',announcement='',announcementLocale='';
     function semantics(view) {
-        document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,s.interaction,s.session]);
-        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
-        if(view.announcement&&view.announcement!==announcement){announcement=view.announcement;document.querySelector('#announcement').textContent=announcement;}
+        document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
+        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
+        const spokenLocale=view.announcement_locale||view.locale||'zh-Hans';if(view.announcement&&(view.announcement!==announcement||spokenLocale!==announcementLocale)){announcement=view.announcement;announcementLocale=spokenLocale;const live=document.querySelector('#announcement');live.lang=spokenLocale;live.textContent=announcement;}
     }
     function frame(now) {
         if(disposed)return;
@@ -447,7 +453,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     request(()=>Promise.all([read('preferences',namespace),read('profile',namespace)]),([savedPreferences,profile])=>{
-        hostEvent('preferences',initialPreferences(preferences,savedPreferences,program.locales,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
+        hostEvent('preferences',initialPreferences(preferences,savedPreferences,program.locale_config,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
         if(profile)hostEvent('profile',profile);
     },e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
     function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
@@ -457,7 +463,27 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
 
 // Author defaults < browser accessibility defaults < explicitly saved player settings.
 export function initialPreferences(defaults,saved,locales,languages,reducedMotion) {
-    if(saved)return {...defaults,...saved};
-    const locale=languages.some(l=>l==='zh'||l==='zh-CN'||l==='zh-SG'||l==='zh-Hans')?'zh-Hans':languages.some(l=>l==='en'||l.startsWith('en-'))?'en':defaults.locale;
-    return {...defaults,locale:locales[locale]?locale:defaults.locale,reduced_motion:defaults.reduced_motion||reducedMotion};
+    const ui=locales?.ui||{},text=locales?.text||{};
+    const match=(supported,fallback)=>{
+        for(const tag of languages){
+            if(supported[tag])return tag;
+            try {
+                const parsed=new Intl.Locale(tag),base=parsed.language.toLowerCase();
+                if(base==='en'&&supported.en)return 'en';
+                if(base==='zh'&&parsed.script?.toLowerCase()==='hans'&&supported['zh-Hans'])return 'zh-Hans';
+            } catch {}
+        }
+        return fallback;
+    };
+    const defaultUi=locales?.default_ui||defaults.ui_locale||'zh-Hans';
+    const defaultText=locales?.default_text||defaults.text_locale||defaultUi;
+    const browserUi=match(ui,defaultUi),browserText=match(text,defaultText);
+    if(saved){
+        const legacy=saved.locale;
+        const {locale:_oldLocale,...rest}=saved;
+        const uiLocale=saved.ui_locale||(ui[legacy]?legacy:browserUi);
+        const textLocale=saved.text_locale||(text[legacy]?legacy:browserText);
+        return {...defaults,...rest,ui_locale:ui[uiLocale]?uiLocale:defaultUi,text_locale:text[textLocale]?textLocale:defaultText};
+    }
+    return {...defaults,ui_locale:browserUi,text_locale:browserText,reduced_motion:defaults.reduced_motion||reducedMotion};
 }

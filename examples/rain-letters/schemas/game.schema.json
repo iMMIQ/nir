@@ -94,6 +94,13 @@
             "type": "string"
           }
         },
+        "locales": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "modules": {
           "type": "array",
           "items": {

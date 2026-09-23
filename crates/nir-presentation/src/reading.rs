@@ -83,6 +83,10 @@ impl ReadingState {
                     16. * m.prefs.font_scale,
                     m.theme.text,
                 );
+                let run = labels.texts.last_mut().unwrap();
+                run.locale = c.locale.clone();
+                run.font_assets = c.font_assets.clone();
+                run.font_plan_digest = c.font_plan_digest.clone();
             }
         }
         text.layout(&labels);
@@ -185,7 +189,7 @@ pub(super) fn controls(p: &mut DrawPacket, view: ScrollView, m: &UiModel, messag
     ] {
         let bx = x + i * (button_width + 6.);
         p.button(
-            messages.text(&m.prefs.locale, label),
+            messages.text(&m.ui_locale, label),
             UiAction::Scroll {
                 region: view.region,
                 delta,
