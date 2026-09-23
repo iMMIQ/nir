@@ -154,6 +154,56 @@ export class SharedRequests {
     }
 }
 
+export function parseRuntimeProgram(runtimeJson) {
+    let runtime;
+    try { runtime=typeof runtimeJson==='string'?JSON.parse(runtimeJson):runtimeJson; }
+    catch { throw new Error('E_RUNTIME_SCHEMA'); }
+    if(!runtime||runtime.format!==2||!runtime.program||typeof runtime.program!=='object')
+        throw new Error('E_RUNTIME_VERSION: expected RuntimeExecutable v2');
+    return runtime.program;
+}
+
+export function initialRuntimePreferences(program,saved,languages,reducedMotion) {
+    if(!program||!program.player||!program.locale_config)throw new Error('E_RUNTIME_SCHEMA');
+    const defaults={
+        ui_locale:program.locale_config.default_ui||program.default_locale,
+        text_locale:program.locale_config.default_text||program.default_locale,
+        font_scale:program.player.font_scale,
+        bgm_volume:program.player.bgm_volume,
+        voice_volume:program.player.voice_volume,
+        sfx_volume:program.player.sfx_volume,
+        reduced_motion:program.player.reduced_motion,
+    };
+    const selected=initialPreferences(defaults,saved,program.locale_config,languages,reducedMotion);
+    const preferences=Object.fromEntries(['ui_locale','text_locale','font_scale','bgm_volume','voice_volume','sfx_volume','reduced_motion']
+        .map(key=>[key,selected[key]]));
+    for(const key of ['font_scale','bgm_volume','voice_volume','sfx_volume'])
+        if(typeof preferences[key]!=='number'||!Number.isFinite(preferences[key]))preferences[key]=defaults[key];
+    if(typeof preferences.reduced_motion!=='boolean')preferences.reduced_motion=defaults.reduced_motion;
+    return preferences;
+}
+
+export function validateAssetRequest(assets,descriptors) {
+    if(!Array.isArray(assets)||!descriptors||typeof descriptors!=='object'||Array.isArray(descriptors))
+        throw new Error('E_ASSET_DESCRIPTOR');
+    const ids=new Set(assets);
+    const keys=Object.keys(descriptors);
+    if(ids.size!==assets.length||keys.length!==ids.size||keys.some(id=>!ids.has(id)))
+        throw new Error('E_ASSET_DESCRIPTOR');
+    for(const id of ids){
+        const asset=descriptors[id];
+        if(!asset||!['image','audio','font'].includes(asset.kind)||
+            typeof asset.object!=='string'||!(/^[0-9a-f]{64}$/).test(asset.object)||
+            !Number.isSafeInteger(asset.bytes)||asset.bytes<0||
+            !Number.isSafeInteger(asset.width)||asset.width<0||
+            !Number.isSafeInteger(asset.height)||asset.height<0||
+            typeof asset.duration_us!=='string'||!(/^\d{1,20}$/).test(asset.duration_us)||
+            !Number.isSafeInteger(asset.decoded_bytes)||asset.decoded_bytes<0)
+            throw new Error(`E_ASSET_DESCRIPTOR: ${id}`);
+    }
+    return descriptors;
+}
+
 // Platform adapter only. Narrative, reading policy, visual UI and layout live in Rust.
 export async function start({wasm,release,releaseDigest,executable,fetchObject,fail,startupTrace=[]}) {
     const params=new URL(location.href).searchParams;
@@ -162,25 +212,29 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const observe=(stage,fields={})=>trace.record(stage,{...traceContext,...fields});
     for(const row of startupTrace)observe(row.stage,row);
     const canvas=document.querySelector('#stage'), shell=document.querySelector('#shell');
+    const program=parseRuntimeProgram(executable);
     const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null};
     const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=innerWidth,height=innerHeight;return {width,height,dpr};};
     let {width,height,dpr}=size();canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
-    const createStart=String(Math.round(performance.now()*1000));
-    const engine=await wasm.Engine.create(executable,releaseDigest,release.title,'stage');
-    observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
-    const program=JSON.parse(executable).program;
-    document.title=release.title;
-    const AudioContext=window.AudioContext||window.webkitAudioContext;
-    const audio=new AudioContext();let unlocked=null,audioPaused=true;
-    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map();
-    let preferences=JSON.parse(engine.state()).preferences, raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
-    const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
-    let ownerTimer=null,pendingElapsed=0;
     const namespace=release.game_id+(location.hostname==='localhost'||location.hostname==='127.0.0.1'?':dev':'');
     const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('nir-player-v1',1);r.onupgradeneeded=()=>{for(const store of ['saves','preferences','profile'])if(!r.result.objectStoreNames.contains(store))r.result.createObjectStore(store);};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
     db.onversionchange=()=>db.close();
     const read=(store,key)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readonly');const r=tx.objectStore(store).get(key);let value;r.onsuccess=()=>{value=r.result;};tx.oncomplete=()=>resolve(value);tx.onabort=tx.onerror=()=>reject(tx.error||r.error);});
     const write=(store,key,value)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(value,key);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});
+    const savedPreferences=await read('preferences',namespace);
+    let preferences=initialRuntimePreferences(program,savedPreferences,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches);
+    observe('preferences_loaded');
+    const createStart=String(Math.round(performance.now()*1000));
+    const engine=await wasm.Engine.create(executable,releaseDigest,release.title,'stage',JSON.stringify(preferences));
+    preferences=JSON.parse(engine.state()).preferences;
+    observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
+    document.title=release.title;
+    const AudioContext=window.AudioContext||window.webkitAudioContext;
+    const audio=new AudioContext();let unlocked=null,audioPaused=true;
+    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map();
+    let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
+    const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
+    let ownerTimer=null,pendingElapsed=0;
     function hostEvent(kind,value) {engine.host_event(kind,typeof value==='string'?value:JSON.stringify(value));}
     function reportHostFailure(error,operation) {
         observe('diagnostic',{domain:'host',code:'E_HOST',operation});
@@ -240,24 +294,36 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             post(slot,()=>failed(e));
         }
     }
-    async function asset(id,signal,context) {
-        const a=program.assets[id];if(!a)throw new Error(`E_ASSET: ${id}`);
+    async function asset(id,a,signal,context) {
+        if(!a)throw new Error(`E_ASSET_DESCRIPTOR: ${id}`);
         signal.throwIfAborted();
-        if(bytesCache.has(a.object)){observe('bytes_cache_hit',context);return bytesCache.get(a.object);}
+        if(bytesCache.has(a.object)){
+            const bytes=bytesCache.get(a.object);
+            if(bytes.byteLength!==a.bytes)throw Object.assign(new Error(`E_ASSET_SIZE: ${id}`),{code:'E_ASSET_SIZE'});
+            observe('bytes_cache_hit',context);return bytes;
+        }
         observe('fetch_started',context);
         const bytes=await requests.get(a.object,signal);signal.throwIfAborted();
+        if(bytes.byteLength!==a.bytes)throw Object.assign(new Error(`E_ASSET_SIZE: ${id}`),{code:'E_ASSET_SIZE'});
         observe('fetch_verified',{...context,bytes:bytes.byteLength});
         bytesCache.set(a.object,bytes);return bytes;
     }
     function cancelPreparation(request) {inbox.cancelGroup(request);const controller=preparations.get(request);controller?.abort();preparations.delete(request);}
     function prune() {
         if(disposed||recovering)return;
-        const keep=new Set(JSON.parse(engine.retained()));for(const v of voices.values())keep.add(v.asset);
-        const objects=new Set([...keep].map(id=>program.assets[id]?.object));
+        const retained=JSON.parse(engine.retained_descriptors());
+        for(const [id,descriptor] of Object.entries(retained))assetDescriptors.set(id,descriptor);
+        const keep=new Set(Object.keys(retained));for(const v of voices.values())keep.add(v.asset);
+        const objects=new Set([...keep].map(id=>assetDescriptors.get(id)?.object).filter(Boolean));
         for(const id of buffers.keys())if(!keep.has(id))buffers.delete(id);
+        for(const id of assetDescriptors.keys())if(!keep.has(id))assetDescriptors.delete(id);
         for(const id of bytesCache.keys())if(!objects.has(id))bytesCache.delete(id);
     }
     async function prepare(c) {
+        let descriptors;
+        try { descriptors=validateAssetRequest(c.assets,c.descriptors); }
+        catch(error) { engine.resource_failed(c.request,String(error));return; }
+        for(const [id,descriptor] of Object.entries(descriptors))assetDescriptors.set(id,descriptor);
         const terminal=inbox.reserve('completion',c.request,{session:c.session,device:c.device});
         if(!terminal){engine.resource_failed(c.request,'E_REQUEST_CAPACITY');return;}
         const controller=new AbortController(),signal=controller.signal;
@@ -270,13 +336,14 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         async function worker(){while(next<c.assets.length&&!disposed&&!signal.aborted){
             const id=c.assets[next++],slot=inbox.reserve('resource',c.request,{session:c.session,device:c.device});
             if(!slot){await post(terminal,()=>failed('E_REQUEST_CAPACITY'));return;}
-            let stage='fetch';const context={request:c.request,session:c.session,device:c.device,asset:id,object:program.assets[id]?.object};
+            const descriptor=descriptors[id];
+            let stage='fetch';const context={request:c.request,session:c.session,device:c.device,asset:id,object:descriptor?.object};
             observe('resource_queued',context);
             try {
                 await resourcePool.run(async()=>{
                     observe('resource_admitted',context);
-                    const bytes=await asset(id,signal,context);signal.throwIfAborted();
-                    if(program.assets[id].kind==='audio'){
+                    const bytes=await asset(id,descriptor,signal,context);signal.throwIfAborted();
+                    if(descriptor.kind==='audio'){
                         stage='audio_decode';observe('audio_decode_started',context);
                         if(!buffers.has(id)){
                             if(!decodeJobs.has(id))decodeJobs.set(id,audio.decodeAudioData(bytes.slice(0)).finally(()=>decodeJobs.delete(id)));
@@ -384,7 +451,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         for(const c of JSON.parse(engine.commands())){
         switch(c.type){
             case 'observation':observe(c.stage,c);break;
-            case 'resource_stage':observe(c.stage,{...c,object:program.assets[c.asset]?.object});break;
+            case 'resource_stage':observe(c.stage,c);break;
             case 'diagnostic':{const d=c.diagnostic;observe('diagnostic',{code:d.code,location:d.location,...d.details,asset:d.details?.references?.[0]});break;}
             case 'get_content':prepareContent(c);break;
             case 'cancel_content':cancelContent(c.request);break;
@@ -489,10 +556,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
-    request(()=>Promise.all([read('preferences',namespace),read('profile',namespace)]),([savedPreferences,profile])=>{
-        hostEvent('preferences',initialPreferences(preferences,savedPreferences,program.locale_config,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
-        if(profile)hostEvent('profile',profile);
-    },e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
+    request(()=>read('profile',namespace),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
     function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
     window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>engine.hidden(true));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>engine.hidden(false));}});
@@ -501,13 +565,14 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
 // Author defaults < browser accessibility defaults < explicitly saved player settings.
 export function initialPreferences(defaults,saved,locales,languages,reducedMotion) {
     const ui=locales?.ui||{},text=locales?.text||{};
+    const supports=(set,tag)=>typeof tag==='string'&&Object.hasOwn(set,tag);
     const match=(supported,fallback)=>{
         for(const tag of languages){
-            if(supported[tag])return tag;
+            if(supports(supported,tag))return tag;
             try {
                 const parsed=new Intl.Locale(tag),base=parsed.language.toLowerCase();
-                if(base==='en'&&supported.en)return 'en';
-                if(base==='zh'&&parsed.script?.toLowerCase()==='hans'&&supported['zh-Hans'])return 'zh-Hans';
+                if(base==='en'&&supports(supported,'en'))return 'en';
+                if(base==='zh'&&parsed.script?.toLowerCase()==='hans'&&supports(supported,'zh-Hans'))return 'zh-Hans';
             } catch {}
         }
         return fallback;
@@ -518,9 +583,9 @@ export function initialPreferences(defaults,saved,locales,languages,reducedMotio
     if(saved){
         const legacy=saved.locale;
         const {locale:_oldLocale,...rest}=saved;
-        const uiLocale=saved.ui_locale||(ui[legacy]?legacy:browserUi);
-        const textLocale=saved.text_locale||(text[legacy]?legacy:browserText);
-        return {...defaults,...rest,ui_locale:ui[uiLocale]?uiLocale:defaultUi,text_locale:text[textLocale]?textLocale:defaultText};
+        const uiLocale=saved.ui_locale||(supports(ui,legacy)?legacy:browserUi);
+        const textLocale=saved.text_locale||(supports(text,legacy)?legacy:browserText);
+        return {...defaults,...rest,ui_locale:supports(ui,uiLocale)?uiLocale:defaultUi,text_locale:supports(text,textLocale)?textLocale:defaultText};
     }
     return {...defaults,ui_locale:browserUi,text_locale:browserText,reduced_motion:defaults.reduced_motion||reducedMotion};
 }

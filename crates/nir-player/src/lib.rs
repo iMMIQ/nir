@@ -40,6 +40,7 @@ pub enum AppCommand {
         stage: String,
         request: u32,
         asset: String,
+        object: Option<String>,
         session: u32,
         device: u32,
         start_us: Micros,
@@ -65,6 +66,7 @@ pub enum AppCommand {
         session: u32,
         device: u32,
         assets: Vec<String>,
+        descriptors: BTreeMap<String, Asset>,
     },
     CancelAssets {
         request: u32,
@@ -245,6 +247,7 @@ pub struct Player {
     work_used: u32,
     prepare: Option<Preparation>,
     content: BTreeMap<u32, ContentPreparation>,
+    content_leases: Vec<nir_core::ContentLease>,
     candidate: Option<Core>,
     device_resume: Option<Purpose>,
     ledger: BudgetLedger,
@@ -260,9 +263,46 @@ pub struct Player {
 }
 impl Player {
     pub fn new(program: Program, release: String, title: String) -> Result<Self> {
-        let validated = ValidatedProgram::new(program)?;
-        let locale = validated.program().locale_config.default_text.clone();
-        let ui_locale = validated.program().locale_config.default_ui.clone();
+        Self::from_validated(ValidatedProgram::new(program)?, release, title, None)
+    }
+    pub fn new_runtime(
+        root: RuntimeProgram,
+        release: String,
+        title: String,
+        preferences: Option<Preferences>,
+    ) -> Result<Self> {
+        Self::from_validated(
+            ValidatedProgram::from_runtime(root)?,
+            release,
+            title,
+            preferences,
+        )
+    }
+    fn from_validated(
+        validated: ValidatedProgram,
+        release: String,
+        title: String,
+        initial: Option<Preferences>,
+    ) -> Result<Self> {
+        let config = &validated.program().locale_config;
+        let mut preferences = initial.unwrap_or_else(|| {
+            validated
+                .program()
+                .player
+                .preferences(config.default_ui.clone(), config.default_text.clone())
+        });
+        if !config.ui.contains_key(&preferences.ui_locale) {
+            preferences.ui_locale = config.default_ui.clone();
+        }
+        if !config.text.contains_key(&preferences.text_locale) {
+            preferences.text_locale = config.default_text.clone();
+        }
+        preferences.font_scale = finite_clamp(preferences.font_scale, 0.8, 1.5, 1.);
+        preferences.bgm_volume = finite_clamp(preferences.bgm_volume, 0., 1., 0.3);
+        preferences.voice_volume = finite_clamp(preferences.voice_volume, 0., 1., 0.8);
+        preferences.sfx_volume = finite_clamp(preferences.sfx_volume, 0., 1., 0.5);
+        let locale = preferences.text_locale.clone();
+        let ui_locale = preferences.ui_locale.clone();
         let core = Core::new(validated.clone(), release.clone(), locale.clone())?;
         let ledger = BudgetLedger::new(128 * 1024 * 1024);
         let _surface_budget = ledger.reserve(&BTreeMap::from([(
@@ -271,10 +311,6 @@ impl Player {
                 + 8 * 1024 * 1024
                 + 32 * 1024 * 1024,
         )]))?;
-        let preferences = validated
-            .program()
-            .player
-            .preferences(ui_locale.clone(), locale.clone());
         let mut p = Self {
             messages: nir_presentation::Messages::default(),
             core,
@@ -326,6 +362,7 @@ impl Player {
             auto_elapsed: 0,
             history_offset: 0,
             content: BTreeMap::new(),
+            content_leases: vec![],
         };
         let assets = p.title_assets();
         p.begin_prepare(Purpose::Boot, 0, assets)?;
@@ -494,6 +531,11 @@ impl Player {
                 }
             }
         }
+        for requirement in self.asset_content_requirements(&fonts)? {
+            if !needs.contains(&requirement) {
+                needs.push(requirement);
+            }
+        }
         if !needs.is_empty() {
             self.locale_error = None;
             return self.begin_content(ContentPurpose::Locale, needs);
@@ -518,6 +560,7 @@ impl Player {
                     request: candidate.request,
                     session: self.generation.session,
                     device: self.generation.device,
+                    descriptors: self.describe_assets(&fonts)?,
                     assets: fonts.into_iter().collect(),
                 });
             }
@@ -566,13 +609,24 @@ impl Player {
                 .any(|p| !p.failed && !matches!(p.purpose, ContentPurpose::Locale))
     }
     fn title_nodes(&self) -> Vec<Node> {
-        let p = self.validated.program();
-        p.title_scene
-            .as_ref()
-            .and_then(|s| p.scenes.get(s))
-            .or_else(|| p.scenes.values().next())
+        self.validated.title_nodes().to_vec()
+    }
+    fn font_assets(&self, ui: &str, text: &str) -> BTreeSet<String> {
+        let config = &self.validated.program().locale_config;
+        config
+            .ui
+            .get(ui)
+            .into_iter()
+            .flat_map(|p| p.fonts.iter())
+            .chain(
+                config
+                    .text
+                    .get(text)
+                    .into_iter()
+                    .flat_map(|p| p.fonts.iter()),
+            )
             .cloned()
-            .unwrap_or_default()
+            .collect()
     }
     fn title_assets(&self) -> BTreeSet<String> {
         let mut a: BTreeSet<_> = self
@@ -580,14 +634,7 @@ impl Player {
             .iter()
             .filter_map(|n| n.asset.clone())
             .collect();
-        a.extend(
-            self.validated
-                .program()
-                .assets
-                .iter()
-                .filter(|(_, a)| a.kind == AssetKind::Font)
-                .map(|(id, _)| id.clone()),
-        );
+        a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         a
     }
     fn state_assets(&self, core: &Core) -> BTreeSet<String> {
@@ -610,15 +657,26 @@ impl Player {
             }
         }
         if let Some(pending) = &s.pending {
-            a.extend(nir_content::cue_assets(core.program(), &pending.cue));
+            a.extend(self.validated.cue_assets(&pending.cue));
         }
-        a.extend(
-            core.program()
-                .assets
-                .iter()
-                .filter(|(_, a)| a.kind == AssetKind::Font)
-                .map(|(id, _)| id.clone()),
-        );
+        a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
+        let config = &core.program().locale_config;
+        for locale in s
+            .tasks
+            .values()
+            .filter_map(|t| t.dialogue.as_ref().map(|d| &d.locale))
+            .chain(
+                s.pending
+                    .iter()
+                    .flat_map(|p| p.dialogues.values().map(|d| &d.locale)),
+            )
+            .chain(s.choice.iter().map(|c| &c.locale))
+            .chain(s.history.iter().map(|h| &h.locale))
+        {
+            if let Some(plan) = config.text.get(locale) {
+                a.extend(plan.fonts.iter().cloned());
+            }
+        }
         a
     }
     pub fn retained_assets(&self) -> BTreeSet<String> {
@@ -635,14 +693,36 @@ impl Player {
         }
         a
     }
+    pub fn content_residency(&self) -> nir_core::ResidencyReport {
+        self.validated.residency()
+    }
+    pub fn asset_descriptor(&self, id: &str) -> Option<&Asset> {
+        self.validated.asset(id)
+    }
+    pub fn retained_descriptors(&self) -> BTreeMap<String, Asset> {
+        self.retained_assets()
+            .into_iter()
+            .filter_map(|id| self.asset_descriptor(&id).cloned().map(|asset| (id, asset)))
+            .collect()
+    }
+    fn describe_assets(&self, ids: &BTreeSet<String>) -> Result<BTreeMap<String, Asset>> {
+        ids.iter()
+            .map(|id| {
+                self.asset_descriptor(id)
+                    .cloned()
+                    .map(|asset| (id.clone(), asset))
+                    .ok_or_else(|| {
+                        Diagnostic::new("E_ASSET", id, "resource catalog is not resident")
+                    })
+            })
+            .collect()
+    }
     fn costs(&self, ids: &BTreeSet<String>) -> Result<BTreeMap<String, u64>> {
         ids.iter()
             .map(|id| {
                 let a = self
                     .validated
-                    .program()
-                    .assets
-                    .get(id)
+                    .asset(id)
                     .ok_or_else(|| Diagnostic::new("E_ASSET", id, "missing asset"))?;
                 let cost = match a.kind {
                     AssetKind::Image => {
@@ -717,6 +797,17 @@ impl Player {
         } else {
             self.state_assets(&self.core)
         });
+        let needs = self.asset_content_requirements(&assets)?;
+        if !needs.is_empty() {
+            return self.begin_content(
+                ContentPurpose::Media {
+                    purpose,
+                    activation,
+                    assets,
+                },
+                needs,
+            );
+        }
         self.request = self
             .request
             .checked_add(1)
@@ -742,6 +833,7 @@ impl Player {
             request,
             session: self.generation.session,
             device: self.generation.device,
+            descriptors: self.describe_assets(&assets)?,
             assets: assets.into_iter().collect(),
         });
         Ok(())
@@ -784,7 +876,7 @@ impl Player {
                 CoreIntent::Prepare { activation, cue } => self.begin_prepare(
                     Purpose::Activation,
                     activation,
-                    nir_content::cue_assets(self.core.program(), &cue),
+                    self.validated.cue_assets(&cue),
                 )?,
                 CoreIntent::AudioStart {
                     task,
@@ -888,6 +980,9 @@ impl Player {
             if let Err(e) = self.step(CoreInput::None, &mut remaining) {
                 self.report(e, true);
             }
+        }
+        if let Err(error) = self.refresh_content_lease() {
+            self.report(error, true);
         }
         self.work_used = limit - remaining;
         let after = self.paused();
@@ -1430,7 +1525,7 @@ impl Player {
                         self.begin_prepare(
                             Purpose::Activation,
                             pending.id,
-                            nir_content::cue_assets(self.core.program(), &pending.cue),
+                            self.validated.cue_assets(&pending.cue),
                         )?;
                     }
                 }
@@ -1763,7 +1858,7 @@ impl Player {
             locale_pending: self.locale_pending(),
             locale_error: self.locale_error.clone(),
             preflight_texts: vec![],
-            theme: c.program().theme.clone(),
+            theme: (*c.program().theme).clone(),
             history: c
                 .state()
                 .history

@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const FORMAT_VERSION: u32 = 1;
+/// Wire version for the indexed, lazily loaded runtime root. Source `Program`
+/// documents deliberately keep `FORMAT_VERSION` so authoring formats can evolve
+/// independently from the runtime package layout.
+pub const RUNTIME_FORMAT_VERSION: u32 = 2;
+pub const CONTENT_PACKAGE_VERSION: u32 = 2;
 pub const SNAPSHOT_VERSION: u32 = 1;
 pub const CAPABILITIES: &[&str] = &[
     "module.lazy.v1",
@@ -289,7 +294,222 @@ pub struct ModuleIndex {
     pub functions: BTreeMap<String, FunctionSignature>,
     pub texts: BTreeSet<String>,
     pub code: String,
+    /// Digest of the module's `ModuleStatic` package.
+    #[serde(default)]
+    pub static_content: String,
     pub locales: BTreeMap<String, String>,
+}
+
+/// An addressable runtime root. Unlike the authoring `Program`, this document
+/// contains identities and ownership indexes, never module bodies or locale
+/// text documents.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProgram {
+    pub format: u32,
+    pub game_id: String,
+    pub revision: String,
+    pub entry: String,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    pub stage: Stage,
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+    /// Static function interfaces and the module responsible for each body.
+    pub function_index: BTreeMap<String, RuntimeFunctionIndex>,
+    /// Module content hashes and per-module declarations.
+    #[serde(default)]
+    pub modules: BTreeMap<String, ModuleIndex>,
+    /// Lightweight owner indexes for static and text objects.
+    #[serde(default)]
+    pub scene_owners: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cue_owners: BTreeMap<String, String>,
+    #[serde(default)]
+    pub choice_owners: BTreeMap<String, String>,
+    #[serde(default)]
+    pub text_owners: BTreeMap<String, String>,
+    /// Stable task ID (`cue/effect`) to owning module, used to resolve restored
+    /// task references without loading every cue package.
+    #[serde(default)]
+    pub task_owners: BTreeMap<String, String>,
+    /// Text identity needed to validate frozen dialogue and request its locale
+    /// bundle while the actual text remains unloaded.
+    #[serde(default)]
+    pub text_contracts: BTreeMap<String, RuntimeTextIdentity>,
+    /// Locale IDs only. Locale documents are held in independent Text blocks.
+    #[serde(default)]
+    pub locales: BTreeSet<String>,
+    pub locale_config: LocaleConfig,
+    /// Asset ID -> kind, immutable media identity and catalog locator.
+    #[serde(default)]
+    pub assets: BTreeMap<String, AssetIndexEntry>,
+    /// Catalog ID -> immutable catalog package digest.
+    #[serde(default)]
+    pub catalogs: BTreeMap<String, String>,
+    pub default_locale: String,
+    #[serde(default)]
+    pub title_scene: Option<String>,
+    /// The title scene is the sole scene body embedded in the root.
+    #[serde(default)]
+    pub title_nodes: Vec<Node>,
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default)]
+    pub player: PlayerDefaults,
+}
+impl RuntimeProgram {
+    pub fn function_signature(&self, id: &str) -> Option<&FunctionSignature> {
+        self.function_index.get(id).map(|entry| &entry.signature)
+    }
+    pub fn function_module(&self, id: &str) -> Option<&str> {
+        self.function_index
+            .get(id)
+            .map(|entry| entry.module.as_str())
+    }
+    pub fn text_module(&self, id: &str) -> Option<&str> {
+        self.text_owners.get(id).map(String::as_str)
+    }
+    pub fn content_requirement(&self, key: &ContentKey) -> Option<ContentRequirement> {
+        let (digest, reason) = match key {
+            ContentKey::Static { module } => (
+                &self.modules.get(module)?.static_content,
+                "module declarations",
+            ),
+            ContentKey::Code { module } => (&self.modules.get(module)?.code, "function bodies"),
+            ContentKey::Text { module, locale } => (
+                self.modules.get(module)?.locales.get(locale)?,
+                "localized text",
+            ),
+            ContentKey::Catalog { catalog } => {
+                (self.catalogs.get(catalog)?, "resource descriptors")
+            }
+        };
+        Some(ContentRequirement {
+            key: key.clone(),
+            digest: digest.clone(),
+            reason: reason.into(),
+        })
+    }
+    pub fn asset_catalogs<'a>(
+        &'a self,
+        assets: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<ContentKey> {
+        assets
+            .into_iter()
+            .filter_map(|id| self.assets.get(id))
+            .map(|asset| ContentKey::Catalog {
+                catalog: asset.catalog.clone(),
+            })
+            .collect()
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFunctionIndex {
+    pub module: String,
+    pub signature: FunctionSignature,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTextIdentity {
+    pub module: String,
+    pub source_revision: u32,
+    pub contract_revision: u32,
+    pub meaning_revision: u32,
+    pub contract_digest: String,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssetIndexEntry {
+    pub kind: AssetKind,
+    pub object: String,
+    pub catalog: String,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleStatic {
+    pub format: u32,
+    pub module: String,
+    #[serde(default)]
+    pub scenes: BTreeMap<String, Vec<Node>>,
+    #[serde(default)]
+    pub cues: BTreeMap<String, Cue>,
+    #[serde(default)]
+    pub choices: BTreeMap<String, Choice>,
+    #[serde(default)]
+    pub text_contracts: BTreeMap<String, TextContract>,
+    /// Cue asset recipes contain only cue audio and images from presented
+    /// scenes. Font plans are separate catalog consumers.
+    #[serde(default)]
+    pub activation_recipes: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetCatalog {
+    pub format: u32,
+    pub catalog: String,
+    pub assets: BTreeMap<String, Asset>,
+}
+
+/// Content identities carried by runtime requests and resident-store APIs.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContentKey {
+    Static { module: String },
+    Code { module: String },
+    Text { module: String, locale: String },
+    Catalog { catalog: String },
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentRequirement {
+    pub key: ContentKey,
+    pub digest: String,
+    pub reason: String,
+}
+
+/// Read-only lease information exposed by runtime residency reports.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseInfo {
+    pub id: u64,
+    pub owner: String,
+    pub keys: BTreeSet<ContentKey>,
+    pub resident_bytes: u64,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidencyBudget {
+    pub resident_bytes: u64,
+}
+
+/// Parsed, digest-verified content. Parsing belongs to `nir-content`; semantic
+/// validation and indexing belong to `nir-core`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone)]
+pub enum RuntimeObject {
+    Static(ModuleStatic),
+    Code(ModuleCode),
+    Text(ModuleTexts),
+    Catalog(AssetCatalog),
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,6 +1203,17 @@ pub struct Executable {
     pub resume_map: BTreeMap<String, u32>,
     pub semantic_cost_map: Vec<u32>,
     pub activation_recipes: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Runtime wire artifact. The source-facing `Executable` stays format 1 for
+/// compiler validation and compatibility; release packaging emits this small
+/// format 2 root and its separately addressed content blocks.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecutable {
+    pub format: u32,
+    pub program: RuntimeProgram,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

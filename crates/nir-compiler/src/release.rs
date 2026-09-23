@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use nir_format::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -105,6 +105,7 @@ pub struct BuildReport {
     pub total_bytes: u64,
     pub objects: usize,
     pub module_packages: BTreeMap<String, ModuleBuildReport>,
+    pub asset_catalogs: BTreeMap<String, AssetCatalogBuildReport>,
     pub resources: Vec<String>,
     pub excluded_resources: Vec<String>,
     pub provenance: BTreeMap<String, String>,
@@ -116,6 +117,9 @@ pub struct BuildReport {
 pub struct ModuleBuildReport {
     pub code: String,
     pub code_bytes: u64,
+    pub static_content: String,
+    pub static_bytes: u64,
+    pub asset_catalogs: Vec<String>,
     pub locales: BTreeMap<String, TextBuildReport>,
 }
 #[derive(Debug, Serialize)]
@@ -124,77 +128,496 @@ pub struct TextBuildReport {
     pub bytes: u64,
 }
 
-/// Write one immutable code object and one immutable text object per module
-/// and locale. The root executable keeps the index and shared tables only.
-fn package_modules(
-    out: &Path,
-    objects: &mut BTreeMap<String, Object>,
-    program: &mut Program,
-) -> Result<BTreeMap<String, ModuleBuildReport>> {
-    if program.modules.is_empty() {
-        // Older projects have one monolithic executable. Keep that release
-        // representation readable while new projects opt into module indexes.
-        return Ok(BTreeMap::new());
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetCatalogBuildReport {
+    pub object: String,
+    pub bytes: u64,
+    pub consumers: Vec<String>,
+    pub assets: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyReport {
+    format: u32,
+    game_id: String,
+    entry: String,
+    module_dependencies: BTreeMap<String, Vec<String>>,
+    boot: BTreeMap<String, BTreeMap<String, DependencyClosure>>,
+    modules: BTreeMap<String, BTreeMap<String, BTreeMap<String, DependencyClosure>>>,
+    entry_reachable: BTreeMap<String, BTreeMap<String, DependencyClosure>>,
+    scope: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DependencyClosure {
+    object_count: usize,
+    object_bytes: u64,
+    file_count: usize,
+    file_bytes: u64,
+    total_bytes: u64,
+    category_bytes: BTreeMap<String, u64>,
+    objects: BTreeMap<String, DependencyObject>,
+    files: BTreeMap<String, DependencyFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DependencyObject {
+    bytes: u64,
+    media_type: String,
+    categories: Vec<String>,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DependencyFile {
+    sha256: String,
+    bytes: u64,
+    media_type: String,
+    reason: String,
+}
+
+#[derive(Clone, Default)]
+struct ClosureBuilder {
+    objects: BTreeMap<String, (u64, String, BTreeSet<String>, BTreeSet<String>)>,
+    files: BTreeMap<String, DependencyFile>,
+}
+impl ClosureBuilder {
+    fn add_object(
+        &mut self,
+        objects: &BTreeMap<String, Object>,
+        hash: &str,
+        category: &str,
+        reason: String,
+    ) -> Result<()> {
+        let object = objects
+            .get(hash)
+            .ok_or_else(|| anyhow::anyhow!("E_DEPENDENCY_OBJECT: missing {hash}"))?;
+        let entry = self.objects.entry(hash.to_owned()).or_insert_with(|| {
+            (
+                object.bytes,
+                object.media_type.clone(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            )
+        });
+        entry.2.insert(reason);
+        entry.3.insert(category.into());
+        Ok(())
     }
 
-    let mut code_owner = BTreeMap::new();
-    let mut text_owner = BTreeMap::new();
-    for (module_id, index) in &program.modules {
-        if module_id.is_empty() || index.functions.is_empty() {
-            bail!("E_MODULE: {module_id} has an empty identity or function interface");
+    fn add_file(&mut self, path: &str, bytes: &[u8], media_type: &str, reason: &str) {
+        self.files.insert(
+            path.into(),
+            DependencyFile {
+                sha256: nir_content::digest(bytes),
+                bytes: bytes.len() as u64,
+                media_type: media_type.into(),
+                reason: reason.into(),
+            },
+        );
+    }
+
+    fn finish(self) -> DependencyClosure {
+        let object_bytes = self.objects.values().map(|entry| entry.0).sum();
+        let file_bytes = self.files.values().map(|entry| entry.bytes).sum();
+        let object_count = self.objects.len();
+        let file_count = self.files.len();
+        let mut category_bytes = BTreeMap::new();
+        for (bytes, _, _, categories) in self.objects.values() {
+            for category in categories {
+                *category_bytes.entry(category.clone()).or_insert(0) += bytes;
+            }
+        }
+        DependencyClosure {
+            object_count,
+            object_bytes,
+            file_count,
+            file_bytes,
+            total_bytes: object_bytes + file_bytes,
+            category_bytes,
+            objects: self
+                .objects
+                .into_iter()
+                .map(|(hash, (bytes, media_type, reasons, categories))| {
+                    (
+                        hash,
+                        DependencyObject {
+                            bytes,
+                            media_type,
+                            categories: categories.into_iter().collect(),
+                            reasons: reasons.into_iter().collect(),
+                        },
+                    )
+                })
+                .collect(),
+            files: self.files,
+        }
+    }
+}
+
+struct RuntimeBuild {
+    executable: RuntimeExecutable,
+    modules: BTreeMap<String, ModuleBuildReport>,
+    catalogs: BTreeMap<String, AssetCatalogBuildReport>,
+    module_dependencies: BTreeMap<String, BTreeSet<String>>,
+    entry_module: String,
+    catalog_assets: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn module_indexes(program: &Program) -> Result<BTreeMap<String, ModuleIndex>> {
+    if !program.modules.is_empty() {
+        return Ok(program.modules.clone());
+    }
+    // Older source fixtures have no module table. Lower them as one runtime
+    // module so the release path still exercises the same package contracts.
+    let id = "_legacy".to_owned();
+    Ok(BTreeMap::from([(
+        id,
+        ModuleIndex {
+            functions: program
+                .functions
+                .iter()
+                .map(|(id, function)| (id.clone(), FunctionSignature::from(function)))
+                .collect(),
+            texts: program.texts.keys().cloned().collect(),
+            code: String::new(),
+            static_content: String::new(),
+            locales: BTreeMap::new(),
+        },
+    )]))
+}
+
+fn declaration_owner(id: &str, modules: &BTreeSet<String>) -> Result<String> {
+    if modules.len() == 1 {
+        return Ok(modules.iter().next().unwrap().clone());
+    }
+    let owner = modules
+        .iter()
+        .find(|module| {
+            id.strip_prefix(module.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("E_MODULE_OWNERSHIP: no module owns {id}"))?;
+    Ok(owner)
+}
+
+fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
+    let mut assets = BTreeSet::new();
+    if let Some(cue) = program.cues.get(cue_id) {
+        for definition in &cue.effects {
+            match &definition.effect {
+                Effect::StagePresent { scene, .. } => {
+                    if let Some(nodes) = program.scenes.get(scene) {
+                        assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                    }
+                }
+                Effect::Audio { asset, .. } => {
+                    assets.insert(asset.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    assets
+}
+
+fn asset_consumers(
+    program: &Program,
+    scene_owners: &BTreeMap<String, String>,
+    cue_owners: &BTreeMap<String, String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut consumers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (scene, nodes) in &program.scenes {
+        if let Some(module) = scene_owners.get(scene) {
+            for asset in nodes.iter().filter_map(|node| node.asset.as_ref()) {
+                consumers
+                    .entry(asset.clone())
+                    .or_default()
+                    .insert(format!("module:{module}"));
+            }
+        }
+    }
+    for (cue, definition) in &program.cues {
+        if let Some(module) = cue_owners.get(cue) {
+            for effect in &definition.effects {
+                if let Effect::Audio { asset, .. } = &effect.effect {
+                    consumers
+                        .entry(asset.clone())
+                        .or_default()
+                        .insert(format!("module:{module}"));
+                }
+            }
+        }
+    }
+    let title_nodes = program
+        .title_scene
+        .as_ref()
+        .and_then(|scene| program.scenes.get(scene))
+        .or_else(|| program.scenes.values().next());
+    if let Some(nodes) = title_nodes {
+        for asset in nodes.iter().filter_map(|node| node.asset.as_ref()) {
+            consumers
+                .entry(asset.clone())
+                .or_default()
+                .insert("bootstrap".into());
+        }
+    }
+    for (locale, plan) in &program.locale_config.ui {
+        for font in &plan.fonts {
+            consumers
+                .entry(font.clone())
+                .or_default()
+                .insert(format!("locale:ui:{locale}"));
+        }
+    }
+    for (locale, plan) in &program.locale_config.text {
+        for font in &plan.fonts {
+            consumers
+                .entry(font.clone())
+                .or_default()
+                .insert(format!("locale:text:{locale}"));
+        }
+    }
+    consumers
+}
+
+fn dependency_graph(
+    program: &Program,
+    function_owners: &BTreeMap<String, String>,
+    modules: &BTreeSet<String>,
+) -> Result<(BTreeMap<String, BTreeSet<String>>, String)> {
+    let mut graph: BTreeMap<String, BTreeSet<String>> = modules
+        .iter()
+        .map(|module| (module.clone(), BTreeSet::new()))
+        .collect();
+    for (source, function) in &program.functions {
+        let source_module = function_owners.get(source).ok_or_else(|| {
+            anyhow::anyhow!("E_MODULE_OWNERSHIP: no module owns function {source}")
+        })?;
+        for block in function.blocks.values() {
+            if let Terminator::Call {
+                function: target, ..
+            } = &block.terminator
+            {
+                let target_module = function_owners.get(target).ok_or_else(|| {
+                    anyhow::anyhow!("E_MODULE_OWNERSHIP: no module owns function {target}")
+                })?;
+                if source_module != target_module {
+                    graph
+                        .get_mut(source_module)
+                        .unwrap()
+                        .insert(target_module.clone());
+                }
+            }
+        }
+    }
+    let entry_module = function_owners
+        .get(&program.entry)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("E_MODULE_OWNERSHIP: no module owns entry {}", program.entry)
+        })?;
+    Ok((graph, entry_module))
+}
+
+fn package_runtime(
+    out: &Path,
+    objects: &mut BTreeMap<String, Object>,
+    source: &Program,
+    reference: &Executable,
+) -> Result<RuntimeBuild> {
+    let mut modules = module_indexes(source)?;
+    let module_ids: BTreeSet<String> = modules.keys().cloned().collect();
+
+    let mut function_owners = BTreeMap::new();
+    let mut text_owners = BTreeMap::new();
+    for (module, index) in &modules {
+        if module.is_empty() || index.functions.is_empty() {
+            bail!("E_MODULE: {module} has an empty identity or function interface");
         }
         for (id, signature) in &index.functions {
-            let function = program.functions.get(id).ok_or_else(|| {
-                anyhow::anyhow!("E_MODULE: {module_id} owns missing function {id}")
-            })?;
+            let function = source
+                .functions
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("E_MODULE: {module} owns missing function {id}"))?;
             if FunctionSignature::from(function) != *signature
-                || code_owner.insert(id.clone(), module_id.clone()).is_some()
+                || function_owners.insert(id.clone(), module.clone()).is_some()
             {
                 bail!("E_MODULE: invalid or duplicate function ownership for {id}");
             }
         }
         for id in &index.texts {
-            if !program.texts.contains_key(id)
-                || text_owner.insert(id.clone(), module_id.clone()).is_some()
+            if !source.texts.contains_key(id)
+                || text_owners.insert(id.clone(), module.clone()).is_some()
             {
                 bail!("E_MODULE: invalid or duplicate text ownership for {id}");
             }
         }
     }
-    if code_owner.len() != program.functions.len()
-        || program
+    if function_owners.len() != source.functions.len()
+        || source
             .functions
             .keys()
-            .any(|id| !code_owner.contains_key(id))
-        || text_owner.len() != program.texts.len()
-        || program.texts.keys().any(|id| !text_owner.contains_key(id))
+            .any(|id| !function_owners.contains_key(id))
+        || text_owners.len() != source.texts.len()
+        || source.texts.keys().any(|id| !text_owners.contains_key(id))
     {
         bail!("E_MODULE: module indexes do not own every function and text contract");
     }
 
-    let locales: Vec<String> = program.locales.keys().cloned().collect();
-    let mut reports = BTreeMap::new();
-    for (module_id, index) in &mut program.modules {
+    let scene_owners: BTreeMap<String, String> = source
+        .scenes
+        .keys()
+        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .collect::<Result<_>>()?;
+    let cue_owners: BTreeMap<String, String> = source
+        .cues
+        .keys()
+        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .collect::<Result<_>>()?;
+    let choice_owners: BTreeMap<String, String> = source
+        .choices
+        .keys()
+        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .collect::<Result<_>>()?;
+    let mut task_owners = BTreeMap::new();
+    for (cue, definition) in &source.cues {
+        let owner = cue_owners.get(cue).unwrap();
+        for effect in &definition.effects {
+            if task_owners
+                .get(&effect.id)
+                .is_some_and(|previous| previous != owner)
+            {
+                bail!("E_TASK_OWNER: duplicate task {}", effect.id);
+            }
+            task_owners.insert(effect.id.clone(), owner.clone());
+        }
+    }
+
+    let consumers = asset_consumers(source, &scene_owners, &cue_owners);
+    let roots: BTreeSet<String> = consumers.keys().cloned().collect();
+    let mut catalog_groups: BTreeMap<BTreeSet<String>, BTreeMap<String, Asset>> = BTreeMap::new();
+    for id in &roots {
+        let asset = source
+            .assets
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("E_ASSET_UNDECLARED: {id}"))?;
+        catalog_groups
+            .entry(consumers[id].clone())
+            .or_default()
+            .insert(id.clone(), asset.clone());
+    }
+
+    let mut catalog_assets = BTreeMap::new();
+    let mut catalog_reports = BTreeMap::new();
+    let mut catalogs = BTreeMap::new();
+    let mut asset_index = BTreeMap::new();
+    for (consumer_set, assets) in catalog_groups {
+        let id = format!(
+            "catalog.{}",
+            nir_content::digest(&serde_json::to_vec(&consumer_set)?)
+        );
+        let package = AssetCatalog {
+            format: CONTENT_PACKAGE_VERSION,
+            catalog: id.clone(),
+            assets: assets.clone(),
+        };
+        let bytes = serde_json::to_vec(&package)?;
+        let hash = object(out, objects, &bytes, "json", "application/json")?;
+        catalogs.insert(id.clone(), hash.clone());
+        catalog_assets.insert(id.clone(), assets.keys().cloned().collect());
+        for (asset_id, asset) in &assets {
+            asset_index.insert(
+                asset_id.clone(),
+                AssetIndexEntry {
+                    kind: asset.kind,
+                    object: asset.object.clone(),
+                    catalog: id.clone(),
+                },
+            );
+        }
+        catalog_reports.insert(
+            id.clone(),
+            AssetCatalogBuildReport {
+                object: hash,
+                bytes: bytes.len() as u64,
+                consumers: consumer_set.iter().cloned().collect(),
+                assets: assets.keys().cloned().collect(),
+            },
+        );
+    }
+
+    let mut module_reports = BTreeMap::new();
+    for (module, index) in &mut modules {
         let functions = index
             .functions
             .keys()
-            .map(|id| Ok((id.clone(), program.functions[id].clone())))
+            .map(|id| Ok((id.clone(), source.functions[id].clone())))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let code = ModuleCode {
-            format: 1,
-            module: module_id.clone(),
+            format: CONTENT_PACKAGE_VERSION,
+            module: module.clone(),
             functions,
         };
         let code_bytes = serde_json::to_vec(&code)?;
         let code_hash = object(out, objects, &code_bytes, "json", "application/json")?;
 
+        let scenes = source
+            .scenes
+            .iter()
+            .filter(|(id, _)| scene_owners[*id] == *module)
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        let cues: BTreeMap<_, _> = source
+            .cues
+            .iter()
+            .filter(|(id, _)| cue_owners[*id] == *module)
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        let choices = source
+            .choices
+            .iter()
+            .filter(|(id, _)| choice_owners[*id] == *module)
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        let contracts = index
+            .texts
+            .iter()
+            .map(|id| Ok((id.clone(), source.texts[id].clone())))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut activation_recipes = BTreeMap::new();
+        for cue in cues.keys() {
+            let expected: BTreeSet<_> = reference.activation_recipes[cue]
+                .iter()
+                .filter(|asset| source.assets[asset.as_str()].kind != AssetKind::Font)
+                .cloned()
+                .collect();
+            let actual = cue_media_assets(source, cue);
+            if expected != actual {
+                bail!("E_RECIPE: eager reference recipe differs for {cue}");
+            }
+            activation_recipes.insert(cue.clone(), actual);
+        }
+        let static_package = ModuleStatic {
+            format: CONTENT_PACKAGE_VERSION,
+            module: module.clone(),
+            scenes,
+            cues,
+            choices,
+            text_contracts: contracts,
+            activation_recipes,
+        };
+        let static_bytes = serde_json::to_vec(&static_package)?;
+        let static_hash = object(out, objects, &static_bytes, "json", "application/json")?;
+
         let mut text_reports = BTreeMap::new();
         let mut locale_objects = BTreeMap::new();
-        for locale in &locales {
+        for locale in source.locales.keys() {
             if index.texts.is_empty() {
                 continue;
             }
-            let available = &program.locales[locale];
+            let available = &source.locales[locale];
             let texts = index
                 .texts
                 .iter()
@@ -204,13 +627,13 @@ fn package_modules(
                         .cloned()
                         .map(|doc| (id.clone(), doc))
                         .ok_or_else(|| {
-                            anyhow::anyhow!("E_MODULE_TEXT: {locale} is missing {module_id}.{id}")
+                            anyhow::anyhow!("E_MODULE_TEXT: {locale} is missing {module}.{id}")
                         })
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
             let bundle = ModuleTexts {
-                format: 1,
-                module: module_id.clone(),
+                format: CONTENT_PACKAGE_VERSION,
+                module: module.clone(),
                 locale: locale.clone(),
                 texts,
             };
@@ -226,23 +649,398 @@ fn package_modules(
             );
         }
         index.code = code_hash.clone();
+        index.static_content = static_hash.clone();
         index.locales = locale_objects;
-        reports.insert(
-            module_id.clone(),
+        let owned_catalogs = catalog_reports
+            .iter()
+            .filter(|(_, report)| report.consumers.contains(&format!("module:{module}")))
+            .map(|(id, _)| id.clone())
+            .collect();
+        module_reports.insert(
+            module.clone(),
             ModuleBuildReport {
                 code: code_hash,
                 code_bytes: code_bytes.len() as u64,
+                static_content: static_hash,
+                static_bytes: static_bytes.len() as u64,
+                asset_catalogs: owned_catalogs,
                 locales: text_reports,
             },
         );
     }
 
-    // Keep the locale keys as the immutable set of supported languages. Their
-    // documents are installed independently from the module text objects.
-    for texts in program.locales.values_mut() {
-        texts.clear();
+    let (module_dependencies, entry_module) =
+        dependency_graph(source, &function_owners, &module_ids)?;
+    let function_index = function_owners
+        .iter()
+        .map(|(id, module)| {
+            (
+                id.clone(),
+                RuntimeFunctionIndex {
+                    module: module.clone(),
+                    signature: modules[module].functions[id].clone(),
+                },
+            )
+        })
+        .collect();
+    let runtime_text_contracts = text_owners
+        .iter()
+        .map(|(id, module)| {
+            let contract = &source.texts[id];
+            (
+                id.clone(),
+                RuntimeTextIdentity {
+                    module: module.clone(),
+                    source_revision: contract.source_revision,
+                    contract_revision: contract.contract_revision,
+                    meaning_revision: contract.meaning_revision,
+                    contract_digest: contract.contract_digest.clone(),
+                },
+            )
+        })
+        .collect();
+    let title_nodes = source
+        .title_scene
+        .as_ref()
+        .and_then(|scene| source.scenes.get(scene))
+        .or_else(|| source.scenes.values().next())
+        .cloned()
+        .unwrap_or_default();
+    let runtime = RuntimeProgram {
+        format: RUNTIME_FORMAT_VERSION,
+        game_id: source.game_id.clone(),
+        revision: source.revision.clone(),
+        entry: source.entry.clone(),
+        requires: source.requires.clone(),
+        stage: source.stage.clone(),
+        variables: source.variables.clone(),
+        function_index,
+        modules,
+        scene_owners,
+        cue_owners,
+        choice_owners,
+        text_owners,
+        task_owners,
+        text_contracts: runtime_text_contracts,
+        locales: source.locales.keys().cloned().collect(),
+        locale_config: source.locale_config.clone(),
+        assets: asset_index,
+        catalogs,
+        default_locale: source.default_locale.clone(),
+        title_scene: source
+            .title_scene
+            .clone()
+            .or_else(|| source.scenes.keys().next().cloned()),
+        title_nodes,
+        theme: source.theme.clone(),
+        player: source.player.clone(),
+    };
+    let executable = RuntimeExecutable {
+        format: RUNTIME_FORMAT_VERSION,
+        program: runtime,
+    };
+    Ok(RuntimeBuild {
+        executable,
+        modules: module_reports,
+        catalogs: catalog_reports,
+        module_dependencies,
+        entry_module,
+        catalog_assets,
+    })
+}
+
+fn module_paths(
+    start: &str,
+    graph: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, String> {
+    let mut paths = BTreeMap::from([(start.to_owned(), start.to_owned())]);
+    let mut queue = vec![start.to_owned()];
+    let mut cursor = 0;
+    while cursor < queue.len() {
+        let module = queue[cursor].clone();
+        cursor += 1;
+        let prefix = paths[&module].clone();
+        for target in graph.get(&module).into_iter().flatten() {
+            if paths.contains_key(target) {
+                continue;
+            }
+            paths.insert(target.clone(), format!("{prefix} -> {target}"));
+            queue.push(target.clone());
+        }
     }
-    Ok(reports)
+    paths
+}
+
+fn add_consumer_catalogs(
+    closure: &mut ClosureBuilder,
+    objects: &BTreeMap<String, Object>,
+    runtime: &RuntimeBuild,
+    consumer: &str,
+) -> Result<()> {
+    for (catalog, report) in &runtime.catalogs {
+        if !report.consumers.iter().any(|actual| actual == consumer) {
+            continue;
+        }
+        closure.add_object(
+            objects,
+            &report.object,
+            "catalog",
+            format!("catalog {catalog} selected by {consumer}"),
+        )?;
+        for asset_id in runtime.catalog_assets.get(catalog).into_iter().flatten() {
+            let asset = runtime
+                .executable
+                .program
+                .assets
+                .get(asset_id)
+                .ok_or_else(|| anyhow::anyhow!("E_DEPENDENCY_ASSET: {asset_id}"))?;
+            let category = match asset.kind {
+                AssetKind::Image => "media_image",
+                AssetKind::Audio => "media_audio",
+                AssetKind::Font => "media_font",
+            };
+            closure.add_object(
+                objects,
+                &asset.object,
+                category,
+                format!("asset {asset_id} selected by {consumer}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn add_module_payload(
+    closure: &mut ClosureBuilder,
+    objects: &BTreeMap<String, Object>,
+    runtime: &RuntimeBuild,
+    module: &str,
+    text_locale: &str,
+    ui_locale: &str,
+    reason: &str,
+) -> Result<()> {
+    let package = runtime
+        .modules
+        .get(module)
+        .ok_or_else(|| anyhow::anyhow!("E_DEPENDENCY_MODULE: {module}"))?;
+    closure.add_object(
+        objects,
+        &package.static_content,
+        "static",
+        format!("module {module} static declarations ({reason})"),
+    )?;
+    closure.add_object(
+        objects,
+        &package.code,
+        "code",
+        format!("module {module} code ({reason})"),
+    )?;
+    if let Some(text) = package.locales.get(text_locale) {
+        closure.add_object(
+            objects,
+            &text.object,
+            "text",
+            format!("module {module} text locale {text_locale} ({reason})"),
+        )?;
+    }
+    add_consumer_catalogs(closure, objects, runtime, &format!("module:{module}"))?;
+    add_consumer_catalogs(closure, objects, runtime, &format!("locale:ui:{ui_locale}"))?;
+    add_consumer_catalogs(
+        closure,
+        objects,
+        runtime,
+        &format!("locale:text:{text_locale}"),
+    )?;
+    Ok(())
+}
+
+fn add_bootstrap_files(
+    closure: &mut ClosureBuilder,
+    out: &Path,
+    sdk: &Path,
+    release: &str,
+) -> Result<()> {
+    for (path, bytes, mime, reason) in [
+        (
+            "index.html".to_owned(),
+            fs::read(sdk.join("index.html"))?,
+            "text/html; charset=utf-8",
+            "document bootstrap",
+        ),
+        (
+            "bootstrap.js".to_owned(),
+            fs::read(sdk.join("bootstrap.js"))?,
+            "text/javascript",
+            "release channel and runtime bootstrap",
+        ),
+        (
+            "channels/stable.json".to_owned(),
+            fs::read(out.join("channels/stable.json"))?,
+            "application/json",
+            "selected release channel pointer",
+        ),
+        (
+            format!("releases/{release}.json"),
+            fs::read(out.join(format!("releases/{release}.json")))?,
+            "application/json",
+            "immutable release object index",
+        ),
+    ] {
+        closure.add_file(&path, &bytes, mime, reason);
+    }
+    Ok(())
+}
+
+fn dependency_report(
+    out: &Path,
+    sdk: &Path,
+    release: &str,
+    program_hash: &str,
+    engine: &EngineFiles,
+    objects: &BTreeMap<String, Object>,
+    runtime: &RuntimeBuild,
+) -> Result<DependencyReport> {
+    let mut graph: BTreeMap<String, Vec<String>> = runtime
+        .module_dependencies
+        .iter()
+        .map(|(module, deps)| (module.clone(), deps.iter().cloned().collect()))
+        .collect();
+    // Include zero-outdegree modules explicitly for a useful, total adjacency map.
+    for module in runtime.modules.keys() {
+        graph.entry(module.clone()).or_default();
+    }
+
+    let ui_locales: Vec<_> = runtime
+        .executable
+        .program
+        .locale_config
+        .ui
+        .keys()
+        .cloned()
+        .collect();
+    let text_locales: Vec<_> = runtime
+        .executable
+        .program
+        .locale_config
+        .text
+        .keys()
+        .cloned()
+        .collect();
+    let mut boot = BTreeMap::new();
+    let reachable = module_paths(&runtime.entry_module, &runtime.module_dependencies);
+    let mut entry_reachable = BTreeMap::new();
+
+    for ui_locale in &ui_locales {
+        let mut boot_by_text = BTreeMap::new();
+        let mut entries_by_ui = BTreeMap::new();
+        for text_locale in &text_locales {
+            let mut boot_builder = ClosureBuilder::default();
+            boot_builder.add_object(
+                objects,
+                program_hash,
+                "root",
+                "runtime root indexes, configuration and minimal title scene".into(),
+            )?;
+            for (name, hash) in [
+                ("engine glue", engine.js.as_str()),
+                ("engine wasm", engine.wasm.as_str()),
+                ("host adapter", engine.host.as_str()),
+            ] {
+                boot_builder.add_object(objects, hash, "engine", name.into())?;
+            }
+            for consumer in [
+                "bootstrap".to_owned(),
+                format!("locale:ui:{ui_locale}"),
+                format!("locale:text:{text_locale}"),
+            ] {
+                add_consumer_catalogs(&mut boot_builder, objects, runtime, &consumer)?;
+            }
+            add_bootstrap_files(&mut boot_builder, out, sdk, release)?;
+
+            let mut entry_builder = boot_builder.clone();
+            for (module, path) in &reachable {
+                add_module_payload(
+                    &mut entry_builder,
+                    objects,
+                    runtime,
+                    module,
+                    text_locale,
+                    ui_locale,
+                    &format!("entry call closure {path}"),
+                )?;
+            }
+            boot_by_text.insert(text_locale.clone(), boot_builder.finish());
+            entries_by_ui.insert(text_locale.clone(), entry_builder.finish());
+        }
+        boot.insert(ui_locale.clone(), boot_by_text);
+        entry_reachable.insert(ui_locale.clone(), entries_by_ui);
+    }
+    let mut modules = BTreeMap::new();
+    for module in runtime.modules.keys() {
+        let mut by_ui = BTreeMap::new();
+        for ui_locale in &ui_locales {
+            let mut by_text = BTreeMap::new();
+            for text_locale in &text_locales {
+                let mut builder = ClosureBuilder::default();
+                add_module_payload(
+                    &mut builder,
+                    objects,
+                    runtime,
+                    module,
+                    text_locale,
+                    ui_locale,
+                    "single-module closure",
+                )?;
+                by_text.insert(text_locale.clone(), builder.finish());
+            }
+            by_ui.insert(ui_locale.clone(), by_text);
+        }
+        modules.insert(module.clone(), by_ui);
+    }
+
+    Ok(DependencyReport {
+        format: 1,
+        game_id: runtime.executable.program.game_id.clone(),
+        entry: runtime.executable.program.entry.clone(),
+        module_dependencies: graph,
+        boot,
+        modules,
+        entry_reachable,
+        scope: "Source-byte counts; object hashes are deduplicated. Bootstrap files are counted by path. HTTP headers, TLS, compression and retry traffic are excluded. Entry closure conservatively includes every statically reachable Call edge and every asset/font referenced by its included packages.".into(),
+    })
+}
+
+fn validate_runtime_packages(out: &Path, executable: &RuntimeExecutable) -> Result<()> {
+    if executable.format != RUNTIME_FORMAT_VERSION
+        || executable.program.format != RUNTIME_FORMAT_VERSION
+    {
+        bail!("E_RUNTIME_VERSION: compiler emitted an unsupported runtime root");
+    }
+    let root = &executable.program;
+    let mut keys = Vec::new();
+    for (module, index) in &root.modules {
+        keys.push(ContentKey::Static {
+            module: module.clone(),
+        });
+        keys.push(ContentKey::Code {
+            module: module.clone(),
+        });
+        keys.extend(index.locales.keys().map(|locale| ContentKey::Text {
+            module: module.clone(),
+            locale: locale.clone(),
+        }));
+    }
+    keys.extend(root.catalogs.keys().map(|catalog| ContentKey::Catalog {
+        catalog: catalog.clone(),
+    }));
+    for key in keys {
+        let requirement = root
+            .content_requirement(&key)
+            .ok_or_else(|| anyhow::anyhow!("E_RUNTIME_INDEX: {key:?}"))?;
+        let bytes = fs::read(out.join(format!("objects/{}.json", requirement.digest)))?;
+        nir_content::parse_runtime_object(root, &key, &bytes).map_err(anyhow::Error::new)?;
+    }
+    Ok(())
 }
 
 pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildReport> {
@@ -257,10 +1055,12 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
     fs::create_dir_all(out.join("channels"))?;
     let mut objects = BTreeMap::new();
     let roots = runtime_roots(&p.program);
-    let mut program = p.program.clone();
-    program.assets.retain(|id, _| roots.contains(id));
     for id in &roots {
-        let a = &program.assets[id];
+        let a = p
+            .program
+            .assets
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("E_ASSET_UNDECLARED: runtime dependency {id}"))?;
         let (ext, mime) = match a.kind {
             AssetKind::Image => ("png", "image/png"),
             AssetKind::Audio => ("wav", "audio/wav"),
@@ -269,24 +1069,17 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         };
         object(out, &mut objects, &p.media[id], ext, mime)?;
     }
-    let mut executable = compile(&program)?;
-    let module_packages = package_modules(out, &mut objects, &mut program)?;
-    let game_id = program.game_id.clone();
-    executable.program = program;
-    if !module_packages.is_empty() {
-        // Executable indexes describe only the currently loaded functions.
-        // The root object starts with none; the runtime installs a module
-        // candidate and builds its indexes when that module is prepared.
-        executable.program.functions.clear();
-        executable.addresses.clear();
-        executable.resume_map.clear();
-        executable.semantic_cost_map.clear();
-    }
-    nir_content::validate_executable(&executable)?;
+    // Compile and validate the complete source representation first. Runtime
+    // lowering is a packaging transform and must not hide invalid references.
+    let reference = compile(&p.program)?;
+    nir_content::validate_executable(&reference)?;
+    let runtime = package_runtime(out, &mut objects, &p.program, &reference)?;
+    validate_runtime_packages(out, &runtime.executable)?;
+    let game_id = p.program.game_id.clone();
     let program_hash = object(
         out,
         &mut objects,
-        &serde_json::to_vec(&executable)?,
+        &serde_json::to_vec(&runtime.executable)?,
         "json",
         "application/json",
     )?;
@@ -337,15 +1130,19 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         title: p.manifest.game.title.clone(),
         version: p.manifest.game.version.clone(),
         engine_build: lock.sdk_digest.clone(),
-        program: program_hash,
+        program: program_hash.clone(),
         objects: objects.clone(),
-        engine: EngineFiles { js, wasm, host },
+        engine: EngineFiles {
+            js: js.clone(),
+            wasm: wasm.clone(),
+            host: host.clone(),
+        },
         notices: vec![notice],
     };
     nir_content::validate_release(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
     let release = nir_content::digest(&bytes);
-    fs::write(out.join(format!("releases/{release}.json")), bytes)?;
+    fs::write(out.join(format!("releases/{release}.json")), &bytes)?;
     for name in ["index.html", "bootstrap.js"] {
         fs::copy(sdk.join(name), out.join(name))?;
     }
@@ -356,12 +1153,22 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         serde_json::to_vec(&serde_json::json!({"format":1,"release":release}))?,
     )?;
     fs::rename(tmp, out.join("channels/stable.json"))?;
+    let dependencies = dependency_report(
+        out,
+        sdk,
+        &release,
+        &program_hash,
+        &manifest.engine,
+        &objects,
+        &runtime,
+    )?;
     let report = BuildReport {
         release,
         game_id,
         total_bytes: objects.values().map(|o| o.bytes).sum(),
         objects: objects.len(),
-        module_packages,
+        module_packages: runtime.modules,
+        asset_catalogs: runtime.catalogs,
         resources: roots.iter().cloned().collect(),
         excluded_resources: p
             .program
@@ -388,6 +1195,10 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
     fs::write(
         reports.join("build.json"),
         serde_json::to_vec_pretty(&report)?,
+    )?;
+    fs::write(
+        reports.join("dependencies.json"),
+        serde_json::to_vec_pretty(&dependencies)?,
     )?;
     Ok(report)
 }

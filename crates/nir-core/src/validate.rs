@@ -1,48 +1,1801 @@
 use nir_format::*;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::ops::Index;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Instruction {
     Op(Op),
     Term(Terminator),
 }
+
+/// An indexed map whose declared keys can be known before their independent
+/// content blocks are resident. Values themselves are shared per body.
+#[derive(Debug, Clone)]
+pub struct ContentTable<T> {
+    declared: Arc<BTreeSet<String>>,
+    values: Arc<BTreeMap<String, Arc<T>>>,
+}
+impl<T> Default for ContentTable<T> {
+    fn default() -> Self {
+        Self {
+            declared: Arc::new(BTreeSet::new()),
+            values: Arc::new(BTreeMap::new()),
+        }
+    }
+}
+impl<T> ContentTable<T> {
+    fn from_owned(values: BTreeMap<String, T>) -> Self {
+        let declared = values.keys().cloned().collect();
+        Self {
+            declared: Arc::new(declared),
+            values: Arc::new(values.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()),
+        }
+    }
+    fn from_index(keys: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            declared: Arc::new(keys.into_iter().collect()),
+            values: Arc::new(BTreeMap::new()),
+        }
+    }
+    fn with_values(&self, values: impl IntoIterator<Item = (String, T)>) -> Self {
+        let mut declared = (*self.declared).clone();
+        let mut entries = (*self.values).clone();
+        for (key, value) in values {
+            declared.insert(key.clone());
+            entries.insert(key, Arc::new(value));
+        }
+        Self {
+            declared: Arc::new(declared),
+            values: Arc::new(entries),
+        }
+    }
+    pub fn get<Q>(&self, key: &Q) -> Option<&T>
+    where
+        String: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.values.get(key).map(AsRef::as_ref)
+    }
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        String: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.declared.contains(key)
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.declared.iter()
+    }
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.values.values().map(AsRef::as_ref)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &T)> {
+        self.values.iter().map(|(key, value)| (key, value.as_ref()))
+    }
+    pub fn len(&self) -> usize {
+        self.declared.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.declared.is_empty()
+    }
+}
+impl<T, Q> Index<&Q> for ContentTable<T>
+where
+    String: Borrow<Q>,
+    Q: ?Sized + Ord,
+{
+    type Output = T;
+    fn index(&self, key: &Q) -> &Self::Output {
+        self.get(key)
+            .expect("indexed runtime content is not resident")
+    }
+}
+
+/// Field-compatible view used by the VM. Root config and indexes are shared;
+/// content values live in independently shared tables.
+#[derive(Debug, Clone)]
+pub struct RuntimeProgramView {
+    pub format: u32,
+    pub game_id: String,
+    pub revision: String,
+    pub entry: String,
+    pub requires: Vec<String>,
+    pub stage: Stage,
+    pub variables: Arc<BTreeMap<String, Value>>,
+    pub functions: ContentTable<Function>,
+    pub modules: Arc<BTreeMap<String, ModuleIndex>>,
+    pub scenes: ContentTable<Vec<Node>>,
+    pub cues: ContentTable<Cue>,
+    pub choices: ContentTable<Choice>,
+    pub texts: ContentTable<TextContract>,
+    pub locales: Arc<BTreeMap<String, ContentTable<TextDoc>>>,
+    pub locale_config: Arc<LocaleConfig>,
+    pub assets: ContentTable<Asset>,
+    pub default_locale: String,
+    pub title_scene: Option<String>,
+    pub theme: Arc<Theme>,
+    pub player: Arc<PlayerDefaults>,
+    title_nodes: Arc<Vec<Node>>,
+    runtime_root: Option<Arc<RuntimeProgram>>,
+    function_index: Arc<BTreeMap<String, RuntimeFunctionIndex>>,
+    text_owners: Arc<BTreeMap<String, String>>,
+    text_identities: Arc<BTreeMap<String, RuntimeTextIdentity>>,
+    asset_index: Arc<BTreeMap<String, AssetIndexEntry>>,
+    cue_recipes: Arc<BTreeMap<String, Arc<BTreeSet<String>>>>,
+    task_definitions: Arc<BTreeMap<String, Vec<Arc<Effect>>>>,
+    op_owners: Arc<BTreeMap<String, String>>,
+}
+impl RuntimeProgramView {
+    pub fn runtime_root(&self) -> Option<&RuntimeProgram> {
+        self.runtime_root.as_deref()
+    }
+    pub fn title_nodes(&self) -> &[Node] {
+        &self.title_nodes
+    }
+    pub fn asset(&self, id: &str) -> Option<&Asset> {
+        self.assets.get(id)
+    }
+    pub fn asset_kind(&self, id: &str) -> Option<AssetKind> {
+        self.asset_index.get(id).map(|asset| asset.kind)
+    }
+    pub fn text_identity(&self, id: &str) -> Option<&RuntimeTextIdentity> {
+        self.text_identities.get(id)
+    }
+    pub fn function_signature(&self, id: &str) -> Option<FunctionSignature> {
+        self.functions
+            .get(id)
+            .map(FunctionSignature::from)
+            .or_else(|| self.function_index.get(id).map(|i| i.signature.clone()))
+            .or_else(|| {
+                self.modules
+                    .values()
+                    .find_map(|m| m.functions.get(id).cloned())
+            })
+    }
+    pub fn function_module(&self, id: &str) -> Option<&str> {
+        self.function_index
+            .get(id)
+            .filter(|i| i.module != "@root")
+            .map(|i| i.module.as_str())
+            .or_else(|| {
+                self.modules
+                    .iter()
+                    .find(|(_, module)| module.functions.contains_key(id))
+                    .map(|(id, _)| id.as_str())
+            })
+    }
+    pub fn text_module(&self, id: &str) -> Option<&str> {
+        self.text_owners.get(id).map(String::as_str).or_else(|| {
+            self.modules
+                .iter()
+                .find(|(_, module)| module.texts.contains(id))
+                .map(|(id, _)| id.as_str())
+        })
+    }
+    pub fn cue_assets(&self, cue: &str) -> BTreeSet<String> {
+        if let Some(assets) = self.cue_recipes.get(cue) {
+            return assets.as_ref().clone();
+        }
+        let mut set = BTreeSet::new();
+        if let Some(definition) = self.cues.get(cue) {
+            for effect in &definition.effects {
+                match &effect.effect {
+                    Effect::StagePresent { scene, .. } => {
+                        if let Some(nodes) = self.scenes.get(scene) {
+                            set.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                        }
+                    }
+                    Effect::Audio { asset, .. } => {
+                        set.insert(asset.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        set
+    }
+    /// Materialize the legacy source representation on demand. Runtime roots
+    /// cannot be converted because unloaded bodies are deliberately absent.
+    pub fn to_source_program(&self) -> Option<Program> {
+        if self.runtime_root.is_some() {
+            return None;
+        }
+        Some(Program {
+            format: self.format,
+            game_id: self.game_id.clone(),
+            revision: self.revision.clone(),
+            entry: self.entry.clone(),
+            requires: self.requires.clone(),
+            stage: self.stage.clone(),
+            variables: (*self.variables).clone(),
+            functions: self
+                .functions
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            modules: (*self.modules).clone(),
+            scenes: self
+                .scenes
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            cues: self
+                .cues
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            choices: self
+                .choices
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            texts: self
+                .texts
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            locales: self
+                .locales
+                .iter()
+                .map(|(locale, docs)| {
+                    (
+                        locale.clone(),
+                        docs.iter()
+                            .map(|(id, value)| (id.clone(), value.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            locale_config: (*self.locale_config).clone(),
+            assets: self
+                .assets
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            default_locale: self.default_locale.clone(),
+            title_scene: self.title_scene.clone(),
+            theme: (*self.theme).clone(),
+            player: (*self.player).clone(),
+        })
+    }
+    fn from_source(p: Program) -> Self {
+        let function_index = p
+            .functions
+            .iter()
+            .map(|(id, function)| {
+                (
+                    id.clone(),
+                    RuntimeFunctionIndex {
+                        module: p.function_module(id).unwrap_or("@root").to_string(),
+                        signature: FunctionSignature::from(function),
+                    },
+                )
+            })
+            .collect();
+        let text_owners: BTreeMap<String, String> = p
+            .modules
+            .iter()
+            .flat_map(|(module, index)| {
+                index
+                    .texts
+                    .iter()
+                    .map(move |id| (id.clone(), module.clone()))
+            })
+            .collect();
+        let text_identities = p
+            .texts
+            .iter()
+            .map(|(id, contract)| {
+                (
+                    id.clone(),
+                    RuntimeTextIdentity {
+                        module: text_owners.get(id).cloned().unwrap_or_default(),
+                        source_revision: contract.source_revision,
+                        contract_revision: contract.contract_revision,
+                        meaning_revision: contract.meaning_revision,
+                        contract_digest: contract.contract_digest.clone(),
+                    },
+                )
+            })
+            .collect();
+        let asset_index = p
+            .assets
+            .iter()
+            .map(|(id, asset)| {
+                (
+                    id.clone(),
+                    AssetIndexEntry {
+                        kind: asset.kind,
+                        object: asset.object.clone(),
+                        catalog: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut cue_recipes = BTreeMap::new();
+        for cue in p.cues.keys() {
+            let mut assets = BTreeSet::new();
+            if let Some(definition) = p.cues.get(cue) {
+                for effect in &definition.effects {
+                    match &effect.effect {
+                        Effect::StagePresent { scene, .. } => {
+                            if let Some(nodes) = p.scenes.get(scene) {
+                                assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                            }
+                        }
+                        Effect::Audio { asset, .. } => {
+                            assets.insert(asset.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            cue_recipes.insert(cue.clone(), Arc::new(assets));
+        }
+        let title_nodes = p
+            .title_scene
+            .as_ref()
+            .and_then(|title| p.scenes.get(title))
+            .cloned()
+            .or_else(|| p.scenes.values().next().cloned())
+            .unwrap_or_default();
+        let mut task_definitions: BTreeMap<String, Vec<Arc<Effect>>> = BTreeMap::new();
+        for effect in p.cues.values().flat_map(|cue| cue.effects.iter()) {
+            task_definitions
+                .entry(effect.id.clone())
+                .or_default()
+                .push(Arc::new(effect.effect.clone()));
+        }
+        let op_owners = p
+            .functions
+            .iter()
+            .flat_map(|(function_id, function)| {
+                function.blocks.values().flat_map(move |block| {
+                    block
+                        .ops
+                        .iter()
+                        .map(move |op| (op.id.clone(), function_id.clone()))
+                })
+            })
+            .collect();
+        Self {
+            format: p.format,
+            game_id: p.game_id,
+            revision: p.revision,
+            entry: p.entry,
+            requires: p.requires,
+            stage: p.stage,
+            variables: Arc::new(p.variables),
+            functions: ContentTable::from_owned(p.functions),
+            modules: Arc::new(p.modules),
+            scenes: ContentTable::from_owned(p.scenes),
+            cues: ContentTable::from_owned(p.cues),
+            choices: ContentTable::from_owned(p.choices),
+            texts: ContentTable::from_owned(p.texts),
+            locales: Arc::new(
+                p.locales
+                    .into_iter()
+                    .map(|(locale, docs)| (locale, ContentTable::from_owned(docs)))
+                    .collect(),
+            ),
+            locale_config: Arc::new(p.locale_config),
+            assets: ContentTable::from_owned(p.assets),
+            default_locale: p.default_locale,
+            title_scene: p.title_scene,
+            theme: Arc::new(p.theme),
+            player: Arc::new(p.player),
+            title_nodes: Arc::new(title_nodes),
+            runtime_root: None,
+            function_index: Arc::new(function_index),
+            text_owners: Arc::new(text_owners),
+            text_identities: Arc::new(text_identities),
+            asset_index: Arc::new(asset_index),
+            cue_recipes: Arc::new(cue_recipes),
+            task_definitions: Arc::new(task_definitions),
+            op_owners: Arc::new(op_owners),
+        }
+    }
+    fn from_runtime(root: RuntimeProgram) -> Result<Self> {
+        let functions = ContentTable::from_index(root.function_index.keys().cloned());
+        let scenes = ContentTable::from_index(root.scene_owners.keys().cloned());
+        let cues = ContentTable::from_index(root.cue_owners.keys().cloned());
+        let choices = ContentTable::from_index(root.choice_owners.keys().cloned());
+        let texts = ContentTable::from_index(root.text_contracts.keys().cloned());
+        let locales = root
+            .locales
+            .iter()
+            .map(|locale| (locale.clone(), ContentTable::default()))
+            .collect();
+        let assets = ContentTable::from_index(root.assets.keys().cloned());
+        let title_nodes = root.title_nodes.clone();
+        let root = Arc::new(root);
+        let view = Self {
+            format: root.format,
+            game_id: root.game_id.clone(),
+            revision: root.revision.clone(),
+            entry: root.entry.clone(),
+            requires: root.requires.clone(),
+            stage: root.stage.clone(),
+            variables: Arc::new(root.variables.clone()),
+            functions,
+            modules: Arc::new(root.modules.clone()),
+            scenes,
+            cues,
+            choices,
+            texts,
+            locales: Arc::new(locales),
+            locale_config: Arc::new(root.locale_config.clone()),
+            assets,
+            default_locale: root.default_locale.clone(),
+            title_scene: root.title_scene.clone(),
+            theme: Arc::new(root.theme.clone()),
+            player: Arc::new(root.player.clone()),
+            title_nodes: Arc::new(title_nodes),
+            function_index: Arc::new(root.function_index.clone()),
+            text_owners: Arc::new(root.text_owners.clone()),
+            text_identities: Arc::new(root.text_contracts.clone()),
+            asset_index: Arc::new(root.assets.clone()),
+            cue_recipes: Arc::new(BTreeMap::new()),
+            task_definitions: Arc::new(BTreeMap::new()),
+            op_owners: Arc::new(BTreeMap::new()),
+            runtime_root: Some(root),
+        };
+        validate_runtime_root(view.runtime_root.as_ref().unwrap())?;
+        Ok(view)
+    }
+    fn with_runtime_objects(&self, objects: &[RuntimeObject]) -> Result<Self> {
+        let mut next = self.clone();
+        let mut functions = Vec::new();
+        let mut scenes = Vec::new();
+        let mut cues = Vec::new();
+        let mut choices = Vec::new();
+        let mut texts = Vec::new();
+        let mut assets = Vec::new();
+        let mut locale_tables = (*self.locales).clone();
+        let mut recipes = (*self.cue_recipes).clone();
+        let mut task_definitions = (*self.task_definitions).clone();
+        let mut op_owners = (*self.op_owners).clone();
+        for object in objects {
+            match object {
+                RuntimeObject::Static(package) => {
+                    for (id, value) in &package.scenes {
+                        scenes.push((id.clone(), value.clone()));
+                    }
+                    for (id, value) in &package.cues {
+                        cues.push((id.clone(), value.clone()));
+                    }
+                    for (id, value) in &package.choices {
+                        choices.push((id.clone(), value.clone()));
+                    }
+                    for (id, value) in &package.text_contracts {
+                        texts.push((id.clone(), value.clone()));
+                    }
+                    recipes.extend(
+                        package
+                            .activation_recipes
+                            .iter()
+                            .map(|(cue, assets)| (cue.clone(), Arc::new(assets.clone()))),
+                    );
+                    for cue in package.cues.values() {
+                        for effect in &cue.effects {
+                            task_definitions
+                                .entry(effect.id.clone())
+                                .or_default()
+                                .push(Arc::new(effect.effect.clone()));
+                        }
+                    }
+                }
+                RuntimeObject::Code(package) => {
+                    for (id, value) in &package.functions {
+                        for block in value.blocks.values() {
+                            for op in &block.ops {
+                                if op_owners.insert(op.id.clone(), id.clone()).is_some() {
+                                    return Err(err(
+                                        "E_DUPLICATE",
+                                        &op.id,
+                                        "duplicate operation identity",
+                                    ));
+                                }
+                            }
+                        }
+                        functions.push((id.clone(), value.clone()));
+                    }
+                }
+                RuntimeObject::Text(package) => {
+                    let table = locale_tables
+                        .get(&package.locale)
+                        .ok_or_else(|| err("E_LOCALE", &package.locale, "unknown locale"))?;
+                    locale_tables.insert(
+                        package.locale.clone(),
+                        table.with_values(package.texts.clone()),
+                    );
+                }
+                RuntimeObject::Catalog(package) => {
+                    for (id, value) in &package.assets {
+                        assets.push((id.clone(), value.clone()));
+                    }
+                }
+            }
+        }
+        next.functions = self.functions.with_values(functions);
+        next.scenes = self.scenes.with_values(scenes);
+        next.cues = self.cues.with_values(cues);
+        next.choices = self.choices.with_values(choices);
+        next.texts = self.texts.with_values(texts);
+        next.assets = self.assets.with_values(assets);
+        next.locales = Arc::new(locale_tables);
+        next.cue_recipes = Arc::new(recipes);
+        next.task_definitions = Arc::new(task_definitions);
+        next.op_owners = Arc::new(op_owners);
+        Ok(next)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedProgram {
-    program: Arc<Program>,
-    instructions: Arc<Vec<Instruction>>,
-    block_offsets: Arc<BTreeMap<String, BTreeMap<String, usize>>>,
+    program: Arc<RuntimeProgramView>,
+    instructions: Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
+    runtime_objects: Arc<BTreeMap<ContentKey, (String, u64)>>,
+    residency: Arc<ResidencyLedger>,
+    budget: ResidencyBudget,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionInstructions {
+    blocks: BTreeMap<String, Vec<Instruction>>,
+}
+fn function_instructions(function: &Function) -> FunctionInstructions {
+    FunctionInstructions {
+        blocks: function
+            .blocks
+            .iter()
+            .map(|(id, block)| {
+                let mut instructions = block
+                    .ops
+                    .iter()
+                    .cloned()
+                    .map(Instruction::Op)
+                    .collect::<Vec<_>>();
+                instructions.push(Instruction::Term(block.terminator.clone()));
+                (id.clone(), instructions)
+            })
+            .collect(),
+    }
+}
+fn build_instruction_map(
+    functions: &ContentTable<Function>,
+) -> BTreeMap<String, Arc<FunctionInstructions>> {
+    functions
+        .iter()
+        .map(|(id, function)| (id.clone(), Arc::new(function_instructions(function))))
+        .collect()
+}
+fn add_instruction_map(
+    current: &Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
+    objects: &[RuntimeObject],
+) -> Arc<BTreeMap<String, Arc<FunctionInstructions>>> {
+    let mut next = (**current).clone();
+    for object in objects {
+        if let RuntimeObject::Code(package) = object {
+            for (id, function) in &package.functions {
+                next.entry(id.clone())
+                    .or_insert_with(|| Arc::new(function_instructions(function)));
+            }
+        }
+    }
+    Arc::new(next)
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
+    leases: BTreeMap<u64, LeaseInfo>,
+}
+#[derive(Debug, Default)]
+struct ResidencyLedger {
+    next_lease: AtomicU64,
+    state: Mutex<LedgerState>,
+}
+impl ResidencyLedger {
+    fn lease(
+        self: &Arc<Self>,
+        keys: BTreeSet<ContentKey>,
+        owner: String,
+        resident: &BTreeMap<ContentKey, (String, u64)>,
+    ) -> ContentLease {
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed) + 1;
+        let resident_bytes = unique_bytes(keys.iter().filter_map(|key| resident.get(key)));
+        let info = LeaseInfo {
+            id,
+            owner,
+            keys,
+            resident_bytes,
+        };
+        self.state
+            .lock()
+            .expect("residency mutex poisoned")
+            .leases
+            .insert(id, info.clone());
+        ContentLease {
+            id,
+            ledger: self.clone(),
+            info,
+        }
+    }
+    fn report(
+        &self,
+        resident: &BTreeMap<ContentKey, (String, u64)>,
+        budget: &ResidencyBudget,
+    ) -> ResidencyReport {
+        let state = self.state.lock().expect("residency mutex poisoned");
+        let all_keys: BTreeSet<_> = resident.keys().cloned().collect();
+        let pinned_keys: BTreeSet<_> = state
+            .leases
+            .values()
+            .flat_map(|lease| lease.keys.iter().cloned())
+            .filter(|key| all_keys.contains(key))
+            .collect();
+        let resident_bytes = unique_bytes(resident.values());
+        let pinned_bytes = unique_bytes(pinned_keys.iter().filter_map(|key| resident.get(key)));
+        let blocks = resident
+            .iter()
+            .map(|(key, (digest, encoded_bytes))| ResidencyEntry {
+                key: key.clone(),
+                digest: digest.clone(),
+                encoded_bytes: *encoded_bytes,
+                pinned_by: state
+                    .leases
+                    .values()
+                    .filter(|lease| lease.keys.contains(key))
+                    .map(|lease| lease.owner.clone())
+                    .collect(),
+            })
+            .collect();
+        ResidencyReport {
+            resident_blocks: resident.len(),
+            pinned_blocks: pinned_keys.len(),
+            lease_count: state.leases.len(),
+            resident_bytes,
+            pinned_bytes,
+            unpinned_bytes: resident_bytes.saturating_sub(pinned_bytes),
+            budget_bytes: budget.resident_bytes,
+            blocks,
+            leases: state.leases.values().cloned().collect(),
+        }
+    }
+}
+fn unique_bytes<'a>(items: impl IntoIterator<Item = &'a (String, u64)>) -> u64 {
+    let mut hashes = BTreeMap::<&str, u64>::new();
+    for (digest, bytes) in items {
+        hashes.entry(digest.as_str()).or_insert(*bytes);
+    }
+    hashes.values().copied().sum()
+}
+
+#[derive(Debug)]
+pub struct ContentLease {
+    id: u64,
+    ledger: Arc<ResidencyLedger>,
+    info: LeaseInfo,
+}
+impl ContentLease {
+    pub fn info(&self) -> &LeaseInfo {
+        &self.info
+    }
+}
+impl Drop for ContentLease {
+    fn drop(&mut self) {
+        self.ledger
+            .state
+            .lock()
+            .expect("residency mutex poisoned")
+            .leases
+            .remove(&self.id);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResidencyReport {
+    pub resident_blocks: usize,
+    pub pinned_blocks: usize,
+    pub lease_count: usize,
+    pub resident_bytes: u64,
+    pub pinned_bytes: u64,
+    pub unpinned_bytes: u64,
+    pub budget_bytes: u64,
+    pub blocks: Vec<ResidencyEntry>,
+    pub leases: Vec<LeaseInfo>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidencyEntry {
+    pub key: ContentKey,
+    pub digest: String,
+    pub encoded_bytes: u64,
+    pub pinned_by: BTreeSet<String>,
 }
 impl ValidatedProgram {
     pub fn new(p: Program) -> Result<Self> {
-        validate(&p)?;
-        let mut instructions = vec![];
-        let mut block_offsets = BTreeMap::new();
-        for (fid, f) in &p.functions {
-            let mut blocks = BTreeMap::new();
-            for (bid, b) in &f.blocks {
-                blocks.insert(bid.clone(), instructions.len());
-                instructions.extend(b.ops.iter().cloned().map(Instruction::Op));
-                instructions.push(Instruction::Term(b.terminator.clone()));
-            }
-            block_offsets.insert(fid.clone(), blocks);
-        }
-        Ok(Self {
-            program: Arc::new(p),
-            instructions: Arc::new(instructions),
-            block_offsets: Arc::new(block_offsets),
-        })
+        let program = RuntimeProgramView::from_source(p);
+        validate(&program)?;
+        let instructions = Arc::new(build_instruction_map(&program.functions));
+        Ok(Self::new_view(
+            program,
+            instructions,
+            Arc::new(BTreeMap::new()),
+            Arc::new(ResidencyLedger::default()),
+            ResidencyBudget {
+                resident_bytes: MAX_INPUT_BYTES as u64,
+            },
+        ))
     }
-    pub fn program(&self) -> &Program {
+    pub fn from_runtime(root: RuntimeProgram) -> Result<Self> {
+        let program = RuntimeProgramView::from_runtime(root)?;
+        let instructions = Arc::new(build_instruction_map(&program.functions));
+        Ok(Self::new_view(
+            program,
+            instructions,
+            Arc::new(BTreeMap::new()),
+            Arc::new(ResidencyLedger::default()),
+            ResidencyBudget {
+                resident_bytes: MAX_INPUT_BYTES as u64,
+            },
+        ))
+    }
+    fn new_view(
+        program: RuntimeProgramView,
+        instructions: Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
+        runtime_objects: Arc<BTreeMap<ContentKey, (String, u64)>>,
+        residency: Arc<ResidencyLedger>,
+        budget: ResidencyBudget,
+    ) -> Self {
+        Self {
+            program: Arc::new(program),
+            instructions,
+            runtime_objects,
+            residency,
+            budget,
+        }
+    }
+    pub fn program(&self) -> &RuntimeProgramView {
         &self.program
     }
+    pub fn legacy_program(&self) -> Option<Program> {
+        self.program.to_source_program()
+    }
+    pub fn runtime_root(&self) -> Option<&RuntimeProgram> {
+        self.program.runtime_root()
+    }
+    pub fn is_resident(&self, key: &ContentKey) -> bool {
+        self.runtime_objects.contains_key(key)
+    }
+    pub fn install_batch(&self, batch: Vec<(ContentKey, RuntimeObject, u64)>) -> Result<Self> {
+        let root = self
+            .runtime_root()
+            .ok_or_else(|| err("E_CONTENT_KEY", "runtime", "not a runtime program"))?;
+        if batch.len() > MAX_CONTENT_BATCH_ITEMS {
+            return Err(err(
+                "E_LIMIT",
+                "content",
+                "content batch has more than 128 blocks",
+            ));
+        }
+        let mut payload_bytes = 0u64;
+        for (_, _, bytes) in &batch {
+            if *bytes == 0 || *bytes > MAX_INPUT_BYTES as u64 {
+                return Err(err(
+                    "E_LIMIT",
+                    "content",
+                    "content block size is outside 1..16 MiB",
+                ));
+            }
+            payload_bytes = payload_bytes
+                .checked_add(*bytes)
+                .ok_or_else(|| err("E_LIMIT", "content", "content batch byte count overflow"))?;
+            if payload_bytes > MAX_INPUT_BYTES as u64 {
+                return Err(err("E_LIMIT", "content", "content batch exceeds 16 MiB"));
+            }
+        }
+        let mut batch = batch;
+        batch.sort_by_key(|(key, _, _)| match key {
+            ContentKey::Static { .. } => 0,
+            ContentKey::Catalog { .. } => 1,
+            ContentKey::Code { .. } => 2,
+            ContentKey::Text { .. } => 3,
+        });
+        let mut objects = Vec::new();
+        let mut records = (*self.runtime_objects).clone();
+        for (key, object, byte_size) in batch {
+            let requirement = root
+                .content_requirement(&key)
+                .ok_or_else(|| err("E_CONTENT_KEY", &format!("{key:?}"), "undeclared content"))?;
+            validate_object_key(root, &key, &object)?;
+            if records.contains_key(&key) {
+                continue;
+            }
+            if let ContentKey::Code { module } | ContentKey::Text { module, .. } = &key {
+                let static_key = ContentKey::Static {
+                    module: module.clone(),
+                };
+                if !records.contains_key(&static_key) {
+                    return Err(err(
+                        "E_CONTENT_MISSING",
+                        module,
+                        "static module package must be resident before code or text",
+                    ));
+                }
+            }
+            objects.push(object);
+            records.insert(key, (requirement.digest, byte_size));
+        }
+        if unique_bytes(records.values()) > self.budget.resident_bytes {
+            return Err(err(
+                "E_RESIDENCY_BUDGET",
+                "runtime",
+                "content exceeds residency budget",
+            ));
+        }
+        let candidate = self.program.with_runtime_objects(&objects)?;
+        validate_runtime_objects(&candidate, &objects)?;
+        let instructions = add_instruction_map(&self.instructions, &objects);
+        Ok(Self::new_view(
+            candidate,
+            instructions,
+            Arc::new(records),
+            self.residency.clone(),
+            self.budget.clone(),
+        ))
+    }
+    pub fn lease(&self, keys: BTreeSet<ContentKey>, owner: String) -> Result<ContentLease> {
+        if let Some(key) = keys.iter().find(|key| !self.is_resident(key)) {
+            return Err(err(
+                "E_CONTENT_MISSING",
+                &format!("{key:?}"),
+                "cannot lease a missing content block",
+            ));
+        }
+        Ok(self.residency.lease(keys, owner, &self.runtime_objects))
+    }
+    pub fn residency(&self) -> ResidencyReport {
+        self.residency.report(&self.runtime_objects, &self.budget)
+    }
+    pub fn set_residency_budget(&self, budget: ResidencyBudget) -> Result<Self> {
+        let report = self.residency.report(&self.runtime_objects, &budget);
+        if report.resident_bytes > budget.resident_bytes {
+            return Err(err(
+                "E_RESIDENCY_BUDGET",
+                "runtime",
+                "resident content exceeds budget",
+            ));
+        }
+        Ok(Self::new_view(
+            (*self.program).clone(),
+            self.instructions.clone(),
+            self.runtime_objects.clone(),
+            self.residency.clone(),
+            budget,
+        ))
+    }
     pub(crate) fn instruction(&self, function: &str, block: &str, op: usize) -> &Instruction {
-        &self.instructions[self.block_offsets[function][block] + op]
+        &self.instructions[function].blocks[block][op]
+    }
+    pub fn asset(&self, id: &str) -> Option<&Asset> {
+        self.program.asset(id)
+    }
+    pub fn title_nodes(&self) -> &[Node] {
+        self.program.title_nodes()
+    }
+    pub fn cue_assets(&self, cue: &str) -> BTreeSet<String> {
+        self.program.cue_assets(cue)
     }
 }
+
+fn bad_runtime(at: &str, message: &str) -> Diagnostic {
+    err("E_RUNTIME_ROOT", at, message)
+}
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
+    validate_ui_config(&root.theme, &root.player)?;
+    let fail = || bad_runtime("program", "invalid runtime root index or configuration");
+    if root.format != RUNTIME_FORMAT_VERSION
+        || root.game_id.is_empty()
+        || root.function_index.len() > 4096
+        || root.text_contracts.len() > 100_000
+        || root.assets.len() > 10_000
+        || root.stage.width == 0
+        || root.stage.height == 0
+        || root.stage.width > 8192
+        || root.stage.height > 8192
+        || !root.locales.contains(&root.default_locale)
+        || root.locales.is_empty()
+        || root
+            .locales
+            .iter()
+            .any(|locale| locale != "zh-Hans" && locale != "en")
+    {
+        return Err(fail());
+    }
+    for capability in &root.requires {
+        if !CAPABILITIES.contains(&capability.as_str()) {
+            return Err(err("E_CAPABILITY", "requires", capability));
+        }
+    }
+    let entry = root.function_signature(&root.entry).ok_or_else(fail)?;
+    if !entry.params.is_empty() {
+        return Err(err("E_CALL", "entry", "entry requires arguments"));
+    }
+    if root.modules.len() > 4096 {
+        return Err(err("E_LIMIT", "modules", "too many modules"));
+    }
+    for (id, module) in &root.modules {
+        if id.is_empty()
+            || module.functions.is_empty()
+            || !valid_hash(&module.code)
+            || !valid_hash(&module.static_content)
+            || module
+                .locales
+                .keys()
+                .any(|locale| !root.locales.contains(locale))
+            || module.locales.values().any(|digest| !valid_hash(digest))
+            || (!module.texts.is_empty()
+                && module.locales.keys().cloned().collect::<BTreeSet<_>>() != root.locales)
+        {
+            return Err(err("E_MODULE", id, "invalid module root index"));
+        }
+        for (function, signature) in &module.functions {
+            let Some(index) = root.function_index.get(function) else {
+                return Err(err("E_MODULE", function, "function index missing"));
+            };
+            if index.module != *id
+                || index.signature != *signature
+                || signature.entry.is_empty()
+                || signature.entry_op.is_empty()
+            {
+                return Err(err(
+                    "E_MODULE",
+                    function,
+                    "function interface ownership mismatch",
+                ));
+            }
+        }
+        let text_ids: BTreeSet<_> = root
+            .text_owners
+            .iter()
+            .filter(|(_, owner)| *owner == id)
+            .map(|(text, _)| text)
+            .collect();
+        if text_ids != module.texts.iter().collect() {
+            return Err(err("E_MODULE", id, "text ownership index mismatch"));
+        }
+    }
+    if root.function_index.iter().any(|(id, index)| {
+        root.modules
+            .get(&index.module)
+            .and_then(|module| module.functions.get(id))
+            != Some(&index.signature)
+    }) {
+        return Err(err(
+            "E_MODULE",
+            "function_index",
+            "orphan or mismatched function",
+        ));
+    }
+    let owner_maps = [
+        &root.scene_owners,
+        &root.cue_owners,
+        &root.choice_owners,
+        &root.text_owners,
+    ];
+    if owner_maps
+        .into_iter()
+        .flat_map(|owners| owners.values())
+        .any(|module| !root.modules.contains_key(module))
+        || root
+            .task_owners
+            .values()
+            .any(|module| !root.modules.contains_key(module))
+        || root.text_contracts.iter().any(|(id, identity)| {
+            root.text_owners.get(id) != Some(&identity.module)
+                || !root.modules.contains_key(&identity.module)
+                || identity.source_revision == 0
+                || identity.contract_revision == 0
+                || identity.meaning_revision == 0
+                || !valid_hash(&identity.contract_digest)
+        })
+        || root
+            .text_owners
+            .keys()
+            .any(|id| !root.text_contracts.contains_key(id))
+    {
+        return Err(err(
+            "E_MODULE",
+            "ownership",
+            "invalid runtime ownership index",
+        ));
+    }
+    let hash_map: BTreeMap<_, _> = root
+        .assets
+        .iter()
+        .map(|(id, asset)| (id.clone(), asset.object.clone()))
+        .collect();
+    if root.locale_config.default_ui != "zh-Hans" && root.locale_config.default_ui != "en"
+        || root.locale_config.default_text != root.default_locale
+        || root
+            .locale_config
+            .text
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != root.locales
+        || !root
+            .locale_config
+            .ui
+            .contains_key(&root.locale_config.default_ui)
+        || root.locale_config.ui.is_empty()
+        || root
+            .locale_config
+            .ui
+            .keys()
+            .any(|locale| locale != "zh-Hans" && locale != "en")
+    {
+        return Err(err(
+            "E_LOCALE_CONFIG",
+            "program.locale_config",
+            "invalid runtime locale set",
+        ));
+    }
+    for (surface, plans) in [
+        ("ui", &root.locale_config.ui),
+        ("text", &root.locale_config.text),
+    ] {
+        for (locale, plan) in plans {
+            if plan.fonts.is_empty()
+                || plan.digest != LocaleFontPlan::digest_for(&plan.fonts, &hash_map)
+                || plan.fonts.iter().collect::<BTreeSet<_>>().len() != plan.fonts.len()
+                || plan
+                    .fonts
+                    .iter()
+                    .any(|font| root.assets.get(font).map(|a| a.kind) != Some(AssetKind::Font))
+            {
+                return Err(err(
+                    "E_FONT_PLAN",
+                    &format!("{surface}.{locale}"),
+                    "invalid font plan index",
+                ));
+            }
+        }
+    }
+    for (catalog, digest) in &root.catalogs {
+        if catalog.is_empty() || !valid_hash(digest) {
+            return Err(err("E_CATALOG", catalog, "invalid catalog identity"));
+        }
+    }
+    for (id, asset) in &root.assets {
+        if id.is_empty()
+            || !valid_hash(&asset.object)
+            || !root.catalogs.contains_key(&asset.catalog)
+        {
+            return Err(err(
+                "E_ASSET",
+                id,
+                "asset index references an unknown object or catalog",
+            ));
+        }
+    }
+    for (task, owner) in &root.task_owners {
+        if task.is_empty() || owner.is_empty() {
+            return Err(err("E_TASK", task, "invalid task owner"));
+        }
+    }
+    if let Some(title) = &root.title_scene {
+        if !root.scene_owners.contains_key(title) || root.title_nodes.len() > MAX_NODES {
+            return Err(err("E_SCENE", title, "invalid root title scene"));
+        }
+        validate_scene_nodes(&root.title_nodes, title, &root.assets)?;
+    } else if !root.title_nodes.is_empty() {
+        return Err(err(
+            "E_SCENE",
+            "title_nodes",
+            "title nodes without a title scene",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_object_key(
+    root: &RuntimeProgram,
+    key: &ContentKey,
+    object: &RuntimeObject,
+) -> Result<()> {
+    let fail = || {
+        err(
+            "E_CONTENT_KEY",
+            &format!("{key:?}"),
+            "package does not match typed root identity",
+        )
+    };
+    match (key, object) {
+        (ContentKey::Static { module }, RuntimeObject::Static(package)) => {
+            let Some(index) = root.modules.get(module) else {
+                return Err(fail());
+            };
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.module != *module
+                || package
+                    .scenes
+                    .keys()
+                    .any(|id| root.scene_owners.get(id) != Some(module))
+                || package
+                    .cues
+                    .keys()
+                    .any(|id| root.cue_owners.get(id) != Some(module))
+                || package
+                    .choices
+                    .keys()
+                    .any(|id| root.choice_owners.get(id) != Some(module))
+                || package
+                    .text_contracts
+                    .keys()
+                    .any(|id| root.text_owners.get(id) != Some(module))
+                || package.scenes.len()
+                    != root
+                        .scene_owners
+                        .values()
+                        .filter(|owner| *owner == module)
+                        .count()
+                || package.cues.len()
+                    != root
+                        .cue_owners
+                        .values()
+                        .filter(|owner| *owner == module)
+                        .count()
+                || package.choices.len()
+                    != root
+                        .choice_owners
+                        .values()
+                        .filter(|owner| *owner == module)
+                        .count()
+                || package
+                    .text_contracts
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != index.texts
+            {
+                return Err(fail());
+            }
+            for cue in package.cues.values() {
+                for effect in &cue.effects {
+                    if root.task_owners.get(&effect.id) != Some(module) {
+                        return Err(err(
+                            "E_TASK",
+                            &effect.id,
+                            "task ownership differs from root",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        (ContentKey::Code { module }, RuntimeObject::Code(package)) => {
+            let Some(index) = root.modules.get(module) else {
+                return Err(fail());
+            };
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.module != *module
+                || package.functions.len() != index.functions.len()
+                || package.functions.iter().any(|(id, function)| {
+                    index.functions.get(id) != Some(&FunctionSignature::from(function))
+                        || root.function_module(id) != Some(module.as_str())
+                })
+            {
+                return Err(fail());
+            }
+            Ok(())
+        }
+        (ContentKey::Text { module, locale }, RuntimeObject::Text(package)) => {
+            let Some(index) = root.modules.get(module) else {
+                return Err(fail());
+            };
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.module != *module
+                || package.locale != *locale
+                || !root.locales.contains(locale)
+                || package.texts.keys().cloned().collect::<BTreeSet<_>>() != index.texts
+            {
+                return Err(fail());
+            }
+            Ok(())
+        }
+        (ContentKey::Catalog { catalog }, RuntimeObject::Catalog(package)) => {
+            let expected: BTreeSet<_> = root
+                .assets
+                .iter()
+                .filter(|(_, a)| a.catalog == *catalog)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.catalog != *catalog
+                || package.assets.keys().cloned().collect::<BTreeSet<_>>() != expected
+                || package.assets.iter().any(|(id, asset)| {
+                    root.assets
+                        .get(id)
+                        .is_none_or(|i| i.kind != asset.kind || i.object != asset.object)
+                })
+            {
+                return Err(fail());
+            }
+            Ok(())
+        }
+        _ => Err(fail()),
+    }
+}
+
+fn validate_runtime_objects(view: &RuntimeProgramView, objects: &[RuntimeObject]) -> Result<()> {
+    for object in objects {
+        match object {
+            RuntimeObject::Static(package) => validate_static_package(view, package)?,
+            RuntimeObject::Code(package) => {
+                for (id, function) in &package.functions {
+                    validate_runtime_function(view, id, function)?;
+                }
+            }
+            RuntimeObject::Text(package) => {
+                let contracts = &view.texts;
+                for (id, document) in &package.texts {
+                    let contract = contracts.get(id).ok_or_else(|| {
+                        err(
+                            "E_TEXT_CONTRACT",
+                            id,
+                            "static text contract is not resident",
+                        )
+                    })?;
+                    if document.source_revision != contract.source_revision
+                        || document.contract_revision != contract.contract_revision
+                        || document.contract_digest != contract.contract_digest
+                    {
+                        return Err(err("E_TEXT_REVISION", id, &package.locale));
+                    }
+                    validate_text_spans(id, contract, &document.spans)?;
+                }
+            }
+            RuntimeObject::Catalog(package) => {
+                for (id, asset) in &package.assets {
+                    if asset.bytes > MAX_INPUT_BYTES as u64 * 16
+                        || asset.width > 8192
+                        || asset.height > 8192
+                        || (asset.kind == AssetKind::Image
+                            && (asset.width == 0 || asset.height == 0))
+                        || (asset.kind == AssetKind::Image
+                            && asset.decoded_bytes != asset.width as u64 * asset.height as u64 * 4)
+                        || (asset.kind == AssetKind::Audio
+                            && (asset.duration_us.0 == 0 || asset.decoded_bytes == 0))
+                        || (asset.kind == AssetKind::Font && asset.decoded_bytes == 0)
+                    {
+                        return Err(err("E_ASSET", id, "invalid asset descriptor"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scene_nodes(
+    nodes: &[Node],
+    id: &str,
+    assets: &BTreeMap<String, AssetIndexEntry>,
+) -> Result<()> {
+    if nodes.len() > MAX_NODES {
+        return Err(err("E_LIMIT", id, "too many nodes"));
+    }
+    let mut ids = BTreeSet::new();
+    for node in nodes {
+        if !ids.insert(&node.id) {
+            return Err(err("E_DUPLICATE", id, &node.id));
+        }
+        if ![
+            node.x,
+            node.y,
+            node.width,
+            node.height,
+            node.scale,
+            node.opacity,
+        ]
+        .iter()
+        .chain(node.color.iter())
+        .all(|v| v.is_finite())
+            || node.width < 0.
+            || node.height < 0.
+            || node.scale < 0.
+            || !(0.0..=1.0).contains(&node.opacity)
+        {
+            return Err(err("E_VISUAL", id, &node.id));
+        }
+        if node
+            .clip
+            .is_some_and(|clip| !clip.iter().all(|v| v.is_finite()) || clip[2] < 0. || clip[3] < 0.)
+        {
+            return Err(err("E_VISUAL", id, &node.id));
+        }
+        if let Some(asset) = &node.asset {
+            if assets.get(asset).map(|a| a.kind) != Some(AssetKind::Image) {
+                return Err(err("E_ASSET_TYPE", id, asset));
+            }
+        }
+    }
+    for node in nodes {
+        let mut seen = BTreeSet::new();
+        let mut parent = node.parent.as_ref();
+        while let Some(key) = parent {
+            if key == &node.id || !seen.insert(key) {
+                return Err(err("E_SCENE_CYCLE", id, key));
+            }
+            parent = nodes
+                .iter()
+                .find(|candidate| &candidate.id == key)
+                .ok_or_else(|| err("E_NODE", id, key))?
+                .parent
+                .as_ref();
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) -> Result<()> {
+    let root = view.runtime_root().unwrap();
+    if package
+        .activation_recipes
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != package.cues.keys().cloned().collect::<BTreeSet<_>>()
+    {
+        return Err(err(
+            "E_RECIPE",
+            &package.module,
+            "activation recipe set differs from cues",
+        ));
+    }
+    for (id, nodes) in &package.scenes {
+        validate_scene_nodes(nodes, id, &root.assets)?;
+    }
+    if view
+        .title_scene
+        .as_deref()
+        .is_some_and(|title| root.scene_owners.get(title) == Some(&package.module))
+        && package
+            .scenes
+            .get(view.title_scene.as_ref().unwrap())
+            .is_some_and(|nodes| nodes.as_slice() != view.title_nodes.as_slice())
+    {
+        return Err(err(
+            "E_SCENE",
+            "title_scene",
+            "root title nodes differ from static scene",
+        ));
+    }
+    for (id, cue) in &package.cues {
+        if cue.effects.is_empty() || cue.effects.len() > MAX_TASKS {
+            return Err(err("E_LIMIT", id, "invalid cue size"));
+        }
+        let mut names = BTreeSet::new();
+        let mut writers = BTreeSet::new();
+        let mut stages = 0;
+        let mut dialogues = 0;
+        for def in &cue.effects {
+            if !names.insert(&def.id) {
+                return Err(err("E_DUPLICATE", id, &def.id));
+            }
+            match &def.effect {
+                Effect::StagePresent { scene, .. } => {
+                    stages += 1;
+                    if root.scene_owners.get(scene) != Some(&package.module)
+                        || view.scenes.get(scene).is_none()
+                    {
+                        return Err(err("E_SCENE", id, scene));
+                    }
+                }
+                Effect::Dialogue { text, speaker, .. } => {
+                    dialogues += 1;
+                    if root.text_owners.get(text) != Some(&package.module)
+                        || view.texts.get(text).is_none()
+                        || (!speaker.is_empty()
+                            && (root.text_owners.get(speaker) != Some(&package.module)
+                                || view.texts.get(speaker).is_none()))
+                    {
+                        return Err(err("E_TEXT", id, text));
+                    }
+                }
+                Effect::Audio { asset, .. } if view.asset_kind(asset) != Some(AssetKind::Audio) => {
+                    return Err(err("E_ASSET_TYPE", id, asset))
+                }
+                Effect::Clip {
+                    node, property, to, ..
+                } if !to.is_finite()
+                    || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
+                    || (*property == Property::Scale && *to < 0.)
+                    || !writers.insert((node, property)) =>
+                {
+                    return Err(err("E_VISUAL", id, node))
+                }
+                Effect::Clip { node, property, .. } => {
+                    writers.insert((node, property));
+                }
+                _ => {}
+            }
+        }
+        if stages > 1 || dialogues > 1 {
+            return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
+        }
+        let recipe = &package.activation_recipes[id];
+        if recipe.iter().any(|asset| {
+            view.asset_kind(asset)
+                .is_none_or(|kind| kind == AssetKind::Font)
+        }) {
+            return Err(err(
+                "E_RECIPE",
+                id,
+                "recipe references a missing or non-runtime asset",
+            ));
+        }
+        let mut expected = BTreeSet::new();
+        let mut all_scenes_known = true;
+        for effect in &cue.effects {
+            if let Effect::Audio { asset, .. } = &effect.effect {
+                expected.insert(asset.clone());
+                if !recipe.contains(asset) {
+                    return Err(err(
+                        "E_RECIPE",
+                        id,
+                        "audio asset missing from activation recipe",
+                    ));
+                }
+            }
+            if let Effect::StagePresent { scene, .. } = &effect.effect {
+                let nodes = view.scenes.get(scene).map(Vec::as_slice).or_else(|| {
+                    (view.title_scene.as_deref() == Some(scene))
+                        .then_some(view.title_nodes.as_slice())
+                });
+                if let Some(nodes) = nodes {
+                    for asset in nodes.iter().filter_map(|node| node.asset.as_ref()) {
+                        expected.insert(asset.clone());
+                    }
+                    if nodes
+                        .iter()
+                        .filter_map(|node| node.asset.as_ref())
+                        .any(|asset| !recipe.contains(asset))
+                    {
+                        return Err(err(
+                            "E_RECIPE",
+                            id,
+                            "scene image missing from activation recipe",
+                        ));
+                    }
+                } else {
+                    all_scenes_known = false;
+                }
+            }
+        }
+        if (all_scenes_known && recipe != &expected)
+            || (!all_scenes_known && !expected.is_subset(recipe))
+        {
+            return Err(err(
+                "E_RECIPE",
+                id,
+                "activation recipe differs from cue consumers",
+            ));
+        }
+    }
+    for (id, choice) in &package.choices {
+        let mut ids = BTreeSet::new();
+        for option in &choice.options {
+            if !ids.insert(&option.id) {
+                return Err(err("E_DUPLICATE", id, &option.id));
+            }
+            if root.text_owners.get(&option.text) != Some(&package.module)
+                || view.texts.get(&option.text).is_none()
+            {
+                return Err(err("E_TEXT", id, &option.text));
+            }
+            let vars = view
+                .variables
+                .iter()
+                .map(|(key, value)| (key.clone(), value.ty()))
+                .collect();
+            for expression in [&option.visible, &option.enabled].into_iter().flatten() {
+                if expr_type(expression, &vars, id)? != ValueType::Bool {
+                    return Err(err("E_TYPE", id, "choice predicate must be Bool"));
+                }
+            }
+        }
+        if choice.timeout_us.is_some()
+            && !choice
+                .default
+                .as_ref()
+                .is_some_and(|default| ids.contains(default))
+        {
+            return Err(err(
+                "E_CHOICE_DEFAULT",
+                id,
+                "timeout requires a valid default",
+            ));
+        }
+    }
+    for (id, contract) in &package.text_contracts {
+        let Some(identity) = root.text_contracts.get(id) else {
+            return Err(err("E_TEXT_CONTRACT", id, "text identity missing"));
+        };
+        if contract.source_revision != identity.source_revision
+            || contract.contract_revision != identity.contract_revision
+            || contract.meaning_revision != identity.meaning_revision
+            || contract.contract_digest != identity.contract_digest
+            || contract.contract_digest != text_contract_digest(contract)
+            || contract
+                .params
+                .iter()
+                .any(|(param, ty)| view.variables.get(param).map(Value::ty) != Some(*ty))
+        {
+            return Err(err(
+                "E_TEXT_REVISION",
+                id,
+                "contract differs from root identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_function(
+    view: &RuntimeProgramView,
+    fid: &str,
+    function: &Function,
+) -> Result<()> {
+    if !function.blocks.contains_key(&function.entry) || function.blocks.len() > 100_000 {
+        return Err(err("E_BLOCK", fid, "invalid entry/block limit"));
+    }
+    let mut vars: BTreeMap<_, _> = view
+        .variables
+        .iter()
+        .map(|(key, value)| (key.clone(), value.ty()))
+        .collect();
+    for (key, ty) in function.params.iter().chain(function.locals.iter()) {
+        if vars.insert(key.clone(), *ty).is_some() {
+            return Err(err("E_DUPLICATE", fid, key));
+        }
+    }
+    let mut op_ids = BTreeSet::new();
+    for (bid, block) in &function.blocks {
+        let at = format!("{fid}/{bid}");
+        for target in outgoing(&block.terminator) {
+            if !function.blocks.contains_key(target) {
+                return Err(err("E_BLOCK", &at, target));
+            }
+        }
+        for op in &block.ops {
+            if !op_ids.insert(&op.id) {
+                return Err(err("E_DUPLICATE", &at, &op.id));
+            }
+            match &op.operation {
+                Operation::Assign { target, value }
+                    if vars.get(target).copied() != Some(expr_type(value, &vars, &op.id)?) =>
+                {
+                    return Err(err("E_TYPE", &op.id, target))
+                }
+                Operation::Random { target, min, max }
+                    if vars.get(target) != Some(&ValueType::I32) || min > max =>
+                {
+                    return Err(err("E_RANDOM", &op.id, "invalid bounds/target"))
+                }
+                Operation::DraftPatch { value, .. } if !value.is_finite() => {
+                    return Err(err("E_VISUAL", &op.id, "non-finite patch"))
+                }
+                _ => {}
+            }
+        }
+        match &block.terminator {
+            Terminator::Branch { condition, .. }
+                if expr_type(condition, &vars, &at)? != ValueType::Bool =>
+            {
+                return Err(err("E_TYPE", &at, "branch requires Bool"))
+            }
+            Terminator::Switch { value, cases, .. } => {
+                let ty = expr_type(value, &vars, &at)?;
+                if ty == ValueType::Bool
+                    || (ty == ValueType::I32 && cases.keys().any(|key| key.parse::<i32>().is_err()))
+                {
+                    return Err(err("E_TYPE", &at, "switch requires I32 or String keys"));
+                }
+            }
+            Terminator::Call {
+                function,
+                args,
+                result,
+                ..
+            } => {
+                let callee = view
+                    .function_signature(function)
+                    .ok_or_else(|| err("E_FUNCTION", &at, function))?;
+                if args.len() != callee.params.len() {
+                    return Err(err("E_CALL", &at, "argument count"));
+                }
+                for (key, ty) in &callee.params {
+                    let expr = args.get(key).ok_or_else(|| err("E_CALL", &at, key))?;
+                    if expr_type(expr, &vars, &at)? != *ty {
+                        return Err(err("E_TYPE", &at, key));
+                    }
+                }
+                if result
+                    .as_ref()
+                    .is_some_and(|target| vars.get(target).copied() != callee.returns)
+                {
+                    return Err(err("E_TYPE", &at, "return target"));
+                }
+            }
+            Terminator::Return { value }
+                if value
+                    .as_ref()
+                    .map(|e| expr_type(e, &vars, &at))
+                    .transpose()?
+                    != function.returns =>
+            {
+                return Err(err("E_TYPE", &at, "return type"))
+            }
+            Terminator::Activate { cue, .. }
+                if view
+                    .runtime_root()
+                    .unwrap()
+                    .cue_owners
+                    .get(cue)
+                    .map(String::as_str)
+                    != view.function_module(fid)
+                    || view.cues.get(cue).is_none() =>
+            {
+                return Err(err("E_CUE", &at, cue))
+            }
+            Terminator::Await { conditions, .. }
+                if conditions.is_empty()
+                    || conditions.iter().any(|condition| {
+                        view.runtime_root()
+                            .unwrap()
+                            .task_owners
+                            .get(&condition.task)
+                            .map(String::as_str)
+                            != view.function_module(fid)
+                            || !view.task_definitions.contains_key(&condition.task)
+                    }) =>
+            {
+                return Err(err(
+                    "E_TASK",
+                    &at,
+                    "unknown, unloaded or cross-module task wait",
+                ))
+            }
+            Terminator::Interact { choice, .. }
+                if view
+                    .runtime_root()
+                    .unwrap()
+                    .choice_owners
+                    .get(choice)
+                    .map(String::as_str)
+                    != view.function_module(fid)
+                    || view.choices.get(choice).is_none() =>
+            {
+                return Err(err("E_CHOICE", &at, choice))
+            }
+            _ => {}
+        }
+        if let Terminator::Await { conditions, .. } = &block.terminator {
+            for condition in conditions {
+                if let Some(definitions) = view.task_definitions.get(&condition.task) {
+                    if condition.milestone == Milestone::Finished
+                        && definitions.iter().all(|effect| {
+                            matches!(effect.as_ref(), Effect::Audio { looped: true, .. })
+                        })
+                    {
+                        return Err(err("E_INFINITE_WAIT", &at, &condition.task));
+                    }
+                    if let Milestone::Marker(marker) = &condition.milestone {
+                        let exists = definitions.iter().any(|effect| match effect.as_ref() {
+                            Effect::Dialogue { text, .. } => view
+                                .texts
+                                .get(text)
+                                .is_some_and(|contract| contract.gates.contains(marker)),
+                            _ => false,
+                        });
+                        if !exists {
+                            return Err(err("E_MILESTONE", &at, marker));
+                        }
+                    }
+                }
+            }
+        }
+        if let Terminator::Interact {
+            choice, branches, ..
+        } = &block.terminator
+        {
+            if let Some(definition) = view.choices.get(choice) {
+                if definition.options.len() != branches.len()
+                    || definition
+                        .options
+                        .iter()
+                        .any(|option| !branches.contains_key(&option.id))
+                {
+                    return Err(err("E_CHOICE", &at, "branch coverage"));
+                }
+            }
+        }
+        for expr in term_exprs(&block.terminator) {
+            expr_type(expr, &vars, &at)?;
+        }
+    }
+    let initial: BTreeSet<_> = view
+        .variables
+        .keys()
+        .chain(function.params.keys())
+        .cloned()
+        .collect();
+    let mut incoming = BTreeMap::from([(function.entry.clone(), initial)]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (bid, block) in &function.blocks {
+            let Some(mut assigned) = incoming.get(bid).cloned() else {
+                continue;
+            };
+            for op in &block.ops {
+                if let Operation::Assign { target, .. } | Operation::Random { target, .. } =
+                    &op.operation
+                {
+                    assigned.insert(target.clone());
+                }
+            }
+            if let Terminator::Call {
+                result: Some(result),
+                ..
+            } = &block.terminator
+            {
+                assigned.insert(result.clone());
+            }
+            for target in outgoing(&block.terminator) {
+                let merged = match incoming.get(target) {
+                    Some(old) => old.intersection(&assigned).cloned().collect(),
+                    None => assigned.clone(),
+                };
+                if incoming.get(target) != Some(&merged) {
+                    incoming.insert(target.to_owned(), merged);
+                    changed = true;
+                }
+            }
+        }
+    }
+    for (bid, block) in &function.blocks {
+        if let Some(mut assigned) = incoming.get(bid).cloned() {
+            for op in &block.ops {
+                if let Operation::Assign { target, value } = &op.operation {
+                    check_reads(value, &assigned, &op.id)?;
+                    assigned.insert(target.clone());
+                } else if let Operation::Random { target, .. } = &op.operation {
+                    assigned.insert(target.clone());
+                }
+            }
+            for expr in term_exprs(&block.terminator) {
+                check_reads(expr, &assigned, &format!("{fid}/{bid}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn err(code: &str, at: &str, message: &str) -> Diagnostic {
     Diagnostic::new(code, at, message)
 }
+const MAX_CONTENT_BATCH_ITEMS: usize = 128;
 pub fn expr_type(e: &Expr, vars: &BTreeMap<String, ValueType>, at: &str) -> Result<ValueType> {
     use BinaryOp::*;
     match e {
@@ -128,7 +1881,10 @@ fn term_exprs(t: &Terminator) -> Vec<&Expr> {
         _ => vec![],
     }
 }
-fn validate(p: &Program) -> Result<()> {
+fn validate(p: &RuntimeProgramView) -> Result<()> {
+    if let Some(root) = p.runtime_root() {
+        return validate_runtime_root(root);
+    }
     validate_ui_config(&p.theme, &p.player)?;
     if p.format != FORMAT_VERSION {
         return Err(err("E_VERSION", "program", "unsupported semantic version"));
@@ -158,7 +1914,7 @@ fn validate(p: &Program) -> Result<()> {
     }
     let config = &p.locale_config;
     let asset_objects: BTreeMap<_, _> = p
-        .assets
+        .asset_index
         .iter()
         .map(|(id, asset)| (id.clone(), asset.object.clone()))
         .collect();
@@ -207,7 +1963,7 @@ fn validate(p: &Program) -> Result<()> {
     if p.modules.len() > 4096 {
         return Err(err("E_LIMIT", "modules", "too many modules"));
     }
-    for (id, module) in &p.modules {
+    for (id, module) in p.modules.iter() {
         if id.is_empty() || module.functions.is_empty() {
             return Err(err("E_MODULE", id, "empty module identity or interface"));
         }
@@ -246,7 +2002,7 @@ fn validate(p: &Program) -> Result<()> {
             "incomplete ownership or function limit",
         ));
     }
-    for (locale, texts) in &p.locales {
+    for (locale, texts) in p.locales.iter() {
         if locale != "zh-Hans" && locale != "en" {
             return Err(err(
                 "E_CAPABILITY",
@@ -254,7 +2010,7 @@ fn validate(p: &Program) -> Result<()> {
                 "locale is not in the tested language profile",
             ));
         }
-        for (id, c) in &p.texts {
+        for (id, c) in p.texts.iter() {
             if c.source_revision == 0
                 || c.contract_revision == 0
                 || c.meaning_revision == 0
@@ -285,12 +2041,12 @@ fn validate(p: &Program) -> Result<()> {
             return Err(err("E_TEXT_CONTRACT", locale, "unexpected text"));
         }
     }
-    for (id, a) in &p.assets {
+    for (id, a) in p.assets.iter() {
         if a.bytes > MAX_INPUT_BYTES as u64 * 16 || a.width > 8192 || a.height > 8192 {
             return Err(err("E_LIMIT", id, "asset too large"));
         }
     }
-    for (id, nodes) in &p.scenes {
+    for (id, nodes) in p.scenes.iter() {
         let err = |code: &str, at: &str, message: &str| {
             err(code, at, message).classified(
                 ErrorDomain::Content,
@@ -341,7 +2097,7 @@ fn validate(p: &Program) -> Result<()> {
         }
     }
     let mut task_defs: BTreeMap<&str, Vec<&Effect>> = BTreeMap::new();
-    for (id, cue) in &p.cues {
+    for (id, cue) in p.cues.iter() {
         let err = |code: &str, at: &str, message: &str| {
             err(code, at, message).classified(
                 ErrorDomain::Content,
@@ -384,16 +2140,17 @@ fn validate(p: &Program) -> Result<()> {
                 }
                 Effect::Clip {
                     node, property, to, ..
-                } => {
-                    if !to.is_finite()
-                        || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
-                        || (*property == Property::Scale && *to < 0.)
-                    {
-                        return Err(err("E_VISUAL", id, node));
-                    }
-                    if !writers.insert((node, property)) {
-                        return Err(err("E_OWNERSHIP", id, node));
-                    }
+                } if !to.is_finite()
+                    || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
+                    || (*property == Property::Scale && *to < 0.) =>
+                {
+                    return Err(err("E_VISUAL", id, node))
+                }
+                Effect::Clip { node, property, .. } if !writers.insert((node, property)) => {
+                    return Err(err("E_OWNERSHIP", id, node))
+                }
+                Effect::Clip { node, property, .. } => {
+                    writers.insert((node, property));
                 }
                 _ => {}
             }
@@ -402,7 +2159,7 @@ fn validate(p: &Program) -> Result<()> {
             return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
         }
     }
-    for (id, c) in &p.choices {
+    for (id, c) in p.choices.iter() {
         let mut ids = BTreeSet::new();
         for o in &c.options {
             if !ids.insert(&o.id) {
@@ -431,7 +2188,7 @@ fn validate(p: &Program) -> Result<()> {
         }
     }
     let mut op_ids = BTreeSet::new();
-    for (fid, f) in &p.functions {
+    for (fid, f) in p.functions.iter() {
         if !f.blocks.contains_key(&f.entry) || f.blocks.len() > 100_000 {
             return Err(err("E_BLOCK", fid, "invalid entry/block limit"));
         }
@@ -621,4 +2378,457 @@ fn validate(p: &Program) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn block(terminator: Terminator, ops: Vec<Op>) -> Block {
+        Block { ops, terminator }
+    }
+    fn simple_function() -> Function {
+        Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "end".into(),
+            blocks: BTreeMap::from([(
+                "end".into(),
+                block(
+                    Terminator::End {
+                        outcome: "done".into(),
+                    },
+                    vec![],
+                ),
+            )]),
+        }
+    }
+    fn runtime_fixture(
+        functions: BTreeMap<String, Function>,
+        mut static_package: ModuleStatic,
+    ) -> (ValidatedProgram, Vec<(ContentKey, RuntimeObject, u64)>) {
+        static_package.format = RUNTIME_FORMAT_VERSION;
+        static_package.module = "m".into();
+        let signatures: BTreeMap<_, _> = functions
+            .iter()
+            .map(|(id, function)| (id.clone(), FunctionSignature::from(function)))
+            .collect();
+        let code = ModuleCode {
+            format: RUNTIME_FORMAT_VERSION,
+            module: "m".into(),
+            functions,
+        };
+        let mut assets: BTreeMap<String, AssetIndexEntry> = BTreeMap::new();
+        assets.insert(
+            "font".into(),
+            AssetIndexEntry {
+                kind: AssetKind::Font,
+                object: "f".repeat(64),
+                catalog: "resources".into(),
+            },
+        );
+        assets.insert(
+            "image".into(),
+            AssetIndexEntry {
+                kind: AssetKind::Image,
+                object: "1".repeat(64),
+                catalog: "resources".into(),
+            },
+        );
+        let objects: BTreeMap<_, _> = assets
+            .iter()
+            .map(|(id, asset)| (id.clone(), asset.object.clone()))
+            .collect();
+        let plan = LocaleFontPlan {
+            fonts: vec!["font".into()],
+            digest: LocaleFontPlan::digest_for(&["font".into()], &objects),
+        };
+        let locale_config = LocaleConfig {
+            default_ui: "en".into(),
+            default_text: "en".into(),
+            ui: BTreeMap::from([("en".into(), plan.clone())]),
+            text: BTreeMap::from([("en".into(), plan)]),
+        };
+        let module_texts: BTreeSet<_> = static_package.text_contracts.keys().cloned().collect();
+        let locales = if module_texts.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("en".into(), "b".repeat(64))])
+        };
+        let module = ModuleIndex {
+            functions: signatures.clone(),
+            texts: module_texts,
+            code: "c".repeat(64),
+            static_content: "a".repeat(64),
+            locales,
+        };
+        let function_index = signatures
+            .iter()
+            .map(|(id, signature)| {
+                (
+                    id.clone(),
+                    RuntimeFunctionIndex {
+                        module: "m".into(),
+                        signature: signature.clone(),
+                    },
+                )
+            })
+            .collect();
+        let scene_owners = static_package
+            .scenes
+            .keys()
+            .map(|id| (id.clone(), "m".into()))
+            .collect();
+        let cue_owners = static_package
+            .cues
+            .keys()
+            .map(|id| (id.clone(), "m".into()))
+            .collect();
+        let choice_owners = static_package
+            .choices
+            .keys()
+            .map(|id| (id.clone(), "m".into()))
+            .collect();
+        let text_owners = static_package
+            .text_contracts
+            .keys()
+            .map(|id| (id.clone(), "m".into()))
+            .collect();
+        let mut task_owners = BTreeMap::new();
+        for cue in static_package.cues.values() {
+            for effect in &cue.effects {
+                task_owners.insert(effect.id.clone(), "m".into());
+            }
+        }
+        let text_contracts = static_package
+            .text_contracts
+            .iter()
+            .map(|(id, contract)| {
+                (
+                    id.clone(),
+                    RuntimeTextIdentity {
+                        module: "m".into(),
+                        source_revision: contract.source_revision,
+                        contract_revision: contract.contract_revision,
+                        meaning_revision: contract.meaning_revision,
+                        contract_digest: contract.contract_digest.clone(),
+                    },
+                )
+            })
+            .collect();
+        let root = RuntimeProgram {
+            format: RUNTIME_FORMAT_VERSION,
+            game_id: "runtime-test".into(),
+            revision: "r1".into(),
+            entry: "m.main".into(),
+            requires: vec![],
+            stage: Stage {
+                width: 640,
+                height: 480,
+            },
+            variables: BTreeMap::new(),
+            function_index,
+            modules: BTreeMap::from([("m".into(), module)]),
+            scene_owners,
+            cue_owners,
+            choice_owners,
+            text_owners,
+            task_owners,
+            text_contracts,
+            locales: BTreeSet::from(["en".into()]),
+            locale_config,
+            assets,
+            catalogs: BTreeMap::from([("resources".into(), "d".repeat(64))]),
+            default_locale: "en".into(),
+            title_scene: None,
+            title_nodes: vec![],
+            theme: Theme::default(),
+            player: PlayerDefaults::default(),
+        };
+        let module = &root.modules["m"];
+        assert!(
+            !module.functions.is_empty(),
+            "test module function index is empty"
+        );
+        assert!(
+            valid_hash(&module.code),
+            "invalid test code hash {:?}",
+            module.code
+        );
+        assert!(
+            valid_hash(&module.static_content),
+            "invalid test static hash {:?}",
+            module.static_content
+        );
+        assert!(
+            module
+                .locales
+                .keys()
+                .all(|locale| root.locales.contains(locale)),
+            "invalid locale hashes/index"
+        );
+        let static_size = serde_json::to_vec(&static_package).unwrap().len() as u64;
+        let code_size = serde_json::to_vec(&code).unwrap().len() as u64;
+        let view = ValidatedProgram::from_runtime(root).unwrap();
+        let batch = vec![
+            (
+                ContentKey::Static { module: "m".into() },
+                RuntimeObject::Static(static_package),
+                static_size,
+            ),
+            (
+                ContentKey::Code { module: "m".into() },
+                RuntimeObject::Code(code),
+                code_size,
+            ),
+        ];
+        (view, batch)
+    }
+    fn empty_static() -> ModuleStatic {
+        ModuleStatic {
+            format: RUNTIME_FORMAT_VERSION,
+            module: "m".into(),
+            scenes: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            choices: BTreeMap::new(),
+            text_contracts: BTreeMap::new(),
+            activation_recipes: BTreeMap::new(),
+        }
+    }
+    fn contract() -> TextContract {
+        let mut contract = TextContract {
+            source_revision: 1,
+            contract_revision: 1,
+            meaning_revision: 1,
+            contract_digest: String::new(),
+            gates: vec![],
+            params: BTreeMap::new(),
+        };
+        contract.contract_digest = text_contract_digest(&contract);
+        contract
+    }
+    #[test]
+    fn runtime_content_installs_valid_static_and_code() {
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            empty_static(),
+        );
+        let next = view.install_batch(batch).unwrap();
+        assert!(next.is_resident(&ContentKey::Static { module: "m".into() }));
+        assert!(next.is_resident(&ContentKey::Code { module: "m".into() }));
+        assert!(view.program().functions.get("m.main").is_none());
+        assert!(next.program().functions.get("m.main").is_some());
+    }
+
+    #[test]
+    fn runtime_code_rejects_unknown_task_and_invalid_dialogue_gate() {
+        let mut static_package = empty_static();
+        static_package.cues.insert(
+            "m.cue".into(),
+            Cue {
+                effects: vec![EffectDef {
+                    id: "m.work".into(),
+                    scope: Scope::Session,
+                    effect: Effect::Delay {
+                        duration_us: Micros(1),
+                    },
+                }],
+            },
+        );
+        static_package
+            .activation_recipes
+            .insert("m.cue".into(), BTreeSet::new());
+        let function = Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "wait".into(),
+            blocks: BTreeMap::from([
+                (
+                    "wait".into(),
+                    block(
+                        Terminator::Await {
+                            conditions: vec![WaitCondition {
+                                task: "m.work".into(),
+                                milestone: Milestone::Marker("missing".into()),
+                            }],
+                            next: "done".into(),
+                            on_cancelled: "done".into(),
+                            on_failed: "done".into(),
+                        },
+                        vec![],
+                    ),
+                ),
+                (
+                    "done".into(),
+                    block(
+                        Terminator::End {
+                            outcome: "done".into(),
+                        },
+                        vec![],
+                    ),
+                ),
+            ]),
+        };
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), function)]),
+            static_package,
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_MILESTONE");
+    }
+
+    #[test]
+    fn runtime_code_rejects_interaction_branch_mismatch() {
+        let mut static_package = empty_static();
+        static_package
+            .text_contracts
+            .insert("m.label".into(), contract());
+        static_package.choices.insert(
+            "m.choice".into(),
+            Choice {
+                options: vec![ChoiceOption {
+                    id: "yes".into(),
+                    text: "m.label".into(),
+                    visible: None,
+                    enabled: None,
+                }],
+                timeout_us: None,
+                default: None,
+            },
+        );
+        let function = Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "choice".into(),
+            blocks: BTreeMap::from([
+                (
+                    "choice".into(),
+                    block(
+                        Terminator::Interact {
+                            choice: "m.choice".into(),
+                            branches: BTreeMap::from([("no".into(), "done".into())]),
+                            on_empty: "done".into(),
+                        },
+                        vec![],
+                    ),
+                ),
+                (
+                    "done".into(),
+                    block(
+                        Terminator::End {
+                            outcome: "done".into(),
+                        },
+                        vec![],
+                    ),
+                ),
+            ]),
+        };
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), function)]),
+            static_package,
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_CHOICE");
+    }
+
+    #[test]
+    fn runtime_code_rejects_duplicate_op_ids_across_functions() {
+        let op = Op {
+            id: "m.shared".into(),
+            operation: Operation::ProfileMerge { key: "seen".into() },
+        };
+        let with_op = || Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "end".into(),
+            blocks: BTreeMap::from([(
+                "end".into(),
+                block(
+                    Terminator::End {
+                        outcome: "done".into(),
+                    },
+                    vec![op.clone()],
+                ),
+            )]),
+        };
+        let functions =
+            BTreeMap::from([("m.main".into(), with_op()), ("m.other".into(), with_op())]);
+        let (view, batch) = runtime_fixture(functions, empty_static());
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_DUPLICATE");
+    }
+
+    #[test]
+    fn runtime_static_rejects_invalid_clip_values_and_incomplete_recipes() {
+        let clip = EffectDef {
+            id: "m.clip".into(),
+            scope: Scope::Scene,
+            effect: Effect::Clip {
+                node: "art".into(),
+                property: Property::X,
+                to: f32::NAN,
+                duration_us: Micros(1),
+                replace: false,
+                easing: Easing::Linear,
+                finish: FinishPolicy::CommitEnd,
+                cancel: CancelPolicy::CommitCurrent,
+            },
+        };
+        let mut clip_package = empty_static();
+        clip_package.cues.insert(
+            "m.cue".into(),
+            Cue {
+                effects: vec![clip],
+            },
+        );
+        clip_package
+            .activation_recipes
+            .insert("m.cue".into(), BTreeSet::new());
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            clip_package,
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_VISUAL");
+
+        let mut recipe_package = empty_static();
+        recipe_package.scenes.insert(
+            "m.scene".into(),
+            vec![Node {
+                id: "art".into(),
+                parent: None,
+                asset: Some("image".into()),
+                x: 0.,
+                y: 0.,
+                width: 1.,
+                height: 1.,
+                scale: 1.,
+                opacity: 1.,
+                color: [1.; 4],
+                order: 0,
+                clip: None,
+            }],
+        );
+        recipe_package.cues.insert(
+            "m.cue".into(),
+            Cue {
+                effects: vec![EffectDef {
+                    id: "m.present".into(),
+                    scope: Scope::Scene,
+                    effect: Effect::StagePresent {
+                        scene: "m.scene".into(),
+                        duration_us: Micros(0),
+                    },
+                }],
+            },
+        );
+        recipe_package
+            .activation_recipes
+            .insert("m.cue".into(), BTreeSet::new());
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            recipe_package,
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_RECIPE");
+    }
 }

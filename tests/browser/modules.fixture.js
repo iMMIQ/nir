@@ -214,8 +214,55 @@ export async function closeModulesFixture(fixture) {
 export function moduleObjectHashes(program) {
   return Object.fromEntries(Object.entries(program.modules).map(([id, index]) => [id, {
     code: index.code,
+    static: index.static_content,
     locales: index.locales,
   }]));
+}
+
+export function catalogObjectHashes(program) {
+  return Object.fromEntries(Object.entries(program.catalogs || {}));
+}
+
+export function moduleContentHashes(program) {
+  return new Set(Object.values(moduleObjectHashes(program)).flatMap(value =>
+    [value.code, value.static, ...Object.values(value.locales)].filter(Boolean)));
+}
+
+export function runtimeAssetsForLocales(program,uiLocale,textLocale) {
+  const ids=new Set((program.title_nodes||[]).map(node=>node.asset).filter(Boolean));
+  for(const id of program.locale_config?.ui?.[uiLocale]?.fonts||[])ids.add(id);
+  for(const id of program.locale_config?.text?.[textLocale]?.fonts||[])ids.add(id);
+  return ids;
+}
+
+export function catalogHashesForAssets(program,assetIds) {
+  const catalogs=new Set([...assetIds].map(id=>program.assets[id]?.catalog).filter(Boolean));
+  return new Set([...catalogs].map(id=>program.catalogs?.[id]).filter(Boolean));
+}
+
+export function mediaHashesForAssets(program,assetIds) {
+  return new Set([...assetIds].map(id=>program.assets[id]?.object).filter(Boolean));
+}
+
+const objectRequests = new WeakMap();
+export function trackObjectRequests(page) {
+  let objects=objectRequests.get(page);
+  if(objects)return objects;
+  objects=new Set();
+  page.on('request',request=>{
+    const match=new URL(request.url()).pathname.match(/\/objects\/([0-9a-f]{64})\./);
+    if(match)objects.add(match[1]);
+  });
+  objectRequests.set(page,objects);
+  return objects;
+}
+
+export function requestedNetworkObjects(page) {
+  return objectRequests.get(page)||new Set();
+}
+
+export function resetNetworkObjects(page) {
+  objectRequests.get(page)?.clear();
 }
 
 export function requestedModuleObjects(page) {

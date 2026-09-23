@@ -59,12 +59,18 @@ impl Engine {
         release: String,
         title: String,
         canvas_id: String,
+        preferences_json: String,
     ) -> std::result::Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
-        let executable: Executable =
-            nir_content::parse(executable_json.as_bytes(), "executable").map_err(js)?;
-        nir_content::validate_executable(&executable).map_err(js)?;
-        let player = Player::new(executable.program, release, title).map_err(js)?;
+        let executable: RuntimeExecutable =
+            nir_content::parse(executable_json.as_bytes(), "runtime-executable").map_err(js)?;
+        if executable.format != 2 {
+            return Err(js("E_RUNTIME_VERSION: expected RuntimeExecutable v2"));
+        }
+        let preferences: Preferences =
+            nir_content::parse(preferences_json.as_bytes(), "preferences").map_err(js)?;
+        let player = Player::new_runtime(executable.program, release, title, Some(preferences))
+            .map_err(js)?;
         let renderer = renderer(&canvas_id).await?;
         let mut e = Self {
             player,
@@ -143,6 +149,9 @@ impl Engine {
     pub fn retained(&self) -> String {
         serde_json::to_string(&self.player.retained_assets()).unwrap()
     }
+    pub fn retained_descriptors(&self) -> String {
+        serde_json::to_string(&self.player.retained_descriptors()).unwrap()
+    }
     pub fn resource(
         &mut self,
         request: u32,
@@ -154,10 +163,8 @@ impl Engine {
         }
         let asset = self
             .player
-            .core()
-            .program()
-            .assets
-            .get(&id)
+            .asset_descriptor(&id)
+            .cloned()
             .ok_or_else(|| js("E_ASSET: unknown resource"))?;
         if bytes.len() as u64 != asset.bytes {
             return Err(js("E_ASSET_SIZE: object length mismatch"));
@@ -488,6 +495,10 @@ impl Engine {
             stage: stage.into(),
             request,
             asset: asset.into(),
+            object: self
+                .player
+                .asset_descriptor(asset)
+                .map(|descriptor| descriptor.object.clone()),
             session: self.player.generation.session,
             device: self.player.generation.device,
             start_us,

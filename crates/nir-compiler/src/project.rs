@@ -815,11 +815,29 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
 }
 pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
-    for cue in p.cues.keys() {
-        roots.extend(nir_content::cue_assets(p, cue));
+    // Every scene declaration is shipped in one module Static package, so its
+    // media identity must be in the root index even when the scene is not the
+    // current title scene. Media bytes remain lazy at runtime.
+    for nodes in p.scenes.values() {
+        roots.extend(nodes.iter().filter_map(|node| node.asset.clone()));
     }
-    if let Some(scene) = &p.title_scene {
-        roots.extend(p.scenes[scene].iter().filter_map(|n| n.asset.clone()));
+    for cue in p.cues.values() {
+        for effect in &cue.effects {
+            if let Effect::Audio { asset, .. } = &effect.effect {
+                roots.insert(asset.clone());
+            }
+        }
+    }
+    // Font plans are locale consumers. They do not belong to every activation
+    // recipe; packaging their catalogs by plan keeps an unrelated language
+    // out of the selected startup closure.
+    for plan in p
+        .locale_config
+        .ui
+        .values()
+        .chain(p.locale_config.text.values())
+    {
+        roots.extend(plan.fonts.iter().cloned());
     }
     roots
 }
@@ -848,6 +866,13 @@ pub fn write_schemas(out: &Path) -> Result<()> {
         ("player", schemars::schema_for!(crate::PlayerConfig)),
         ("locales", schemars::schema_for!(crate::LocaleManifest)),
         ("program", schemars::schema_for!(Program)),
+        ("runtime-program", schemars::schema_for!(RuntimeProgram)),
+        (
+            "runtime-executable",
+            schemars::schema_for!(RuntimeExecutable),
+        ),
+        ("module-static", schemars::schema_for!(ModuleStatic)),
+        ("asset-catalog", schemars::schema_for!(AssetCatalog)),
         ("diagnostic", schemars::schema_for!(Diagnostic)),
     ];
     for (name, schema) in schemas {

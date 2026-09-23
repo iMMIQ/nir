@@ -6,7 +6,7 @@ use serde::{
     Deserialize, Deserializer,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -80,6 +80,126 @@ pub fn install_module_texts(
         .ok_or_else(|| Diagnostic::new("E_LOCALE", module, locale))?
         .extend(text.texts);
     Ok(())
+}
+
+/// Parse one runtime package after authenticating it against the root's typed
+/// identity index. This does shape/ownership checks; `nir-core` still performs
+/// semantic validation before making the resulting block resident.
+pub fn parse_runtime_object(
+    root: &RuntimeProgram,
+    key: &ContentKey,
+    bytes: &[u8],
+) -> Result<RuntimeObject> {
+    let requirement = root.content_requirement(key).ok_or_else(|| {
+        Diagnostic::new("E_CONTENT_KEY", format!("{key:?}"), "undeclared content")
+    })?;
+    verify(bytes, &requirement.digest)?;
+    match key {
+        ContentKey::Static { module } => {
+            let package: ModuleStatic = parse(bytes, module)?;
+            if package.format != RUNTIME_FORMAT_VERSION || package.module != *module {
+                return Err(Diagnostic::new(
+                    "E_STATIC",
+                    module,
+                    "static package identity mismatch",
+                ));
+            }
+            let names_owned = |owners: &BTreeMap<String, String>| -> BTreeSet<String> {
+                owners
+                    .iter()
+                    .filter(|(_, owner)| owner.as_str() == module)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            if package.scenes.keys().cloned().collect::<BTreeSet<_>>()
+                != names_owned(&root.scene_owners)
+                || package.cues.keys().cloned().collect::<BTreeSet<_>>()
+                    != names_owned(&root.cue_owners)
+                || package.choices.keys().cloned().collect::<BTreeSet<_>>()
+                    != names_owned(&root.choice_owners)
+                || package
+                    .text_contracts
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != names_owned(&root.text_owners)
+            {
+                return Err(Diagnostic::new(
+                    "E_STATIC_INDEX",
+                    module,
+                    "static package ownership differs from root",
+                ));
+            }
+            Ok(RuntimeObject::Static(package))
+        }
+        ContentKey::Code { module } => {
+            let package: ModuleCode = parse(bytes, module)?;
+            let index = root.modules.get(module).unwrap();
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.module != *module
+                || package.functions.len() != index.functions.len()
+                || package
+                    .functions
+                    .iter()
+                    .any(|(id, f)| index.functions.get(id) != Some(&FunctionSignature::from(f)))
+                || package.functions.keys().any(|id| {
+                    root.function_index
+                        .get(id)
+                        .is_none_or(|entry| entry.module != *module)
+                })
+            {
+                return Err(Diagnostic::new(
+                    "E_MODULE_INTERFACE",
+                    module,
+                    "code package differs from root interface",
+                ));
+            }
+            Ok(RuntimeObject::Code(package))
+        }
+        ContentKey::Text { module, locale } => {
+            let package: ModuleTexts = parse(bytes, module)?;
+            let index = root.modules.get(module).unwrap();
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.module != *module
+                || package.locale != *locale
+                || package.texts.keys().cloned().collect::<BTreeSet<_>>() != index.texts
+            {
+                return Err(Diagnostic::new(
+                    "E_MODULE_TEXT",
+                    module,
+                    "text package differs from root ownership",
+                ));
+            }
+            Ok(RuntimeObject::Text(package))
+        }
+        ContentKey::Catalog { catalog } => {
+            let package: AssetCatalog = parse(bytes, catalog)?;
+            let expected: BTreeSet<_> = root
+                .assets
+                .iter()
+                .filter(|(_, index)| index.catalog == *catalog)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if package.format != RUNTIME_FORMAT_VERSION
+                || package.catalog != *catalog
+                || package.assets.keys().cloned().collect::<BTreeSet<_>>() != expected
+                || package.assets.iter().any(|(id, asset)| {
+                    root.assets.get(id).is_none_or(|index| {
+                        index.kind != asset.kind
+                            || index.object != asset.object
+                            || index.catalog != *catalog
+                    })
+                })
+            {
+                return Err(Diagnostic::new(
+                    "E_CATALOG",
+                    catalog,
+                    "catalog descriptors differ from root index",
+                ));
+            }
+            Ok(RuntimeObject::Catalog(package))
+        }
+    }
 }
 /// Check the complete, canonical index table without linking the compiler.
 pub fn validate_executable(e: &Executable) -> Result<()> {

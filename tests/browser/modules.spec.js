@@ -7,9 +7,17 @@ import {
   buildModulesFixture,
   chapters,
   closeModulesFixture,
+  catalogHashesForAssets,
+  catalogObjectHashes,
+  mediaHashesForAssets,
+  moduleContentHashes,
   moduleObjectHashes,
   readRelease,
+  requestedNetworkObjects,
   requestedModuleObjects,
+  resetNetworkObjects,
+  runtimeAssetsForLocales,
+  trackObjectRequests,
 } from './modules.fixture.js';
 
 const run = promisify(execFile);
@@ -18,10 +26,36 @@ const action = (page, value) => page.evaluate(v => window.__nir.action(v), value
 let fixture;
 
 async function boot(page) {
+  trackObjectRequests(page);
   await page.goto(`${fixture.origin}/?test=1`);
   await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
-  expect((await state(page)).screen).toBe('Title');
-  expect(await requestedModuleObjects(page)).toEqual([]);
+  const current=await state(page);
+  expect(current.screen).toBe('Title');
+  const stages=(await page.evaluate(()=>window.__nir.diagnostics().events)).map(event=>event.stage);
+  expect(stages.indexOf('preferences_loaded')).toBeGreaterThanOrEqual(0);
+  expect(stages.indexOf('preferences_loaded')).toBeLessThan(stages.indexOf('engine_created'));
+  await assertRuntimeContent(page,new Set());
+  await assertAssetClosure(page,runtimeAssetsForLocales(fixture.program,current.ui_locale,current.text_locale));
+}
+
+async function assertRuntimeContent(page,expected) {
+  const moduleHashes=moduleContentHashes(fixture.program);
+  const loaded=new Set(await requestedModuleObjects(page)),network=requestedNetworkObjects(page);
+  const expectedHashes=[...expected].sort();
+  expect([...loaded].filter(hash=>moduleHashes.has(hash)).sort()).toEqual(expectedHashes);
+  expect([...network].filter(hash=>moduleHashes.has(hash)).sort()).toEqual(expectedHashes);
+}
+
+async function assertAssetClosure(page,assetIds) {
+  const catalogHashes=new Set(Object.values(catalogObjectHashes(fixture.program)));
+  const mediaHashes=new Set(Object.values(fixture.program.assets).map(asset=>asset.object));
+  const network=requestedNetworkObjects(page);
+  const content=new Set(await requestedModuleObjects(page));
+  const expectedCatalogs=[...catalogHashesForAssets(fixture.program,assetIds)].sort();
+  expect([...content].filter(hash=>catalogHashes.has(hash)).sort()).toEqual(expectedCatalogs);
+  expect([...network].filter(hash=>catalogHashes.has(hash)).sort()).toEqual(expectedCatalogs);
+  expect([...network].filter(hash=>mediaHashes.has(hash)).sort())
+    .toEqual([...mediaHashesForAssets(fixture.program,assetIds)].sort());
 }
 
 async function start(page) {
@@ -41,10 +75,40 @@ async function advance(page, expectedText) {
   return state(page);
 }
 
+async function seedPreferences(page,preferences) {
+  const namespace=`${fixture.manifest.game_id}:dev`;
+  await page.goto(`${fixture.origin}/channels/stable.json`);
+  await page.evaluate(({namespace,value})=>new Promise((resolve,reject)=>{
+    const request=indexedDB.open('nir-player-v1',1);
+    request.onupgradeneeded=()=>{for(const store of ['saves','preferences','profile'])if(!request.result.objectStoreNames.contains(store))request.result.createObjectStore(store);};
+    request.onerror=()=>reject(request.error);
+    request.onsuccess=()=>{
+      const db=request.result,tx=db.transaction('preferences','readwrite');
+      tx.objectStore('preferences').put(value,namespace);
+      tx.oncomplete=()=>{db.close();resolve();};
+      tx.onabort=tx.onerror=()=>{db.close();reject(tx.error);};
+    };
+  }),{namespace,value:preferences});
+}
+
+async function readSavedEnvelope(page,namespace,slot) {
+  return page.evaluate(({key})=>new Promise((resolve,reject)=>{
+    const request=indexedDB.open('nir-player-v1',1);
+    request.onerror=()=>reject(request.error);
+    request.onsuccess=()=>{
+      const db=request.result,tx=db.transaction('saves','readonly'),get=tx.objectStore('saves').get(key);
+      let value;
+      get.onsuccess=()=>{value=get.result;};
+      tx.oncomplete=()=>{db.close();resolve(value);};
+      tx.onabort=tx.onerror=()=>{db.close();reject(tx.error||get.error);};
+    };
+  }),{key:`${namespace}:${slot}`});
+}
+
 const expectedText = (chapter, locale) => locale === 'en'
   ? `${chapter.english}: the shared road continues.`
   : `${chapter.number} 雨`;
-const requiredHashes = hashes => Object.values(hashes).flatMap(value => [value.code, ...Object.values(value.locales)]);
+const requiredHashes = hashes => Object.values(hashes).flatMap(value => [value.code, value.static, ...Object.values(value.locales)].filter(Boolean));
 
 test.beforeAll(async () => {
   fixture = await buildModulesFixture();
@@ -56,6 +120,8 @@ test.afterAll(async () => {
 
 test('startup and module calls fetch only the selected chapter and language; chapter two saves restore without re-entry', async ({ page }) => {
   const hashes = moduleObjectHashes(fixture.program);
+  expect(fixture.executable.format).toBe(2);
+  for(const chapter of chapters)expect(hashes[chapter.id].static).toMatch(/^[0-9a-f]{64}$/);
   const sharedImage = fixture.program.assets['bg.station'].object;
   let imageRequests = 0;
   page.on('request', request => { if (request.url().includes(sharedImage)) imageRequests++; });
@@ -63,28 +129,38 @@ test('startup and module calls fetch only the selected chapter and language; cha
   await start(page);
   expect((await state(page)).dialogue.visible).toBe(expectedText(chapters[0], 'zh-Hans'));
   expect((await state(page)).variables.visit_count.value).toBe(1);
+  expect(fixture.program.assets['bg.station'].bytes).toBeUndefined();
+  expect(Object.keys(fixture.program.catalogs||{}).length).toBeGreaterThan(0);
   const chapterOneImageRequests = imageRequests;
   expect(chapterOneImageRequests).toBeGreaterThan(0);
 
   let requested = new Set(await requestedModuleObjects(page));
-  expect([...requested].sort()).toEqual([
+  const chapterOneZh=new Set([
     hashes.ch01.code,
+    hashes.ch01.static,
     hashes.ch01.locales['zh-Hans'],
-  ].sort());
-  expect(requiredHashes(hashes).filter(hash => !requested.has(hash))).toHaveLength(7);
+  ]);
+  await assertRuntimeContent(page,chapterOneZh);
+  expect(requiredHashes(hashes).filter(hash => !requested.has(hash))).toHaveLength(requiredHashes(hashes).length-3);
 
   await action(page, { type: 'text_locale', locale: 'en' });
   await page.waitForFunction(() => window.__nir.state().text_locale === 'en' && !window.__nir.state().locale_pending);
   expect((await state(page)).dialogue.locale).toBe('zh-Hans');
   expect((await state(page)).dialogue.visible).toBe(expectedText(chapters[0], 'zh-Hans'));
   requested = new Set(await requestedModuleObjects(page));
+  const chapterOneBothLocales=new Set([...chapterOneZh,hashes.ch01.locales.en]);
+  await assertRuntimeContent(page,chapterOneBothLocales);
   expect(requested.has(hashes.ch01.locales.en)).toBe(true);
   expect(requested.has(hashes.ch02.locales.en)).toBe(false);
+  await assertAssetClosure(page,runtimeAssetsForLocales(fixture.program,'zh-Hans','en'));
 
   await advance(page, expectedText(chapters[1], 'en'));
   expect((await state(page)).variables.visit_count.value).toBe(2);
   requested = new Set(await requestedModuleObjects(page));
+  const throughChapterTwo=new Set([...chapterOneBothLocales,hashes.ch02.code,hashes.ch02.static,hashes.ch02.locales.en]);
+  await assertRuntimeContent(page,throughChapterTwo);
   expect(requested.has(hashes.ch02.code)).toBe(true);
+  expect(requested.has(hashes.ch02.static)).toBe(true);
   expect(requested.has(hashes.ch02.locales.en)).toBe(true);
   expect(requested.has(hashes.ch03.code)).toBe(false);
   expect(requested.has(hashes.ch03.locales.en)).toBe(false);
@@ -93,9 +169,18 @@ test('startup and module calls fetch only the selected chapter and language; cha
   await action(page, { type: 'saves' });
   await action(page, { type: 'save', slot: 0 });
   await page.waitForFunction(() => /已保存|Saved/.test(window.__nir.state().status));
+  const saved=await readSavedEnvelope(page,`${fixture.manifest.game_id}:dev`,0);
+  const frozenDialogues=Object.values(saved.snapshot.tasks).map(task=>task.dialogue).filter(Boolean);
+  expect(frozenDialogues).toEqual(expect.arrayContaining([
+    expect.objectContaining({text_id:'ch01.line',locale:'zh-Hans'}),
+    expect.objectContaining({text_id:'ch02.line',locale:'en'}),
+  ]));
+  resetNetworkObjects(page);
   await page.reload();
   await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
-  expect(await requestedModuleObjects(page)).toEqual([]);
+  await assertRuntimeContent(page,new Set());
+  const reloaded=await state(page);
+  await assertAssetClosure(page,runtimeAssetsForLocales(fixture.program,reloaded.ui_locale,reloaded.text_locale));
   await action(page, { type: 'saves' });
   await action(page, { type: 'load', slot: 0 });
   await page.waitForFunction(() => {
@@ -105,10 +190,18 @@ test('startup and module calls fetch only the selected chapter and language; cha
   expect((await state(page)).dialogue.visible).toBe(expectedText(chapters[1], 'en'));
   expect((await state(page)).variables.visit_count.value).toBe(2);
   requested = new Set(await requestedModuleObjects(page));
+  await assertRuntimeContent(page,new Set([
+    hashes.ch01.code,hashes.ch01.static,hashes.ch01.locales['zh-Hans'],
+    hashes.ch02.code,hashes.ch02.static,hashes.ch02.locales.en,
+  ]));
   expect(requested.has(hashes.ch01.code)).toBe(true);
   expect(requested.has(hashes.ch02.code)).toBe(true);
+  expect(requested.has(hashes.ch02.static)).toBe(true);
   expect(requested.has(hashes.ch02.locales.en)).toBe(true);
+  expect(requested.has(hashes.ch01.locales.en)).toBe(false);
   expect(requested.has(hashes.ch03.code)).toBe(false);
+  expect(requested.has(hashes.ch03.static)).toBe(false);
+  expect(requested.has(hashes.ch03.locales['zh-Hans'])).toBe(false);
   expect(requested.has(hashes.ch03.locales.en)).toBe(false);
   const restoredImageRequests = imageRequests;
 
@@ -116,7 +209,13 @@ test('startup and module calls fetch only the selected chapter and language; cha
   await advance(page, expectedText(chapters[2], 'en'));
   expect((await state(page)).variables.visit_count.value).toBe(3);
   requested = new Set(await requestedModuleObjects(page));
+  await assertRuntimeContent(page,new Set([
+    hashes.ch01.code,hashes.ch01.static,hashes.ch01.locales['zh-Hans'],
+    hashes.ch02.code,hashes.ch02.static,hashes.ch02.locales.en,
+    hashes.ch03.code,hashes.ch03.static,hashes.ch03.locales.en,
+  ]));
   expect(requested.has(hashes.ch03.code)).toBe(true);
+  expect(requested.has(hashes.ch03.static)).toBe(true);
   expect(requested.has(hashes.ch03.locales.en)).toBe(true);
   expect(imageRequests).toBe(restoredImageRequests);
 });
@@ -189,6 +288,22 @@ test('module fetch failure keeps the active scene and retries; cancelled work ca
   expect(afterLateFetch.variables.visit_count.value).toBe(2);
 });
 
+test('saved locale is applied before the first Boot fetch and selects only English chapter text', async ({ page }) => {
+  const hashes=moduleObjectHashes(fixture.program);
+  await seedPreferences(page,{
+    ui_locale:'en',text_locale:'en',font_scale:1,bgm_volume:.3,voice_volume:.8,sfx_volume:.5,reduced_motion:false,
+  });
+  await boot(page);
+  expect((await state(page)).ui_locale).toBe('en');
+  expect((await state(page)).text_locale).toBe('en');
+  await start(page);
+  expect((await state(page)).dialogue.locale).toBe('en');
+  expect((await state(page)).dialogue.visible).toBe(expectedText(chapters[0],'en'));
+  await assertRuntimeContent(page,new Set([hashes.ch01.code,hashes.ch01.static,hashes.ch01.locales.en]));
+  expect(new Set(await requestedModuleObjects(page)).has(hashes.ch01.locales['zh-Hans'])).toBe(false);
+  await assertAssetClosure(page,runtimeAssetsForLocales(fixture.program,'en','en'));
+});
+
 test('editing chapter two English changes only its localized object', async () => {
   const before = fixture.program;
   const beforeHashes = moduleObjectHashes(before);
@@ -204,12 +319,14 @@ test('editing chapter two English changes only its localized object', async () =
 
   for (const chapter of ['ch01', 'ch02', 'ch03']) {
     expect(afterHashes[chapter].code, `${chapter} code`).toBe(beforeHashes[chapter].code);
+    expect(afterHashes[chapter].static, `${chapter} static`).toBe(beforeHashes[chapter].static);
     for (const locale of ['zh-Hans', 'en']) {
       if (chapter === 'ch02' && locale === 'en') continue;
       expect(afterHashes[chapter].locales[locale], `${chapter}/${locale}`).toBe(beforeHashes[chapter].locales[locale]);
     }
   }
   expect(afterHashes.ch02.locales.en).not.toBe(beforeHashes.ch02.locales.en);
+  expect(catalogObjectHashes(after)).toEqual(catalogObjectHashes(before));
   expect(Object.fromEntries(Object.entries(after.assets).map(([id, asset]) => [id, asset.object])))
     .toEqual(Object.fromEntries(Object.entries(before.assets).map(([id, asset]) => [id, asset.object])));
 });

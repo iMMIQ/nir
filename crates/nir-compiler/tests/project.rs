@@ -1,9 +1,6 @@
 use nir_compiler::*;
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::fs;
+use std::path::{Path, PathBuf};
 fn source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/rain-letters")
 }
@@ -252,7 +249,7 @@ fn reproducible_release_lock_drift_and_corruption() {
 }
 
 #[test]
-fn release_splits_module_code_and_text_without_cross_locale_invalidation() {
+fn release_splits_runtime_packages_and_reports_locale_closures() {
     let d = project();
     let sdk = test_sdk();
     resolve(d.path(), sdk.path()).unwrap();
@@ -263,28 +260,94 @@ fn release_splits_module_code_and_text_without_cross_locale_invalidation() {
         &fs::read(first_out.join(format!("releases/{}.json", first.release))).unwrap(),
     )
     .unwrap();
-    let first_exe: nir_format::Executable = serde_json::from_slice(
+    let first_exe: nir_format::RuntimeExecutable = serde_json::from_slice(
         &fs::read(first_out.join(&first_release.objects[&first_release.program].path)).unwrap(),
     )
     .unwrap();
-    nir_content::validate_executable(&first_exe).unwrap();
-    assert!(first_exe.program.functions.is_empty());
-    assert!(first_exe.program.locales.values().all(BTreeMap::is_empty));
+    assert_eq!(first_exe.format, 2);
+    assert_eq!(first_exe.program.format, 2);
+    let root_json = serde_json::to_value(&first_exe.program).unwrap();
+    for full_body in ["functions", "scenes", "cues", "choices", "texts"] {
+        assert!(
+            root_json.get(full_body).is_none(),
+            "root retained {full_body}"
+        );
+    }
+    assert!(!root_json["locales"].is_object());
+    assert!(!root_json["title_nodes"].as_array().unwrap().is_empty());
+    assert_eq!(root_json["title_scene"], "station");
+    assert!(root_json["assets"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|asset| {
+            let mut fields: Vec<_> = asset
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            fields == ["catalog", "kind", "object"]
+        }));
     let module_id = first_exe.program.modules.keys().next().unwrap().clone();
     let first_index = &first_exe.program.modules[&module_id];
     let first_code = first_index.code.clone();
+    let first_static = first_index.static_content.clone();
     let first_zh = first_index.locales["zh-Hans"].clone();
     let first_en = first_index.locales["en"].clone();
-    for hash in [&first_code, &first_zh, &first_en] {
+    for hash in [&first_static, &first_code, &first_zh, &first_en] {
         let object = &first_release.objects[hash];
         nir_content::verify(&fs::read(first_out.join(&object.path)).unwrap(), hash).unwrap();
     }
+    let module_static: nir_format::ModuleStatic = serde_json::from_slice(
+        &fs::read(first_out.join(&first_release.objects[&first_static].path)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(module_static.format, 2);
+    assert_eq!(module_static.module, module_id);
+    assert!(!module_static.scenes.is_empty());
+    assert_eq!(
+        module_static
+            .scenes
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        first_exe
+            .program
+            .scene_owners
+            .iter()
+            .filter(|(_, owner)| *owner == &module_id)
+            .map(|(scene, _)| scene.clone())
+            .collect()
+    );
     let module_code: nir_format::ModuleCode = serde_json::from_slice(
         &fs::read(first_out.join(&first_release.objects[&first_code].path)).unwrap(),
     )
     .unwrap();
+    assert_eq!(module_code.format, 2);
     assert_eq!(module_code.module, module_id);
     assert_eq!(module_code.functions.len(), first_index.functions.len());
+
+    // The English-only font is absent from the Chinese boot closure, while the
+    // selected English boot closure includes both its catalog and media.
+    let dependencies: serde_json::Value =
+        serde_json::from_slice(&fs::read(d.path().join("reports/dependencies.json")).unwrap())
+            .unwrap();
+    let zh_boot = &dependencies["boot"]["zh-Hans"]["zh-Hans"];
+    let en_boot = &dependencies["boot"]["en"]["en"];
+    let latin = &first_exe.program.assets["font.latin"];
+    let latin_catalog = &first_exe.program.catalogs[&latin.catalog];
+    assert!(zh_boot["objects"].get(&latin.object).is_none());
+    assert!(en_boot["objects"].get(&latin.object).is_some());
+    assert!(en_boot["objects"].get(latin_catalog).is_some());
+    assert!(zh_boot["objects"].get(&first_release.program).is_some());
+    assert!(zh_boot["category_bytes"]["engine"].as_u64().unwrap() > 0);
+    for path in ["index.html", "bootstrap.js", "channels/stable.json"] {
+        assert!(zh_boot["files"].get(path).is_some());
+    }
+    let release_path = format!("releases/{}.json", first.release);
+    assert!(zh_boot["files"].get(release_path.as_str()).is_some());
 
     let english_path = d.path().join("content/ch01/texts/en.json");
     let mut english: serde_json::Value =
@@ -304,7 +367,7 @@ fn release_splits_module_code_and_text_without_cross_locale_invalidation() {
         &fs::read(second_out.join(format!("releases/{}.json", second.release))).unwrap(),
     )
     .unwrap();
-    let second_exe: nir_format::Executable = serde_json::from_slice(
+    let second_exe: nir_format::RuntimeExecutable = serde_json::from_slice(
         &fs::read(second_out.join(&second_release.objects[&second_release.program].path)).unwrap(),
     )
     .unwrap();

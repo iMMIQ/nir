@@ -21,6 +21,8 @@ try {
     // bind the subsequent browser import to the same publisher-controlled object graph.
     await Promise.all([fetchObject(release.engine.js),fetchObject(release.engine.host)]);
     const [wasm,host,executable]=await Promise.all([import(objectUrl(release.engine.js).href),import(objectUrl(release.engine.host).href),fetchObject(release.program)]);
+    const runtimeRoot=JSON.parse(new TextDecoder().decode(executable));
+    if(runtimeRoot.format!==2||!runtimeRoot.program||typeof runtimeRoot.program!=='object')throw new Error('E_RUNTIME_VERSION: expected RuntimeExecutable v2');
     // Verify the actual WASM bytes used for instantiation, including a corrupted cache.
     const wasmBytes=await fetchObject(release.engine.wasm);
     mark('wasm_verified');

@@ -97,12 +97,7 @@ fn random_stream_restores_after_budget_boundary() {
         serde_json::to_string(b.state()).unwrap()
     );
     assert_eq!(a.state().outcome.as_deref(), Some("returned"));
-    Core::restore(
-        ValidatedProgram::new(a.program().clone()).unwrap(),
-        a.snapshot(),
-        "rng",
-    )
-    .unwrap();
+    Core::restore(a.validated_program().clone(), a.snapshot(), "rng").unwrap();
 }
 #[test]
 fn non_suspending_loop_yields_then_faults_with_location() {
@@ -600,7 +595,7 @@ fn revision_identity_is_frozen_during_preparation_and_validated_on_restore() {
     }
     dialogue.insert("revision".into(), serde_json::json!(1));
     assert!(serde_json::from_value::<nir_core::Snapshot>(legacy).is_err());
-    let validated = ValidatedProgram::new(c.program().clone()).unwrap();
+    let validated = c.validated_program().clone();
     let mut restored = Core::restore(validated.clone(), snapshot.clone(), "test-release").unwrap();
     let activation = restored.state().pending.as_ref().unwrap().id;
     restored.step(CoreInput::Prepared { activation }, 1000);

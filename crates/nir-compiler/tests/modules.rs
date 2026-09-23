@@ -15,6 +15,22 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+fn test_sdk() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "player_web.js",
+        "player_web_bg.wasm",
+        "host.js",
+        "index.html",
+        "bootstrap.js",
+        "THIRD-PARTY.txt",
+        "compiler.sha256",
+    ] {
+        fs::write(dir.path().join(name), format!("packaging fixture: {name}")).unwrap();
+    }
+    dir
+}
+
 fn module_toml(id: &str) -> String {
     format!(
         "id = \"{id}\"\nmodule_format = 1\nsources = [\"story.nir.json\"]\ntext_contracts = \"texts/contracts.json\"\ntext_revisions = \"texts/revisions.json\"\n\n[exports]\nstart = \"main\"\n\n[text_bundles]\nen = \"texts/en.json\"\nzh-Hans = \"texts/zh-Hans.json\"\n"
@@ -226,4 +242,81 @@ fn text_revision_commands_route_namespaced_ids_to_their_module() {
     assert_eq!(after.program.texts["ch02.arrival"].source_revision, 2);
     assert_eq!(after.program.texts["ch01.arrival"].source_revision, 1);
     assert!(text_status(root).unwrap().ready);
+}
+
+#[test]
+fn release_reports_cyclic_module_closure_and_exact_shared_catalog_consumers() {
+    let project = project();
+    add_second_module(project.path());
+
+    // Export a helper from ch01, then make ch02 call it. The existing ch01 ->
+    // ch02 call now forms a cycle in the module dependency graph.
+    let ch01_module = project.path().join("content/ch01/module.toml");
+    let text = fs::read_to_string(&ch01_module)
+        .unwrap()
+        .replace("start = \"main\"", "start = \"main\"\nhelper = \"helper\"");
+    fs::write(ch01_module, text).unwrap();
+
+    let ch02_story = project.path().join("content/ch02/story.nir.json");
+    let mut ch02: Json = serde_json::from_slice(&fs::read(&ch02_story).unwrap()).unwrap();
+    ch02["functions"]["main"] = json!({
+        "returns": "i32",
+        "entry": "call_ch01",
+        "blocks": {
+            "call_ch01": {
+                "ops": [],
+                "terminator": {
+                    "type": "call",
+                    "function": "ch01.helper",
+                    "args": {"x": {"type": "const", "value": {"type": "i32", "value": 1}}},
+                    "next": "return",
+                    "result": "affection"
+                }
+            },
+            "return": {
+                "ops": [],
+                "terminator": {"type": "return", "value": {"type": "var", "name": "affection"}}
+            }
+        }
+    });
+    fs::write(&ch02_story, serde_json::to_vec_pretty(&ch02).unwrap()).unwrap();
+
+    let sdk = test_sdk();
+    let out = project.path().join("dist/cyclic");
+    let build = build(project.path(), sdk.path(), &out, false).unwrap();
+    let dependencies: Json = serde_json::from_slice(
+        &fs::read(project.path().join("reports/dependencies.json")).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(dependencies["module_dependencies"]["ch01"], json!(["ch02"]));
+    assert_eq!(dependencies["module_dependencies"]["ch02"], json!(["ch01"]));
+    let entry = &dependencies["entry_reachable"]["en"]["en"];
+    let entry_objects = entry["objects"].as_object().unwrap();
+    assert!(entry_objects.len() >= 2);
+    assert_eq!(
+        entry["object_count"].as_u64().unwrap() as usize,
+        entry_objects.len()
+    );
+    assert_eq!(
+        entry["object_bytes"].as_u64().unwrap(),
+        entry_objects
+            .values()
+            .map(|object| object["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    );
+
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", build.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    let title_catalog = &executable.program.assets["bg.station"].catalog;
+    assert_eq!(
+        build.asset_catalogs[title_catalog].consumers,
+        ["bootstrap", "module:ch01", "module:ch02"]
+    );
 }

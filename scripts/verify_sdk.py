@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from verify_runtime import verify_runtime
 
 source = Path("dist").resolve()
 Path("target/tmp").mkdir(parents=True, exist_ok=True)
@@ -28,35 +29,7 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
         raw = (directory / "releases" / f"{release_id}.json").read_bytes()
         assert hashlib.sha256(raw).hexdigest() == release_id
         release = json.loads(raw)
-        program = json.loads((directory / release["objects"][release["program"]]["path"]).read_bytes())["program"]
-        modules = program.get("modules", {})
-        assert modules, "SDK release did not publish module indexes"
-        assert not program["functions"]
-        assert all(not texts for texts in program["locales"].values())
-        function_owners = set()
-        text_owners = set()
-        for module_id, index in modules.items():
-            code_hash = index["code"]
-            assert code_hash in release["objects"]
-            code_raw = (directory / release["objects"][code_hash]["path"]).read_bytes()
-            assert hashlib.sha256(code_raw).hexdigest() == code_hash
-            code = json.loads(code_raw)
-            assert code["format"] == 1 and code["module"] == module_id
-            assert set(code["functions"]) == set(index["functions"])
-            assert not (function_owners & set(index["functions"]))
-            function_owners.update(index["functions"])
-            assert not (text_owners & set(index["texts"]))
-            text_owners.update(index["texts"])
-            assert set(index["locales"]) == (set(program["locales"]) if index["texts"] else set())
-            for locale, text_hash in index["locales"].items():
-                assert text_hash in release["objects"]
-                text_raw = (directory / release["objects"][text_hash]["path"]).read_bytes()
-                assert hashlib.sha256(text_raw).hexdigest() == text_hash
-                texts = json.loads(text_raw)
-                assert texts["module"] == module_id and texts["locale"] == locale
-                assert set(texts["texts"]) == set(index["texts"])
-        assert program["entry"] in function_owners
-        assert text_owners == set(program["texts"])
+        verify_runtime(directory, release)
     run("init", "story", "--template", "web-basic")
     for cmd in [("resolve",), ("doctor",), ("check", "--locked"), ("test",), ("build", "--locked")]:
         run("-p", "story", *cmd)

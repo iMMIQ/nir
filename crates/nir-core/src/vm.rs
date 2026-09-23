@@ -1,3 +1,4 @@
+use crate::validate::RuntimeProgramView;
 use crate::ValidatedProgram;
 use nir_format::*;
 use rand_chacha::ChaCha8Rng;
@@ -268,7 +269,7 @@ impl Core {
             revision: p.revision.clone(),
             release,
             tick_us: Micros(0),
-            variables: p.variables.clone(),
+            variables: (*p.variables).clone(),
             frames: vec![frame],
             scene: vec![],
             draft: vec![],
@@ -298,12 +299,21 @@ impl Core {
     pub fn state(&self) -> &Snapshot {
         &self.state
     }
-    pub fn program(&self) -> &Program {
+    pub fn program(&self) -> &RuntimeProgramView {
         self.program.program()
+    }
+    pub fn validated_program(&self) -> &ValidatedProgram {
+        &self.program
     }
     /// Installing verified immutable bodies does not replay any story operation.
     pub fn replace_program(&mut self, program: ValidatedProgram) -> Result<()> {
-        if program.program().revision != self.state.revision
+        let same_root = match (self.program.runtime_root(), program.runtime_root()) {
+            (Some(current), Some(next)) => std::ptr::eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_root
+            || program.program().revision != self.state.revision
             || program.program().game_id != self.state.game_id
         {
             return Err(self.error("E_MODULE", "content identity changed"));
@@ -632,7 +642,7 @@ impl Core {
             }
             // Content barriers precede semantic execution. No arguments, RNG,
             // instance IDs or story time are consumed while a body is missing.
-            if let Some(module) = self.missing_content() {
+            if let Some(module) = self.missing_content()? {
                 self.intents.push(CoreIntent::PrepareContent {
                     module,
                     locale: self.state.locale.clone(),
@@ -661,23 +671,58 @@ impl Core {
         }
         Ok(())
     }
-    fn missing_content(&self) -> Option<String> {
+    fn missing_content(&self) -> Result<Option<String>> {
         let p = self.program();
         let frame = self.frame();
-        if !p.functions.contains_key(&frame.function) {
-            return p.function_module(&frame.function).map(str::to_owned);
+        let missing = |owner: Option<&str>, id: &str| {
+            owner
+                .map(|module| Some(module.to_owned()))
+                .ok_or_else(|| self.error("E_CONTENT_INDEX", id))
+        };
+        if let Some(root) = p.runtime_root() {
+            let module = root
+                .function_module(&frame.function)
+                .ok_or_else(|| self.error("E_CONTENT_INDEX", &frame.function))?;
+            if !self.program.is_resident(&ContentKey::Static {
+                module: module.into(),
+            }) {
+                return Ok(Some(module.into()));
+            }
         }
-        let block = &p.functions[&frame.function].blocks[&frame.block];
+        let Some(function) = p.functions.get(&frame.function) else {
+            return missing(p.function_module(&frame.function), &frame.function);
+        };
+        let block = function
+            .blocks
+            .get(&frame.block)
+            .ok_or_else(|| self.error("E_CONTENT_INDEX", &frame.block))?;
         if frame.op < block.ops.len() {
-            return None;
+            return Ok(None);
         }
         let mut texts = vec![];
         match &block.terminator {
-            Terminator::Call { function, .. } if !p.functions.contains_key(function) => {
-                return p.function_module(function).map(str::to_owned)
+            Terminator::Call { function, .. } => {
+                let owner = p.function_module(function);
+                let missing_static = p.runtime_root().is_some()
+                    && owner.is_some_and(|module| {
+                        !self.program.is_resident(&ContentKey::Static {
+                            module: module.into(),
+                        })
+                    });
+                if p.functions.get(function).is_none() || missing_static {
+                    return missing(owner, function);
+                }
             }
             Terminator::Activate { cue, .. } => {
-                for effect in &p.cues[cue].effects {
+                let Some(definition) = p.cues.get(cue) else {
+                    return missing(
+                        p.runtime_root()
+                            .and_then(|root| root.cue_owners.get(cue))
+                            .map(String::as_str),
+                        cue,
+                    );
+                };
+                for effect in &definition.effects {
                     if let Effect::Dialogue { text, speaker, .. } = &effect.effect {
                         texts.push(text);
                         if !speaker.is_empty() {
@@ -687,15 +732,29 @@ impl Core {
                 }
             }
             Terminator::Interact { choice, .. } => {
-                texts.extend(p.choices[choice].options.iter().map(|o| &o.text))
+                let Some(definition) = p.choices.get(choice) else {
+                    return missing(
+                        p.runtime_root()
+                            .and_then(|root| root.choice_owners.get(choice))
+                            .map(String::as_str),
+                        choice,
+                    );
+                };
+                texts.extend(definition.options.iter().map(|o| &o.text));
             }
             _ => {}
         }
-        texts
-            .into_iter()
-            .find(|id| !p.locales[&self.state.locale].contains_key(*id))
-            .and_then(|id| p.text_module(id))
-            .map(str::to_owned)
+        for id in texts {
+            if p.texts.get(id).is_none()
+                || p.locales
+                    .get(&self.state.locale)
+                    .and_then(|texts| texts.get(id))
+                    .is_none()
+            {
+                return missing(p.text_module(id), id);
+            }
+        }
+        Ok(None)
     }
     fn execute_op(&mut self, op: &Operation) -> Result<()> {
         match op {
@@ -1507,8 +1566,7 @@ impl Core {
         }
         for h in &s.history {
             let c = p
-                .texts
-                .get(&h.text_id)
+                .text_identity(&h.text_id)
                 .ok_or_else(|| fail("unknown history text"))?;
             if h.meaning_revision != c.meaning_revision
                 || h.source_revision != c.source_revision
@@ -1746,7 +1804,7 @@ impl Core {
                 }
                 if n.asset
                     .as_ref()
-                    .is_some_and(|a| p.assets.get(a).map(|a| a.kind) != Some(AssetKind::Image))
+                    .is_some_and(|a| p.asset_kind(a) != Some(AssetKind::Image))
                 {
                     return Err(fail("scene asset missing"));
                 }
@@ -1806,7 +1864,12 @@ fn ease(p: f32, e: Easing) -> f32 {
     }
 }
 
-fn validate_dialogue(d: &Dialogue, p: &Program, tick: Micros, next_id: u32) -> Result<()> {
+fn validate_dialogue(
+    d: &Dialogue,
+    p: &RuntimeProgramView,
+    tick: Micros,
+    next_id: u32,
+) -> Result<()> {
     let fail = |msg: &str| Diagnostic::new("E_SNAPSHOT", "dialogue", msg);
     let contract = p
         .texts
