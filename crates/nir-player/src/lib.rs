@@ -9,12 +9,19 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod content;
 mod pause;
 pub use content::ContentRequest;
-use content::{ContentPreparation, ContentPurpose};
+use content::{ContentPreparation, ContentPurpose, RestoreWork};
 pub use pause::PauseToken;
 use pause::Pauses;
 
 pub const EVENT_CAPACITY: usize = 256;
 const INPUT_CAPACITY: usize = 128;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPriority {
+    Required,
+    Prefetch,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +39,13 @@ pub enum AppCommand {
         request: u32,
         session: u32,
         objects: Vec<ContentRequest>,
+        priority: ContentPriority,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+    PromoteContent {
+        request: u32,
+        session: u32,
     },
     CancelContent {
         request: u32,
@@ -132,6 +146,11 @@ pub enum AppEvent {
         request: u32,
         message: String,
     },
+    ContentSkipped {
+        request: u32,
+        code: String,
+        message: String,
+    },
     Action {
         action: UiAction,
         interaction: u32,
@@ -219,6 +238,14 @@ struct LocaleCandidate {
     text_locale: String,
     preflight: bool,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefetchAttempt {
+    wait: String,
+    function: String,
+    module: String,
+    locale: String,
+    session: u32,
+}
 pub struct Player {
     messages: nir_presentation::Messages,
     core: Core,
@@ -248,6 +275,8 @@ pub struct Player {
     prepare: Option<Preparation>,
     content: BTreeMap<u32, ContentPreparation>,
     content_leases: Vec<nir_core::ContentLease>,
+    restore_work: Option<RestoreWork>,
+    prefetch_attempted: Option<PrefetchAttempt>,
     candidate: Option<Core>,
     device_resume: Option<Purpose>,
     ledger: BudgetLedger,
@@ -363,6 +392,8 @@ impl Player {
             history_offset: 0,
             content: BTreeMap::new(),
             content_leases: vec![],
+            restore_work: None,
+            prefetch_attempted: None,
         };
         let assets = p.title_assets();
         p.begin_prepare(Purpose::Boot, 0, assets)?;
@@ -598,15 +629,17 @@ impl Player {
             && self.pauses.is_empty()
             && (self.core.needs_clock() || self.auto || self.skip)
     }
+    fn story_context_active(&self) -> bool {
+        self.screen != Screen::Title && self.return_screen != Screen::Title
+    }
     pub fn paused(&self) -> bool {
         !self.pauses.is_empty()
     }
     pub fn is_loading(&self) -> bool {
         self.prepare.is_some()
-            || self
-                .content
-                .values()
-                .any(|p| !p.failed && !matches!(p.purpose, ContentPurpose::Locale))
+            || self.content.values().any(|p| {
+                !p.failed && !matches!(p.purpose, ContentPurpose::Locale | ContentPurpose::Prefetch)
+            })
     }
     fn title_nodes(&self) -> Vec<Node> {
         self.validated.title_nodes().to_vec()
@@ -680,7 +713,7 @@ impl Player {
         a
     }
     pub fn retained_assets(&self) -> BTreeSet<String> {
-        let mut a = if self.screen == Screen::Title {
+        let mut a = if !self.story_context_active() {
             self.title_assets()
         } else {
             self.state_assets(&self.core)
@@ -792,7 +825,7 @@ impl Player {
         mut assets: BTreeSet<String>,
     ) -> Result<()> {
         // Old and candidate resources are admitted together; never pin half a cue.
-        assets.extend(if self.screen == Screen::Title {
+        assets.extend(if !self.story_context_active() {
             self.title_assets()
         } else {
             self.state_assets(&self.core)
@@ -848,8 +881,12 @@ impl Player {
         }
     }
     fn step(&mut self, input: CoreInput, budget: &mut u32) -> Result<()> {
+        let before_location = self.core.location();
         let output = self.core.step(input, *budget);
         *budget -= output.work_used;
+        if before_location != output.location {
+            self.touch_snapshot_content(self.core.state())?;
+        }
         if output.remaining_time_us > 0 {
             self.inbox.push_front((
                 self.generation.session,
@@ -865,11 +902,9 @@ impl Player {
                     // Independent media completions may wake the VM while its
                     // PC is at the same barrier. They do not restart a download
                     // or implicitly retry a failed preparation.
-                    if !self
-                        .content
-                        .values()
-                        .any(|p| !matches!(p.purpose, ContentPurpose::Locale))
-                    {
+                    if !self.content.values().any(|p| {
+                        !matches!(p.purpose, ContentPurpose::Locale | ContentPurpose::Prefetch)
+                    }) {
                         self.begin_content(ContentPurpose::Execution, needs)?;
                     }
                 }
@@ -933,6 +968,108 @@ impl Player {
         }
         Ok(())
     }
+    fn cancel_prefetch_content(&mut self) -> bool {
+        let requests: Vec<_> = self
+            .content
+            .iter()
+            .filter(|(_, job)| matches!(job.purpose, ContentPurpose::Prefetch))
+            .map(|(request, _)| *request)
+            .collect();
+        for request in &requests {
+            self.content.remove(request);
+            self.commands
+                .push(AppCommand::CancelContent { request: *request });
+        }
+        !requests.is_empty()
+    }
+    fn maybe_prefetch_content(&mut self) {
+        let eligible = self.screen == Screen::Story
+            && self.story_context_active()
+            && !self.paused()
+            && self.prepare.is_none()
+            && self.candidate.is_none()
+            && self.restore_work.is_none()
+            && self.validated.program().player.prefetch_content
+            && !self.content.values().any(|job| {
+                !matches!(
+                    job.purpose,
+                    ContentPurpose::Locale | ContentPurpose::Prefetch
+                )
+            });
+        if !eligible {
+            if self.cancel_prefetch_content() {
+                self.prefetch_attempted = None;
+            }
+            return;
+        }
+        let Some(module) = self.core.prefetch_module() else {
+            if self.cancel_prefetch_content() {
+                self.prefetch_attempted = None;
+            }
+            self.prefetch_attempted = None;
+            return;
+        };
+        let state = self.core.state();
+        let Some(frame) = state.frames.last() else {
+            self.prefetch_attempted = None;
+            return;
+        };
+        let wait = state
+            .waiting
+            .as_ref()
+            .and_then(|waiting| serde_json::to_string(waiting).ok())
+            .unwrap_or_default();
+        let attempt = PrefetchAttempt {
+            wait: format!("{}:{wait}", self.core.location()),
+            function: frame.function.clone(),
+            module,
+            locale: self.effective_text_locale.clone(),
+            session: self.generation.session,
+        };
+        if self.prefetch_attempted.as_ref() != Some(&attempt) {
+            self.cancel_prefetch_content();
+            self.prefetch_attempted = None;
+        }
+        if self.prefetch_attempted.as_ref() == Some(&attempt) {
+            return;
+        }
+        if self
+            .content
+            .values()
+            .any(|job| matches!(job.purpose, ContentPurpose::Prefetch))
+        {
+            self.prefetch_attempted = Some(attempt);
+            return;
+        }
+        let objects = match self.content_requirements(&attempt.module, Some(&attempt.locale), true)
+        {
+            Ok(objects) => objects,
+            Err(_) => {
+                self.prefetch_attempted = Some(attempt);
+                return;
+            }
+        };
+        if objects.is_empty() {
+            self.prefetch_attempted = Some(attempt);
+            return;
+        }
+        if self
+            .begin_content(ContentPurpose::Prefetch, objects)
+            .is_err()
+        {
+            // Speculation must not affect the running story on admission or
+            // request-limit failures.
+            self.prefetch_attempted = Some(attempt);
+            return;
+        }
+        if self
+            .content
+            .values()
+            .any(|job| matches!(job.purpose, ContentPurpose::Prefetch))
+        {
+            self.prefetch_attempted = Some(attempt);
+        }
+    }
     pub fn pump(&mut self, events: Vec<AppEvent>, budget: u32) -> Vec<AppCommand> {
         // Admission leaves room for resource, audio and storage terminal events.
         for event in events {
@@ -981,6 +1118,7 @@ impl Player {
                 self.report(e, true);
             }
         }
+        self.maybe_prefetch_content();
         if let Err(error) = self.refresh_content_lease() {
             self.report(error, true);
         }
@@ -1003,8 +1141,41 @@ impl Player {
             self.fail_content(request, message);
             return Ok(());
         }
+        if let AppEvent::ContentSkipped {
+            request,
+            code,
+            message,
+        } = e
+        {
+            if self.accepts_content(request) {
+                let job = self.content.remove(&request).unwrap();
+                self.commands.push(AppCommand::CancelContent { request });
+                if matches!(job.purpose, ContentPurpose::Prefetch) {
+                    self.observe("prefetch_skipped", Some(request));
+                } else {
+                    // A prefetch can be promoted after the host's speculative
+                    // size preflight has already rejected it. Retry the same
+                    // exact objects under a fresh required request envelope.
+                    self.observe("promoted_prefetch_skipped", Some(request));
+                    if let Err(error) = self.begin_content(job.purpose, job.objects) {
+                        self.pauses.insert("content".into());
+                        self.report(
+                            Diagnostic::new(
+                                "E_MODULE_PREPARE",
+                                "content",
+                                format!("{code}: {message}; retry failed: {error}"),
+                            ),
+                            true,
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
         match e {
-            AppEvent::ContentReady { .. } | AppEvent::ContentFailed { .. } => unreachable!(),
+            AppEvent::ContentReady { .. }
+            | AppEvent::ContentFailed { .. }
+            | AppEvent::ContentSkipped { .. } => unreachable!(),
             AppEvent::Action {
                 action,
                 interaction,
@@ -1112,6 +1283,9 @@ impl Player {
                         self.locale_candidate = None;
                         self.locale_error = None;
                         self.pauses.remove("locale");
+                        self.prefetch_attempted = None;
+                        self.touch_snapshot_content(self.core.state())?;
+                        self.restore_locale_changed()?;
                         self.status = self
                             .messages
                             .text(&self.effective_ui_locale, "language-applied");
@@ -1260,6 +1434,34 @@ impl Player {
             }
             AppEvent::DeviceReady => {
                 self.observe("device_ready", None);
+                if let Some(work) = &self.restore_work {
+                    if let Some(candidate) = &self.candidate {
+                        let purpose = if work.rollback {
+                            Purpose::Rollback
+                        } else {
+                            Purpose::Restore
+                        };
+                        let assets = self.state_assets(candidate);
+                        self.begin_prepare(purpose, 0, assets)?;
+                    } else if self.content.values().any(|job| {
+                        matches!(
+                            job.purpose,
+                            ContentPurpose::RestoreValidation | ContentPurpose::RestoreBodies(_)
+                        )
+                    }) {
+                        // Keep the old device pause until staged restore has a
+                        // complete candidate whose media can be prepared.
+                    } else {
+                        self.resume_restore_work()?;
+                    }
+                    if self.locale_error.is_none()
+                        && (self.preferences.ui_locale != self.effective_ui_locale
+                            || self.preferences.text_locale != self.effective_text_locale)
+                    {
+                        self.start_locale_switch()?;
+                    }
+                    return Ok(());
+                }
                 let purpose = match self.device_resume.take() {
                     Some(Purpose::Restore) => Purpose::Restore,
                     Some(Purpose::Rollback) => Purpose::Rollback,
@@ -1363,6 +1565,8 @@ impl Player {
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = candidate;
+                self.restore_work = None;
+                self.touch_snapshot_content(self.core.state())?;
                 self.screen = Screen::Story;
                 self.return_screen = Screen::Story;
                 self.pauses.remove("menu");
@@ -1429,6 +1633,9 @@ impl Player {
         self.restore_with_purpose(s, false)
     }
     fn restore_with_purpose(&mut self, s: Snapshot, rollback: bool) -> Result<()> {
+        if self.validated.runtime_root().is_some() {
+            return self.start_staged_restore(s, rollback);
+        }
         self.cancel_content(false);
         let needs = self.restore_content_requirements(&s)?;
         if !needs.is_empty() {
@@ -1465,6 +1672,9 @@ impl Player {
                 }
                 let restart_locale = self.locale_pending();
                 self.cancel_content(false);
+                self.restore_work = None;
+                self.candidate = None;
+                self.prefetch_attempted = None;
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = Core::new(
@@ -1479,9 +1689,13 @@ impl Player {
                 self.error = None;
                 self.diagnostic = None;
                 self.status.clear();
-                self.step(CoreInput::None, budget)?;
                 if restart_locale {
                     self.start_locale_switch()?;
+                }
+                // Freeze the first dialogue only after a pending language
+                // transaction commits its effective context for this session.
+                if !self.locale_pending() {
+                    self.step(CoreInput::None, budget)?;
                 }
             }
             UiAction::Scroll { .. } => {
@@ -1557,6 +1771,9 @@ impl Player {
                 self.commands.push(AppCommand::AudioReset);
                 self.cancel_preparation();
                 self.candidate = None;
+                self.restore_work = None;
+                self.prefetch_attempted = None;
+                self.device_resume = None;
                 self.pauses.retain(|r| r == "hidden");
                 self.screen = Screen::Title;
                 self.return_screen = Screen::Title;
@@ -1707,6 +1924,19 @@ impl Player {
                     .cloned()
                 {
                     self.begin_content(job.purpose, job.objects)?;
+                } else if self.candidate.is_some() {
+                    let rollback = self.restore_work.as_ref().is_some_and(|work| work.rollback);
+                    let purpose = if rollback {
+                        Purpose::Rollback
+                    } else {
+                        Purpose::Restore
+                    };
+                    let assets = self
+                        .candidate
+                        .as_ref()
+                        .map(|candidate| self.state_assets(candidate))
+                        .unwrap_or_default();
+                    self.begin_prepare(purpose, 0, assets)?;
                 } else {
                     self.restart_preparation()?;
                 }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { OwnerInbox, SharedRequests, WorkPool } from '../../crates/nir-platform-web/host.js';
+import { ContentStagingBudget, OwnerInbox, SharedRequests, WorkPool, acquireRequiredContentStage, contentBatchEnvelope, queueContentSkip } from '../../crates/nir-platform-web/host.js';
 
 test('input overload leaves room for terminal completions',()=>{
     const q=new OwnerInbox(8,4),out=[];
@@ -61,6 +61,88 @@ test('resource admission is global and cancelled decoders hold their slot until 
     const next=pool.run(()=>started++,c.signal);a.abort();
     assert.equal(started,1);assert.equal(pool.active,1);assert.equal(pool.waiting.length,1);
     finish();await first;await next;assert.equal(started,2);
+});
+
+test('required resource work jumps queued prefetch work after the active job settles',async()=>{
+    const pool=new WorkPool(1),signal=new AbortController().signal,order=[];
+    let finish;
+    const active=pool.run(()=>new Promise(resolve=>finish=resolve),signal);
+    await Promise.resolve();
+    const prefetch=pool.run(()=>order.push('prefetch'),signal,{priority:'prefetch',group:'prefetch:1'});
+    const required=pool.run(()=>order.push('required'),signal);
+    finish();
+    await Promise.all([active,prefetch,required]);
+    assert.deepEqual(order,['required','prefetch']);
+});
+
+test('promoting queued prefetch work retains its place as required work',async()=>{
+    const pool=new WorkPool(1),signal=new AbortController().signal,order=[];
+    let finish;
+    const active=pool.run(()=>new Promise(resolve=>finish=resolve),signal);
+    await Promise.resolve();
+    const prefetch=pool.run(()=>order.push('promoted'),signal,{priority:'prefetch',group:'content:8'});
+    const unrelated=pool.run(()=>order.push('other-required'),signal);
+    assert.equal(pool.promoteGroup('content:8'),1);
+    finish();
+    await Promise.all([active,prefetch,unrelated]);
+    assert.deepEqual(order,['promoted','other-required']);
+});
+
+test('content preflight applies prefetch and global encoded-byte limits',()=>{
+    const one='a'.repeat(64),large='b'.repeat(64),manifest={
+        [one]:{bytes:1024*1024},
+        [large]:{bytes:2*1024*1024+1},
+    };
+    assert.equal(contentBatchEnvelope([{hash:one}],manifest,{priority:'prefetch',maxBytes:1024*1024}).ok,true);
+    assert.deepEqual(contentBatchEnvelope([{hash:large}],manifest,{priority:'prefetch',maxBytes:2*1024*1024}),{
+        ok:false,code:'E_PREFETCH_LIMIT',reason:'available_budget',totalBytes:2*1024*1024+1,maxBytes:2*1024*1024,prefetch:true,
+    });
+    const overGlobal={...manifest,[large]:{bytes:16*1024*1024+1}};
+    assert.equal(contentBatchEnvelope([{hash:large}],overGlobal).code,'E_CONTENT_LIMIT');
+});
+
+test('required staging waits for released prefetch bytes and records encoded peak',async()=>{
+    const budget=new ContentStagingBudget(10),controller=new AbortController();
+    assert.equal(budget.tryReserve('prefetch',7),true);
+    let admitted=false;
+    const demand=budget.acquire('demand',6,controller.signal).then(value=>{admitted=value;return value;});
+    assert.equal(budget.tryReserve('later-prefetch',1),false);
+    await Promise.resolve();assert.equal(admitted,false);assert.equal(budget.used,7);
+    assert.equal(budget.release('prefetch'),true);
+    assert.equal(await demand,true);assert.equal(admitted,true);assert.equal(budget.used,6);
+    assert.equal(budget.peak,7);
+    assert.equal(budget.release('demand'),true);assert.equal(budget.used,0);
+});
+
+test('a granted demand staging reservation is owned before a racing cancellation',async()=>{
+    const budget=new ContentStagingBudget(10),controller=new AbortController();
+    const job={group:'content:cancel-race',signal:controller.signal,staged:false};
+    const admission=acquireRequiredContentStage(job,budget,6);
+    controller.abort(new Error('cancelled after reservation grant'));
+    try {
+        await assert.rejects(admission,/cancelled after reservation grant/);
+    } finally {
+        if(job.staged)budget.release(job.group);
+    }
+    assert.equal(job.staged,true);assert.equal(budget.used,0);
+});
+
+test('a fetch-failure skip promoted before owner delivery reuses its terminal slot',async()=>{
+    const inbox=new OwnerInbox(4,4,0),controller=new AbortController();
+    const job={priority:'prefetch',state:'fetching',signal:controller.signal,terminal:inbox.reserve('completion','content:1')};
+    let skipped=0,failed=0;
+    const queued=queueContentSkip(job,{code:'E_PREFETCH_FAILED',reason:'fetch_failed'}, {
+        post:(slot,run,terminal)=>slot.post(run,{terminal}),
+        skip:()=>skipped++,
+    });
+    assert.equal(job.state,'skip_queued');
+    job.priority='required'; // PromoteContent for the exact same request/session.
+    inbox.drain({milliseconds:Infinity});
+    assert.equal(await queued,true);
+    assert.equal(skipped,0);assert.equal(job.terminal.state,'pending');assert.equal(inbox.used,1);
+    const failedRequest=job.terminal.post(()=>failed++);
+    inbox.drain({milliseconds:Infinity});assert.equal(await failedRequest,true);
+    assert.equal(failed,1);assert.equal(inbox.used,0);
 });
 
 

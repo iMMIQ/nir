@@ -380,6 +380,20 @@ fn cold_restore_prepares_canonical_definitions_and_original_dialogue_locale() {
     }));
     assert_eq!(restored.core().dialogue().unwrap().1.locale, "zh-Hans");
     assert_eq!(restored.effective_text_locale, "en");
+    let resident = restored.content_residency();
+    assert!(resident.blocks.iter().any(|block| block.key
+        == ContentKey::Text {
+            module: "story".into(),
+            locale: "en".into()
+        }));
+    assert!(
+        !resident.blocks.iter().any(|block| block.key
+            == ContentKey::Text {
+                module: "story".into(),
+                locale: "zh-Hans".into()
+            }),
+        "original dialogue text is only needed in the verification scratch view"
+    );
     assert_eq!(
         restored.core().state().variables,
         original.core().state().variables
@@ -704,4 +718,314 @@ fn authenticated_but_invalid_static_recipe_rejects_the_entire_module_batch() {
     assert_eq!(p.content_residency().resident_bytes, before);
     assert!(p.core().program().functions.get(&entry).is_none());
     assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), state);
+}
+
+#[test]
+fn staged_restore_failure_retries_and_cancelled_completion_cannot_install() {
+    let (root, objects) = bundled();
+    let mut original =
+        Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
+    let boot = original.pump(vec![], 1000);
+    drain(&mut original, boot, &objects);
+    let start = action(&mut original, UiAction::NewGame);
+    drain(&mut original, start, &objects);
+    let snapshot = original.core().snapshot();
+    let envelope = SaveEnvelope {
+        format: 1,
+        slot: 0,
+        revision: 1,
+        digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+        snapshot,
+    };
+    let mut restored = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = restored.pump(vec![], 1000);
+    drain(&mut restored, boot, &objects);
+    let before = serde_json::to_value(restored.core().snapshot()).unwrap();
+    let resident_before = restored.content_residency().resident_bytes;
+    let load = restored.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(envelope.clone()),
+        }],
+        1000,
+    );
+    let (request, requirements) = load
+        .into_iter()
+        .find_map(|command| match command {
+            AppCommand::GetContent {
+                request, objects, ..
+            } => Some((request, objects)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(requirements
+        .iter()
+        .all(|r| !matches!(r.key, Some(ContentKey::Code { .. }))));
+    restored.pump(
+        vec![AppEvent::ContentReady {
+            request,
+            objects: requirements.iter().map(|_| b"{}".to_vec()).collect(),
+        }],
+        1000,
+    );
+    assert!(restored.error.is_some());
+    assert_eq!(
+        serde_json::to_value(restored.core().snapshot()).unwrap(),
+        before
+    );
+    assert_eq!(restored.content_residency().resident_bytes, resident_before);
+    let retry = action(&mut restored, UiAction::Retry);
+    drain(&mut restored, retry, &objects);
+    assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+    assert!(restored.core().dialogue().is_some());
+
+    let load = restored.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(envelope),
+        }],
+        1000,
+    );
+    let (request, requirements) = load
+        .into_iter()
+        .find_map(|command| match command {
+            AppCommand::GetContent {
+                request, objects, ..
+            } => Some((request, objects)),
+            _ => None,
+        })
+        .unwrap();
+    let title = action(&mut restored, UiAction::Title);
+    drain(&mut restored, title, &objects);
+    let before = serde_json::to_value(restored.core().snapshot()).unwrap();
+    let resident_before = restored.content_residency().resident_bytes;
+    assert!(!restored.accepts_content(request));
+    let late = restored.pump(
+        vec![AppEvent::ContentReady {
+            request,
+            objects: requirements
+                .iter()
+                .map(|r| objects[&r.hash].clone())
+                .collect(),
+        }],
+        1000,
+    );
+    drain(&mut restored, late, &objects);
+    assert_eq!(restored.screen, nir_presentation::Screen::Title);
+    assert_eq!(
+        serde_json::to_value(restored.core().snapshot()).unwrap(),
+        before
+    );
+    assert_eq!(restored.content_residency().resident_bytes, resident_before);
+    assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+}
+
+#[test]
+fn player_evicts_and_reloads_returned_modules_without_replaying_calls() {
+    let (mut root, mut objects) = bundled();
+    root.player.prefetch_content = false;
+    let mut blocks = BTreeMap::new();
+    for index in 0..11 {
+        let module_index = index % 10;
+        blocks.insert(
+            format!("call{index}"),
+            Block {
+                ops: vec![],
+                terminator: Terminator::Call {
+                    function: format!("chapter{module_index}.entry"),
+                    args: BTreeMap::new(),
+                    next: if index == 10 {
+                        "end".into()
+                    } else {
+                        format!("call{}", index + 1)
+                    },
+                    result: None,
+                },
+            },
+        );
+    }
+    blocks.insert(
+        "end".into(),
+        Block {
+            ops: vec![],
+            terminator: Terminator::End {
+                outcome: "reloaded".into(),
+            },
+        },
+    );
+    let driver = Function {
+        params: BTreeMap::new(),
+        locals: BTreeMap::new(),
+        returns: None,
+        entry: "call0".into(),
+        blocks,
+    };
+    let owner = root.function_index[&root.entry].module.clone();
+    let module = root.modules.get_mut(&owner).unwrap();
+    let mut code: ModuleCode = serde_json::from_slice(&objects[&module.code]).unwrap();
+    code.functions.insert(root.entry.clone(), driver.clone());
+    module.code = object(&mut objects, &code);
+    module
+        .functions
+        .insert(root.entry.clone(), FunctionSignature::from(&driver));
+    root.function_index.get_mut(&root.entry).unwrap().signature = FunctionSignature::from(&driver);
+    let mut chapter_hashes = Vec::new();
+    for index in 0..10 {
+        let name = format!("chapter{index}");
+        let function_id = format!("{name}.entry");
+        let function = Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "return".into(),
+            blocks: BTreeMap::from([(
+                "return".into(),
+                Block {
+                    ops: vec![],
+                    terminator: Terminator::Return { value: None },
+                },
+            )]),
+        };
+        let signature = FunctionSignature::from(&function);
+        let package = ModuleCode {
+            format: 2,
+            module: name.clone(),
+            functions: BTreeMap::from([(function_id.clone(), function)]),
+        };
+        // Valid encoded whitespace makes the cache budget observable without
+        // constructing an artificial multi-megabyte runtime value.
+        let mut bytes = serde_json::to_vec(&package).unwrap();
+        bytes.resize(2 * 1024 * 1024, b' ');
+        let hash = nir_content::digest(&bytes);
+        objects.insert(hash.clone(), bytes);
+        chapter_hashes.push(hash.clone());
+        let static_content = object(
+            &mut objects,
+            &ModuleStatic {
+                format: 2,
+                module: name.clone(),
+                scenes: BTreeMap::new(),
+                cues: BTreeMap::new(),
+                choices: BTreeMap::new(),
+                text_contracts: BTreeMap::new(),
+                activation_recipes: BTreeMap::new(),
+            },
+        );
+        root.modules.insert(
+            name.clone(),
+            ModuleIndex {
+                functions: BTreeMap::from([(function_id.clone(), signature.clone())]),
+                texts: BTreeSet::new(),
+                code: hash,
+                static_content,
+                locales: BTreeMap::new(),
+            },
+        );
+        root.function_index.insert(
+            function_id,
+            RuntimeFunctionIndex {
+                module: name,
+                signature,
+            },
+        );
+    }
+    let mut player = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = player.pump(vec![], 1000);
+    drain(&mut player, boot, &objects);
+    let mut commands = action(&mut player, UiAction::NewGame);
+    let mut requested = Vec::new();
+    for _ in 0..100 {
+        if commands.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for command in commands {
+            match command {
+                AppCommand::GetContent {
+                    request,
+                    objects: requirements,
+                    priority,
+                    ..
+                } => {
+                    assert_eq!(priority, ContentPriority::Required);
+                    requested.extend(requirements.iter().map(|r| r.hash.clone()));
+                    next.extend(player.pump(
+                        vec![AppEvent::ContentReady {
+                                request,
+                                objects: requirements
+                                    .iter()
+                                    .map(|r| objects[&r.hash].clone())
+                                    .collect(),
+                            }],
+                        1000,
+                    ));
+                }
+                other => {
+                    drain(&mut player, vec![other], &objects);
+                }
+            }
+        }
+        commands = next;
+        assert!(player.error.is_none(), "{:?}", player.diagnostic);
+        let residency = player.content_residency();
+        assert!(residency.resident_bytes <= residency.budget_bytes);
+    }
+    assert_eq!(player.core().state().outcome.as_deref(), Some("reloaded"));
+    assert_eq!(
+        requested
+            .iter()
+            .filter(|hash| **hash == chapter_hashes[0])
+            .count(),
+        2
+    );
+    for hash in &chapter_hashes[1..] {
+        assert_eq!(
+            requested
+                .iter()
+                .filter(|requested| *requested == hash)
+                .count(),
+            1
+        );
+    }
+    assert!(player.content_residency().resident_bytes < 20 * 1024 * 1024);
+}
+
+#[test]
+fn new_game_waits_for_in_flight_text_locale_before_freezing_first_dialogue() {
+    let (root, objects) = bundled();
+    let mut player = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = player.pump(vec![], 1000);
+    drain(&mut player, boot, &objects);
+    let start = action(&mut player, UiAction::NewGame);
+    drain(&mut player, start, &objects);
+    assert_eq!(player.core().dialogue().unwrap().1.locale, "zh-Hans");
+    let change = action(
+        &mut player,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    let (old_request, old_objects) = change
+        .into_iter()
+        .find_map(|command| match command {
+            AppCommand::GetContent {
+                request, objects, ..
+            } => Some((request, objects)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(player.locale_pending());
+    let mut start = action(&mut player, UiAction::NewGame);
+    assert!(player.core().dialogue().is_none());
+    assert!(player.core().state().pending.is_none());
+    assert!(!player.accepts_content(old_request));
+    start.extend(player.pump(
+        vec![AppEvent::ContentReady {
+        request: old_request,
+        objects: old_objects.iter().map(|r| objects[&r.hash].clone()).collect(),
+    }],
+        1000,
+    ));
+    drain(&mut player, start, &objects);
+    assert!(player.error.is_none(), "{:?}", player.diagnostic);
+    assert_eq!(player.effective_text_locale, "en");
+    assert_eq!(player.core().dialogue().unwrap().1.locale, "en");
 }

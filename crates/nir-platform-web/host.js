@@ -102,19 +102,115 @@ export class OwnerInbox {
     }
 }
 
+const CONTENT_STAGING_LIMIT = 16 * 1024 * 1024;
+const CONTENT_PREFETCH_LIMIT = 2 * 1024 * 1024;
+
+export function contentBatchEnvelope(objects, manifestObjects, {priority='required',maxBytes}={}) {
+    const prefetch=priority==='prefetch';
+    const limit=prefetch
+        ? Math.min(CONTENT_PREFETCH_LIMIT,Number.isSafeInteger(maxBytes)&&maxBytes>=0?maxBytes:CONTENT_PREFETCH_LIMIT)
+        : CONTENT_STAGING_LIMIT;
+    if(!Array.isArray(objects)||objects.length===0||objects.length>128)
+        return {ok:false,code:'E_CONTENT_LIMIT',reason:'object_count',totalBytes:null,maxBytes:limit,prefetch};
+    let totalBytes=0;
+    for(const object of objects){
+        const bytes=manifestObjects?.[object?.hash]?.bytes;
+        if(!Number.isSafeInteger(bytes)||bytes<1)
+            return {ok:false,code:'E_CONTENT_MANIFEST',reason:'missing_object_size',totalBytes:null,maxBytes:limit,prefetch};
+        totalBytes+=bytes;
+        if(!Number.isSafeInteger(totalBytes))
+            return {ok:false,code:'E_CONTENT_LIMIT',reason:'byte_count_overflow',totalBytes:null,maxBytes:limit,prefetch};
+    }
+    if(totalBytes>CONTENT_STAGING_LIMIT)
+        return {ok:false,code:'E_CONTENT_LIMIT',reason:'staging_envelope',totalBytes,maxBytes:limit,prefetch};
+    if(totalBytes>limit)
+        return {ok:false,code:prefetch?'E_PREFETCH_LIMIT':'E_CONTENT_LIMIT',reason:prefetch?'available_budget':'batch_limit',totalBytes,maxBytes:limit,prefetch};
+    return {ok:true,totalBytes,maxBytes:limit,prefetch};
+}
+
+// Accounts for encoded content buffers held across all active batches.
+export class ContentStagingBudget {
+    constructor(limit=CONTENT_STAGING_LIMIT,onChange=()=>{}){this.limit=limit;this.onChange=onChange;this.used=0;this.peak=0;this.reservations=new Map();this.waiting=[];this.sequence=0;}
+    get available(){return Math.max(0,this.limit-this.used);}
+    reserveNow(key,bytes){
+        if(this.reservations.has(key))return this.reservations.get(key)===bytes;
+        if(!Number.isSafeInteger(bytes)||bytes<1||bytes>this.limit||this.used+bytes>this.limit)return false;
+        this.reservations.set(key,bytes);this.used+=bytes;this.peak=Math.max(this.peak,this.used);this.onChange(this);return true;
+    }
+    tryReserve(key,bytes){return this.waiting.length===0&&this.reserveNow(key,bytes);}
+    acquire(key,bytes,signal){
+        if(signal.aborted)return Promise.reject(signal.reason);
+        if(this.reservations.has(key))return Promise.resolve(this.reservations.get(key)===bytes);
+        if(!Number.isSafeInteger(bytes)||bytes<1||bytes>this.limit)return Promise.reject(new Error('E_CONTENT_LIMIT'));
+        if(this.waiting.length===0&&this.reserveNow(key,bytes))return Promise.resolve(true);
+        return new Promise((resolve,reject)=>{
+            const item={key,bytes,signal,resolve,reject,sequence:this.sequence++};
+            item.abort=()=>{const index=this.waiting.indexOf(item);if(index>=0){this.waiting.splice(index,1);this.onChange(this);reject(signal.reason);}};
+            signal.addEventListener('abort',item.abort,{once:true});this.waiting.push(item);this.onChange(this);
+        });
+    }
+    release(key){
+        const bytes=this.reservations.get(key);if(bytes===undefined)return false;
+        this.reservations.delete(key);this.used-=bytes;this.onChange(this);this.drain();return true;
+    }
+    drain(){
+        this.waiting.sort((a,b)=>a.sequence-b.sequence);
+        for(let index=0;index<this.waiting.length;){
+            const item=this.waiting[index];
+            if(item.signal.aborted){this.waiting.splice(index,1);item.signal.removeEventListener('abort',item.abort);this.onChange(this);item.reject(item.signal.reason);continue;}
+            if(this.reserveNow(item.key,item.bytes)){
+                this.waiting.splice(index,1);item.signal.removeEventListener('abort',item.abort);this.onChange(this);item.resolve(true);continue;
+            }
+            index++;
+        }
+    }
+}
+
+export async function acquireRequiredContentStage(job,budget,bytes) {
+    const admitted=await budget.acquire(job.group,bytes,job.signal);
+    // Take ownership before checking cancellation. acquire() can resolve and
+    // then the caller can be cancelled before this continuation runs.
+    if(admitted)job.staged=true;
+    job.signal.throwIfAborted();
+    return admitted;
+}
+
+// A prefetch skip that has not reached the owner yet can be superseded by a
+// required request for the same batch. Keep the reserved slot pending in that
+// case so the promoted job can report its final result without racing a second
+// slot reservation.
+export async function queueContentSkip(job,envelope,{post,skip,isActive=()=>true}) {
+    job.state='skip_queued';job.skipEnvelope=envelope;
+    await post(job.terminal,()=>{
+        if(job.signal.aborted||job.priority!=='prefetch'||!isActive())return false;
+        skip(envelope);
+        return true;
+    },value=>value===true);
+    if(job.signal.aborted||!isActive()||job.priority==='prefetch')return false;
+    job.state='admitting';
+    return true;
+}
+
 // Global admission across preparation generations, including uncancellable decoders.
 export class WorkPool {
-    constructor(limit=4, capacity=128){this.limit=limit;this.capacity=capacity;this.active=0;this.waiting=[];}
-    run(work,signal){
+    constructor(limit=4, capacity=128){this.limit=limit;this.capacity=capacity;this.active=0;this.waiting=[];this.sequence=0;}
+    run(work,signal,{priority='required',group=null}={}){
         if(signal.aborted)return Promise.reject(signal.reason);
         if(this.waiting.length>=this.capacity)return Promise.reject(new Error('E_RESOURCE_QUEUE'));
         return new Promise((resolve,reject)=>{
-            const item={work,signal,resolve,reject};
+            const item={work,signal,resolve,reject,priority:priority==='prefetch'?1:0,group,sequence:this.sequence++};
             item.abort=()=>{const index=this.waiting.indexOf(item);if(index>=0){this.waiting.splice(index,1);reject(signal.reason);}};
             signal.addEventListener('abort',item.abort,{once:true});this.waiting.push(item);this.drain();
         });
     }
+    promoteGroup(group){
+        let promoted=0;
+        for(const item of this.waiting)if(item.group===group&&item.priority!==0){item.priority=0;promoted++;}
+        if(promoted)this.drain();
+        return promoted;
+    }
     drain(){
+        this.waiting.sort((a,b)=>a.priority-b.priority||a.sequence-b.sequence);
         while(this.active<this.limit&&this.waiting.length){
             const item=this.waiting.shift();item.signal.removeEventListener('abort',item.abort);this.active++;
             Promise.resolve().then(()=>{item.signal.throwIfAborted();return item.work();}).then(item.resolve,item.reject).finally(()=>{this.active--;this.drain();});
@@ -213,7 +309,14 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     for(const row of startupTrace)observe(row.stage,row);
     const canvas=document.querySelector('#stage'), shell=document.querySelector('#shell');
     const program=parseRuntimeProgram(executable);
-    const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null};
+    const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null,contentStagingBytes:0,peakContentStagingBytes:0,contentStagingBudgetBytes:CONTENT_STAGING_LIMIT,contentStagingReservations:0,contentStagingWaiters:0};
+    const syncContentStagingMetrics=budget=>{
+        metrics.contentStagingBytes=budget.used;
+        metrics.peakContentStagingBytes=budget.peak;
+        metrics.contentStagingBudgetBytes=budget.limit;
+        metrics.contentStagingReservations=budget.reservations.size;
+        metrics.contentStagingWaiters=budget.waiting.length;
+    };
     const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=innerWidth,height=innerHeight;return {width,height,dpr};};
     let {width,height,dpr}=size();canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
     const namespace=release.game_id+(location.hostname==='localhost'||location.hostname==='127.0.0.1'?':dev':'');
@@ -231,7 +334,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     document.title=release.title;
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
-    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map();
+    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
     let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
     let ownerTimer=null,pendingElapsed=0;
@@ -375,39 +478,118 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         } finally {if(preparations.get(c.request)===controller)preparations.delete(c.request);}
     }
     function cancelContent(request) {
+        const job=contentPreparations.get(request);
         inbox.cancelGroup(`content:${request}`);
-        contentPreparations.get(request)?.abort();contentPreparations.delete(request);
+        job?.controller.abort();
+        if(job)job.cancelled=true;
     }
-    async function prepareContent(c) {
+    function contentDetail(envelope) {
+        return JSON.stringify({reason:envelope.reason,total_bytes:envelope.totalBytes,max_bytes:envelope.maxBytes});
+    }
+    function postContentSkip(job,envelope) {
+        return queueContentSkip(job,envelope,{
+            post,
+            isActive:()=>!disposed,
+            skip:skipped=>{
+                observe('module_skipped',{request:job.request,session:job.session,code:skipped.code,bytes:skipped.totalBytes??0});
+                engine.content_skipped(job.request,skipped.code,contentDetail(skipped));
+            },
+        });
+    }
+    function promoteContent(request,session) {
+        const job=contentPreparations.get(request);
+        if(!job||job.signal.aborted||job.session!==session)return false;
+        job.priority='required';job.maxBytes=null;
+        resourcePool.promoteGroup(job.group);
+        // A queued skip checks this priority when its owner callback runs. It
+        // then leaves the reservation pending for this request's result.
+        return true;
+    }
+    async function admitContentStage(job,totalBytes) {
+        if(job.priority==='prefetch')return contentStaging.tryReserve(job.group,totalBytes);
+        // Demand can reclaim speculative reservations, but never releases a
+        // reservation while its consumer still retains response bytes.
+        for(const other of contentPreparations.values()){
+            if(other!==job&&other.priority==='prefetch'&&!other.signal.aborted)cancelContent(other.request);
+        }
+        return acquireRequiredContentStage(job,contentStaging,totalBytes);
+    }
+    async function runContent(job) {
+        const {request,session,group,signal}=job;
+        const bytes=[],fetched=new Map();job.bytes=bytes;
+        try {
+            let envelope=contentBatchEnvelope(job.objects,release.objects,{priority:job.priority,maxBytes:job.maxBytes});
+            if(!envelope.ok){
+                if(job.priority==='prefetch'){
+                    if(!await postContentSkip(job,envelope))return;
+                    envelope=contentBatchEnvelope(job.objects,release.objects,{priority:'required'});
+                    if(!envelope.ok)throw new Error(envelope.code);
+                }else throw new Error(envelope.code);
+            }
+            job.totalBytes=envelope.totalBytes;
+            let staged=await admitContentStage(job,envelope.totalBytes);
+            if(!staged&&job.priority==='prefetch'){
+                const skipped={ok:false,code:'E_PREFETCH_LIMIT',reason:'staging_capacity',totalBytes:envelope.totalBytes,maxBytes:contentStaging.available,prefetch:true};
+                if(!await postContentSkip(job,skipped))return;
+                staged=await admitContentStage(job,envelope.totalBytes);
+            }
+            // Promotion can race the synchronous prefetch admission result.
+            // Re-enter the required waiter path instead of treating that stale
+            // speculative denial as a terminal capacity error.
+            if(!staged&&job.priority==='required')staged=await admitContentStage(job,envelope.totalBytes);
+            if(!staged)throw new Error('E_CONTENT_STAGE_LIMIT');
+            job.staged=true;signal.throwIfAborted();
+            for(;;){
+                bytes.length=0;
+                try{
+                    job.state='fetching';
+                    for(const object of job.objects){
+                        let data=fetched.get(object.hash);
+                        if(!data){
+                            observe('module_requested',{request,session,object:object.hash,kind:job.priority});
+                            data=await resourcePool.run(()=>requests.get(object.hash,signal),signal,{priority:job.priority,group});
+                            fetched.set(object.hash,data);
+                        }
+                        bytes.push(data);signal.throwIfAborted();
+                    }
+                    job.state='delivering';
+                    await post(job.terminal,()=>{
+                        if(!signal.aborted&&engine.accepts_content(request)){
+                            engine.content_ready(request,bytes.map(b=>new Uint8Array(b)));
+                            observe('module_delivered',{request,session,kind:job.priority,bytes:job.totalBytes});
+                        }
+                    });
+                    break;
+                }catch(error){
+                    if(signal.aborted||disposed||job.priority!=='prefetch')throw error;
+                    const skipped={ok:false,code:'E_PREFETCH_FAILED',reason:'fetch_failed',totalBytes:job.totalBytes,maxBytes:job.maxBytes,prefetch:true};
+                    if(!await postContentSkip(job,skipped))return;
+                    // A same-batch demand may promote while the skip completion
+                    // is queued. Retry the failed object under the same request.
+                    if(job.priority!=='required')return;
+                }
+            }
+        }catch(error){
+            if(!signal.aborted&&!disposed)await post(job.terminal,()=>{
+                observe('module_failed',{request,session,code:'E_MODULE_PREPARE'});
+                engine.content_failed(request,String(error));
+            });
+            else job.terminal?.cancel();
+        }finally{
+            bytes.length=0;fetched.clear();job.bytes=null;
+            if(job.staged)contentStaging.release(group);
+            if(contentPreparations.get(request)===job)contentPreparations.delete(request);
+        }
+    }
+    function prepareContent(c) {
         const group=`content:${c.request}`;
         const terminal=inbox.reserve('completion',group,{session:c.session});
         if(!terminal){engine.content_failed(c.request,'E_REQUEST_CAPACITY');return;}
-        const controller=new AbortController(),signal=controller.signal;
-        contentPreparations.set(c.request,controller);
-        try {
-            // Reserve a finite byte envelope before any network work. At most two
-            // content batches exist (execution/restore and locale selection).
-            const total=c.objects.reduce((n,o)=>n+(release.objects[o.hash]?.bytes??Infinity),0);
-            if(!c.objects.length||c.objects.length>128||total>16*1024*1024)throw Error('E_CONTENT_LIMIT');
-            const bytes=[];
-            for(const object of c.objects){
-                observe('module_requested',{request:c.request,session:c.session,object:object.hash});
-                bytes.push(await resourcePool.run(()=>requests.get(object.hash,signal),signal));
-                signal.throwIfAborted();
-            }
-            await post(terminal,()=>{
-                if(!signal.aborted&&engine.accepts_content(c.request)){
-                    engine.content_ready(c.request,bytes.map(b=>new Uint8Array(b)));
-                    observe('module_delivered',{request:c.request,session:c.session});
-                }
-            });
-        }catch(error){
-            if(!signal.aborted&&!disposed)await post(terminal,()=>{
-                observe('module_failed',{request:c.request,session:c.session,code:'E_MODULE_PREPARE'});
-                engine.content_failed(c.request,String(error));
-            });
-            else terminal.cancel();
-        }finally{if(contentPreparations.get(c.request)===controller)contentPreparations.delete(c.request);}
+        const controller=new AbortController();
+        const priority=c.priority==='prefetch'?'prefetch':'required';
+        const job={request:c.request,session:c.session,objects:c.objects,group,priority,maxBytes:priority==='prefetch'?c.max_bytes:null,controller,signal:controller.signal,terminal,state:'starting',staged:false,cancelled:false};
+        contentPreparations.set(c.request,job);
+        void runContent(job);
     }
     function listSaves() {
         return request(async()=>{
@@ -455,6 +637,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'diagnostic':{const d=c.diagnostic;observe('diagnostic',{code:d.code,location:d.location,...d.details,asset:d.details?.references?.[0]});break;}
             case 'get_content':prepareContent(c);break;
             case 'cancel_content':cancelContent(c.request);break;
+            case 'promote_content':promoteContent(c.request,c.session);break;
             case 'get_assets':prepare(c);break;
             case 'cancel_assets':cancelPreparation(c.request);break;
             case 'audio_start':playVoice(c);break;
@@ -504,7 +687,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             const submitBefore=state().frames;
             const view=JSON.parse(engine.draw(width,height,dpr));flush();prune();semantics(view);const s=state();
             if(s.frames!==submitBefore)observe('render_submitted',{session:s.session,device:s.device,frames:s.frames});
-            metrics.frames=s.frames;metrics.peakResidentBytes=Math.max(metrics.peakResidentBytes,s.resident_bytes);
+            metrics.frames=s.frames;metrics.peakResidentBytes=Math.max(metrics.peakResidentBytes,s.resident_bytes);syncContentStagingMetrics(contentStaging);
             metrics.maxTurnUploadBytes=Math.max(metrics.maxTurnUploadBytes||0,s.turn_upload_bytes);metrics.uploadSteps=s.upload_steps;
             metrics.activeRequests=inbox.slots.size;metrics.requestHighWater=inbox.reservedHighWater;metrics.acceptedRequests=inbox.accepted;metrics.completedRequests=inbox.completed;metrics.cancelledRequests=inbox.cancelled;
             metrics.inboxHighWater=inbox.highWater;metrics.maxTurnWork=Math.max(metrics.maxTurnWork||0,s.turn_work);
@@ -553,7 +736,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
-    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
+    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     request(()=>read('profile',namespace),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});

@@ -307,6 +307,13 @@ impl Core {
     }
     /// Installing verified immutable bodies does not replay any story operation.
     pub fn replace_program(&mut self, program: ValidatedProgram) -> Result<()> {
+        self.check_program_replacement(&program)?;
+        self.program = program;
+        Ok(())
+    }
+    /// Check an admission before committing it to the shared residency ledger.
+    /// The caller can then commit and rebind without cloning the snapshot.
+    pub fn check_program_replacement(&self, program: &ValidatedProgram) -> Result<()> {
         let same_root = match (self.program.runtime_root(), program.runtime_root()) {
             (Some(current), Some(next)) => std::ptr::eq(current, next),
             (None, None) => true,
@@ -318,7 +325,75 @@ impl Core {
         {
             return Err(self.error("E_MODULE", "content identity changed"));
         }
-        self.program = program;
+        // A runtime view may have evicted unpinned bodies. Rebinding is safe
+        // only when every body the live continuation can execute or consult
+        // is still present in the replacement view. Task effects and frozen
+        // dialogue payloads are owned by the snapshot and intentionally do
+        // not keep their original definition packages resident.
+        if let Some(root) = program.runtime_root() {
+            let missing = |message: &str| self.error("E_CONTENT_MISSING", message);
+            for frame in &self.state.frames {
+                // Core starts with a metadata-only entry frame while the host
+                // is still presenting the title screen. In that state there
+                // is no executable body to preserve yet. Once a frame body
+                // has been resident, every replacement must retain the
+                // already-present parts of its execution package. A freshly
+                // created Core may have cached Code while awaiting Static.
+                if self
+                    .program
+                    .program()
+                    .functions
+                    .get(&frame.function)
+                    .is_none()
+                {
+                    continue;
+                }
+                let module = root
+                    .function_index
+                    .get(&frame.function)
+                    .map(|index| index.module.as_str())
+                    .ok_or_else(|| missing("active function index"))?;
+                for key in [
+                    ContentKey::Static {
+                        module: module.to_owned(),
+                    },
+                    ContentKey::Code {
+                        module: module.to_owned(),
+                    },
+                ] {
+                    if self.program.contains_content_body(&key) && !program.is_resident(&key) {
+                        return Err(missing(&format!("active frame body missing: {key:?}")));
+                    }
+                }
+                if program.program().functions.get(&frame.function).is_none() {
+                    return Err(missing("active function body missing"));
+                }
+            }
+            if let Some(pending) = &self.state.pending {
+                let module = root
+                    .cue_owners
+                    .get(&pending.cue)
+                    .ok_or_else(|| missing("active cue index"))?;
+                if !program.is_resident(&ContentKey::Static {
+                    module: module.clone(),
+                }) || program.program().cues.get(&pending.cue).is_none()
+                {
+                    return Err(missing("active cue body missing"));
+                }
+            }
+            if let Some(choice) = &self.state.choice {
+                let module = root
+                    .choice_owners
+                    .get(&choice.id)
+                    .ok_or_else(|| missing("active choice index"))?;
+                if !program.is_resident(&ContentKey::Static {
+                    module: module.clone(),
+                }) || program.program().choices.get(&choice.id).is_none()
+                {
+                    return Err(missing("active choice body missing"));
+                }
+            }
+        }
         Ok(())
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -330,6 +405,39 @@ impl Core {
             .last()
             .map(|f| format!("{}/{}/{}", f.function, f.block, f.op))
             .unwrap_or_else(|| "end".into())
+    }
+    /// Predict one content-only target along the normal success path of a
+    /// suspended story. This never evaluates expressions or advances the VM.
+    pub fn prefetch_module(&self) -> Option<String> {
+        if self.state.waiting.is_none()
+            || self.state.pending.is_some()
+            || self.state.choice.is_some()
+            || self.state.fault.is_some()
+            || self.state.outcome.is_some()
+        {
+            return None;
+        }
+        let root = self.program.runtime_root()?;
+        let frame = self.state.frames.last()?;
+        let module = &root.function_index.get(&frame.function)?.module;
+        let function = self.program.program().functions.get(&frame.function)?;
+        let mut block = frame.block.as_str();
+        let mut visited = BTreeSet::new();
+        for _ in 0..64 {
+            if !visited.insert(block) {
+                return None;
+            }
+            block = match &function.blocks.get(block)?.terminator {
+                Terminator::Goto { target } => target,
+                Terminator::Activate { next, .. } | Terminator::Await { next, .. } => next,
+                Terminator::Call { function, .. } => {
+                    let target = &root.function_index.get(function)?.module;
+                    return (target != module).then(|| target.clone());
+                }
+                _ => return None,
+            };
+        }
+        None
     }
     pub fn set_locale(&mut self, locale: &str) -> Result<()> {
         if !self.program().locales.contains_key(locale)
@@ -1537,6 +1645,22 @@ impl Core {
             })
     }
     pub fn restore(program: ValidatedProgram, s: Snapshot, release: &str) -> Result<Self> {
+        Self::restore_inner(program, s, release, false)
+    }
+    pub fn restore_verified(
+        program: ValidatedProgram,
+        proof: crate::VerifiedSnapshot,
+        release: &str,
+    ) -> Result<Self> {
+        let snapshot = proof.consume(&program, release)?;
+        Self::restore_inner(program, snapshot, release, true)
+    }
+    fn restore_inner(
+        program: ValidatedProgram,
+        s: Snapshot,
+        release: &str,
+        canonical_verified: bool,
+    ) -> Result<Self> {
         let fail = |msg: &str| Diagnostic::new("E_SNAPSHOT", "restore", msg);
         let p = program.program();
         if s.format != SNAPSHOT_VERSION
@@ -1685,7 +1809,9 @@ impl Core {
                 }) {
                     return Err(fail("pending dialogue mismatch"));
                 }
-                validate_dialogue(d, p, s.tick_us, s.next_id)?;
+                if !canonical_verified {
+                    validate_dialogue(d, p, s.tick_us, s.next_id)?;
+                }
             }
         }
         if let Some(w) = &s.waiting {
@@ -1752,14 +1878,8 @@ impl Core {
             }
         }
         for t in s.tasks.values() {
-            let definition = p.cues.values().flat_map(|c| &c.effects).any(|d| {
-                d.id == t.name
-                    && d.scope == t.scope
-                    && serde_json::to_value(&d.effect).unwrap()
-                        == serde_json::to_value(&t.effect).unwrap()
-            });
-            if !definition {
-                return Err(fail("task does not match a declared effect"));
+            if !canonical_verified {
+                validate_task_definition(t, p)?;
             }
             if t.state == TaskState::Running
                 && t.scope == Scope::Frame
@@ -1773,8 +1893,10 @@ impl Core {
             if (t.state == TaskState::Finished) != t.milestones.contains(&Milestone::Finished) {
                 return Err(fail("task terminal milestone mismatch"));
             }
-            if let Some(d) = &t.dialogue {
-                validate_dialogue(d, p, s.tick_us, s.next_id)?;
+            if !canonical_verified {
+                if let Some(d) = &t.dialogue {
+                    validate_dialogue(d, p, s.tick_us, s.next_id)?;
+                }
             }
         }
         for nodes in std::iter::once(&s.scene)
@@ -1864,7 +1986,28 @@ fn ease(p: f32, e: Easing) -> f32 {
     }
 }
 
-fn validate_dialogue(
+pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView) -> Result<()> {
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|definition| {
+            definition.id == task.name
+                && definition.scope == task.scope
+                && serde_json::to_value(&definition.effect).unwrap()
+                    == serde_json::to_value(&task.effect).unwrap()
+        })
+    {
+        return Err(Diagnostic::new(
+            "E_SNAPSHOT",
+            "restore",
+            "task does not match a declared effect",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_dialogue(
     d: &Dialogue,
     p: &RuntimeProgramView,
     tick: Micros,

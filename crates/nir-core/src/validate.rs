@@ -2,10 +2,7 @@ use nir_format::*;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Instruction {
@@ -52,6 +49,18 @@ impl<T> ContentTable<T> {
         Self {
             declared: Arc::new(declared),
             values: Arc::new(entries),
+        }
+    }
+    fn without_values(&self, removed: &BTreeSet<String>) -> Self {
+        Self {
+            declared: self.declared.clone(),
+            values: Arc::new(
+                self.values
+                    .iter()
+                    .filter(|(key, _)| !removed.contains(*key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
         }
     }
     pub fn get<Q>(&self, key: &Q) -> Option<&T>
@@ -448,7 +457,11 @@ impl RuntimeProgramView {
         validate_runtime_root(view.runtime_root.as_ref().unwrap())?;
         Ok(view)
     }
-    fn with_runtime_objects(&self, objects: &[RuntimeObject]) -> Result<Self> {
+    fn with_runtime_objects(
+        &self,
+        objects: &[RuntimeObject],
+        op_owners: &BTreeMap<String, String>,
+    ) -> Result<Self> {
         let mut next = self.clone();
         let mut functions = Vec::new();
         let mut scenes = Vec::new();
@@ -459,7 +472,8 @@ impl RuntimeProgramView {
         let mut locale_tables = (*self.locales).clone();
         let mut recipes = (*self.cue_recipes).clone();
         let mut task_definitions = (*self.task_definitions).clone();
-        let mut op_owners = (*self.op_owners).clone();
+        let mut loaded_op_owners = (*self.op_owners).clone();
+        let mut batch_op_ids = BTreeSet::new();
         for object in objects {
             match object {
                 RuntimeObject::Static(package) => {
@@ -494,13 +508,16 @@ impl RuntimeProgramView {
                     for (id, value) in &package.functions {
                         for block in value.blocks.values() {
                             for op in &block.ops {
-                                if op_owners.insert(op.id.clone(), id.clone()).is_some() {
+                                if !batch_op_ids.insert(op.id.clone())
+                                    || op_owners.get(&op.id).is_some_and(|owner| owner != id)
+                                {
                                     return Err(err(
                                         "E_DUPLICATE",
                                         &op.id,
                                         "duplicate operation identity",
                                     ));
                                 }
+                                loaded_op_owners.insert(op.id.clone(), id.clone());
                             }
                         }
                         functions.push((id.clone(), value.clone()));
@@ -531,18 +548,112 @@ impl RuntimeProgramView {
         next.locales = Arc::new(locale_tables);
         next.cue_recipes = Arc::new(recipes);
         next.task_definitions = Arc::new(task_definitions);
-        next.op_owners = Arc::new(op_owners);
+        // Operation identities are root-scoped tombstones. Keep owners for
+        // code that was resident in the past even when its body is evicted.
+        let mut all_op_owners = op_owners.clone();
+        for (id, owner) in loaded_op_owners {
+            if all_op_owners
+                .get(&id)
+                .is_some_and(|expected| expected != &owner)
+            {
+                return Err(err("E_DUPLICATE", &id, "duplicate operation identity"));
+            }
+            all_op_owners.insert(id, owner);
+        }
+        next.op_owners = Arc::new(all_op_owners);
         Ok(next)
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ValidatedProgram {
-    program: Arc<RuntimeProgramView>,
-    instructions: Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
-    runtime_objects: Arc<BTreeMap<ContentKey, (String, u64)>>,
-    residency: Arc<ResidencyLedger>,
-    budget: ResidencyBudget,
+    fn without_runtime_objects(&self, keys: &BTreeSet<ContentKey>) -> Self {
+        let Some(root) = self.runtime_root.as_deref() else {
+            return self.clone();
+        };
+        let mut next = self.clone();
+        let mut scenes = BTreeSet::new();
+        let mut cues = BTreeSet::new();
+        let mut choices = BTreeSet::new();
+        let mut contracts = BTreeSet::new();
+        let mut locale_texts = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut functions = BTreeSet::new();
+        let mut assets = BTreeSet::new();
+        let mut static_modules = BTreeSet::new();
+        for key in keys {
+            match key {
+                ContentKey::Static { module } => {
+                    static_modules.insert(module.clone());
+                    scenes.extend(
+                        root.scene_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
+                    cues.extend(
+                        root.cue_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
+                    choices.extend(
+                        root.choice_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
+                    contracts.extend(
+                        root.text_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
+                }
+                ContentKey::Code { module } => functions.extend(
+                    root.function_index
+                        .iter()
+                        .filter(|(_, index)| index.module == *module)
+                        .map(|(id, _)| id.clone()),
+                ),
+                ContentKey::Text { module, locale } => {
+                    locale_texts.entry(locale.clone()).or_default().extend(
+                        root.text_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
+                }
+                ContentKey::Catalog { catalog } => assets.extend(
+                    root.assets
+                        .iter()
+                        .filter(|(_, asset)| asset.catalog == *catalog)
+                        .map(|(id, _)| id.clone()),
+                ),
+            }
+        }
+        next.functions = self.functions.without_values(&functions);
+        next.scenes = self.scenes.without_values(&scenes);
+        next.cues = self.cues.without_values(&cues);
+        next.choices = self.choices.without_values(&choices);
+        next.texts = self.texts.without_values(&contracts);
+        next.assets = self.assets.without_values(&assets);
+        let mut locales = (*self.locales).clone();
+        for (locale, texts) in locale_texts {
+            if let Some(docs) = locales.get_mut(&locale) {
+                *docs = docs.without_values(&texts);
+            }
+        }
+        next.locales = Arc::new(locales);
+        let mut recipes = (*self.cue_recipes).clone();
+        for id in &cues {
+            recipes.remove(id);
+        }
+        next.cue_recipes = Arc::new(recipes);
+        let mut task_definitions = (*self.task_definitions).clone();
+        for (task, owner) in &root.task_owners {
+            if static_modules.contains(owner) {
+                task_definitions.remove(task);
+            }
+        }
+        next.task_definitions = Arc::new(task_definitions);
+        next
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -575,96 +686,183 @@ fn build_instruction_map(
         .map(|(id, function)| (id.clone(), Arc::new(function_instructions(function))))
         .collect()
 }
-fn add_instruction_map(
-    current: &Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
+fn add_instructions(
+    instructions: &mut BTreeMap<String, Arc<FunctionInstructions>>,
     objects: &[RuntimeObject],
-) -> Arc<BTreeMap<String, Arc<FunctionInstructions>>> {
-    let mut next = (**current).clone();
+) {
     for object in objects {
         if let RuntimeObject::Code(package) = object {
             for (id, function) in &package.functions {
-                next.entry(id.clone())
+                instructions
+                    .entry(id.clone())
                     .or_insert_with(|| Arc::new(function_instructions(function)));
             }
         }
     }
-    Arc::new(next)
+}
+fn remove_instructions(
+    instructions: &mut BTreeMap<String, Arc<FunctionInstructions>>,
+    root: &RuntimeProgram,
+    keys: &BTreeSet<ContentKey>,
+) {
+    let removed_modules: BTreeSet<_> = keys
+        .iter()
+        .filter_map(|key| match key {
+            ContentKey::Code { module } => Some(module.as_str()),
+            _ => None,
+        })
+        .collect();
+    instructions.retain(|id, _| {
+        !root
+            .function_index
+            .get(id)
+            .is_some_and(|index| removed_modules.contains(index.module.as_str()))
+    });
 }
 
-#[derive(Debug, Default)]
-struct LedgerState {
-    leases: BTreeMap<u64, LeaseInfo>,
+#[derive(Debug, Clone)]
+struct ResidentBlock {
+    digest: String,
+    encoded_bytes: u64,
+    generation: u64,
+    speculative: bool,
 }
-#[derive(Debug, Default)]
+impl ResidentBlock {
+    fn metadata(&self) -> (String, u64) {
+        (self.digest.clone(), self.encoded_bytes)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpTombstone {
+    function: String,
+    code_digest: String,
+}
+#[derive(Debug, Clone)]
+struct ActiveLease {
+    info: LeaseInfo,
+    generations: BTreeMap<ContentKey, u64>,
+}
+#[derive(Debug, Clone, Copy)]
+struct UsageStamp {
+    last_used: Option<u64>,
+    speculative: bool,
+    admitted: u64,
+}
+#[derive(Debug)]
+struct LedgerState {
+    leases: BTreeMap<u64, ActiveLease>,
+    retired: BTreeSet<u64>,
+    usage: BTreeMap<u64, UsageStamp>,
+    op_tombstones: BTreeMap<String, OpTombstone>,
+    next_generation: u64,
+    next_lease: u64,
+    clock: u64,
+    revision: u64,
+}
+impl LedgerState {
+    fn empty() -> Self {
+        Self {
+            leases: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            usage: BTreeMap::new(),
+            op_tombstones: BTreeMap::new(),
+            next_generation: 1,
+            next_lease: 1,
+            clock: 1,
+            revision: 0,
+        }
+    }
+}
+#[derive(Debug)]
 struct ResidencyLedger {
-    next_lease: AtomicU64,
     state: Mutex<LedgerState>,
 }
 impl ResidencyLedger {
-    fn lease(
-        self: &Arc<Self>,
-        keys: BTreeSet<ContentKey>,
-        owner: String,
-        resident: &BTreeMap<ContentKey, (String, u64)>,
-    ) -> ContentLease {
-        let id = self.next_lease.fetch_add(1, Ordering::Relaxed) + 1;
-        let resident_bytes = unique_bytes(keys.iter().filter_map(|key| resident.get(key)));
-        let info = LeaseInfo {
-            id,
-            owner,
-            keys,
-            resident_bytes,
-        };
-        self.state
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LedgerState::empty()),
+        }
+    }
+    fn with_tombstones(tombstones: BTreeMap<String, OpTombstone>) -> Self {
+        let ledger = Self::new();
+        ledger
+            .state
             .lock()
             .expect("residency mutex poisoned")
-            .leases
-            .insert(id, info.clone());
-        ContentLease {
-            id,
-            ledger: self.clone(),
-            info,
-        }
+            .op_tombstones = tombstones;
+        ledger
     }
     fn report(
         &self,
-        resident: &BTreeMap<ContentKey, (String, u64)>,
+        resident: &BTreeMap<ContentKey, (String, u64, u64)>,
         budget: &ResidencyBudget,
     ) -> ResidencyReport {
         let state = self.state.lock().expect("residency mutex poisoned");
-        let all_keys: BTreeSet<_> = resident.keys().cloned().collect();
-        let pinned_keys: BTreeSet<_> = state
-            .leases
-            .values()
-            .flat_map(|lease| lease.keys.iter().cloned())
-            .filter(|key| all_keys.contains(key))
-            .collect();
-        let resident_bytes = unique_bytes(resident.values());
-        let pinned_bytes = unique_bytes(pinned_keys.iter().filter_map(|key| resident.get(key)));
-        let blocks = resident
+        let current: BTreeMap<_, _> = resident
             .iter()
-            .map(|(key, (digest, encoded_bytes))| ResidencyEntry {
-                key: key.clone(),
-                digest: digest.clone(),
-                encoded_bytes: *encoded_bytes,
-                pinned_by: state
-                    .leases
-                    .values()
-                    .filter(|lease| lease.keys.contains(key))
-                    .map(|lease| lease.owner.clone())
-                    .collect(),
+            .filter(|(_, (_, _, generation))| !state.retired.contains(generation))
+            .map(|(key, (digest, bytes, generation))| {
+                (key.clone(), (digest.clone(), *bytes, *generation))
             })
             .collect();
+        let active_leases: Vec<_> = state
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.generations.iter().any(|(key, generation)| {
+                    current.get(key).is_some_and(|(_, _, resident_generation)| {
+                        resident_generation == generation
+                    })
+                })
+            })
+            .collect();
+        let pinned = |key: &ContentKey, generation: u64| {
+            active_leases
+                .iter()
+                .any(|lease| lease.generations.get(key) == Some(&generation))
+        };
+        let resident_values: Vec<_> = current
+            .values()
+            .map(|(digest, bytes, _)| (digest.clone(), *bytes))
+            .collect();
+        let resident_bytes = unique_bytes(resident_values.iter());
+        let pinned_records: Vec<_> = current
+            .iter()
+            .filter(|(key, (_, _, generation))| pinned(key, *generation))
+            .map(|(_, (digest, bytes, _))| (digest.clone(), *bytes))
+            .collect();
+        let pinned_bytes = unique_bytes(pinned_records.iter());
+        let blocks = current
+            .iter()
+            .map(
+                |(key, (digest, encoded_bytes, generation))| ResidencyEntry {
+                    key: key.clone(),
+                    digest: digest.clone(),
+                    encoded_bytes: *encoded_bytes,
+                    pinned_by: active_leases
+                        .iter()
+                        .filter(|lease| lease.generations.get(key) == Some(generation))
+                        .map(|lease| lease.info.owner.clone())
+                        .collect(),
+                },
+            )
+            .collect();
         ResidencyReport {
-            resident_blocks: resident.len(),
-            pinned_blocks: pinned_keys.len(),
-            lease_count: state.leases.len(),
+            resident_blocks: current.len(),
+            pinned_blocks: current
+                .iter()
+                .filter(|(key, (_, _, generation))| pinned(key, *generation))
+                .count(),
+            lease_count: active_leases.len(),
             resident_bytes,
             pinned_bytes,
             unpinned_bytes: resident_bytes.saturating_sub(pinned_bytes),
             budget_bytes: budget.resident_bytes,
             blocks,
-            leases: state.leases.values().cloned().collect(),
+            leases: active_leases
+                .iter()
+                .map(|lease| lease.info.clone())
+                .collect(),
         }
     }
 }
@@ -675,27 +873,63 @@ fn unique_bytes<'a>(items: impl IntoIterator<Item = &'a (String, u64)>) -> u64 {
     }
     hashes.values().copied().sum()
 }
+fn record_bytes(records: &BTreeMap<ContentKey, ResidentBlock>) -> u64 {
+    let values: Vec<_> = records.values().map(ResidentBlock::metadata).collect();
+    unique_bytes(values.iter())
+}
+fn key_priority(key: &ContentKey) -> u8 {
+    match key {
+        ContentKey::Static { .. } => 0,
+        ContentKey::Catalog { .. } => 1,
+        ContentKey::Code { .. } => 2,
+        ContentKey::Text { .. } => 3,
+    }
+}
+fn block_lru_key(
+    key: &ContentKey,
+    block: &ResidentBlock,
+    usage: &BTreeMap<u64, UsageStamp>,
+) -> (u8, u64, ContentKey) {
+    let stamp = usage.get(&block.generation).copied().unwrap_or(UsageStamp {
+        last_used: Some(0),
+        speculative: block.speculative,
+        admitted: 0,
+    });
+    let speculative_rank = u8::from(!(stamp.speculative && stamp.last_used.is_none()));
+    let age = stamp.last_used.unwrap_or(stamp.admitted);
+    (speculative_rank, age, key.clone())
+}
+fn metadata_map(
+    records: &BTreeMap<ContentKey, ResidentBlock>,
+) -> BTreeMap<ContentKey, (String, u64)> {
+    records
+        .iter()
+        .map(|(key, block)| (key.clone(), block.metadata()))
+        .collect()
+}
+fn generation_map(records: &BTreeMap<ContentKey, ResidentBlock>) -> BTreeMap<ContentKey, u64> {
+    records
+        .iter()
+        .map(|(key, block)| (key.clone(), block.generation))
+        .collect()
+}
+fn op_owner_map(tombstones: &BTreeMap<String, OpTombstone>) -> BTreeMap<String, String> {
+    tombstones
+        .iter()
+        .map(|(id, tombstone)| (id.clone(), tombstone.function.clone()))
+        .collect()
+}
 
-#[derive(Debug)]
-pub struct ContentLease {
-    id: u64,
-    ledger: Arc<ResidencyLedger>,
-    info: LeaseInfo,
-}
-impl ContentLease {
-    pub fn info(&self) -> &LeaseInfo {
-        &self.info
-    }
-}
-impl Drop for ContentLease {
-    fn drop(&mut self) {
-        self.ledger
-            .state
-            .lock()
-            .expect("residency mutex poisoned")
-            .leases
-            .remove(&self.id);
-    }
+#[derive(Debug, Clone)]
+pub struct ValidatedProgram {
+    program: Arc<RuntimeProgramView>,
+    instructions: Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
+    runtime_objects: Arc<BTreeMap<ContentKey, (String, u64)>>,
+    runtime_generations: Arc<BTreeMap<ContentKey, u64>>,
+    op_tombstones: Arc<BTreeMap<String, OpTombstone>>,
+    residency: Arc<ResidencyLedger>,
+    budget: ResidencyBudget,
+    projected: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -717,6 +951,179 @@ pub struct ResidencyEntry {
     pub encoded_bytes: u64,
     pub pinned_by: BTreeSet<String>,
 }
+
+#[derive(Debug)]
+pub struct ContentLease {
+    id: u64,
+    ledger: Arc<ResidencyLedger>,
+    info: LeaseInfo,
+}
+impl ContentLease {
+    pub fn info(&self) -> &LeaseInfo {
+        &self.info
+    }
+}
+impl Drop for ContentLease {
+    fn drop(&mut self) {
+        let mut state = self.ledger.state.lock().expect("residency mutex poisoned");
+        if state.leases.remove(&self.id).is_some() {
+            state.revision = state.revision.wrapping_add(1);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ContentAdmission {
+    ledger: Arc<ResidencyLedger>,
+    base_revision: u64,
+    next_generation: u64,
+    clock: u64,
+    candidate: ValidatedProgram,
+    evicted: BTreeSet<ContentKey>,
+    evicted_generations: BTreeMap<ContentKey, u64>,
+    admitted: BTreeMap<u64, bool>,
+}
+impl ContentAdmission {
+    /// Validated projected view. New keys become leaseable only after commit.
+    pub fn view(&self) -> &ValidatedProgram {
+        &self.candidate
+    }
+    pub fn evicted_keys(&self) -> &BTreeSet<ContentKey> {
+        &self.evicted
+    }
+    pub fn commit(self) -> Result<ValidatedProgram> {
+        self.commit_inner(None).map(|(program, _)| program)
+    }
+    /// Commit and register the replacement active reference while holding the
+    /// same mutex, so no concurrent admission can retire it between the two.
+    pub fn commit_with_lease(
+        self,
+        keys: BTreeSet<ContentKey>,
+        owner: String,
+    ) -> Result<(ValidatedProgram, ContentLease)> {
+        let (program, lease) = self.commit_inner(Some((keys, owner)))?;
+        Ok((program, lease.expect("lease requested")))
+    }
+    fn commit_inner(
+        self,
+        lease: Option<(BTreeSet<ContentKey>, String)>,
+    ) -> Result<(ValidatedProgram, Option<ContentLease>)> {
+        let mut state = self.ledger.state.lock().expect("residency mutex poisoned");
+        if state.revision != self.base_revision {
+            return Err(err(
+                "E_RESIDENCY_STALE",
+                "runtime",
+                "content admission changed while the transaction was prepared",
+            ));
+        }
+        for (key, generation) in &self.evicted_generations {
+            if state
+                .leases
+                .values()
+                .any(|lease| lease.generations.get(key) == Some(generation))
+            {
+                return Err(err(
+                    "E_CONTENT_PINNED",
+                    &format!("{key:?}"),
+                    "content is protected by an active lease",
+                ));
+            }
+        }
+        let bytes: Vec<_> = self
+            .candidate
+            .runtime_objects
+            .values()
+            .map(|(digest, bytes)| (digest.clone(), *bytes))
+            .collect();
+        if unique_bytes(bytes.iter()) > self.candidate.budget.resident_bytes {
+            return Err(err(
+                "E_RESIDENCY_BUDGET",
+                "runtime",
+                "content exceeds residency budget",
+            ));
+        }
+        if let Some((keys, _)) = &lease {
+            if let Some(key) = keys.iter().find(|key| {
+                !self.candidate.runtime_generations.contains_key(*key)
+                    || state
+                        .retired
+                        .contains(&self.candidate.runtime_generations[*key])
+            }) {
+                return Err(err(
+                    "E_CONTENT_MISSING",
+                    &format!("{key:?}"),
+                    "cannot lease a missing content block",
+                ));
+            }
+        }
+        for generation in self.evicted_generations.values() {
+            state.retired.insert(*generation);
+            state.usage.remove(generation);
+        }
+        state.op_tombstones = (*self.candidate.op_tombstones).clone();
+        state.next_generation = self.next_generation;
+        state.clock = self.clock;
+        for (generation, speculative) in &self.admitted {
+            let admitted = state.clock;
+            state.usage.insert(
+                *generation,
+                UsageStamp {
+                    last_used: if *speculative { None } else { Some(admitted) },
+                    speculative: *speculative,
+                    admitted,
+                },
+            );
+            if !speculative {
+                state.clock = state.clock.wrapping_add(1);
+            }
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let mut lease_value = None;
+        if let Some((keys, owner)) = lease {
+            let id = state.next_lease;
+            state.next_lease = state.next_lease.wrapping_add(1).max(1);
+            let generations: BTreeMap<_, _> = keys
+                .iter()
+                .filter_map(|key| {
+                    self.candidate
+                        .runtime_generations
+                        .get(key)
+                        .map(|generation| (key.clone(), *generation))
+                })
+                .collect();
+            let resident_bytes = unique_bytes(
+                keys.iter()
+                    .filter_map(|key| self.candidate.runtime_objects.get(key))
+                    .map(|(digest, bytes)| (digest.clone(), *bytes))
+                    .collect::<Vec<_>>()
+                    .iter(),
+            );
+            let info = LeaseInfo {
+                id,
+                owner,
+                keys,
+                resident_bytes,
+            };
+            state.leases.insert(
+                id,
+                ActiveLease {
+                    info: info.clone(),
+                    generations,
+                },
+            );
+            state.revision = state.revision.wrapping_add(1);
+            lease_value = Some(ContentLease {
+                id,
+                ledger: self.ledger.clone(),
+                info,
+            });
+        }
+        let mut candidate = self.candidate;
+        candidate.projected = false;
+        Ok((candidate, lease_value))
+    }
+}
+
 impl ValidatedProgram {
     pub fn new(p: Program) -> Result<Self> {
         let program = RuntimeProgramView::from_source(p);
@@ -725,40 +1132,64 @@ impl ValidatedProgram {
         Ok(Self::new_view(
             program,
             instructions,
-            Arc::new(BTreeMap::new()),
-            Arc::new(ResidencyLedger::default()),
+            BTreeMap::new(),
+            Arc::new(ResidencyLedger::new()),
+            BTreeMap::new(),
             ResidencyBudget {
                 resident_bytes: MAX_INPUT_BYTES as u64,
             },
+            false,
         ))
     }
     pub fn from_runtime(root: RuntimeProgram) -> Result<Self> {
         let program = RuntimeProgramView::from_runtime(root)?;
-        let instructions = Arc::new(build_instruction_map(&program.functions));
         Ok(Self::new_view(
             program,
-            instructions,
             Arc::new(BTreeMap::new()),
-            Arc::new(ResidencyLedger::default()),
+            BTreeMap::new(),
+            Arc::new(ResidencyLedger::new()),
+            BTreeMap::new(),
             ResidencyBudget {
                 resident_bytes: MAX_INPUT_BYTES as u64,
             },
+            false,
         ))
     }
     fn new_view(
         program: RuntimeProgramView,
         instructions: Arc<BTreeMap<String, Arc<FunctionInstructions>>>,
-        runtime_objects: Arc<BTreeMap<ContentKey, (String, u64)>>,
+        records: BTreeMap<ContentKey, ResidentBlock>,
         residency: Arc<ResidencyLedger>,
+        op_tombstones: BTreeMap<String, OpTombstone>,
         budget: ResidencyBudget,
+        projected: bool,
     ) -> Self {
         Self {
             program: Arc::new(program),
             instructions,
-            runtime_objects,
+            runtime_objects: Arc::new(metadata_map(&records)),
+            runtime_generations: Arc::new(generation_map(&records)),
+            op_tombstones: Arc::new(op_tombstones),
             residency,
             budget,
+            projected,
         }
+    }
+    fn record_snapshot(&self) -> BTreeMap<ContentKey, ResidentBlock> {
+        self.runtime_objects
+            .iter()
+            .filter_map(|(key, (digest, encoded_bytes))| {
+                Some((
+                    key.clone(),
+                    ResidentBlock {
+                        digest: digest.clone(),
+                        encoded_bytes: *encoded_bytes,
+                        generation: *self.runtime_generations.get(key)?,
+                        speculative: false,
+                    },
+                ))
+            })
+            .collect()
     }
     pub fn program(&self) -> &RuntimeProgramView {
         &self.program
@@ -769,10 +1200,202 @@ impl ValidatedProgram {
     pub fn runtime_root(&self) -> Option<&RuntimeProgram> {
         self.program.runtime_root()
     }
-    pub fn is_resident(&self, key: &ContentKey) -> bool {
+    pub(crate) fn runtime_root_arc(&self) -> Option<Arc<RuntimeProgram>> {
+        self.program.runtime_root.clone()
+    }
+    pub(crate) fn contains_content_body(&self, key: &ContentKey) -> bool {
         self.runtime_objects.contains_key(key)
     }
+    pub fn is_resident(&self, key: &ContentKey) -> bool {
+        let Some(generation) = self.runtime_generations.get(key) else {
+            return false;
+        };
+        if self.projected {
+            return true;
+        }
+        !self
+            .residency
+            .state
+            .lock()
+            .expect("residency mutex poisoned")
+            .retired
+            .contains(generation)
+    }
+    /// Pure additive compatibility API: it preserves every currently resident
+    /// block and fails if the candidate cannot fit without eviction.
     pub fn install_batch(&self, batch: Vec<(ContentKey, RuntimeObject, u64)>) -> Result<Self> {
+        self.prepare_batch(batch, false, false)?.commit()
+    }
+    /// Prepare a demand admission. The transaction may evict unused speculative
+    /// blocks first, then least recently used unleased blocks.
+    pub fn prepare_install_batch(
+        &self,
+        batch: Vec<(ContentKey, RuntimeObject, u64)>,
+    ) -> Result<ContentAdmission> {
+        self.prepare_batch(batch, true, false)
+    }
+    /// Prepare speculative content without evicting anything. These blocks are
+    /// the first eligible LRU victims if a later demand needs their space.
+    pub fn prepare_prefetch_batch(
+        &self,
+        batch: Vec<(ContentKey, RuntimeObject, u64)>,
+    ) -> Result<ContentAdmission> {
+        self.prepare_batch(batch, false, true)
+    }
+    pub fn empty_content_view(&self) -> Result<Self> {
+        self.runtime_root()
+            .ok_or_else(|| err("E_CONTENT_KEY", "runtime", "not a runtime program"))?;
+        let mut tombstones = (*self.op_tombstones).clone();
+        {
+            let state = self
+                .residency
+                .state
+                .lock()
+                .expect("residency mutex poisoned");
+            for (id, tombstone) in &state.op_tombstones {
+                if tombstones.get(id).is_some_and(|known| known != tombstone) {
+                    return Err(err(
+                        "E_DUPLICATE",
+                        id,
+                        "operation identity tombstone differs",
+                    ));
+                }
+                tombstones.insert(id.clone(), tombstone.clone());
+            }
+        }
+        let resident_keys = self.runtime_generations.keys().cloned().collect();
+        let mut program = self.program.without_runtime_objects(&resident_keys);
+        program.op_owners = Arc::new(op_owner_map(&tombstones));
+        Ok(Self::new_view(
+            program,
+            Arc::new(BTreeMap::new()),
+            BTreeMap::new(),
+            Arc::new(ResidencyLedger::with_tombstones(tombstones.clone())),
+            tombstones,
+            ResidencyBudget {
+                resident_bytes: MAX_INPUT_BYTES as u64,
+            },
+            false,
+        ))
+    }
+    pub fn prepare_eviction(&self, keys: BTreeSet<ContentKey>) -> Result<ContentAdmission> {
+        self.prepare_eviction_inner(keys)
+    }
+    pub fn evict(&self, keys: BTreeSet<ContentKey>) -> Result<Self> {
+        self.prepare_eviction(keys)?.commit()
+    }
+    fn prepare_eviction_inner(&self, keys: BTreeSet<ContentKey>) -> Result<ContentAdmission> {
+        let root = self
+            .runtime_root()
+            .ok_or_else(|| err("E_CONTENT_KEY", "runtime", "not a runtime program"))?;
+        let state = self
+            .residency
+            .state
+            .lock()
+            .expect("residency mutex poisoned");
+        let source_records = self.record_snapshot();
+        if source_records
+            .values()
+            .any(|record| state.retired.contains(&record.generation))
+        {
+            return Err(err(
+                "E_RESIDENCY_STALE",
+                "runtime",
+                "cannot evict from a view with retired content",
+            ));
+        }
+        for key in &keys {
+            let Some(record) = source_records.get(key) else {
+                return Err(err(
+                    "E_CONTENT_MISSING",
+                    &format!("{key:?}"),
+                    "cannot evict a missing content block",
+                ));
+            };
+            if state.retired.contains(&record.generation) {
+                return Err(err(
+                    "E_CONTENT_RETIRED",
+                    &format!("{key:?}"),
+                    "content generation has been retired",
+                ));
+            }
+            if state
+                .leases
+                .values()
+                .any(|lease| lease.generations.get(key) == Some(&record.generation))
+            {
+                return Err(err(
+                    "E_CONTENT_PINNED",
+                    &format!("{key:?}"),
+                    "content is protected by an active lease",
+                ));
+            }
+        }
+        let base_revision = state.revision;
+        let mut tombstones = state.op_tombstones.clone();
+        for (id, tombstone) in self.op_tombstones.iter() {
+            if tombstones.get(id).is_some_and(|known| known != tombstone) {
+                return Err(err(
+                    "E_DUPLICATE",
+                    id,
+                    "operation identity tombstone differs",
+                ));
+            }
+            tombstones.insert(id.clone(), tombstone.clone());
+        }
+        let next_generation = state.next_generation;
+        let clock = state.clock;
+        let evicted_generations = keys
+            .iter()
+            .filter_map(|key| {
+                source_records
+                    .get(key)
+                    .map(|record| (key.clone(), record.generation))
+            })
+            .collect();
+        drop(state);
+        let mut records = source_records;
+        for key in &keys {
+            records.remove(key);
+        }
+        let tombstone_owners = op_owner_map(&tombstones);
+        let candidate_parts = self.materialize_records(
+            root,
+            &self.record_snapshot(),
+            &records,
+            &tombstone_owners,
+            &[],
+        )?;
+        let mut program = candidate_parts.0;
+        let mut instructions = candidate_parts.1;
+        program = program.without_runtime_objects(&keys);
+        remove_instructions(&mut instructions, root, &keys);
+        let candidate = Self::new_view(
+            program,
+            Arc::new(instructions),
+            records,
+            self.residency.clone(),
+            tombstones,
+            self.budget.clone(),
+            true,
+        );
+        Ok(ContentAdmission {
+            ledger: self.residency.clone(),
+            base_revision,
+            next_generation,
+            clock,
+            candidate,
+            evicted: keys,
+            evicted_generations,
+            admitted: BTreeMap::new(),
+        })
+    }
+    fn prepare_batch(
+        &self,
+        batch: Vec<(ContentKey, RuntimeObject, u64)>,
+        allow_eviction: bool,
+        speculative: bool,
+    ) -> Result<ContentAdmission> {
         let root = self
             .runtime_root()
             .ok_or_else(|| err("E_CONTENT_KEY", "runtime", "not a runtime program"))?;
@@ -784,7 +1407,15 @@ impl ValidatedProgram {
             ));
         }
         let mut payload_bytes = 0u64;
-        for (_, _, bytes) in &batch {
+        let mut seen = BTreeSet::new();
+        for (key, _, bytes) in &batch {
+            if !seen.insert(key.clone()) {
+                return Err(err(
+                    "E_DUPLICATE",
+                    &format!("{key:?}"),
+                    "duplicate content key",
+                ));
+            }
             if *bytes == 0 || *bytes > MAX_INPUT_BYTES as u64 {
                 return Err(err(
                     "E_LIMIT",
@@ -799,21 +1430,70 @@ impl ValidatedProgram {
                 return Err(err("E_LIMIT", "content", "content batch exceeds 16 MiB"));
             }
         }
+        let mut records = self.record_snapshot();
+        let state = self
+            .residency
+            .state
+            .lock()
+            .expect("residency mutex poisoned");
+        if records
+            .values()
+            .any(|record| state.retired.contains(&record.generation))
+        {
+            return Err(err(
+                "E_RESIDENCY_STALE",
+                "runtime",
+                "cannot admit from a view with retired content",
+            ));
+        }
+        let base_revision = state.revision;
+        let mut op_tombstones = state.op_tombstones.clone();
+        for (id, tombstone) in self.op_tombstones.iter() {
+            if op_tombstones
+                .get(id)
+                .is_some_and(|known| known != tombstone)
+            {
+                return Err(err(
+                    "E_DUPLICATE",
+                    id,
+                    "operation identity tombstone differs",
+                ));
+            }
+            op_tombstones.insert(id.clone(), tombstone.clone());
+        }
+        let mut next_generation = state.next_generation;
+        let clock = state.clock;
+        let usage = state.usage.clone();
+        let pinned: BTreeSet<_> = state
+            .leases
+            .values()
+            .flat_map(|lease| lease.generations.values().copied())
+            .collect();
+        drop(state);
+
         let mut batch = batch;
-        batch.sort_by_key(|(key, _, _)| match key {
-            ContentKey::Static { .. } => 0,
-            ContentKey::Catalog { .. } => 1,
-            ContentKey::Code { .. } => 2,
-            ContentKey::Text { .. } => 3,
-        });
-        let mut objects = Vec::new();
-        let mut records = (*self.runtime_objects).clone();
-        for (key, object, byte_size) in batch {
+        batch.sort_by_key(|(key, _, _)| (key_priority(key), key.clone()));
+        let mut added_objects = Vec::<RuntimeObject>::new();
+        let mut incoming = BTreeSet::new();
+        let mut admitted = BTreeMap::new();
+        let mut seen_ops = BTreeSet::new();
+        for (key, object, encoded_bytes) in batch {
             let requirement = root
                 .content_requirement(&key)
                 .ok_or_else(|| err("E_CONTENT_KEY", &format!("{key:?}"), "undeclared content"))?;
             validate_object_key(root, &key, &object)?;
-            if records.contains_key(&key) {
+            incoming.insert(key.clone());
+            if let Some(existing) = records.get(&key) {
+                if existing.digest != requirement.digest {
+                    return Err(err(
+                        "E_CONTENT_KEY",
+                        &format!("{key:?}"),
+                        "resident digest differs",
+                    ));
+                }
+                if !speculative {
+                    admitted.insert(existing.generation, false);
+                }
                 continue;
             }
             if let ContentKey::Code { module } | ContentKey::Text { module, .. } = &key {
@@ -828,56 +1508,283 @@ impl ValidatedProgram {
                     ));
                 }
             }
-            objects.push(object);
-            records.insert(key, (requirement.digest, byte_size));
+            if let RuntimeObject::Code(package) = &object {
+                for (function_id, function) in &package.functions {
+                    for op in function.blocks.values().flat_map(|block| &block.ops) {
+                        if !seen_ops.insert(op.id.clone()) {
+                            return Err(err("E_DUPLICATE", &op.id, "duplicate operation identity"));
+                        }
+                        let tombstone = OpTombstone {
+                            function: function_id.clone(),
+                            code_digest: requirement.digest.clone(),
+                        };
+                        if op_tombstones
+                            .get(&op.id)
+                            .is_some_and(|known| known != &tombstone)
+                        {
+                            return Err(err(
+                                "E_DUPLICATE",
+                                &op.id,
+                                "operation identity belongs to different code",
+                            ));
+                        }
+                        op_tombstones.insert(op.id.clone(), tombstone);
+                    }
+                }
+            }
+            records.insert(
+                key.clone(),
+                ResidentBlock {
+                    digest: requirement.digest,
+                    encoded_bytes,
+                    generation: next_generation,
+                    speculative,
+                },
+            );
+            admitted.insert(next_generation, speculative);
+            next_generation = next_generation.wrapping_add(1).max(1);
+            added_objects.push(object);
         }
-        if unique_bytes(records.values()) > self.budget.resident_bytes {
-            return Err(err(
-                "E_RESIDENCY_BUDGET",
-                "runtime",
-                "content exceeds residency budget",
-            ));
+        let tombstone_owners = op_owner_map(&op_tombstones);
+        let mut candidate_program = self.materialize_records(
+            root,
+            &self.record_snapshot(),
+            &records,
+            &tombstone_owners,
+            &added_objects,
+        )?;
+        if !added_objects.is_empty() {
+            validate_runtime_objects(&candidate_program.0, &added_objects)?;
         }
-        let candidate = self.program.with_runtime_objects(&objects)?;
-        validate_runtime_objects(&candidate, &objects)?;
-        let instructions = add_instruction_map(&self.instructions, &objects);
-        Ok(Self::new_view(
-            candidate,
-            instructions,
-            Arc::new(records),
+
+        let mut evicted = BTreeSet::new();
+        let mut evicted_generations = BTreeMap::new();
+        if record_bytes(&records) > self.budget.resident_bytes {
+            if !allow_eviction {
+                return Err(err(
+                    "E_RESIDENCY_BUDGET",
+                    "runtime",
+                    "content exceeds residency budget",
+                ));
+            }
+            let mut victims: Vec<_> = records
+                .iter()
+                .filter(|(key, block)| {
+                    !incoming.contains(*key) && !pinned.contains(&block.generation)
+                })
+                .map(|(key, block)| (block_lru_key(key, block, &usage), key.clone()))
+                .collect();
+            victims.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, key) in victims {
+                if record_bytes(&records) <= self.budget.resident_bytes {
+                    break;
+                }
+                if let Some(record) = records.remove(&key) {
+                    evicted_generations.insert(key.clone(), record.generation);
+                    evicted.insert(key);
+                }
+            }
+            if record_bytes(&records) > self.budget.resident_bytes {
+                return Err(err(
+                    "E_RESIDENCY_BUDGET",
+                    "runtime",
+                    "resident and pinned content exceeds budget",
+                ));
+            }
+        }
+        if !evicted.is_empty() {
+            candidate_program.0 = candidate_program.0.without_runtime_objects(&evicted);
+            remove_instructions(&mut candidate_program.1, root, &evicted);
+        }
+        let final_candidate = ValidatedProgram::new_view(
+            candidate_program.0,
+            Arc::new(candidate_program.1),
+            records.clone(),
             self.residency.clone(),
+            op_tombstones,
             self.budget.clone(),
-        ))
+            true,
+        );
+        Ok(ContentAdmission {
+            ledger: self.residency.clone(),
+            base_revision,
+            next_generation,
+            clock,
+            candidate: final_candidate,
+            evicted,
+            evicted_generations,
+            admitted,
+        })
+    }
+    fn materialize_records(
+        &self,
+        root: &RuntimeProgram,
+        old_records: &BTreeMap<ContentKey, ResidentBlock>,
+        new_records: &BTreeMap<ContentKey, ResidentBlock>,
+        op_owners: &BTreeMap<String, String>,
+        newly_added: &[RuntimeObject],
+    ) -> Result<(
+        RuntimeProgramView,
+        BTreeMap<String, Arc<FunctionInstructions>>,
+    )> {
+        let mut stale = BTreeSet::new();
+        for (key, old) in self.runtime_generations.iter() {
+            if old_records
+                .get(key)
+                .is_none_or(|record| record.generation != *old)
+            {
+                stale.insert(key.clone());
+            }
+        }
+        let mut program = self.program.without_runtime_objects(&stale);
+        // `prepare_batch` orders incoming objects by dependency; borrow them
+        // directly so installation does not clone already parsed bodies.
+        if !newly_added.is_empty() {
+            program = program.with_runtime_objects(newly_added, op_owners)?;
+        } else if !program.op_owners.as_ref().eq(op_owners) {
+            program.op_owners = Arc::new(op_owners.clone());
+        }
+        let mut instructions = (*self.instructions).clone();
+        remove_instructions(&mut instructions, root, &stale);
+        add_instructions(&mut instructions, newly_added);
+        let _ = new_records;
+        Ok((program, instructions))
     }
     pub fn lease(&self, keys: BTreeSet<ContentKey>, owner: String) -> Result<ContentLease> {
-        if let Some(key) = keys.iter().find(|key| !self.is_resident(key)) {
+        if self.projected {
             return Err(err(
-                "E_CONTENT_MISSING",
-                &format!("{key:?}"),
-                "cannot lease a missing content block",
+                "E_CONTENT_PENDING",
+                "runtime",
+                "projected content cannot be leased before admission commits",
             ));
         }
-        Ok(self.residency.lease(keys, owner, &self.runtime_objects))
+        let mut state = self
+            .residency
+            .state
+            .lock()
+            .expect("residency mutex poisoned");
+        let mut generations = BTreeMap::new();
+        for key in &keys {
+            let Some(generation) = self.runtime_generations.get(key) else {
+                return Err(err(
+                    "E_CONTENT_MISSING",
+                    &format!("{key:?}"),
+                    "cannot lease a missing content block",
+                ));
+            };
+            if state.retired.contains(generation) {
+                return Err(err(
+                    "E_CONTENT_RETIRED",
+                    &format!("{key:?}"),
+                    "content generation has been retired",
+                ));
+            }
+            generations.insert(key.clone(), *generation);
+        }
+        let id = state.next_lease;
+        state.next_lease = state.next_lease.wrapping_add(1).max(1);
+        let values: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.runtime_objects.get(key))
+            .map(|(digest, bytes)| (digest.clone(), *bytes))
+            .collect();
+        let resident_bytes = unique_bytes(values.iter());
+        let info = LeaseInfo {
+            id,
+            owner,
+            keys,
+            resident_bytes,
+        };
+        state.leases.insert(
+            id,
+            ActiveLease {
+                info: info.clone(),
+                generations,
+            },
+        );
+        state.revision = state.revision.wrapping_add(1);
+        Ok(ContentLease {
+            id,
+            ledger: self.residency.clone(),
+            info,
+        })
+    }
+    /// Mark resident keys as used without extending their lifetime with a pin.
+    pub fn touch_content(&self, keys: &BTreeSet<ContentKey>) -> Result<()> {
+        if self.projected {
+            return Err(err(
+                "E_CONTENT_PENDING",
+                "runtime",
+                "projected content is not committed",
+            ));
+        }
+        let mut state = self
+            .residency
+            .state
+            .lock()
+            .expect("residency mutex poisoned");
+        for key in keys {
+            let Some(generation) = self.runtime_generations.get(key) else {
+                return Err(err(
+                    "E_CONTENT_MISSING",
+                    &format!("{key:?}"),
+                    "content is not resident",
+                ));
+            };
+            if state.retired.contains(generation) {
+                return Err(err(
+                    "E_CONTENT_RETIRED",
+                    &format!("{key:?}"),
+                    "content generation has been retired",
+                ));
+            }
+        }
+        for key in keys {
+            if let Some(generation) = self.runtime_generations.get(key) {
+                let admitted = state
+                    .usage
+                    .get(generation)
+                    .map(|stamp| stamp.admitted)
+                    .unwrap_or(state.clock);
+                let used = state.clock;
+                state.usage.insert(
+                    *generation,
+                    UsageStamp {
+                        last_used: Some(used),
+                        speculative: false,
+                        admitted,
+                    },
+                );
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        state.revision = state.revision.wrapping_add(1);
+        Ok(())
     }
     pub fn residency(&self) -> ResidencyReport {
-        self.residency.report(&self.runtime_objects, &self.budget)
+        let generations = &self.runtime_generations;
+        let resident: BTreeMap<_, _> = self
+            .runtime_objects
+            .iter()
+            .filter_map(|(key, (digest, bytes))| {
+                generations
+                    .get(key)
+                    .map(|generation| (key.clone(), (digest.clone(), *bytes, *generation)))
+            })
+            .collect();
+        self.residency.report(&resident, &self.budget)
     }
     pub fn set_residency_budget(&self, budget: ResidencyBudget) -> Result<Self> {
-        let report = self.residency.report(&self.runtime_objects, &budget);
-        if report.resident_bytes > budget.resident_bytes {
+        if self.residency().resident_bytes > budget.resident_bytes {
             return Err(err(
                 "E_RESIDENCY_BUDGET",
                 "runtime",
                 "resident content exceeds budget",
             ));
         }
-        Ok(Self::new_view(
-            (*self.program).clone(),
-            self.instructions.clone(),
-            self.runtime_objects.clone(),
-            self.residency.clone(),
-            budget,
-        ))
+        let mut next = self.clone();
+        next.budget = budget;
+        Ok(next)
     }
     pub(crate) fn instruction(&self, function: &str, block: &str, op: usize) -> &Instruction {
         &self.instructions[function].blocks[block][op]
@@ -1413,7 +2320,7 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                     }
                 }
                 Effect::Audio { asset, .. } if view.asset_kind(asset) != Some(AssetKind::Audio) => {
-                    return Err(err("E_ASSET_TYPE", id, asset))
+                    return Err(err("E_ASSET_TYPE", id, asset));
                 }
                 Effect::Clip {
                     node, property, to, ..
@@ -1422,7 +2329,7 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                     || (*property == Property::Scale && *to < 0.)
                     || !writers.insert((node, property)) =>
                 {
-                    return Err(err("E_VISUAL", id, node))
+                    return Err(err("E_VISUAL", id, node));
                 }
                 Effect::Clip { node, property, .. } => {
                     writers.insert((node, property));
@@ -1585,15 +2492,15 @@ fn validate_runtime_function(
                 Operation::Assign { target, value }
                     if vars.get(target).copied() != Some(expr_type(value, &vars, &op.id)?) =>
                 {
-                    return Err(err("E_TYPE", &op.id, target))
+                    return Err(err("E_TYPE", &op.id, target));
                 }
                 Operation::Random { target, min, max }
                     if vars.get(target) != Some(&ValueType::I32) || min > max =>
                 {
-                    return Err(err("E_RANDOM", &op.id, "invalid bounds/target"))
+                    return Err(err("E_RANDOM", &op.id, "invalid bounds/target"));
                 }
                 Operation::DraftPatch { value, .. } if !value.is_finite() => {
-                    return Err(err("E_VISUAL", &op.id, "non-finite patch"))
+                    return Err(err("E_VISUAL", &op.id, "non-finite patch"));
                 }
                 _ => {}
             }
@@ -1602,7 +2509,7 @@ fn validate_runtime_function(
             Terminator::Branch { condition, .. }
                 if expr_type(condition, &vars, &at)? != ValueType::Bool =>
             {
-                return Err(err("E_TYPE", &at, "branch requires Bool"))
+                return Err(err("E_TYPE", &at, "branch requires Bool"));
             }
             Terminator::Switch { value, cases, .. } => {
                 let ty = expr_type(value, &vars, &at)?;
@@ -1644,7 +2551,7 @@ fn validate_runtime_function(
                     .transpose()?
                     != function.returns =>
             {
-                return Err(err("E_TYPE", &at, "return type"))
+                return Err(err("E_TYPE", &at, "return type"));
             }
             Terminator::Activate { cue, .. }
                 if view
@@ -1656,7 +2563,7 @@ fn validate_runtime_function(
                     != view.function_module(fid)
                     || view.cues.get(cue).is_none() =>
             {
-                return Err(err("E_CUE", &at, cue))
+                return Err(err("E_CUE", &at, cue));
             }
             Terminator::Await { conditions, .. }
                 if conditions.is_empty()
@@ -1674,7 +2581,7 @@ fn validate_runtime_function(
                     "E_TASK",
                     &at,
                     "unknown, unloaded or cross-module task wait",
-                ))
+                ));
             }
             Terminator::Interact { choice, .. }
                 if view
@@ -1686,7 +2593,7 @@ fn validate_runtime_function(
                     != view.function_module(fid)
                     || view.choices.get(choice).is_none() =>
             {
-                return Err(err("E_CHOICE", &at, choice))
+                return Err(err("E_CHOICE", &at, choice));
             }
             _ => {}
         }
@@ -2144,10 +3051,10 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
                     || (*property == Property::Scale && *to < 0.) =>
                 {
-                    return Err(err("E_VISUAL", id, node))
+                    return Err(err("E_VISUAL", id, node));
                 }
                 Effect::Clip { node, property, .. } if !writers.insert((node, property)) => {
-                    return Err(err("E_OWNERSHIP", id, node))
+                    return Err(err("E_OWNERSHIP", id, node));
                 }
                 Effect::Clip { node, property, .. } => {
                     writers.insert((node, property));
@@ -2448,13 +3355,16 @@ mod runtime_tests {
             default_ui: "en".into(),
             default_text: "en".into(),
             ui: BTreeMap::from([("en".into(), plan.clone())]),
-            text: BTreeMap::from([("en".into(), plan)]),
+            text: BTreeMap::from([("en".into(), plan.clone()), ("zh-Hans".into(), plan)]),
         };
         let module_texts: BTreeSet<_> = static_package.text_contracts.keys().cloned().collect();
         let locales = if module_texts.is_empty() {
             BTreeMap::new()
         } else {
-            BTreeMap::from([("en".into(), "b".repeat(64))])
+            BTreeMap::from([
+                ("en".into(), "b".repeat(64)),
+                ("zh-Hans".into(), "e".repeat(64)),
+            ])
         };
         let module = ModuleIndex {
             functions: signatures.clone(),
@@ -2536,7 +3446,7 @@ mod runtime_tests {
             text_owners,
             task_owners,
             text_contracts,
-            locales: BTreeSet::from(["en".into()]),
+            locales: BTreeSet::from(["en".into(), "zh-Hans".into()]),
             locale_config,
             assets,
             catalogs: BTreeMap::from([("resources".into(), "d".repeat(64))]),
@@ -2619,6 +3529,369 @@ mod runtime_tests {
         assert!(next.is_resident(&ContentKey::Code { module: "m".into() }));
         assert!(view.program().functions.get("m.main").is_none());
         assert!(next.program().functions.get("m.main").is_some());
+    }
+
+    fn text_block(contract: &TextContract) -> RuntimeObject {
+        text_block_locale("en", contract)
+    }
+
+    fn text_block_locale(locale: &str, contract: &TextContract) -> RuntimeObject {
+        RuntimeObject::Text(ModuleTexts {
+            format: RUNTIME_FORMAT_VERSION,
+            module: "m".into(),
+            locale: locale.into(),
+            texts: BTreeMap::from([(
+                "m.label".into(),
+                TextDoc {
+                    source_revision: contract.source_revision,
+                    contract_revision: contract.contract_revision,
+                    contract_digest: contract.contract_digest.clone(),
+                    spans: vec![],
+                },
+            )]),
+        })
+    }
+
+    fn catalog_block() -> RuntimeObject {
+        let font = Asset {
+            kind: AssetKind::Font,
+            object: "f".repeat(64),
+            bytes: 1,
+            width: 0,
+            height: 0,
+            duration_us: Micros(0),
+            decoded_bytes: 1,
+        };
+        let image = Asset {
+            kind: AssetKind::Image,
+            object: "1".repeat(64),
+            bytes: 4,
+            width: 1,
+            height: 1,
+            duration_us: Micros(0),
+            decoded_bytes: 4,
+        };
+        RuntimeObject::Catalog(AssetCatalog {
+            format: RUNTIME_FORMAT_VERSION,
+            catalog: "resources".into(),
+            assets: BTreeMap::from([("font".into(), font), ("image".into(), image)]),
+        })
+    }
+
+    #[test]
+    fn runtime_content_eviction_is_independent_and_reloadable() {
+        let mut static_package = empty_static();
+        let contract = contract();
+        static_package
+            .text_contracts
+            .insert("m.label".into(), contract.clone());
+        static_package.cues.insert(
+            "m.cue".into(),
+            Cue {
+                effects: vec![EffectDef {
+                    id: "m.wait".into(),
+                    scope: Scope::Session,
+                    effect: Effect::Delay {
+                        duration_us: Micros(1),
+                    },
+                }],
+            },
+        );
+        static_package
+            .activation_recipes
+            .insert("m.cue".into(), BTreeSet::new());
+        let (base, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            static_package,
+        );
+        let static_object = batch
+            .iter()
+            .find_map(|(key, object, _)| {
+                matches!(key, ContentKey::Static { .. }).then(|| object.clone())
+            })
+            .unwrap();
+        let static_bytes = batch
+            .iter()
+            .find_map(|(key, _, bytes)| matches!(key, ContentKey::Static { .. }).then_some(*bytes))
+            .unwrap();
+        let mut resident = base.install_batch(batch).unwrap();
+        resident = resident
+            .install_batch(vec![
+                (
+                    ContentKey::Text {
+                        module: "m".into(),
+                        locale: "en".into(),
+                    },
+                    text_block(&contract),
+                    100,
+                ),
+                (
+                    ContentKey::Text {
+                        module: "m".into(),
+                        locale: "zh-Hans".into(),
+                    },
+                    text_block_locale("zh-Hans", &contract),
+                    100,
+                ),
+                (
+                    ContentKey::Catalog {
+                        catalog: "resources".into(),
+                    },
+                    catalog_block(),
+                    100,
+                ),
+            ])
+            .unwrap();
+        assert!(resident.program().cues.get("m.cue").is_some());
+        assert!(resident.program().functions.get("m.main").is_some());
+        assert!(resident.program().locales["en"].get("m.label").is_some());
+        assert!(resident.program().locales["zh-Hans"]
+            .get("m.label")
+            .is_some());
+        assert!(resident.asset("image").is_some());
+        let cue = resident.program.cues.values.get("m.cue").unwrap();
+        let weak_cue = Arc::downgrade(cue);
+
+        let without_static = resident
+            .evict(BTreeSet::from([ContentKey::Static { module: "m".into() }]))
+            .unwrap();
+        assert!(!without_static.is_resident(&ContentKey::Static { module: "m".into() }));
+        assert!(without_static.is_resident(&ContentKey::Code { module: "m".into() }));
+        assert!(without_static.is_resident(&ContentKey::Text {
+            module: "m".into(),
+            locale: "en".into(),
+        }));
+        assert!(without_static.is_resident(&ContentKey::Catalog {
+            catalog: "resources".into(),
+        }));
+        assert!(without_static.program().functions.get("m.main").is_some());
+        assert!(without_static.program().locales["en"]
+            .get("m.label")
+            .is_some());
+        assert!(without_static.program().locales["zh-Hans"]
+            .get("m.label")
+            .is_some());
+        assert!(without_static.program().texts.get("m.label").is_none());
+        assert!(weak_cue.upgrade().is_some());
+        drop(resident);
+        assert!(weak_cue.upgrade().is_none());
+
+        let restored_static = without_static
+            .install_batch(vec![(
+                ContentKey::Static { module: "m".into() },
+                static_object,
+                static_bytes,
+            )])
+            .unwrap();
+        assert!(restored_static.program().cues.get("m.cue").is_some());
+        assert!(restored_static.program().texts.get("m.label").is_some());
+        assert!(restored_static.program().locales["en"]
+            .get("m.label")
+            .is_some());
+        assert!(restored_static.program().locales["zh-Hans"]
+            .get("m.label")
+            .is_some());
+
+        let without_english = restored_static
+            .evict(BTreeSet::from([ContentKey::Text {
+                module: "m".into(),
+                locale: "en".into(),
+            }]))
+            .unwrap();
+        assert!(without_english.program().texts.get("m.label").is_some());
+        assert!(without_english.program().locales["en"]
+            .get("m.label")
+            .is_none());
+        assert!(without_english.program().locales["zh-Hans"]
+            .get("m.label")
+            .is_some());
+        assert!(without_english.program().functions.get("m.main").is_some());
+        let without_chinese = without_english
+            .evict(BTreeSet::from([ContentKey::Text {
+                module: "m".into(),
+                locale: "zh-Hans".into(),
+            }]))
+            .unwrap();
+        assert!(without_chinese.program().locales["zh-Hans"]
+            .get("m.label")
+            .is_none());
+        let without_catalog = without_chinese
+            .evict(BTreeSet::from([ContentKey::Catalog {
+                catalog: "resources".into(),
+            }]))
+            .unwrap();
+        assert!(without_catalog.asset("image").is_none());
+        assert!(without_catalog.program().functions.get("m.main").is_some());
+        assert!(without_catalog.program().cues.get("m.cue").is_some());
+    }
+
+    #[test]
+    fn leased_content_cannot_be_evicted_and_stale_views_cannot_repin_it() {
+        let (base, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            empty_static(),
+        );
+        let resident = base.install_batch(batch).unwrap();
+        let code = ContentKey::Code { module: "m".into() };
+        let lease = resident
+            .lease(BTreeSet::from([code.clone()]), "active frame".into())
+            .unwrap();
+        assert_eq!(
+            resident
+                .evict(BTreeSet::from([code.clone()]))
+                .unwrap_err()
+                .code,
+            "E_CONTENT_PINNED"
+        );
+        assert!(resident.is_resident(&code));
+        drop(lease);
+        let retired = resident.evict(BTreeSet::from([code.clone()])).unwrap();
+        assert!(!retired.is_resident(&code));
+        assert_eq!(
+            resident
+                .lease(BTreeSet::from([code]), "stale view".into())
+                .unwrap_err()
+                .code,
+            "E_CONTENT_RETIRED"
+        );
+    }
+
+    #[test]
+    fn speculative_blocks_are_first_lru_victims_and_admission_is_atomic() {
+        let mut static_package = empty_static();
+        let contract = contract();
+        static_package
+            .text_contracts
+            .insert("m.label".into(), contract.clone());
+        let (base, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            static_package,
+        );
+        let mut resident = base.install_batch(batch).unwrap();
+        let static_key = ContentKey::Static { module: "m".into() };
+        let code_key = ContentKey::Code { module: "m".into() };
+        let catalog_key = ContentKey::Catalog {
+            catalog: "resources".into(),
+        };
+        let prefetch = resident
+            .prepare_prefetch_batch(vec![(catalog_key.clone(), catalog_block(), 100)])
+            .unwrap();
+        assert_eq!(resident.residency().resident_blocks, 2);
+        resident = prefetch.commit().unwrap();
+        let budget = resident.residency().resident_bytes;
+        resident = resident
+            .set_residency_budget(ResidencyBudget {
+                resident_bytes: budget,
+            })
+            .unwrap();
+        let transaction = resident
+            .prepare_install_batch(vec![(
+                ContentKey::Text {
+                    module: "m".into(),
+                    locale: "en".into(),
+                },
+                text_block(&contract),
+                100,
+            )])
+            .unwrap();
+        assert_eq!(
+            transaction.evicted_keys(),
+            &BTreeSet::from([catalog_key.clone()])
+        );
+        assert!(resident.is_resident(&catalog_key));
+        assert!(transaction.view().is_resident(&ContentKey::Text {
+            module: "m".into(),
+            locale: "en".into(),
+        }));
+        resident = transaction.commit().unwrap();
+        assert!(!resident.is_resident(&catalog_key));
+        assert!(resident.is_resident(&static_key));
+        assert!(resident.is_resident(&code_key));
+        assert_eq!(resident.residency().resident_bytes, budget);
+    }
+
+    #[test]
+    fn op_id_owner_tombstones_survive_code_eviction_and_stale_views() {
+        let with_ops = |op_ids: &[&str]| Function {
+            params: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            returns: None,
+            entry: "end".into(),
+            blocks: BTreeMap::from([(
+                "end".into(),
+                block(
+                    Terminator::End {
+                        outcome: "done".into(),
+                    },
+                    op_ids
+                        .iter()
+                        .map(|id| Op {
+                            id: (*id).into(),
+                            operation: Operation::ProfileMerge { key: "seen".into() },
+                        })
+                        .collect(),
+                ),
+            )]),
+        };
+        let functions = BTreeMap::from([
+            ("m.main".into(), with_ops(&["m.main-entry", "m.shared"])),
+            ("m.other".into(), with_ops(&["m.other-entry"])),
+        ]);
+        let (base, batch) = runtime_fixture(functions.clone(), empty_static());
+        let static_object = batch
+            .iter()
+            .find_map(|(key, object, _)| {
+                matches!(key, ContentKey::Static { .. }).then(|| object.clone())
+            })
+            .unwrap();
+        let static_bytes = batch
+            .iter()
+            .find_map(|(key, _, bytes)| matches!(key, ContentKey::Static { .. }).then_some(*bytes))
+            .unwrap();
+        let stale_root = base.clone();
+        let resident = base.install_batch(batch).unwrap();
+        let code_key = ContentKey::Code { module: "m".into() };
+        let without_code = resident.evict(BTreeSet::from([code_key.clone()])).unwrap();
+        assert!(!without_code.program().functions.values().any(|_| true));
+        let valid_reload = functions.clone();
+        let reloaded = without_code
+            .install_batch(vec![(
+                code_key.clone(),
+                RuntimeObject::Code(ModuleCode {
+                    format: RUNTIME_FORMAT_VERSION,
+                    module: "m".into(),
+                    functions: valid_reload,
+                }),
+                100,
+            )])
+            .unwrap();
+        assert!(reloaded.program().functions.get("m.main").is_some());
+        let without_code = reloaded.evict(BTreeSet::from([code_key])).unwrap();
+        let conflicting = BTreeMap::from([
+            ("m.main".into(), with_ops(&["m.main-entry"])),
+            ("m.other".into(), with_ops(&["m.other-entry", "m.shared"])),
+        ]);
+        let bad = vec![
+            (
+                ContentKey::Static { module: "m".into() },
+                static_object,
+                static_bytes,
+            ),
+            (
+                ContentKey::Code { module: "m".into() },
+                RuntimeObject::Code(ModuleCode {
+                    format: RUNTIME_FORMAT_VERSION,
+                    module: "m".into(),
+                    functions: conflicting,
+                }),
+                100,
+            ),
+        ];
+        assert_eq!(
+            stale_root.install_batch(bad).unwrap_err().code,
+            "E_DUPLICATE"
+        );
+        assert!(!without_code.program().functions.values().any(|_| true));
     }
 
     #[test]

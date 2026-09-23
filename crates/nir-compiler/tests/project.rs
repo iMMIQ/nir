@@ -475,6 +475,11 @@ fn resolves_author_configuration_with_per_field_sources() {
     let p = load_project(d.path()).unwrap();
     assert_eq!(p.program.player.font_scale, 1.2);
     assert_eq!(p.program.player.auto_delay_us.0, 2_500_000);
+    assert!(p.program.player.prefetch_content);
+    assert_eq!(
+        p.resolved_config["player.prefetch_content"].source,
+        "builtin:web-standard"
+    );
     assert_eq!(
         p.resolved_config["player.font_scale"].source,
         "config/player.toml#/defaults/font_scale"
@@ -505,6 +510,17 @@ fn resolves_author_configuration_with_per_field_sources() {
     assert_eq!(
         load_project(d.path()).unwrap().program.revision,
         p.program.revision
+    );
+    fs::write(
+        d.path().join("config/player.toml"),
+        "format = 1\n[defaults]\nprefetch_content = false\n",
+    )
+    .unwrap();
+    let configured = load_project(d.path()).unwrap();
+    assert!(!configured.program.player.prefetch_content);
+    assert_eq!(
+        configured.resolved_config["player.prefetch_content"].source,
+        "config/player.toml#/defaults/prefetch_content"
     );
 }
 

@@ -9,6 +9,7 @@
         "auto_delay_us": "1200000",
         "bgm_volume": 0.30000001192092896,
         "font_scale": 1.0,
+        "prefetch_content": true,
         "reduced_motion": false,
         "sfx_volume": 0.5,
         "voice_volume": 0.800000011920929
@@ -44,6 +45,10 @@
           "type": "number",
           "format": "float",
           "default": 1.0
+        },
+        "prefetch_content": {
+          "type": "boolean",
+          "default": true
         },
         "reduced_motion": {
           "type": "boolean",

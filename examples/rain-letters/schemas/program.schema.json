@@ -58,12 +58,20 @@
       },
       "default": {}
     },
+    "modules": {
+      "description": "Immutable module interfaces; bodies and text bundles may be absent until prepared.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ModuleIndex"
+      }
+    },
     "player": {
       "$ref": "#/$defs/PlayerDefaults",
       "default": {
         "auto_delay_us": "1200000",
         "bgm_volume": 0.30000001192092896,
         "font_scale": 1.0,
+        "prefetch_content": true,
         "reduced_motion": false,
         "sfx_volume": 0.5,
         "voice_volume": 0.800000011920929
@@ -713,6 +721,39 @@
         "blocks"
       ]
     },
+    "FunctionSignature": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "type": "string"
+        },
+        "entry_op": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ValueType"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValueType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "params",
+        "entry",
+        "entry_op"
+      ]
+    },
     "LocaleConfig": {
       "type": "object",
       "properties": {
@@ -810,6 +851,45 @@
             "id"
           ]
         }
+      ]
+    },
+    "ModuleIndex": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "functions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/FunctionSignature"
+          }
+        },
+        "locales": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "static_content": {
+          "description": "Digest of the module's `ModuleStatic` package.",
+          "type": "string",
+          "default": ""
+        },
+        "texts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "functions",
+        "texts",
+        "code",
+        "locales"
       ]
     },
     "Node": {
@@ -1066,6 +1146,10 @@
           "type": "number",
           "format": "float",
           "default": 1.0
+        },
+        "prefetch_content": {
+          "type": "boolean",
+          "default": true
         },
         "reduced_motion": {
           "type": "boolean",

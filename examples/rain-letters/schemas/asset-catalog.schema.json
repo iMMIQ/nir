@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AssetCatalog",
+  "type": "object",
+  "properties": {
+    "assets": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Asset"
+      }
+    },
+    "catalog": {
+      "type": "string"
+    },
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "catalog",
+    "assets"
+  ],
+  "$defs": {
+    "Asset": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "decoded_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "duration_us": {
+          "$ref": "#/$defs/Micros",
+          "default": "0"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/AssetKind"
+        },
+        "object": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "object",
+        "bytes"
+      ]
+    },
+    "AssetKind": {
+      "type": "string",
+      "enum": [
+        "image",
+        "audio",
+        "font"
+      ]
+    },
+    "Micros": {
+      "type": "string"
+    }
+  }
+}

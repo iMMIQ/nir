@@ -13,6 +13,228 @@ pub struct ContentRequest {
 mod tests {
     use super::*;
 
+    fn player() -> Player {
+        let program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        Player::new(program, "release".into(), "Test".into()).unwrap()
+    }
+
+    fn request() -> ContentRequest {
+        ContentRequest {
+            key: Some(ContentKey::Static {
+                module: "story".into(),
+            }),
+            module: "story".into(),
+            locale: None,
+            hash: "ab".repeat(32),
+        }
+    }
+
+    fn preparation(purpose: ContentPurpose, max_bytes: Option<u64>) -> ContentPreparation {
+        ContentPreparation {
+            purpose,
+            objects: vec![request()],
+            session: 1,
+            failed: false,
+            max_bytes,
+        }
+    }
+
+    #[test]
+    fn promoted_prefetch_skipped_retries_as_a_required_request() {
+        let mut player = player();
+        player.commands.clear();
+        player.request = 41;
+        player
+            .content
+            .insert(41, preparation(ContentPurpose::Prefetch, Some(1024)));
+
+        player
+            .begin_content(ContentPurpose::Execution, vec![request()])
+            .unwrap();
+        assert!(player
+            .commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::PromoteContent { request: 41, .. })));
+        assert!(matches!(
+            player.content[&41].purpose,
+            ContentPurpose::Execution
+        ));
+
+        player.commands.clear();
+        player
+            .event(
+                AppEvent::ContentSkipped {
+                    request: 41,
+                    code: "E_PREFETCH_LIMIT".into(),
+                    message: "manifest too large".into(),
+                },
+                &mut 100,
+            )
+            .unwrap();
+        assert!(!player.content.contains_key(&41));
+        let (request_id, job) = player.content.iter().next().unwrap();
+        assert_eq!(*request_id, 42);
+        assert!(matches!(job.purpose, ContentPurpose::Execution));
+        assert_eq!(job.max_bytes, None);
+        assert!(player.commands.iter().any(|command| matches!(
+            command,
+            AppCommand::GetContent {
+                request: 42,
+                priority: ContentPriority::Required,
+                max_bytes: None,
+                ..
+            }
+        )));
+        assert!(player.error.is_none());
+    }
+
+    #[test]
+    fn speculative_skip_is_silent_and_remembers_the_wait_fingerprint() {
+        let mut player = player();
+        player.commands.clear();
+        player.prepare = None;
+        player.pauses.remove("prepare");
+        player.request = 7;
+        let attempt = PrefetchAttempt {
+            wait: "main/start/0:wait".into(),
+            function: "main".into(),
+            module: "next".into(),
+            locale: "en".into(),
+            session: player.generation.session,
+        };
+        player.prefetch_attempted = Some(attempt.clone());
+        let mut job = preparation(ContentPurpose::Prefetch, Some(1024));
+        job.session = player.generation.session;
+        player.content.insert(7, job);
+
+        player
+            .event(
+                AppEvent::ContentSkipped {
+                    request: 7,
+                    code: "E_PREFETCH_LIMIT".into(),
+                    message: "manifest too large".into(),
+                },
+                &mut 100,
+            )
+            .unwrap();
+        assert!(player.content.is_empty());
+        assert_eq!(player.prefetch_attempted, Some(attempt));
+        assert!(player.error.is_none());
+        assert!(!player.paused());
+        assert!(!player
+            .commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::GetContent { .. })));
+    }
+
+    #[test]
+    fn oversized_speculative_completion_is_discarded_without_installing() {
+        let mut player = player();
+        player.commands.clear();
+        player.request = 8;
+        let mut job = preparation(ContentPurpose::Prefetch, Some(1024));
+        job.session = player.generation.session;
+        player.content.insert(8, job);
+
+        player.complete_content(8, vec![vec![0; 1025]]).unwrap();
+        assert!(!player.content.contains_key(&8));
+        assert!(player.error.is_none());
+        assert!(!player
+            .commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::Diagnostic { .. })));
+    }
+
+    #[test]
+    fn title_cancels_staged_restore_and_late_content_cannot_resume_it() {
+        let mut player = player();
+        player.commands.clear();
+        player.candidate = Some(player.core.clone());
+        player.restore_work = Some(RestoreWork {
+            session: None,
+            proof: None,
+            active_batches: VecDeque::new(),
+            rollback: false,
+        });
+        let mut job = preparation(ContentPurpose::RestoreBodies(false), None);
+        job.session = player.generation.session;
+        player.content.insert(55, job);
+        let mut budget = 100;
+
+        player.action(UiAction::Title, 0, 0, &mut budget).unwrap();
+        assert!(player.restore_work.is_none());
+        assert!(player.candidate.is_none());
+        assert!(!player.content.contains_key(&55));
+        assert!(player
+            .commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::CancelContent { request: 55 })));
+        // A late terminal callback for the removed request is ignored.
+        player
+            .event(
+                AppEvent::ContentReady {
+                    request: 55,
+                    objects: vec![vec![]],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        assert!(player.restore_work.is_none());
+        assert!(player.candidate.is_none());
+    }
+
+    #[test]
+    fn device_recovery_keeps_restore_purpose_and_restarts_requested_locale() {
+        let mut player = player();
+        player.commands.clear();
+        player.prepare = None;
+        player.candidate = Some(player.core.clone());
+        player.restore_work = Some(RestoreWork {
+            session: None,
+            proof: None,
+            active_batches: VecDeque::new(),
+            rollback: false,
+        });
+        player.preferences.text_locale = "en".into();
+        player.pauses.insert("device".into());
+        let mut budget = 100;
+
+        player.event(AppEvent::DeviceReady, &mut budget).unwrap();
+        assert!(matches!(
+            player.prepare.as_ref().unwrap().purpose,
+            Purpose::Restore
+        ));
+        assert_eq!(
+            player
+                .locale_candidate
+                .as_ref()
+                .map(|candidate| candidate.text_locale.as_str()),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn retry_restarts_media_after_verified_restore_consumed_its_proof() {
+        let mut player = player();
+        player.commands.clear();
+        player.prepare = None;
+        player.candidate = Some(player.core.clone());
+        player.restore_work = Some(RestoreWork {
+            session: None,
+            proof: None,
+            active_batches: VecDeque::new(),
+            rollback: true,
+        });
+
+        player.action(UiAction::Retry, 0, 0, &mut 100).unwrap();
+        assert!(player.prepare.is_some());
+        assert!(matches!(
+            player.prepare.as_ref().unwrap().purpose,
+            Purpose::Rollback
+        ));
+    }
+
     #[test]
     fn initial_preferences_select_boot_fonts_before_the_first_request() {
         let mut program: Program =
@@ -119,7 +341,10 @@ pub(super) enum ContentPurpose {
         assets: BTreeSet<String>,
     },
     Restore(Box<Snapshot>, bool),
+    RestoreValidation,
+    RestoreBodies(bool),
     Locale,
+    Prefetch,
 }
 #[derive(Clone)]
 pub(super) struct ContentPreparation {
@@ -127,8 +352,217 @@ pub(super) struct ContentPreparation {
     pub objects: Vec<ContentRequest>,
     pub session: u32,
     pub failed: bool,
+    pub max_bytes: Option<u64>,
+}
+
+pub(super) struct RestoreWork {
+    pub session: Option<RestoreSession>,
+    pub proof: Option<VerifiedSnapshot>,
+    pub active_batches: VecDeque<Vec<ContentRequest>>,
+    pub rollback: bool,
+}
+impl RestoreWork {
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.session
+            .as_ref()
+            .map(RestoreSession::snapshot)
+            .or_else(|| self.proof.as_ref().map(VerifiedSnapshot::snapshot))
+    }
+}
+
+fn same_content_objects(left: &[ContentRequest], right: &[ContentRequest]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| {
+            a.key == b.key && a.module == b.module && a.locale == b.locale && a.hash == b.hash
+        })
 }
 impl Player {
+    pub(super) fn start_staged_restore(
+        &mut self,
+        snapshot: Snapshot,
+        rollback: bool,
+    ) -> Result<()> {
+        self.cancel_content(false);
+        self.cancel_preparation();
+        self.candidate = None;
+        self.restore_work = None;
+        self.pauses.remove("content");
+        self.refresh_content_lease()?;
+        let session = RestoreSession::new(&self.validated, snapshot, &self.release)?;
+        self.restore_work = Some(RestoreWork {
+            session: Some(session),
+            proof: None,
+            active_batches: VecDeque::new(),
+            rollback,
+        });
+        self.resume_restore_work()
+    }
+    pub(super) fn restore_locale_changed(&mut self) -> Result<()> {
+        let Some(proof) = self
+            .restore_work
+            .as_ref()
+            .and_then(|work| work.proof.as_ref())
+        else {
+            return Ok(());
+        };
+        if self.candidate.is_some() {
+            return Ok(());
+        }
+        let batches = self.restore_active_batches(proof.snapshot())?;
+        let requests: Vec<_> = self
+            .content
+            .iter()
+            .filter(|(_, job)| matches!(job.purpose, ContentPurpose::RestoreBodies(_)))
+            .map(|(request, _)| *request)
+            .collect();
+        for request in requests {
+            self.content.remove(&request);
+            self.commands.push(AppCommand::CancelContent { request });
+        }
+        self.pauses.remove("content");
+        if let Some(work) = &mut self.restore_work {
+            work.active_batches = batches;
+        }
+        self.resume_restore_work()
+    }
+    fn restore_requirements_to_requests(
+        &self,
+        requirements: Vec<ContentRequirement>,
+    ) -> Vec<ContentRequest> {
+        requirements
+            .into_iter()
+            .map(|requirement| {
+                let (module, locale) = match &requirement.key {
+                    ContentKey::Static { module } | ContentKey::Code { module } => {
+                        (module.clone(), None)
+                    }
+                    ContentKey::Text { module, locale } => (module.clone(), Some(locale.clone())),
+                    ContentKey::Catalog { catalog } => (catalog.clone(), None),
+                };
+                ContentRequest {
+                    key: Some(requirement.key),
+                    module,
+                    locale,
+                    hash: requirement.digest,
+                }
+            })
+            .collect()
+    }
+    fn restore_active_batches(&self, snapshot: &Snapshot) -> Result<VecDeque<Vec<ContentRequest>>> {
+        let root = self
+            .validated
+            .runtime_root()
+            .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "missing runtime root"))?;
+        let mut by_module = BTreeMap::<String, BTreeSet<ContentKey>>::new();
+        for frame in &snapshot.frames {
+            let index = root
+                .function_index
+                .get(&frame.function)
+                .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "unknown function"))?;
+            let keys = by_module.entry(index.module.clone()).or_default();
+            keys.insert(ContentKey::Static {
+                module: index.module.clone(),
+            });
+            keys.insert(ContentKey::Code {
+                module: index.module.clone(),
+            });
+        }
+        if let Some(frame) = snapshot.frames.last() {
+            if let Some(index) = root.function_index.get(&frame.function) {
+                if root
+                    .modules
+                    .get(&index.module)
+                    .is_some_and(|module| !module.texts.is_empty())
+                {
+                    by_module
+                        .entry(index.module.clone())
+                        .or_default()
+                        .insert(ContentKey::Text {
+                            module: index.module.clone(),
+                            locale: self.effective_text_locale.clone(),
+                        });
+                }
+            }
+        }
+        if let Some(pending) = &snapshot.pending {
+            let module = root
+                .cue_owners
+                .get(&pending.cue)
+                .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "unknown cue"))?;
+            by_module
+                .entry(module.clone())
+                .or_default()
+                .insert(ContentKey::Static {
+                    module: module.clone(),
+                });
+        }
+        if let Some(choice) = &snapshot.choice {
+            let module = root
+                .choice_owners
+                .get(&choice.id)
+                .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "unknown choice"))?;
+            by_module
+                .entry(module.clone())
+                .or_default()
+                .insert(ContentKey::Static {
+                    module: module.clone(),
+                });
+        }
+        let mut batches = VecDeque::new();
+        let mut current = Vec::new();
+        for keys in by_module.values() {
+            let required = self.requests_for_keys(keys.iter().cloned())?;
+            if required.is_empty() {
+                continue;
+            }
+            if current.len() + required.len() > 128 {
+                batches.push_back(std::mem::take(&mut current));
+            }
+            current.extend(required);
+        }
+        if !current.is_empty() {
+            batches.push_back(current);
+        }
+        Ok(batches)
+    }
+    pub(super) fn resume_restore_work(&mut self) -> Result<()> {
+        let mut work = self
+            .restore_work
+            .take()
+            .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "missing restore session"))?;
+        if let Some(session) = &work.session {
+            if let Some(requirements) = session.next_requirements() {
+                let objects = self.restore_requirements_to_requests(requirements);
+                self.restore_work = Some(work);
+                return self.begin_content(ContentPurpose::RestoreValidation, objects);
+            }
+        }
+        if let Some(session) = work.session.take() {
+            let proof = session.finish()?;
+            work.active_batches = self.restore_active_batches(proof.snapshot())?;
+            work.proof = Some(proof);
+        }
+        if let Some(objects) = work.active_batches.pop_front() {
+            let rollback = work.rollback;
+            self.restore_work = Some(work);
+            return self.begin_content(ContentPurpose::RestoreBodies(rollback), objects);
+        }
+        let proof = work
+            .proof
+            .take()
+            .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "missing verified snapshot"))?;
+        let mut candidate = Core::restore_verified(self.validated.clone(), proof, &self.release)?;
+        candidate.set_locale(&self.effective_text_locale)?;
+        let assets = self.state_assets(&candidate);
+        self.candidate = Some(candidate);
+        let purpose = if work.rollback {
+            Purpose::Rollback
+        } else {
+            Purpose::Restore
+        };
+        self.restore_work = Some(work);
+        self.begin_prepare(purpose, 0, assets)
+    }
     pub fn accepts_content(&self, request: u32) -> bool {
         self.content
             .get(&request)
@@ -261,6 +695,13 @@ impl Player {
         self.requests_for_keys(keys)
     }
     fn snapshot_content_keys(&self, snapshot: &Snapshot) -> BTreeSet<ContentKey> {
+        self.snapshot_content_keys_for_locale(snapshot, &snapshot.locale)
+    }
+    fn snapshot_content_keys_for_locale(
+        &self,
+        snapshot: &Snapshot,
+        locale: &str,
+    ) -> BTreeSet<ContentKey> {
         let Some(root) = self.validated.runtime_root() else {
             return BTreeSet::new();
         };
@@ -278,13 +719,8 @@ impl Player {
             if let Some(index) = root.function_index.get(&frame.function) {
                 keys.insert(ContentKey::Text {
                     module: index.module.clone(),
-                    locale: snapshot.locale.clone(),
+                    locale: locale.to_owned(),
                 });
-            }
-        }
-        for task in snapshot.tasks.values() {
-            if let Some(module) = root.task_owners.get(&task.name) {
-                modules.insert(module.clone());
             }
         }
         if let Some(pending) = &snapshot.pending {
@@ -297,20 +733,6 @@ impl Player {
                 modules.insert(module.clone());
             }
         }
-        for dialogue in snapshot
-            .tasks
-            .values()
-            .filter_map(|t| t.dialogue.as_ref())
-            .chain(snapshot.pending.iter().flat_map(|p| p.dialogues.values()))
-        {
-            if let Some(module) = root.text_owners.get(&dialogue.text_id) {
-                modules.insert(module.clone());
-                keys.insert(ContentKey::Text {
-                    module: module.clone(),
-                    locale: dialogue.locale.clone(),
-                });
-            }
-        }
         keys.extend(
             modules
                 .into_iter()
@@ -318,12 +740,23 @@ impl Player {
         );
         keys
     }
+    pub(super) fn touch_snapshot_content(&self, snapshot: &Snapshot) -> Result<()> {
+        if self.validated.runtime_root().is_none() {
+            return Ok(());
+        }
+        let mut keys = self.snapshot_content_keys(snapshot);
+        keys.retain(|key| self.validated.is_resident(key));
+        if !keys.is_empty() {
+            self.validated.touch_content(&keys)?;
+        }
+        Ok(())
+    }
     pub(super) fn refresh_content_lease(&mut self) -> Result<()> {
         let Some(root) = self.validated.runtime_root() else {
             return Ok(());
         };
         let mut groups = BTreeMap::new();
-        if self.screen != Screen::Title {
+        if self.story_context_active() {
             groups.insert(
                 "active-execution".to_owned(),
                 self.snapshot_content_keys(self.core.state()),
@@ -335,7 +768,19 @@ impl Player {
                 self.snapshot_content_keys(candidate.state()),
             );
         }
+        if let Some(snapshot) = self.restore_work.as_ref().and_then(RestoreWork::snapshot) {
+            groups.insert(
+                "restore-candidate".to_owned(),
+                self.snapshot_content_keys_for_locale(snapshot, &self.effective_text_locale),
+            );
+        }
         for (request, preparation) in &self.content {
+            if matches!(
+                preparation.purpose,
+                ContentPurpose::RestoreValidation | ContentPurpose::Prefetch
+            ) {
+                continue;
+            }
             let mut keys: BTreeSet<_> = preparation
                 .objects
                 .iter()
@@ -372,10 +817,17 @@ impl Player {
         Ok(())
     }
     pub(super) fn cancel_content(&mut self, locale: bool) {
+        self.cancel_content_except(locale, None);
+    }
+    fn cancel_content_except(&mut self, locale: bool, keep: Option<u32>) {
         let ids: Vec<_> = self
             .content
             .iter()
-            .filter(|(_, p)| matches!(p.purpose, ContentPurpose::Locale) == locale)
+            .filter(|(id, p)| {
+                Some(**id) != keep
+                    && (matches!(p.purpose, ContentPurpose::Locale) == locale
+                        || matches!(p.purpose, ContentPurpose::Prefetch))
+            })
             .map(|(id, _)| *id)
             .collect();
         for request in ids {
@@ -398,7 +850,6 @@ impl Player {
                 "content batch exceeds 128 objects",
             ));
         }
-        self.cancel_content(locale);
         if objects.is_empty() {
             return Err(Diagnostic::new(
                 "E_MODULE",
@@ -406,6 +857,53 @@ impl Player {
                 "empty content barrier",
             ));
         }
+        if !matches!(purpose, ContentPurpose::Prefetch) {
+            let matching_prefetch = self.content.iter().find_map(|(request, preparation)| {
+                (matches!(preparation.purpose, ContentPurpose::Prefetch)
+                    && same_content_objects(&preparation.objects, &objects))
+                .then_some(*request)
+            });
+            if let Some(request) = matching_prefetch {
+                self.cancel_content_except(locale, Some(request));
+                if let Some(preparation) = self.content.get_mut(&request) {
+                    preparation.purpose = purpose;
+                }
+                self.pauses
+                    .insert(if locale { "locale" } else { "content" }.into());
+                self.commands.push(AppCommand::PromoteContent {
+                    request,
+                    session: self.generation.session,
+                });
+                self.observe("content_promoted", Some(request));
+                return Ok(());
+            }
+            self.cancel_content(locale);
+        } else {
+            let old_prefetches: Vec<_> = self
+                .content
+                .iter()
+                .filter(|(_, p)| matches!(p.purpose, ContentPurpose::Prefetch))
+                .map(|(id, _)| *id)
+                .collect();
+            for request in old_prefetches {
+                self.content.remove(&request);
+                self.commands.push(AppCommand::CancelContent { request });
+            }
+        }
+        let is_prefetch = matches!(purpose, ContentPurpose::Prefetch);
+        let max_bytes = if is_prefetch {
+            let residency = self.validated.residency();
+            let available = residency
+                .budget_bytes
+                .saturating_sub(residency.resident_bytes)
+                .min(2 * 1024 * 1024);
+            if available == 0 {
+                return Ok(());
+            }
+            Some(available)
+        } else {
+            None
+        };
         self.request = self
             .request
             .checked_add(1)
@@ -418,11 +916,14 @@ impl Player {
                 objects: objects.clone(),
                 session: self.generation.session,
                 failed: false,
+                max_bytes,
             },
         );
-        self.pauses
-            .insert(if locale { "locale" } else { "content" }.into());
-        if !locale {
+        if !is_prefetch {
+            self.pauses
+                .insert(if locale { "locale" } else { "content" }.into());
+        }
+        if !locale && !is_prefetch {
             self.error = None;
             self.diagnostic = None;
         }
@@ -430,18 +931,34 @@ impl Player {
             request,
             session: self.generation.session,
             objects,
+            priority: if is_prefetch {
+                ContentPriority::Prefetch
+            } else {
+                ContentPriority::Required
+            },
+            max_bytes,
         });
-        self.observe("content_requested", Some(request));
+        self.observe(
+            if is_prefetch {
+                "prefetch_requested"
+            } else {
+                "content_requested"
+            },
+            Some(request),
+        );
         Ok(())
     }
     pub(super) fn fail_content(&mut self, request: u32, message: String) {
         if !self.accepts_content(request) {
             return;
         }
-        let job = self.content.get_mut(&request).unwrap();
-        job.failed = true;
+        let purpose = self.content[&request].purpose.clone();
+        self.content.get_mut(&request).unwrap().failed = true;
         self.commands.push(AppCommand::CancelContent { request });
-        if matches!(job.purpose, ContentPurpose::Locale) {
+        if matches!(purpose, ContentPurpose::Prefetch) {
+            self.content.remove(&request);
+            self.observe("prefetch_failed", Some(request));
+        } else if matches!(purpose, ContentPurpose::Locale) {
             self.locale_error = Some(message);
             self.pauses.remove("locale");
         } else {
@@ -455,6 +972,217 @@ impl Player {
                 true,
             );
         }
+    }
+    fn complete_restore_validation(
+        &mut self,
+        request: u32,
+        job: &ContentPreparation,
+        bytes: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let root = self
+            .validated
+            .runtime_root()
+            .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "missing runtime root"))?;
+        let objects = job
+            .objects
+            .iter()
+            .zip(&bytes)
+            .map(|(request, bytes)| {
+                let key = request.key.as_ref().ok_or_else(|| {
+                    Diagnostic::new("E_SNAPSHOT", "restore", "missing content key")
+                })?;
+                let object = nir_content::parse_runtime_object(root, key, bytes)?;
+                Ok((key.clone(), object, bytes.len() as u64))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let scratch = self
+            .validated
+            .empty_content_view()?
+            .install_batch(objects)?;
+        let work = self
+            .restore_work
+            .as_mut()
+            .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "missing restore session"))?;
+        work.session
+            .as_mut()
+            .ok_or_else(|| {
+                Diagnostic::new("E_SNAPSHOT", "restore", "verification already finished")
+            })?
+            .verify_next_unit(&scratch)?;
+        self.content.remove(&request);
+        self.pauses.remove("content");
+        self.observe("restore_unit_verified", Some(request));
+        if let Err(error) = self.resume_restore_work() {
+            self.pauses.insert("content".into());
+            self.report(error, true);
+        }
+        Ok(())
+    }
+    fn complete_restore_bodies(
+        &mut self,
+        request: u32,
+        job: ContentPreparation,
+        objects: Vec<(ContentKey, RuntimeObject, u64)>,
+    ) -> Result<()> {
+        let rollback = match job.purpose {
+            ContentPurpose::RestoreBodies(rollback) => rollback,
+            _ => unreachable!(),
+        };
+        self.admit_live_batch(request, objects)?;
+        self.content.remove(&request);
+        self.pauses.remove("content");
+        self.observe("restore_body_ready", Some(request));
+        debug_assert_eq!(
+            self.restore_work.as_ref().map(|work| work.rollback),
+            Some(rollback)
+        );
+        if let Err(error) = self.resume_restore_work() {
+            self.pauses.insert("content".into());
+            self.report(error, true);
+        }
+        Ok(())
+    }
+    fn complete_prefetch(
+        &mut self,
+        request: u32,
+        _job: &ContentPreparation,
+        objects: Vec<(ContentKey, RuntimeObject, u64)>,
+    ) -> Result<()> {
+        // A speculative request cannot retire resident blocks. Any parse,
+        // accounting, or promotion race failure remains an optional fallback.
+        let result = (|| {
+            let admission = self.validated.prepare_prefetch_batch(objects)?;
+            let projected = admission.view();
+            if self.story_context_active() {
+                self.core.check_program_replacement(projected)?;
+            }
+            if let Some(candidate) = &self.candidate {
+                candidate.check_program_replacement(projected)?;
+            }
+            let validated = admission.commit()?;
+            if self.story_context_active() {
+                self.core.replace_program(validated.clone())?;
+            } else {
+                self.core = Core::new(
+                    validated.clone(),
+                    self.release.clone(),
+                    self.effective_text_locale.clone(),
+                )?;
+            }
+            if let Some(candidate) = &mut self.candidate {
+                candidate.replace_program(validated.clone())?;
+            }
+            Ok::<_, Diagnostic>(validated)
+        })();
+        if let Ok(validated) = result {
+            self.validated = validated;
+            self.content.remove(&request);
+            self.observe("prefetch_ready", Some(request));
+        } else {
+            self.content.remove(&request);
+            self.commands.push(AppCommand::CancelContent { request });
+            self.observe("prefetch_failed", Some(request));
+        }
+        Ok(())
+    }
+    fn admission_lease_keys(&self, view: &ValidatedProgram) -> BTreeSet<ContentKey> {
+        let mut keys = BTreeSet::new();
+        if self.story_context_active() {
+            keys.extend(self.snapshot_content_keys(self.core.state()));
+        }
+        if let Some(candidate) = &self.candidate {
+            keys.extend(self.snapshot_content_keys(candidate.state()));
+        }
+        if let Some(snapshot) = self.restore_work.as_ref().and_then(RestoreWork::snapshot) {
+            keys.extend(
+                self.snapshot_content_keys_for_locale(snapshot, &self.effective_text_locale),
+            );
+        }
+        for preparation in self.content.values() {
+            if matches!(
+                preparation.purpose,
+                ContentPurpose::RestoreValidation | ContentPurpose::Prefetch
+            ) {
+                continue;
+            }
+            keys.extend(
+                preparation
+                    .objects
+                    .iter()
+                    .filter_map(|object| object.key.clone()),
+            );
+        }
+        if let Some(root) = view.runtime_root() {
+            let mut assets = self.retained_assets();
+            if let Some(candidate) = &self.locale_candidate {
+                assets.extend(self.font_assets(&candidate.ui_locale, &candidate.text_locale));
+            }
+            keys.extend(root.asset_catalogs(assets.iter().map(String::as_str)));
+        }
+        keys.retain(|key| view.is_resident(key));
+        keys
+    }
+    fn admit_live_batch(
+        &mut self,
+        request: u32,
+        objects: Vec<(ContentKey, RuntimeObject, u64)>,
+    ) -> Result<()> {
+        let demanded: BTreeSet<_> = objects.iter().map(|(key, _, _)| key.clone()).collect();
+        // Update reference ownership immediately before the residency ledger
+        // chooses any blocks to retire.
+        self.refresh_content_lease()?;
+        let admission = self.validated.prepare_install_batch(objects)?;
+        let projected = admission.view();
+        if self.story_context_active() {
+            self.core.check_program_replacement(projected)?;
+        }
+        if let Some(candidate) = &self.candidate {
+            candidate.check_program_replacement(projected)?;
+        }
+        let lease_keys = self.admission_lease_keys(admission.view());
+        let (validated, lease) =
+            admission.commit_with_lease(lease_keys, format!("content-admission-{request}"))?;
+        if self.story_context_active() {
+            self.core.replace_program(validated.clone())?;
+        } else {
+            self.core = Core::new(
+                validated.clone(),
+                self.release.clone(),
+                self.effective_text_locale.clone(),
+            )?;
+        }
+        if let Some(candidate) = &mut self.candidate {
+            candidate.replace_program(validated.clone())?;
+        }
+        self.content_leases.push(lease);
+        self.validated = validated;
+        if !demanded.is_empty() {
+            self.validated.touch_content(&demanded)?;
+        }
+        self.refresh_content_lease()?;
+        Ok(())
+    }
+    fn admit_live_program(&mut self, validated: ValidatedProgram) -> Result<()> {
+        if self.story_context_active() {
+            self.core.check_program_replacement(&validated)?;
+        }
+        if let Some(candidate) = &self.candidate {
+            candidate.check_program_replacement(&validated)?;
+        }
+        if self.story_context_active() {
+            self.core.replace_program(validated.clone())?;
+        } else {
+            self.core = Core::new(
+                validated.clone(),
+                self.release.clone(),
+                self.effective_text_locale.clone(),
+            )?;
+        }
+        if let Some(candidate) = &mut self.candidate {
+            candidate.replace_program(validated.clone())?;
+        }
+        self.validated = validated;
+        Ok(())
     }
     pub(super) fn complete_content(&mut self, request: u32, bytes: Vec<Vec<u8>>) -> Result<()> {
         if !self.accepts_content(request) {
@@ -474,20 +1202,47 @@ impl Player {
                 "content batch count/bytes",
             ));
         }
-        let validated = if let Some(root) = self.validated.runtime_root() {
+        if matches!(job.purpose, ContentPurpose::Prefetch) {
+            let total_bytes: u64 = bytes.iter().map(|item| item.len() as u64).sum();
+            let cap = job
+                .max_bytes
+                .unwrap_or(2 * 1024 * 1024)
+                .min(2 * 1024 * 1024);
+            if total_bytes > cap {
+                self.content.remove(&request);
+                self.commands.push(AppCommand::CancelContent { request });
+                self.observe("prefetch_failed", Some(request));
+                return Ok(());
+            }
+        }
+        if matches!(job.purpose, ContentPurpose::RestoreValidation) {
+            return self.complete_restore_validation(request, &job, bytes);
+        }
+        if let Some(root) = self.validated.runtime_root() {
             let objects = job
                 .objects
                 .iter()
-                .zip(bytes)
+                .zip(&bytes)
                 .map(|(request, bytes)| {
                     let key = request.key.as_ref().ok_or_else(|| {
                         Diagnostic::new("E_MODULE", "content", "runtime request missing typed key")
                     })?;
-                    let object = nir_content::parse_runtime_object(root, key, &bytes)?;
+                    let object = nir_content::parse_runtime_object(root, key, bytes)?;
                     Ok((key.clone(), object, bytes.len() as u64))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.validated.install_batch(objects)?
+            if matches!(job.purpose, ContentPurpose::Prefetch) {
+                self.complete_prefetch(request, &job, objects)?;
+                return Ok(());
+            }
+            if matches!(job.purpose, ContentPurpose::RestoreBodies(_)) {
+                return self.complete_restore_bodies(request, job, objects);
+            }
+            if let ContentPurpose::Restore(snapshot, _) = &job.purpose {
+                let projected = self.validated.install_batch(objects.clone())?;
+                Core::restore(projected, *snapshot.clone(), &self.release)?;
+            }
+            self.admit_live_batch(request, objects)?;
         } else {
             let mut p = self
                 .validated
@@ -513,17 +1268,9 @@ impl Player {
                     "resident program exceeds 16 MiB",
                 ));
             }
-            ValidatedProgram::new(p)?
-        };
-        // Validate restore candidates before installing anything into the live view.
-        if let ContentPurpose::Restore(snapshot, _) = &job.purpose {
-            Core::restore(validated.clone(), *snapshot.clone(), &self.release)?;
+            let validated = ValidatedProgram::new(p)?;
+            self.admit_live_program(validated)?;
         }
-        self.core.replace_program(validated.clone())?;
-        if let Some(candidate) = &mut self.candidate {
-            candidate.replace_program(validated.clone())?;
-        }
-        self.validated = validated;
         self.content.remove(&request);
         self.pauses
             .remove(if matches!(job.purpose, ContentPurpose::Locale) {
@@ -547,6 +1294,9 @@ impl Player {
                 self.restore_with_purpose(*snapshot, rollback)
             }
             ContentPurpose::Locale => self.start_locale_switch(),
+            ContentPurpose::RestoreValidation => unreachable!(),
+            ContentPurpose::RestoreBodies(_) => unreachable!(),
+            ContentPurpose::Prefetch => unreachable!(),
         };
         if let Err(error) = continuation {
             // Bytes are already verified, but admitting the following media or

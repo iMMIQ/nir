@@ -1,0 +1,796 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeExecutable",
+  "description": "Runtime wire artifact. The source-facing `Executable` stays format 1 for\ncompiler validation and compatibility; release packaging emits this small\nformat 2 root and its separately addressed content blocks.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "program": {
+      "$ref": "#/$defs/RuntimeProgram"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "program"
+  ],
+  "$defs": {
+    "AssetIndexEntry": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AssetKind"
+        },
+        "object": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "object",
+        "catalog"
+      ]
+    },
+    "AssetKind": {
+      "type": "string",
+      "enum": [
+        "image",
+        "audio",
+        "font"
+      ]
+    },
+    "ChoiceComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.choice",
+        "builtin.choice.compact"
+      ]
+    },
+    "ChoiceProps": {
+      "type": "object",
+      "properties": {
+        "item_height": {
+          "type": "number",
+          "format": "float",
+          "default": 58.0
+        },
+        "width": {
+          "type": "number",
+          "format": "float",
+          "default": 520.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "DialogueComponent": {
+      "type": "string",
+      "enum": [
+        "builtin.dialogue",
+        "builtin.dialogue.top"
+      ]
+    },
+    "DialogueProps": {
+      "type": "object",
+      "properties": {
+        "font_size": {
+          "type": "number",
+          "format": "float",
+          "default": 23.0
+        },
+        "height": {
+          "type": "number",
+          "format": "float",
+          "default": 220.0
+        },
+        "padding": {
+          "type": "number",
+          "format": "float",
+          "default": 24.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FunctionSignature": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "type": "string"
+        },
+        "entry_op": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ValueType"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValueType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "params",
+        "entry",
+        "entry_op"
+      ]
+    },
+    "LocaleConfig": {
+      "type": "object",
+      "properties": {
+        "default_text": {
+          "type": "string"
+        },
+        "default_ui": {
+          "type": "string"
+        },
+        "text": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/LocaleFontPlan"
+          }
+        },
+        "ui": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/LocaleFontPlan"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "default_ui",
+        "default_text",
+        "ui",
+        "text"
+      ]
+    },
+    "LocaleFontPlan": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "fonts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fonts",
+        "digest"
+      ]
+    },
+    "Micros": {
+      "type": "string"
+    },
+    "ModuleIndex": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "functions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/FunctionSignature"
+          }
+        },
+        "locales": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "static_content": {
+          "description": "Digest of the module's `ModuleStatic` package.",
+          "type": "string",
+          "default": ""
+        },
+        "texts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "functions",
+        "texts",
+        "code",
+        "locales"
+      ]
+    },
+    "Node": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "clip": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "color": {
+          "type": "array",
+          "default": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "height": {
+          "type": "number",
+          "format": "float"
+        },
+        "id": {
+          "type": "string"
+        },
+        "opacity": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "order": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "scale": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "width": {
+          "type": "number",
+          "format": "float"
+        },
+        "x": {
+          "type": "number",
+          "format": "float"
+        },
+        "y": {
+          "type": "number",
+          "format": "float"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "x",
+        "y",
+        "width",
+        "height"
+      ]
+    },
+    "PlayerDefaults": {
+      "type": "object",
+      "properties": {
+        "auto_delay_us": {
+          "$ref": "#/$defs/Micros",
+          "default": "1200000"
+        },
+        "bgm_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.30000001192092896
+        },
+        "font_scale": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "prefetch_content": {
+          "type": "boolean",
+          "default": true
+        },
+        "reduced_motion": {
+          "type": "boolean",
+          "default": false
+        },
+        "sfx_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.5
+        },
+        "voice_volume": {
+          "type": "number",
+          "format": "float",
+          "default": 0.800000011920929
+        }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeFunctionIndex": {
+      "type": "object",
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "signature": {
+          "$ref": "#/$defs/FunctionSignature"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "signature"
+      ]
+    },
+    "RuntimeProgram": {
+      "description": "An addressable runtime root. Unlike the authoring `Program`, this document\ncontains identities and ownership indexes, never module bodies or locale\ntext documents.",
+      "type": "object",
+      "properties": {
+        "assets": {
+          "description": "Asset ID -> kind, immutable media identity and catalog locator.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/AssetIndexEntry"
+          },
+          "default": {}
+        },
+        "catalogs": {
+          "description": "Catalog ID -> immutable catalog package digest.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "choice_owners": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "cue_owners": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "default_locale": {
+          "type": "string"
+        },
+        "entry": {
+          "type": "string"
+        },
+        "format": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "function_index": {
+          "description": "Static function interfaces and the module responsible for each body.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RuntimeFunctionIndex"
+          }
+        },
+        "game_id": {
+          "type": "string"
+        },
+        "locale_config": {
+          "$ref": "#/$defs/LocaleConfig"
+        },
+        "locales": {
+          "description": "Locale IDs only. Locale documents are held in independent Text blocks.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "modules": {
+          "description": "Module content hashes and per-module declarations.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ModuleIndex"
+          },
+          "default": {}
+        },
+        "player": {
+          "$ref": "#/$defs/PlayerDefaults",
+          "default": {
+            "auto_delay_us": "1200000",
+            "bgm_volume": 0.30000001192092896,
+            "font_scale": 1.0,
+            "prefetch_content": true,
+            "reduced_motion": false,
+            "sfx_volume": 0.5,
+            "voice_volume": 0.800000011920929
+          }
+        },
+        "requires": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "revision": {
+          "type": "string"
+        },
+        "scene_owners": {
+          "description": "Lightweight owner indexes for static and text objects.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "stage": {
+          "$ref": "#/$defs/Stage"
+        },
+        "task_owners": {
+          "description": "Stable task ID (`cue/effect`) to owning module, used to resolve restored\ntask references without loading every cue package.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "text_contracts": {
+          "description": "Text identity needed to validate frozen dialogue and request its locale\nbundle while the actual text remains unloaded.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RuntimeTextIdentity"
+          },
+          "default": {}
+        },
+        "text_owners": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "theme": {
+          "$ref": "#/$defs/Theme",
+          "default": {
+            "accent": [
+              0.8299999833106995,
+              0.7300000190734863,
+              0.47999998927116394,
+              1.0
+            ],
+            "background": [
+              0.03999999910593033,
+              0.07500000298023224,
+              0.09000000357627869,
+              1.0
+            ],
+            "choice": {
+              "item_height": 58.0,
+              "width": 520.0
+            },
+            "dialogue": {
+              "font_size": 23.0,
+              "height": 220.0,
+              "padding": 24.0
+            },
+            "muted": [
+              0.5799999833106995,
+              0.6899999976158142,
+              0.6899999976158142,
+              1.0
+            ],
+            "panel": [
+              0.05999999865889549,
+              0.10499999672174454,
+              0.11999999731779099,
+              0.9700000286102295
+            ],
+            "slots": {
+              "choice.main": "builtin.choice",
+              "dialogue.main": "builtin.dialogue"
+            },
+            "text": [
+              0.9300000071525574,
+              0.9399999976158142,
+              0.8799999952316284,
+              1.0
+            ]
+          }
+        },
+        "title_nodes": {
+          "description": "The title scene is the sole scene body embedded in the root.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Node"
+          }
+        },
+        "title_scene": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "variables": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Value"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "game_id",
+        "revision",
+        "entry",
+        "stage",
+        "function_index",
+        "locale_config",
+        "default_locale"
+      ]
+    },
+    "RuntimeTextIdentity": {
+      "type": "object",
+      "properties": {
+        "contract_digest": {
+          "type": "string"
+        },
+        "contract_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "meaning_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "module": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "source_revision",
+        "contract_revision",
+        "meaning_revision",
+        "contract_digest"
+      ]
+    },
+    "Stage": {
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "width",
+        "height"
+      ]
+    },
+    "Theme": {
+      "type": "object",
+      "properties": {
+        "accent": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "background": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "choice": {
+          "$ref": "#/$defs/ChoiceProps",
+          "default": {
+            "item_height": 58.0,
+            "width": 520.0
+          }
+        },
+        "dialogue": {
+          "$ref": "#/$defs/DialogueProps",
+          "default": {
+            "font_size": 23.0,
+            "height": 220.0,
+            "padding": 24.0
+          }
+        },
+        "muted": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "panel": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "slots": {
+          "$ref": "#/$defs/ThemeSlots",
+          "default": {
+            "choice.main": "builtin.choice",
+            "dialogue.main": "builtin.dialogue"
+          }
+        },
+        "text": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "background",
+        "panel",
+        "accent",
+        "text",
+        "muted"
+      ]
+    },
+    "ThemeSlots": {
+      "description": "Closed component registry implemented by the locked player SDK. Components\nonly project state; their actions and focus semantics remain player-owned.",
+      "type": "object",
+      "properties": {
+        "choice.main": {
+          "$ref": "#/$defs/ChoiceComponent",
+          "default": "builtin.choice"
+        },
+        "dialogue.main": {
+          "$ref": "#/$defs/DialogueComponent",
+          "default": "builtin.dialogue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Value": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "bool"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "i32"
+            },
+            "value": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ValueType": {
+      "type": "string",
+      "enum": [
+        "bool",
+        "i32",
+        "string"
+      ]
+    }
+  }
+}

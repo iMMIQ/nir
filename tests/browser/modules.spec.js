@@ -23,7 +23,7 @@ import {
 const run = promisify(execFile);
 const state = page => page.evaluate(() => window.__nir.state());
 const action = (page, value) => page.evaluate(v => window.__nir.action(v), value);
-let fixture;
+let fixture,prefetchFixture;
 
 async function boot(page) {
   trackObjectRequests(page);
@@ -112,10 +112,85 @@ const requiredHashes = hashes => Object.values(hashes).flatMap(value => [value.c
 
 test.beforeAll(async () => {
   fixture = await buildModulesFixture();
+  prefetchFixture = await buildModulesFixture({prefetchContent:true,port:4192});
 });
 
 test.afterAll(async () => {
   if (fixture) await closeModulesFixture(fixture);
+  if (prefetchFixture) await closeModulesFixture(prefetchFixture);
+});
+
+test('default-on prefetch loads only the next module static, code, and current text locale', async ({page}) => {
+  const previous=fixture;fixture=prefetchFixture;
+  try {
+    const hashes=moduleObjectHashes(fixture.program);
+    await boot(page);
+    const title=await state(page);
+    const titleResidency=title.content_residency;
+    await start(page);
+    const current=await state(page),locale=current.text_locale;
+    const prefetched=[hashes.ch02.static,hashes.ch02.code,hashes.ch02.locales[locale]].filter(Boolean);
+    await page.waitForFunction(expected=>{
+      const events=window.__nir.diagnostics().events;
+      return events.some(event=>event.stage==='module_delivered'&&event.kind==='prefetch')&&
+        expected.every(hash=>events.some(event=>event.stage==='module_requested'&&event.object===hash));
+    },prefetched);
+    const expected=new Set([
+      hashes.ch01.static,hashes.ch01.code,hashes.ch01.locales[locale],...prefetched,
+    ]);
+    await assertRuntimeContent(page,expected);
+    const requested=await requestedModuleObjects(page);
+    expect(requested).not.toContain(hashes.ch02.locales[locale==='en'?'zh-Hans':'en']);
+    expect(requested).not.toContain(hashes.ch03.static);
+    expect(requested).not.toContain(hashes.ch03.code);
+    expect(requested).not.toContain(hashes.ch03.locales[locale]);
+    await assertAssetClosure(page,runtimeAssetsForLocales(fixture.program,current.ui_locale,locale));
+
+    const report=await page.evaluate(()=>({host:window.__nir.diagnostics().content_staging,state:window.__nir.state()}));
+    expect(report.host.budget_encoded_bytes).toBe(16*1024*1024);
+    expect(report.host.peak_encoded_bytes).toBeGreaterThan(0);
+    expect(report.host.encoded_bytes).toBe(0);
+    expect(report.state.content_residency.resident_blocks).toBeGreaterThan(titleResidency.resident_blocks);
+    expect(report.state.content_residency.pinned_bytes).toBeLessThanOrEqual(report.state.content_residency.resident_bytes);
+    expect(report.state.content_residency.resident_bytes).toBeLessThanOrEqual(report.state.content_residency.budget_bytes);
+  } finally {
+    fixture=previous;
+  }
+});
+
+test('a failed prefetch promoted by demand reports failure and retries cleanly', async ({page}) => {
+  const previous=fixture;fixture=prefetchFixture;
+  try {
+    const ch02Code=moduleObjectHashes(fixture.program).ch02.code;
+    let attempts=0,seeFirst,releaseFirst;
+    const firstStarted=new Promise(resolve=>{seeFirst=resolve;});
+    const firstGate=new Promise(resolve=>{releaseFirst=resolve;});
+    await page.route(`**/objects/${ch02Code}.json`,async route=>{
+      attempts++;
+      if(attempts===1){seeFirst();await firstGate;await route.fulfill({status:503,body:'temporary prefetch failure'});}
+      else await route.continue();
+    });
+    await boot(page);
+    await start(page);
+    await firstStarted;
+    await page.keyboard.press('Space');
+    await page.waitForFunction(()=>window.__nir.state().loading);
+    releaseFirst();
+    await page.waitForFunction(()=>window.__nir.diagnostics().events.some(event=>event.stage==='module_failed'));
+    const beforeRetry=await page.evaluate(hash=>window.__nir.diagnostics().events
+      .filter(event=>event.stage==='module_requested'&&event.object===hash),ch02Code);
+    expect(new Set(beforeRetry.map(event=>event.request)).size).toBe(1);
+    expect(attempts).toBe(1);
+
+    await action(page,{type:'retry'});
+    await page.waitForFunction(text=>{
+      const s=window.__nir.state();
+      return s.dialogue?.visible===text&&s.dialogue.ready&&!s.loading;
+    },expectedText(chapters[1],'zh-Hans'));
+    expect(attempts).toBe(2);
+  } finally {
+    fixture=previous;
+  }
 });
 
 test('startup and module calls fetch only the selected chapter and language; chapter two saves restore without re-entry', async ({ page }) => {

@@ -123,7 +123,7 @@ async function copyProject(project) {
   });
 }
 
-async function setInputs(project) {
+async function setInputs(project,prefetchContent) {
   const file = path.join(project, 'game.toml');
   const content = await fs.readFile(file, 'utf8');
   const replacement = `shared = ["content/shared/story.nir.json"]
@@ -132,17 +132,22 @@ modules = ["content/ch01/module.toml", "content/ch02/module.toml", "content/ch03
     .replace('title_scene = "station"', 'title_scene = "ch01.station"');
   if (updated === content) throw new Error('could not replace game.toml module list');
   await fs.writeFile(file, updated);
+  const playerFile=path.join(project,'config/player.toml');
+  const player=await fs.readFile(playerFile,'utf8');
+  const configured=player.replace(/^prefetch_content\s*=\s*(?:true|false)\s*$/m,`prefetch_content = ${prefetchContent}`);
+  if(configured===player&&!/^prefetch_content\s*=\s*(?:true|false)\s*$/m.test(player))
+    throw new Error('could not set config/player.toml prefetch_content');
+  await fs.writeFile(playerFile,configured);
 }
 
-export async function buildModulesFixture() {
+export async function buildModulesFixture({prefetchContent=false,port=4191}={}) {
   const cli = path.resolve('dist/novelc');
   await fs.mkdir(path.resolve('target/tmp'), { recursive: true });
   const temp = await fs.mkdtemp(path.resolve('target/tmp/nir-modules-'));
   const project = path.join(temp, 'story');
   const web = path.join(temp, 'web');
-  const port = 4191;
   await copyProject(project);
-  await setInputs(project);
+  await setInputs(project,prefetchContent);
 
   await writeJson(path.join(project, 'content/shared/story.nir.json'), {
     fragment_format: 1,
