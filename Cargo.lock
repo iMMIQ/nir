@@ -871,6 +871,7 @@ name = "nir-compiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "hb-subset",
  "image",
  "nir-content",
@@ -985,6 +986,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "nir-compiler",
  "nir-content",
  "nir-format",

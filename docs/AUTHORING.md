@@ -51,3 +51,13 @@ Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末
 | E_BUDGET | 减小资源/舞台或拆减同时活动的视觉与声音资源 |
 
 发布前运行 `check --locked`、`test`、`build --locked` 和发行校验脚本，再用实际发布目录跑浏览器测试。不要将开发服务器 HTML 回退响应当作丢失资源，也不要只测试源码预览而忽略最终静态目录。
+
+## 静态发行的压缩传输
+
+构建会为能够缩小的 WASM、JavaScript 和 JSON 不可变对象生成同目录 `.gz` 旁文件，使用固定时间戳的 gzip level 6。部署时一并上传。对象路径、发行清单、摘要和大小仍描述原始对象；旁文件不建立新的剧情或发行身份。
+
+`novelc serve` 和作者预览按 `Accept-Encoding` 返回压缩表示，设置 `Content-Encoding: gzip`、`Vary: Accept-Encoding` 及压缩后的 `Content-Length`，保留原对象 MIME 和不可变缓存头。浏览器解压后，启动器与运行时继续校验原始长度和 SHA-256。无 gzip 支持或请求明确禁用 gzip 时返回原文件。
+
+生产静态托管应开启对应的预压缩文件协商（例如 Nginx 的 `gzip_static on` 配合 `gzip_vary on`，需要服务器包含相应模块），或由托管服务动态压缩相同 MIME。需要保留原 MIME、正确的 `Content-Encoding` 和 `Vary: Accept-Encoding`。原始 URL 必须保持不变，不能将请求重定向到 `.gz` URL，也不能让 SPA 回退页面覆盖对象缺失错误。只上传旁文件而没有协商规则不会产生优化效果；托管不支持压缩时原文件仍可正常使用。
+
+发布前运行 `python3 scripts/verify_release.py <发行目录>`；校验器会额外检查清单对象已有旁文件的解压结果。预览更新同样验证并同步旁文件后才切换 channel。

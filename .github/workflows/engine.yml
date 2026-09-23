@@ -67,9 +67,28 @@ jobs:
           export CHROMIUM
           mkdir -p target/tmp
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:browser --max-failures=1
-      - name: Navigation and recovery performance baseline
+      - name: Module performance smoke
+        if: github.event_name == 'pull_request'
+        env:
+          NIR_PERF_MODE: ci
+          NIR_PERF_SAMPLES: '2'
+          NIR_PERF_CYCLES: '2'
+          NIR_PERF_SCALE_REPETITIONS: '1'
+          NIR_PERF_SMOKE: '1'
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
+        run: |
+          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          export CHROMIUM
+          mkdir -p target/tmp
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance:smoke
+      - name: Performance baselines and module scale
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
+          NIR_PERF_MODE: ci
+          NIR_PERF_SCALE_REPETITIONS: '5'
           NIR_CHROME_ARGS: >-
             --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
             --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist

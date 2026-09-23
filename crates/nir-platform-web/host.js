@@ -166,13 +166,33 @@ export class ContentStagingBudget {
     }
 }
 
-export async function acquireRequiredContentStage(job,budget,bytes) {
-    const admitted=await budget.acquire(job.group,bytes,job.signal);
+export async function acquireRequiredContentStage(job,budget,bytes,preparations=[]) {
+    job.signal.throwIfAborted();
+    const reserved=budget.tryReserve(job.group,bytes);
+    if(!reserved&&Number.isSafeInteger(bytes)&&bytes>0&&bytes<=budget.limit){
+        for(const other of preparations){
+            if(other!==job&&other.priority==='prefetch'&&other.staged&&other.state==='fetching'&&!other.signal.aborted){
+                // Only reclaim for actual pressure. Unlike CancelContent from
+                // Rust, this host decision must return a terminal skip to Rust.
+                other.stageEviction={code:'E_PREFETCH_LIMIT',reason:'staging_reclaimed',totalBytes:other.totalBytes,maxBytes:budget.available};
+                other.controller.abort();
+            }
+        }
+    }
+    const admitted=await (reserved?true:budget.acquire(job.group,bytes,job.signal));
     // Take ownership before checking cancellation. acquire() can resolve and
     // then the caller can be cancelled before this continuation runs.
     if(admitted)job.staged=true;
     job.signal.throwIfAborted();
     return admitted;
+}
+
+// Eviction has already aborted the download. Even a subsequent promotion must
+// receive this skip; Rust can then issue a fresh required request. Cancellation
+// by Rust still cancels the reserved slot and suppresses late notifications.
+export async function postContentEviction(job,{post,skip,isActive=()=>true}) {
+    if(job.cancelled||!isActive()){job.terminal?.cancel();return;}
+    await post(job.terminal,()=>{if(!job.cancelled&&isActive())skip(job.stageEviction);});
 }
 
 // A prefetch skip that has not reached the owner yet can be superseded by a
@@ -221,7 +241,7 @@ export class WorkPool {
 // A fetch belongs to its consumers, so cancelling one does not cancel another.
 export class SharedRequests {
     constructor(load){this.load=load;this.jobs=new Map();}
-    get(key,signal) {
+    get(key,signal,{settleOnAbort=false}={}) {
         if(signal.aborted)return Promise.reject(signal.reason);
         let job=this.jobs.get(key);
         if(!job){
@@ -235,19 +255,62 @@ export class SharedRequests {
         job.consumers++;
         return new Promise((resolve,reject)=>{
             let done=false;
-            const finish=(fn,value)=>{
+            const finish=(fn,value,cancelled=false)=>{
                 if(done)return;done=true;signal.removeEventListener('abort',abort);
-                if(--job.consumers===0){
+                const last=--job.consumers===0;
+                if(last){
                     if(this.jobs.get(key)===job)this.jobs.delete(key);
                     job.controller.abort();
                 }
+                // Content staging must cover even the final consumer's
+                // uncancellable hash verification after fetch cancellation.
+                if(cancelled&&last&&settleOnAbort){job.promise.then(()=>fn(value),()=>fn(value));return;}
                 fn(value);
             };
-            const abort=()=>finish(reject,signal.reason);
+            const abort=()=>finish(reject,signal.reason,true);
             signal.addEventListener('abort',abort,{once:true});
             job.promise.then(value=>finish(resolve,value),error=>finish(reject,error));
         });
     }
+}
+
+// One attempt owns its cancellation signal. Settle every worker before the
+// caller can retry or release staging; successful objects survive a retry.
+export async function fetchContentBatch(job,{pool,requests,fetched=new Map(),observe=()=>{}}) {
+    const controller=new AbortController(),signal=controller.signal;
+    const abort=()=>controller.abort(job.signal.reason);
+    job.signal.addEventListener('abort',abort,{once:true});
+    if(job.signal.aborted)abort();
+    const pending=[...new Map(job.objects.map(object=>[object.hash,object])).values()]
+        .filter(object=>!fetched.has(object.hash));
+    let next=0,failure;
+    async function worker(){
+        try{
+            while(next<pending.length){
+                signal.throwIfAborted();
+                const object=pending[next++];
+                const context={request:job.request,session:job.session,object:object.hash};
+                observe('module_requested',{...context,kind:job.priority});
+                const data=await pool.run(()=>{
+                    observe('module_fetch_started',{...context,kind:job.priority});
+                    return requests.get(object.hash,signal,{settleOnAbort:true});
+                },signal,{priority:job.priority,group:job.group});
+                signal.throwIfAborted();
+                fetched.set(object.hash,data);
+            }
+        }catch(error){
+            if(!signal.aborted){failure=error;controller.abort(error);}
+            throw error;
+        }
+    }
+    try{
+        const settled=await Promise.allSettled(Array.from({length:Math.min(4,pending.length)},worker));
+        if(failure!==undefined)throw failure;
+        signal.throwIfAborted();
+        const rejected=settled.find(result=>result.status==='rejected');
+        if(rejected)throw rejected.reason;
+        return job.objects.map(object=>fetched.get(object.hash));
+    }finally{job.signal.removeEventListener('abort',abort);}
 }
 
 export function parseRuntimeProgram(runtimeJson) {
@@ -334,7 +397,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     document.title=release.title;
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
-    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
+    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
     let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
     let ownerTimer=null,pendingElapsed=0;
@@ -453,7 +516,10 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
                             const buffer=await decodeJobs.get(id);signal.throwIfAborted();buffers.set(id,buffer);
                         }
                         observe('audio_decode_ready',context);
-                        if(unlocked)await unlocked;
+                        // Preparation itself pauses audio. A resume overtaken
+                        // by suspend may remain pending until preparation ends;
+                        // decoding/admission must not wait on that cycle.
+                        if(unlocked&&!audioPaused)await unlocked;
                         signal.throwIfAborted();
                         if(audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
                     }
@@ -490,11 +556,12 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         return queueContentSkip(job,envelope,{
             post,
             isActive:()=>!disposed,
-            skip:skipped=>{
-                observe('module_skipped',{request:job.request,session:job.session,code:skipped.code,bytes:skipped.totalBytes??0});
-                engine.content_skipped(job.request,skipped.code,contentDetail(skipped));
-            },
+            skip:skipped=>skipContent(job,skipped),
         });
+    }
+    function skipContent(job,skipped) {
+        observe('module_skipped',{request:job.request,session:job.session,code:skipped.code,bytes:skipped.totalBytes??0});
+        engine.content_skipped(job.request,skipped.code,contentDetail(skipped));
     }
     function promoteContent(request,session) {
         const job=contentPreparations.get(request);
@@ -507,12 +574,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     async function admitContentStage(job,totalBytes) {
         if(job.priority==='prefetch')return contentStaging.tryReserve(job.group,totalBytes);
-        // Demand can reclaim speculative reservations, but never releases a
-        // reservation while its consumer still retains response bytes.
-        for(const other of contentPreparations.values()){
-            if(other!==job&&other.priority==='prefetch'&&!other.signal.aborted)cancelContent(other.request);
-        }
-        return acquireRequiredContentStage(job,contentStaging,totalBytes);
+        return acquireRequiredContentStage(job,contentStaging,totalBytes,contentPreparations.values());
     }
     async function runContent(job) {
         const {request,session,group,signal}=job;
@@ -543,15 +605,8 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
                 bytes.length=0;
                 try{
                     job.state='fetching';
-                    for(const object of job.objects){
-                        let data=fetched.get(object.hash);
-                        if(!data){
-                            observe('module_requested',{request,session,object:object.hash,kind:job.priority});
-                            data=await resourcePool.run(()=>requests.get(object.hash,signal),signal,{priority:job.priority,group});
-                            fetched.set(object.hash,data);
-                        }
-                        bytes.push(data);signal.throwIfAborted();
-                    }
+                    bytes.push(...await fetchContentBatch(job,{pool:resourcePool,requests,fetched,observe}));
+                    signal.throwIfAborted();
                     job.state='delivering';
                     await post(job.terminal,()=>{
                         if(!signal.aborted&&engine.accepts_content(request)){
@@ -570,7 +625,8 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
                 }
             }
         }catch(error){
-            if(!signal.aborted&&!disposed)await post(job.terminal,()=>{
+            if(job.stageEviction)await postContentEviction(job,{post,isActive:()=>!disposed,skip:skipped=>skipContent(job,skipped)});
+            else if(!signal.aborted&&!disposed)await post(job.terminal,()=>{
                 observe('module_failed',{request,session,code:'E_MODULE_PREPARE'});
                 engine.content_failed(request,String(error));
             });
@@ -736,7 +792,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
-    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
+    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
     request(()=>read('profile',namespace),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});

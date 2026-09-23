@@ -8,7 +8,9 @@
     "test:browser": "playwright test",
     "test:browser:headed": "playwright test --headed",
     "test:host": "bun test ./tests/host",
-    "test:performance": "playwright test --config playwright.performance.config.js"
+    "test:performance": "node scripts/run-performance.mjs ci",
+    "test:performance:hardware": "node scripts/run-performance.mjs hardware",
+    "test:performance:smoke": "node scripts/run-performance.mjs smoke"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0"

@@ -3,6 +3,7 @@ use nir_compiler::{build, diagnostic};
 use nir_format::ReleaseManifest;
 use std::{
     fs,
+    io::Read,
     path::Path,
     sync::{Arc, Mutex},
     thread,
@@ -88,6 +89,16 @@ fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
         let source = candidate.join(&object.path);
         nir_content::verify(&fs::read(&source)?, hash)?;
         copy_atomic(&source, &out.join(&object.path))?;
+        let compressed = candidate.join(format!("{}.gz", object.path));
+        if compressed.try_exists()? {
+            let mut decoded = Vec::new();
+            flate2::read::MultiGzDecoder::new(fs::File::open(&compressed)?)
+                .take(object.bytes + 1)
+                .read_to_end(&mut decoded)?;
+            anyhow::ensure!(decoded.len() as u64 == object.bytes, "E_GZIP_SIZE");
+            nir_content::verify(&decoded, hash)?;
+            copy_atomic(&compressed, &out.join(format!("{}.gz", object.path)))?;
+        }
     }
     copy_atomic(&candidate.join(&release_path), &out.join(&release_path))?;
     for name in ["index.html", "bootstrap.js", "NOTICE.txt"] {
@@ -189,77 +200,140 @@ fn serve_inner(directory: &Path, port: u16, dev: Option<Arc<Mutex<DevStatus>>>) 
         root.display()
     );
     for request in server.incoming_requests() {
-        let raw = request.url().split('?').next().unwrap_or("/");
-        if let Some(dev) = &dev {
-            if raw == "/__nir_dev/status" || raw == "/__nir_dev/client.js" {
-                let (body, mime) = if raw.ends_with("status") {
-                    (dev.lock().unwrap().json().to_string(), "application/json")
-                } else {
-                    (
-                        include_str!("preview-client.js").into(),
-                        "text/javascript; charset=utf-8",
-                    )
-                };
-                let r = tiny_http::Response::from_string(body)
-                    .with_header(tiny_http::Header::from_bytes("Content-Type", mime).unwrap())
-                    .with_header(
-                        tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
-                    );
-                let _ = request.respond(r);
-                continue;
+        serve_request(request, &root, dev.as_ref())?;
+    }
+    Ok(())
+}
+
+// An explicit gzip quality overrides a wildcard, including gzip;q=0.
+fn accepts_gzip(value: &str) -> bool {
+    let mut gzip = None::<f32>;
+    let mut wildcard = None::<f32>;
+    for entry in value.split(',') {
+        let mut parts = entry.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let mut quality = 1.0_f32;
+        for parameter in parts {
+            if let Some((name, value)) = parameter.trim().split_once('=') {
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|q| q.is_finite() && (0.0..=1.0).contains(q))
+                        .unwrap_or(0.0);
+                }
             }
         }
-        let path = if raw == "/" {
-            "index.html"
+        let target = if coding.eq_ignore_ascii_case("gzip") {
+            &mut gzip
+        } else if coding == "*" {
+            &mut wildcard
         } else {
-            raw.trim_start_matches('/')
+            continue;
         };
-        let full = if raw.ends_with('/') && raw != "/" {
-            root.join(path).join("index.html")
-        } else {
-            root.join(path)
-        };
-        let safe =
-            !path.contains('%') && !path.contains('\\') && !path.split('/').any(|p| p == "..");
-        let resolved = if safe {
-            fs::canonicalize(&full).ok()
-        } else {
-            None
-        };
-        if let Some(file) = resolved.filter(|p| p.starts_with(&root) && p.is_file()) {
-            let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
-            let mime = match ext {
-                "html" => "text/html; charset=utf-8",
-                "js" => "text/javascript; charset=utf-8",
-                "json" => "application/json",
-                "txt" => "text/plain; charset=utf-8",
-                "wasm" => "application/wasm",
-                "png" => "image/png",
-                "wav" => "audio/wav",
-                "otf" => "font/otf",
-                _ => "application/octet-stream",
-            };
-            let cache = if path
-                .split('/')
-                .any(|part| matches!(part, "objects" | "releases"))
-            {
-                "public, max-age=31536000, immutable"
+        *target = Some(target.unwrap_or(0.0).max(quality));
+    }
+    gzip.or(wildcard).unwrap_or(0.0) > 0.0
+}
+
+fn serve_request(
+    request: tiny_http::Request,
+    root: &Path,
+    dev: Option<&Arc<Mutex<DevStatus>>>,
+) -> Result<()> {
+    let raw = request.url().split('?').next().unwrap_or("/");
+    if let Some(dev) = &dev {
+        if raw == "/__nir_dev/status" || raw == "/__nir_dev/client.js" {
+            let (body, mime) = if raw.ends_with("status") {
+                (dev.lock().unwrap().json().to_string(), "application/json")
             } else {
-                "no-cache"
+                (
+                    include_str!("preview-client.js").into(),
+                    "text/javascript; charset=utf-8",
+                )
             };
-            let mut r = if let Some(dev) = dev.as_ref().filter(|_| ext == "html") {
-                let release = dev.lock().unwrap().release.clone();
-                let html = fs::read_to_string(&file)?.replace("</body>", &format!("<script src=\"/__nir_dev/client.js\" data-release=\"{release}\"></script></body>"));
-                tiny_http::Response::from_string(html).boxed()
-            } else {
-                tiny_http::Response::from_file(fs::File::open(file)?).boxed()
-            };
-            for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
+            let r = tiny_http::Response::from_string(body)
+                .with_header(tiny_http::Header::from_bytes("Content-Type", mime).unwrap())
+                .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap());
             let _ = request.respond(r);
-        } else {
-            let _ = request
-                .respond(tiny_http::Response::from_string("Not found").with_status_code(404));
+            return Ok(());
         }
+    }
+    let path = if raw == "/" {
+        "index.html"
+    } else {
+        raw.trim_start_matches('/')
+    };
+    let full = if raw.ends_with('/') && raw != "/" {
+        root.join(path).join("index.html")
+    } else {
+        root.join(path)
+    };
+    let safe = !path.contains('%') && !path.contains('\\') && !path.split('/').any(|p| p == "..");
+    let resolved = if safe {
+        fs::canonicalize(&full).ok()
+    } else {
+        None
+    };
+    if let Some(file) = resolved.filter(|p| p.starts_with(&root) && p.is_file()) {
+        let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let mime = match ext {
+            "html" => "text/html; charset=utf-8",
+            "js" => "text/javascript; charset=utf-8",
+            "json" => "application/json",
+            "txt" => "text/plain; charset=utf-8",
+            "wasm" => "application/wasm",
+            "png" => "image/png",
+            "wav" => "audio/wav",
+            "otf" => "font/otf",
+            _ => "application/octet-stream",
+        };
+        let cache = if path
+            .split('/')
+            .any(|part| matches!(part, "objects" | "releases"))
+        {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        let negotiable =
+            path.split('/').any(|part| part == "objects") && matches!(ext, "wasm" | "js" | "json");
+        let accepted = request
+            .headers()
+            .iter()
+            .filter(|header| header.field.equiv("Accept-Encoding"))
+            .map(|header| header.value.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let gzip = negotiable
+            .then(|| {
+                full.with_file_name(format!(
+                    "{}.gz",
+                    full.file_name().unwrap().to_string_lossy()
+                ))
+            })
+            .filter(|_| accepts_gzip(&accepted))
+            .and_then(|sidecar| fs::canonicalize(sidecar).ok())
+            .filter(|sidecar| sidecar.starts_with(root) && sidecar.is_file());
+        let mut r = if let Some(dev) = dev.as_ref().filter(|_| ext == "html") {
+            let release = dev.lock().unwrap().release.clone();
+            let html = fs::read_to_string(&file)?.replace("</body>", &format!("<script src=\"/__nir_dev/client.js\" data-release=\"{release}\"></script></body>"));
+            tiny_http::Response::from_string(html).boxed()
+        } else {
+            tiny_http::Response::from_file(fs::File::open(gzip.as_ref().unwrap_or(&file))?).boxed()
+        };
+        for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
+        if negotiable {
+            r.add_header(tiny_http::Header::from_bytes("Vary", "Accept-Encoding").unwrap());
+        }
+        if gzip.is_some() {
+            r.add_header(tiny_http::Header::from_bytes("Content-Encoding", "gzip").unwrap());
+        }
+        let _ = request.respond(r);
+    } else {
+        let _ =
+            request.respond(tiny_http::Response::from_string("Not found").with_status_code(404));
     }
     Ok(())
 }
@@ -267,6 +341,102 @@ fn serve_inner(directory: &Path, port: u16, dev: Option<Arc<Mutex<DevStatus>>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write, net::TcpStream};
+
+    fn get(root: &Path, path: &str, encoding: Option<&str>) -> (String, Vec<u8>) {
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let root = root.to_path_buf();
+        let worker = thread::spawn(move || {
+            let request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            serve_request(request, &root, None).unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let encoding = encoding
+            .map(|v| format!("Accept-Encoding: {v}\r\n"))
+            .unwrap_or_default();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{encoding}\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(response[..split].to_vec())
+                .unwrap()
+                .to_lowercase(),
+            response[split + 4..].to_vec(),
+        )
+    }
+
+    #[test]
+    fn gzip_negotiation_preserves_mime_cache_length_and_identity() {
+        let t = Temp::new();
+        fs::create_dir(t.0.join("objects")).unwrap();
+        let original = b"sample module content ".repeat(100);
+        let mut encoder = flate2::GzBuilder::new()
+            .mtime(0)
+            .write(Vec::new(), flate2::Compression::new(6));
+        encoder.write_all(&original).unwrap();
+        let gzip = encoder.finish().unwrap();
+        fs::write(t.0.join("objects/test.json"), &original).unwrap();
+        fs::write(t.0.join("objects/test.json.gz"), &gzip).unwrap();
+        for encoding in ["gzip", "br, gzip;q=0.5", "*", "GZIP;Q=1"] {
+            let (headers, body) = get(&t.0, "/objects/test.json", Some(encoding));
+            assert!(headers.contains("content-encoding: gzip"));
+            assert!(headers.contains("content-type: application/json"));
+            assert!(headers.contains("vary: accept-encoding"));
+            assert!(headers.contains("cache-control: public, max-age=31536000, immutable"));
+            assert!(headers.contains(&format!("content-length: {}", gzip.len())));
+            assert_eq!(body, gzip);
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(body.as_slice())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, original);
+        }
+        for encoding in [
+            None,
+            Some("br"),
+            Some("gzip;q=0, *;q=1"),
+            Some("gzip;q=NaN"),
+            Some("gzip;q=2"),
+        ] {
+            let (headers, body) = get(&t.0, "/objects/test.json", encoding);
+            assert!(!headers.contains("content-encoding:"));
+            assert!(headers.contains("vary: accept-encoding"));
+            assert_eq!(body, original);
+        }
+        fs::remove_file(t.0.join("objects/test.json.gz")).unwrap();
+        assert_eq!(get(&t.0, "/objects/test.json", Some("gzip")).1, original);
+        for path in [
+            "/../objects/test.json",
+            "/%2e%2e/objects/test.json",
+            "/objects/missing.json",
+        ] {
+            assert!(get(&t.0, path, Some("gzip")).0.starts_with("http/1.1 404"));
+        }
+        #[cfg(unix)]
+        {
+            let outside = Temp::new();
+            fs::write(outside.0.join("secret"), "outside").unwrap();
+            std::os::unix::fs::symlink(outside.0.join("secret"), t.0.join("objects/test.json.gz"))
+                .unwrap();
+            assert_eq!(get(&t.0, "/objects/test.json", Some("gzip")).1, original);
+        }
+    }
     struct Temp(std::path::PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -333,6 +503,19 @@ mod tests {
             &fs::read(candidate.join(format!("releases/{}.json", report.release))).unwrap(),
         )
         .unwrap();
+        let compressed = r
+            .objects
+            .values()
+            .find_map(|o| {
+                let p = candidate.join(format!("{}.gz", o.path));
+                p.exists().then_some(p)
+            })
+            .unwrap();
+        let original_gzip = fs::read(&compressed).unwrap();
+        fs::write(&compressed, b"corrupt gzip").unwrap();
+        assert!(publish(&candidate, &live, &report.release).is_err());
+        assert_eq!(fs::read(live.join("channels/stable.json")).unwrap(), old);
+        fs::write(compressed, original_gzip).unwrap();
         fs::write(
             candidate.join(&r.objects.values().next().unwrap().path),
             "corrupt",

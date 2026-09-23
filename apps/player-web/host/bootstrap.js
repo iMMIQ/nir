@@ -1,6 +1,6 @@
 // Mutable entry point. All session components come from one immutable release graph.
 const startupTrace=[];
-const mark=stage=>startupTrace.push({stage,start_us:String(Math.round(performance.now()*1000)),end_us:String(Math.round(performance.now()*1000))});
+const mark=(stage,fields={})=>startupTrace.push({stage,start_us:String(Math.round(performance.now()*1000)),end_us:String(Math.round(performance.now()*1000)),...fields});
 mark('bootstrap_started');
 const base = new URL('./', import.meta.url);
 const message = document.querySelector('#shell-message');
@@ -16,16 +16,34 @@ try {
     if(release.format!==1||!release.engine||!release.objects)throw new Error('E_RELEASE_SCHEMA');
     mark('release_verified');
     const objectUrl=(id)=>{const o=release.objects[id];if(!o||!(/^[0-9a-f]{64}$/).test(id)||!o.path.startsWith(`objects/${id}.`)||o.path.includes('..')||o.path.includes(':')||o.path.includes('\\'))throw new Error('E_OBJECT_REFERENCE');return new URL(o.path,base);};
-    const fetchObject=async(id,signal)=>{const o=release.objects[id],url=objectUrl(id);const r=await fetch(url,{signal});if(!r.ok)throw Object.assign(new Error(`E_HTTP: ${r.status}`),{code:'E_HTTP'});const bytes=await r.arrayBuffer();if(bytes.byteLength!==o.bytes||await hash(bytes)!==id)throw Object.assign(new Error(`E_OBJECT_DIGEST: ${id}`),{code:'E_OBJECT_DIGEST'});return bytes;};
+    const fetchObject=async(id,signal,observe=()=>{})=>{
+        const o=release.objects[id],url=objectUrl(id),start_us=String(Math.round(performance.now()*1000));
+        const r=await fetch(url,{signal});if(!r.ok)throw Object.assign(new Error(`E_HTTP: ${r.status}`),{code:'E_HTTP'});
+        const bytes=await r.arrayBuffer(),downloaded_us=String(Math.round(performance.now()*1000));
+        observe('object_downloaded',{object:id,bytes:bytes.byteLength,start_us,end_us:downloaded_us});
+        if(bytes.byteLength!==o.bytes||await hash(bytes)!==id)throw Object.assign(new Error(`E_OBJECT_DIGEST: ${id}`),{code:'E_OBJECT_DIGEST'});
+        observe('object_verified',{object:id,bytes:bytes.byteLength,start_us:downloaded_us,end_us:String(Math.round(performance.now()*1000))});
+        return bytes;
+    };
     // Small code objects are verified before import. Immutable URLs and same-origin policy
     // bind the subsequent browser import to the same publisher-controlled object graph.
-    await Promise.all([fetchObject(release.engine.js),fetchObject(release.engine.host)]);
-    const [wasm,host,executable]=await Promise.all([import(objectUrl(release.engine.js).href),import(objectUrl(release.engine.host).href),fetchObject(release.program)]);
-    const runtimeRoot=JSON.parse(new TextDecoder().decode(executable));
-    if(runtimeRoot.format!==2||!runtimeRoot.program||typeof runtimeRoot.program!=='object')throw new Error('E_RUNTIME_VERSION: expected RuntimeExecutable v2');
-    // Verify the actual WASM bytes used for instantiation, including a corrupted cache.
-    const wasmBytes=await fetchObject(release.engine.wasm);
-    mark('wasm_verified');
+    const controller=new AbortController(),verified=id=>fetchObject(id,controller.signal,mark);
+    // Start all four downloads once the release is verified, before any import.
+    const tasks=[
+        verified(release.engine.js).then(()=>import(objectUrl(release.engine.js).href)),
+        verified(release.engine.host).then(()=>import(objectUrl(release.engine.host).href)),
+        verified(release.program).then(bytes=>{
+            const root=JSON.parse(new TextDecoder().decode(bytes));
+            if(root.format!==2||!root.program||typeof root.program!=='object')throw new Error('E_RUNTIME_VERSION: expected RuntimeExecutable v2');
+            return bytes;
+        }),
+        verified(release.engine.wasm).then(bytes=>{mark('wasm_verified');return bytes;}),
+    ];
+    let components;
+    try {components=await Promise.all(tasks);}
+    catch(error){controller.abort(error);await Promise.allSettled(tasks);throw error;}
+    const [wasm,host,executable,wasmBytes]=components;
+    // Instantiate only the verified bytes, including when HTTP cache supplied them.
     await wasm.default({module_or_path:wasmBytes});
     mark('wasm_initialized');
     await host.start({wasm,release,releaseDigest:channel.release,executable:new TextDecoder().decode(executable),fetchObject,fail,startupTrace});

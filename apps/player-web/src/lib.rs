@@ -441,7 +441,12 @@ impl Engine {
             self.player.viewport_changed().map_err(js)?;
             self.pump(vec![])?;
         }
-        if self.ready {
+        // Title changes immediately, before its replacement media is ready.
+        // Other screens still need layout updates while a cue is preparing
+        // (history, scrolling and a dialogue paused at an authored gate).
+        let waiting_for_title =
+            self.player.screen == nir_presentation::Screen::Title && self.player.is_loading();
+        if self.ready && !waiting_for_title {
             self.packet = self.reading.project(
                 &self.player.model(),
                 (

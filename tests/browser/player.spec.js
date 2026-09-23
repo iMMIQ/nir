@@ -252,6 +252,20 @@ test('actual device loss during a dissolve preserves progress', async ({ page })
   expect(after.tick_us).toBe(before.tick_us);
 });
 
+test('startup downloads WASM and program while verified script imports are blocked', async ({ page }) => {
+  let unblock;
+  const blocked=new Promise(resolve=>{unblock=resolve;});
+  await page.route('**/objects/*.js',async route=>{await blocked;await route.continue();});
+  const wasm=page.waitForRequest(request=>new URL(request.url()).pathname.endsWith('.wasm'));
+  const program=page.waitForRequest(request=>/\/objects\/.*\.json$/.test(new URL(request.url()).pathname));
+  try {
+    await page.goto('/?test=1',{waitUntil:'commit'});
+    await Promise.all([wasm,program]);
+    expect(await page.evaluate(()=>!!window.__nir)).toBe(false);
+  } finally {unblock();}
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+});
+
 test('corrupt WASM is rejected before instantiation', async ({ page }) => {
   await page.route('**/objects/*.wasm',async route=>{
     const response=await route.fetch();const bytes=await response.body();bytes[bytes.length-1]^=1;
@@ -260,6 +274,25 @@ test('corrupt WASM is rejected before instantiation', async ({ page }) => {
   await page.goto('/?test=1');
   await expect(page.locator('#shell-message')).toContainText('E_OBJECT_DIGEST');
   expect(await page.evaluate(()=>!!window.__nir)).toBe(false);
+});
+
+test('gzip transport verifies decoded bytes and identity fallback still starts', async ({ page }) => {
+  const wasmResponse=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('.wasm'));
+  await boot(page);
+  const response=await wasmResponse;
+  expect(response.headers()['content-encoding']).toBe('gzip');
+  expect(response.headers()['vary']).toContain('Accept-Encoding');
+  expect((await response.body()).subarray(0,4)).toEqual(Buffer.from([0,97,115,109]));
+  // Chromium owns Accept-Encoding and may replace a continue() override.
+  // Negotiate identity through the HTTP client, then deliver that response.
+  await page.route('**/objects/*',async route=>{
+    const response=await route.fetch({headers:{...route.request().headers(),'accept-encoding':'identity'}});
+    expect(response.headers()['content-encoding']).toBeUndefined();
+    await route.fulfill({response});
+  });
+  const identityResponse=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('.wasm'));
+  await boot(page);
+  expect((await identityResponse).headers()['content-encoding']).toBeUndefined();
 });
 
 test('save export/import and tamper rejection preserve independent preferences',async({page})=>{
@@ -332,6 +365,23 @@ test('owner inbox defers actions, drains bursts and keeps turn work bounded', as
   expect(result.metrics.uploadSteps).toBeGreaterThan(1);
 });
 
+test('paused preparation does not wait for an outstanding audio resume promise',async({page})=>{
+  await page.addInitScript(()=>{
+    const resume=AudioContext.prototype.resume;
+    window.__resumeCalls=0;
+    AudioContext.prototype.resume=function(){
+      window.__resumeCalls++;
+      resume.call(this).catch(()=>{});
+      return new Promise(()=>{});
+    };
+  });
+  await boot(page);await start(page);
+  expect(await page.evaluate(()=>window.__resumeCalls)).toBeGreaterThan(0);
+  expect((await state(page)).error).toBeNull();
+  await act(page,{type:'title'});
+  await page.waitForFunction(()=>window.__nir.state().screen==='Title'&&!window.__nir.state().loading&&window.__nir.metrics.activeRequests===0);
+});
+
 test('leaving preparation cancels its fetch and a new request still succeeds', async ({ page }) => {
   await boot(page);
   let intercepted=false,release;
@@ -343,6 +393,8 @@ test('leaving preparation cancels its fetch and a new request still succeeds', a
   });
   await page.keyboard.press('Space');
   await expect.poll(()=>intercepted).toBe(true);
+  const preparing=await state(page);
+  expect(preparing.loading).toBe(true);
   await act(page,{type:'title'});
   await page.waitForFunction(()=>window.__nir.state().screen==='Title'&&!window.__nir.state().loading);
   await expect.poll(()=>cancelled.length).toBeGreaterThan(0);

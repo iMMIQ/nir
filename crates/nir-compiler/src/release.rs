@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +88,23 @@ fn object(
         nir_content::verify(&fs::read(&path)?, &hash)?;
     } else {
         fs::write(&path, bytes)?;
+    }
+    // Transport variants never participate in the immutable object identity.
+    if matches!(ext, "wasm" | "js" | "json") {
+        let mut encoder = flate2::GzBuilder::new()
+            .mtime(0)
+            .write(Vec::new(), flate2::Compression::new(6));
+        encoder.write_all(bytes)?;
+        let compressed = encoder.finish()?;
+        let sidecar = out.join(format!("{rel}.gz"));
+        if compressed.len() < bytes.len() {
+            // Replace atomically: a preview may be serving this same output.
+            let temporary = out.join(format!("{rel}.gz.next"));
+            fs::write(&temporary, compressed)?;
+            fs::rename(temporary, sidecar)?;
+        } else if sidecar.try_exists()? {
+            fs::remove_file(sidecar)?;
+        }
     }
     objects.insert(
         hash.clone(),
@@ -1272,4 +1290,42 @@ pub fn default_sdk() -> PathBuf {
         }
     }
     PathBuf::from("dist/sdk")
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn gzip_is_reproducible_and_preserves_object_identity() {
+        let out = tempfile::tempdir().unwrap();
+        fs::create_dir(out.path().join("objects")).unwrap();
+        let mut objects = BTreeMap::new();
+        let bytes = b"compressible release content ".repeat(100);
+        let hash = object(out.path(), &mut objects, &bytes, "json", "application/json").unwrap();
+        let descriptor = &objects[&hash];
+        assert_eq!(descriptor.bytes, bytes.len() as u64);
+        let sidecar = out.path().join(format!("{}.gz", descriptor.path));
+        let first = fs::read(&sidecar).unwrap();
+        assert!(first.len() < bytes.len());
+        assert_eq!(&first[4..8], &[0; 4]);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(first.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, bytes);
+        object(out.path(), &mut objects, &bytes, "json", "application/json").unwrap();
+        assert_eq!(fs::read(sidecar).unwrap(), first);
+        let tiny = object(out.path(), &mut objects, b"{}", "json", "application/json").unwrap();
+        assert!(!out
+            .path()
+            .join(format!("{}.gz", objects[&tiny].path))
+            .exists());
+        let media = object(out.path(), &mut objects, &bytes, "png", "image/png").unwrap();
+        assert!(!out
+            .path()
+            .join(format!("{}.gz", objects[&media].path))
+            .exists());
+    }
 }
