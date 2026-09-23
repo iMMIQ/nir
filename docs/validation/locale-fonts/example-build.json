@@ -1,0 +1,213 @@
+{
+  "release": "ec7adbcd18425e43b5b22589c06a1bf5e72cea3a5cd7d47928d070d99447b263",
+  "game_id": "org.nir.rain-letters",
+  "total_bytes": 7340193,
+  "objects": 13,
+  "resources": [
+    "actor.aki",
+    "audio.bell",
+    "audio.bgm",
+    "audio.voice",
+    "bg.river",
+    "bg.station",
+    "font.latin",
+    "font.reader"
+  ],
+  "excluded_resources": [],
+  "provenance": {
+    "actor.aki": "CC0-1.0",
+    "audio.bell": "CC0-1.0",
+    "audio.bgm": "CC0-1.0",
+    "audio.voice": "CC0-1.0",
+    "bg.river": "CC0-1.0",
+    "bg.station": "CC0-1.0",
+    "font.latin": "OFL-1.1; ABeeZee Project Authors",
+    "font.reader": "OFL-1.1"
+  },
+  "engine_build": "84f3d19562b1a440cd0520f49f57f7782b2adad4804ccd26f5b679caba90f95f",
+  "resolved_config": {
+    "engine.api": {
+      "value": "nir-player/0.1",
+      "source": "game.toml#/engine/api"
+    },
+    "engine.capability_profile": {
+      "value": "web-v1",
+      "source": "game.toml#/engine/capability_profile"
+    },
+    "engine.runtime_preset": {
+      "value": "web-standard",
+      "source": "game.toml#/engine/runtime_preset"
+    },
+    "game.id": {
+      "value": "org.nir.rain-letters",
+      "source": "game.toml#/game/id"
+    },
+    "game.slug": {
+      "value": "rain-letters",
+      "source": "game.toml#/game/slug"
+    },
+    "game.source_locale": {
+      "value": "zh-Hans",
+      "source": "game.toml#/game/source_locale"
+    },
+    "game.title": {
+      "value": "雨后书简 · Rain Letters",
+      "source": "game.toml#/game/title"
+    },
+    "game.title_scene": {
+      "value": "station",
+      "source": "game.toml#/game/title_scene"
+    },
+    "game.version": {
+      "value": "0.1.0",
+      "source": "game.toml#/game/version"
+    },
+    "player.auto_delay_us": {
+      "value": "1200000",
+      "source": "config/player.toml#/defaults/auto_delay_us"
+    },
+    "player.bgm_volume": {
+      "value": 0.30000001192092896,
+      "source": "config/player.toml#/defaults/bgm_volume"
+    },
+    "player.font_scale": {
+      "value": 1.0,
+      "source": "config/player.toml#/defaults/font_scale"
+    },
+    "player.reduced_motion": {
+      "value": false,
+      "source": "config/player.toml#/defaults/reduced_motion"
+    },
+    "player.sfx_volume": {
+      "value": 0.5,
+      "source": "config/player.toml#/defaults/sfx_volume"
+    },
+    "player.voice_volume": {
+      "value": 0.800000011920929,
+      "source": "config/player.toml#/defaults/voice_volume"
+    },
+    "stage.height": {
+      "value": 720,
+      "source": "game.toml#/stage/height"
+    },
+    "stage.width": {
+      "value": 1280,
+      "source": "game.toml#/stage/width"
+    },
+    "theme.base": {
+      "value": "builtin.reader",
+      "source": "themes/rain/theme.toml#/base"
+    },
+    "theme.choice.item_height": {
+      "value": 58.0,
+      "source": "themes/rain/theme.toml#/choice/item_height"
+    },
+    "theme.choice.width": {
+      "value": 520.0,
+      "source": "themes/rain/theme.toml#/choice/width"
+    },
+    "theme.dialogue.font_size": {
+      "value": 23.0,
+      "source": "themes/rain/theme.toml#/dialogue/font_size"
+    },
+    "theme.dialogue.height": {
+      "value": 240.0,
+      "source": "themes/rain/theme.toml#/dialogue/height"
+    },
+    "theme.dialogue.padding": {
+      "value": 24.0,
+      "source": "themes/rain/theme.toml#/dialogue/padding"
+    },
+    "theme.id": {
+      "value": "theme.rain",
+      "source": "themes/rain/theme.toml#/id"
+    },
+    "theme.slots.choice.main": {
+      "value": "builtin.choice",
+      "source": "themes/rain/theme.toml#/slots/choice.main"
+    },
+    "theme.slots.dialogue.main": {
+      "value": "builtin.dialogue",
+      "source": "themes/rain/theme.toml#/slots/dialogue.main"
+    },
+    "theme.tokens.accent": {
+      "value": [
+        0.8299999833106995,
+        0.7300000190734863,
+        0.47999998927116394,
+        1.0
+      ],
+      "source": "themes/rain/tokens.json#/accent"
+    },
+    "theme.tokens.background": {
+      "value": [
+        0.03999999910593033,
+        0.07500000298023224,
+        0.09000000357627869,
+        1.0
+      ],
+      "source": "themes/rain/tokens.json#/background"
+    },
+    "theme.tokens.muted": {
+      "value": [
+        0.5799999833106995,
+        0.6899999976158142,
+        0.6899999976158142,
+        1.0
+      ],
+      "source": "themes/rain/tokens.json#/muted"
+    },
+    "theme.tokens.panel": {
+      "value": [
+        0.05999999865889549,
+        0.10499999672174454,
+        0.11999999731779099,
+        0.9700000286102295
+      ],
+      "source": "themes/rain/tokens.json#/panel"
+    },
+    "theme.tokens.text": {
+      "value": [
+        0.9300000071525574,
+        0.9399999976158142,
+        0.8799999952316284,
+        1.0
+      ],
+      "source": "themes/rain/tokens.json#/text"
+    }
+  },
+  "fonts": {
+    "font.latin": {
+      "tool": "nir-font/1;hb-subset/0.3.0;harfbuzz/8.2.2;unicode-normalization/0.1.25",
+      "mode": "subset",
+      "face_index": 0,
+      "source": "assets/fonts/ABeeZee-Regular.ttf",
+      "source_digest": "2901c8df256648cc2bb2e3afb381cb8d28e65ed3dbe11de20695ae4d5ffdeda9",
+      "source_bytes": 46016,
+      "object": "d45a2fdd2cbfe705919a9fc09050db9e9c6e7df70081a728fbe3a75a894d88c7",
+      "output_bytes": 25736,
+      "requested_characters": 106,
+      "retained_characters": 99,
+      "cache_key": "8e8e96165c08e0f14cb57b05f8e026bf13de05a6d9c4120c66052817a7a1b0c3",
+      "cache_hit": true,
+      "license": "assets/fonts/ABeeZee-OFL.txt",
+      "license_digest": "6a93093e698838e9f066fe2267e5e01d1f67b6c56ea939895ff36957875e23d0"
+    },
+    "font.reader": {
+      "tool": "nir-font/1;hb-subset/0.3.0;harfbuzz/8.2.2;unicode-normalization/0.1.25",
+      "mode": "subset",
+      "face_index": 0,
+      "source": "assets/source/reader.otf",
+      "source_digest": "64a913c415053556f4c75aaf6b219016ba0804505af2ff999c0c6758208dc7ef",
+      "source_bytes": 155228,
+      "object": "849e759b73650ae90d3f307a05c5581349f3a102a6ee66698dda72becb7eff84",
+      "output_bytes": 127824,
+      "requested_characters": 285,
+      "retained_characters": 285,
+      "cache_key": "5edef5ca9487b09348e004a7b435b34322ab8154c7b5ce37a8a6ead81b61c4ab",
+      "cache_hit": true,
+      "license": "assets/fonts/Noto-OFL.txt",
+      "license_digest": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    }
+  }
+}

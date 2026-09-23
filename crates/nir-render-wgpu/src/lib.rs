@@ -465,6 +465,16 @@ impl Renderer {
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
         self.text.layout(p);
+        if let Some(error) = self.text.missing_font.take() {
+            return Err(
+                Diagnostic::new("E_FONT_PLAN", "presentation.prepare", error).classified(
+                    ErrorDomain::Render,
+                    "prepare",
+                    "font-plan",
+                    vec![Recovery::KeepCurrent],
+                ),
+            );
+        }
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -474,6 +484,9 @@ impl Renderer {
         );
         let mut areas = vec![];
         for r in &p.texts {
+            if r.preflight_only {
+                continue;
+            }
             let key = TextEngine::key(r);
             let b = &self.text.buffers[&key];
             let color = Color::rgba(

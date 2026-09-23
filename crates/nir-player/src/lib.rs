@@ -61,6 +61,11 @@ pub enum AppCommand {
     PreparePresentation {
         request: u32,
     },
+    PrepareLocale {
+        request: u32,
+        ui_locale: String,
+        text_locale: String,
+    },
     AudioStart {
         task: u32,
         asset: String,
@@ -130,6 +135,13 @@ pub enum AppEvent {
     PresentationReady {
         request: u32,
     },
+    LocaleReady {
+        request: u32,
+    },
+    LocaleFailed {
+        request: u32,
+        message: String,
+    },
     AudioEnded {
         task: u32,
         session: u32,
@@ -179,6 +191,13 @@ struct Preparation {
     preflight: bool,
     failed: bool,
 }
+#[derive(Debug, Clone)]
+struct LocaleCandidate {
+    request: u32,
+    ui_locale: String,
+    text_locale: String,
+    preflight: bool,
+}
 pub struct Player {
     messages: nir_presentation::Messages,
     core: Core,
@@ -188,6 +207,11 @@ pub struct Player {
     pub screen: Screen,
     return_screen: Screen,
     pub preferences: Preferences,
+    pub effective_ui_locale: String,
+    pub effective_text_locale: String,
+    locale_candidate: Option<LocaleCandidate>,
+    locale_job: Option<PrepareJob>,
+    locale_error: Option<String>,
     pub generation: Generation,
     pub status: String,
     pub error: Option<String>,
@@ -217,7 +241,8 @@ pub struct Player {
 impl Player {
     pub fn new(program: Program, release: String, title: String) -> Result<Self> {
         let validated = ValidatedProgram::new(program)?;
-        let locale = validated.program().default_locale.clone();
+        let locale = validated.program().locale_config.default_text.clone();
+        let ui_locale = validated.program().locale_config.default_ui.clone();
         let core = Core::new(validated.clone(), release.clone(), locale.clone())?;
         let ledger = BudgetLedger::new(128 * 1024 * 1024);
         let _surface_budget = ledger.reserve(&BTreeMap::from([(
@@ -226,7 +251,10 @@ impl Player {
                 + 8 * 1024 * 1024
                 + 32 * 1024 * 1024,
         )]))?;
-        let preferences = validated.program().player.preferences(locale);
+        let preferences = validated
+            .program()
+            .player
+            .preferences(ui_locale.clone(), locale.clone());
         let mut p = Self {
             messages: nir_presentation::Messages::default(),
             core,
@@ -236,6 +264,11 @@ impl Player {
             screen: Screen::Title,
             return_screen: Screen::Title,
             preferences,
+            effective_ui_locale: ui_locale,
+            effective_text_locale: locale,
+            locale_candidate: None,
+            locale_job: None,
+            locale_error: None,
             generation: Generation {
                 session: 1,
                 device: 1,
@@ -288,6 +321,174 @@ impl Player {
     }
     pub fn core(&self) -> &Core {
         &self.core
+    }
+    pub fn locale_preview(&self, request: u32) -> Option<UiModel> {
+        let candidate = self
+            .locale_candidate
+            .as_ref()
+            .filter(|c| c.request == request)?;
+        let mut model = self.model_for_locale(&self.core, self.screen, &candidate.ui_locale);
+        model.locale_pending = true;
+        let ui_plan = &self.core.program().locale_config.ui[&candidate.ui_locale];
+        let text_plan = &self.core.program().locale_config.text[&candidate.text_locale];
+        model.text_locale = candidate.text_locale.clone();
+        model.text_fonts = text_plan.fonts.clone();
+        model.text_font_plan_digest = text_plan.digest.clone();
+        let mut preflight_texts = Vec::new();
+        let mut append = |text: String, locale: &str, fonts: &[String], digest: &str| {
+            preflight_texts.push(nir_presentation::TextRun {
+                text,
+                visible: None,
+                x: -10_000.,
+                y: -10_000.,
+                width: 4096.,
+                height: 64.,
+                size: 18.,
+                color: [0., 0., 0., 0.],
+                emphasis: vec![],
+                scroll: 0.,
+                clip: None,
+                region: None,
+                locale: locale.into(),
+                font_assets: fonts.to_vec(),
+                font_plan_digest: digest.into(),
+                preflight_only: true,
+            });
+        };
+        for text in self.messages.preflight(&candidate.ui_locale) {
+            append(text, &candidate.ui_locale, &ui_plan.fonts, &ui_plan.digest);
+        }
+        if let Some(docs) = self.core.program().locales.get(&candidate.text_locale) {
+            for doc in docs.values() {
+                let mut text = String::new();
+                for span in &doc.spans {
+                    match span {
+                        Span::Text { text: value, .. } => text.push_str(value),
+                        Span::Break { .. } => text.push('\n'),
+                        Span::Gate { .. } => {}
+                        Span::Param { name, .. } => {
+                            if let Some(value) = self
+                                .core
+                                .state()
+                                .variables
+                                .get(name)
+                                .or_else(|| self.core.program().variables.get(name))
+                            {
+                                match value {
+                                    Value::Bool(value) => {
+                                        text.push_str(if *value { "true" } else { "false" })
+                                    }
+                                    Value::I32(value) => text.push_str(&value.to_string()),
+                                    Value::String(value) => text.push_str(value),
+                                }
+                            }
+                        }
+                    }
+                }
+                append(
+                    text,
+                    &candidate.text_locale,
+                    &text_plan.fonts,
+                    &text_plan.digest,
+                );
+            }
+        }
+        model.preflight_texts = preflight_texts;
+        Some(model)
+    }
+    pub fn accepts_locale(&self, request: u32) -> bool {
+        self.locale_error.is_none()
+            && self
+                .locale_candidate
+                .as_ref()
+                .is_some_and(|c| c.request == request)
+    }
+    pub fn accepts_resource(&self, request: u32) -> bool {
+        self.accepts(request) || (self.accepts_locale(request) && self.locale_job.is_some())
+    }
+    pub fn locale_pending(&self) -> bool {
+        self.locale_candidate.is_some() && self.locale_error.is_none()
+    }
+    fn invalidate_locale_candidate(&mut self) {
+        if let Some(candidate) = self.locale_candidate.take() {
+            self.commands.push(AppCommand::CancelAssets {
+                request: candidate.request,
+            });
+        }
+        self.locale_job = None;
+    }
+    fn locale_failed(&mut self, request: u32, message: String) {
+        if !self.accepts_locale(request) {
+            return;
+        }
+        self.locale_job = None;
+        self.locale_error = Some(message);
+        self.pauses.remove("locale");
+        self.commands.push(AppCommand::CancelAssets { request });
+        self.status = self
+            .messages
+            .text(&self.effective_ui_locale, "language-failed");
+    }
+    fn start_locale_switch(&mut self) -> Result<()> {
+        let config = &self.core.program().locale_config;
+        if !config.ui.contains_key(&self.preferences.ui_locale)
+            || !config.text.contains_key(&self.preferences.text_locale)
+        {
+            return Err(Diagnostic::new(
+                "E_LOCALE",
+                "preferences",
+                "unsupported UI or text locale",
+            ));
+        }
+        if self.preferences.ui_locale == self.effective_ui_locale
+            && self.preferences.text_locale == self.effective_text_locale
+        {
+            self.invalidate_locale_candidate();
+            self.locale_error = None;
+            self.pauses.remove("locale");
+            return Ok(());
+        }
+        let fonts: BTreeSet<_> = config.ui[&self.preferences.ui_locale]
+            .fonts
+            .iter()
+            .chain(&config.text[&self.preferences.text_locale].fonts)
+            .cloned()
+            .collect();
+        self.invalidate_locale_candidate();
+        self.request = self.request.checked_add(1).ok_or_else(|| {
+            Diagnostic::new("E_LIMIT", "locale", "locale request counter overflow")
+        })?;
+        let candidate = LocaleCandidate {
+            request: self.request,
+            ui_locale: self.preferences.ui_locale.clone(),
+            text_locale: self.preferences.text_locale.clone(),
+            preflight: false,
+        };
+        self.locale_candidate = Some(candidate.clone());
+        self.locale_error = None;
+        self.pauses.insert("locale".into());
+        let costs = self.costs(&fonts)?;
+        match PrepareJob::new(candidate.request, self.generation, costs, &self.ledger) {
+            Ok(job) => {
+                self.locale_job = Some(job);
+                self.commands.push(AppCommand::GetAssets {
+                    request: candidate.request,
+                    session: self.generation.session,
+                    device: self.generation.device,
+                    assets: fonts.into_iter().collect(),
+                });
+            }
+            Err(error) => self.locale_failed(candidate.request, error.to_string()),
+        }
+        Ok(())
+    }
+    fn cancel_locale_switch(&mut self) {
+        self.invalidate_locale_candidate();
+        self.locale_error = None;
+        self.pauses.remove("locale");
+        self.preferences.ui_locale = self.effective_ui_locale.clone();
+        self.preferences.text_locale = self.effective_text_locale.clone();
+        self.persist_preferences();
     }
     pub fn current_interaction(&self) -> u32 {
         self.core
@@ -443,7 +644,7 @@ impl Player {
         details.release = Some(self.release.clone());
         details.session.get_or_insert(self.generation.session);
         details.device = Some(self.generation.device);
-        let message = self.messages.diagnostic(&d, &self.preferences.locale);
+        let message = self.messages.diagnostic(&d, &self.effective_ui_locale);
         self.status = message.clone();
         if blocking {
             self.error = Some(message);
@@ -676,7 +877,7 @@ impl Player {
                 }
             }
             AppEvent::AssetReady { request, asset } => {
-                if !self.accepts(request) {
+                if !self.accepts_resource(request) {
                     self.observe("stale_asset_discarded", Some(request));
                 }
                 if let Some(p) = self
@@ -691,18 +892,71 @@ impl Player {
                             .push(AppCommand::PreparePresentation { request });
                     }
                 }
+                if let (Some(candidate), Some(job)) =
+                    (self.locale_candidate.as_mut(), self.locale_job.as_mut())
+                {
+                    if candidate.request == request && self.locale_error.is_none() {
+                        job.ready(&asset, self.generation);
+                        if job.missing.is_empty() && !candidate.preflight {
+                            candidate.preflight = true;
+                            self.commands.push(AppCommand::PrepareLocale {
+                                request,
+                                ui_locale: candidate.ui_locale.clone(),
+                                text_locale: candidate.text_locale.clone(),
+                            });
+                        }
+                    }
+                }
             }
             AppEvent::AssetFailed { request, message } => {
-                self.asset_fault(
-                    request,
-                    Diagnostic::new("E_PREPARE", self.core.location(), message),
-                );
+                if self.accepts_locale(request) {
+                    self.locale_failed(request, message);
+                } else {
+                    self.asset_fault(
+                        request,
+                        Diagnostic::new("E_PREPARE", self.core.location(), message),
+                    );
+                }
             }
             AppEvent::AssetFault {
                 request,
                 diagnostic,
-            } => self.asset_fault(request, *diagnostic),
+            } => {
+                if self.accepts_locale(request) {
+                    self.locale_failed(request, diagnostic.to_string());
+                } else {
+                    self.asset_fault(request, *diagnostic);
+                }
+            }
             AppEvent::PresentationReady { request } => self.complete(request, budget)?,
+            AppEvent::LocaleReady { request } => {
+                if let Some(candidate) = self
+                    .locale_candidate
+                    .clone()
+                    .filter(|c| c.request == request && c.preflight && self.locale_error.is_none())
+                {
+                    let lease = self.locale_job.take().and_then(|job| job.finish().ok());
+                    if lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.valid(request, self.generation))
+                    {
+                        self.core.set_locale(&candidate.text_locale)?;
+                        self.effective_ui_locale = candidate.ui_locale;
+                        self.effective_text_locale = candidate.text_locale;
+                        self.locale_candidate = None;
+                        self.locale_error = None;
+                        self.pauses.remove("locale");
+                        self.status = self
+                            .messages
+                            .text(&self.effective_ui_locale, "language-applied");
+                    } else {
+                        self.locale_failed(request, "E_STALE_LEASE".into());
+                    }
+                }
+            }
+            AppEvent::LocaleFailed { request, message } => {
+                self.locale_failed(request, message);
+            }
             AppEvent::AudioEnded { task, session } => {
                 if session == self.generation.session {
                     self.step(CoreInput::AudioEnded { task }, budget)?;
@@ -790,7 +1044,7 @@ impl Player {
                     .is_some_and(|(saved_slot, _)| saved_slot == slot)
                 {
                     self.slot_revisions.insert(slot, revision);
-                    self.status = if self.preferences.locale == "en" {
+                    self.status = if self.effective_ui_locale == "en" {
                         "Saved in this browser"
                     } else {
                         "浏览器已保存"
@@ -808,22 +1062,30 @@ impl Player {
                 self.slot_revisions = revisions;
             }
             AppEvent::Preferences(mut p) => {
-                if !self.core.program().locales.contains_key(&p.locale) {
-                    p.locale = self.core.program().default_locale.clone();
+                let locale_config = &self.core.program().locale_config;
+                if !locale_config.ui.contains_key(&p.ui_locale) {
+                    p.ui_locale = locale_config.default_ui.clone();
+                }
+                if !locale_config.text.contains_key(&p.text_locale) {
+                    p.text_locale = locale_config.default_text.clone();
                 }
                 p.font_scale = finite_clamp(p.font_scale, 0.8, 1.5, 1.);
                 p.bgm_volume = finite_clamp(p.bgm_volume, 0., 1., 0.3);
                 p.voice_volume = finite_clamp(p.voice_volume, 0., 1., 0.8);
                 p.sfx_volume = finite_clamp(p.sfx_volume, 0., 1., 0.5);
                 self.preferences = p;
-                self.core.set_locale(&self.preferences.locale)?;
                 self.commands.push(AppCommand::ApplyPreferences {
                     preferences: self.preferences.clone(),
                 });
+                self.start_locale_switch()?;
             }
             AppEvent::Profile(keys) => self.profile.extend(keys),
             AppEvent::DeviceLost => {
                 self.observe("device_lost", None);
+                if self.locale_pending() {
+                    self.invalidate_locale_candidate();
+                    self.pauses.remove("locale");
+                }
                 self.generation.device += 1;
                 self.device_resume = self.prepare.as_ref().map(|p| p.purpose);
                 self.cancel_preparation();
@@ -838,6 +1100,12 @@ impl Player {
                     _ => Purpose::Device,
                 };
                 self.begin_prepare(purpose, 0, self.retained_assets())?;
+                if self.locale_error.is_none()
+                    && (self.preferences.ui_locale != self.effective_ui_locale
+                        || self.preferences.text_locale != self.effective_text_locale)
+                {
+                    self.start_locale_switch()?;
+                }
             }
         }
         Ok(())
@@ -873,7 +1141,7 @@ impl Player {
             );
         }
         d.details.as_mut().unwrap().request = Some(request);
-        let message = self.messages.diagnostic(&d, &self.preferences.locale);
+        let message = self.messages.diagnostic(&d, &self.effective_ui_locale);
         self.report(d, true);
         self.observe("prepare_failed", Some(request));
         if let Some(p) = &self.core.state().pending {
@@ -893,6 +1161,8 @@ impl Player {
         }
         let prep = self.prepare.take().unwrap();
         let purpose = prep.purpose;
+        let restart_locale =
+            matches!(purpose, Purpose::Restore | Purpose::Rollback) && self.locale_pending();
         let lease = prep.job.finish()?;
         if !lease.valid(lease.activation, self.generation) {
             return Err(Diagnostic::new(
@@ -919,10 +1189,11 @@ impl Player {
                 budget,
             )?,
             Purpose::Restore | Purpose::Rollback => {
-                let candidate = self
+                let mut candidate = self
                     .candidate
                     .take()
                     .ok_or_else(|| Diagnostic::new("E_RESTORE", "commit", "no candidate"))?;
+                candidate.set_locale(&self.effective_text_locale)?;
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = candidate;
@@ -962,6 +1233,9 @@ impl Player {
             session: commit_generation.session,
             device: commit_generation.device,
         });
+        if restart_locale {
+            self.start_locale_switch()?;
+        }
         Ok(())
     }
     fn restart_audio(&mut self) {
@@ -989,7 +1263,7 @@ impl Player {
         let mut candidate = Core::restore(self.validated.clone(), s, &self.release)?;
         // Preferences are independent of saves. Frozen current instances retain
         // their saved language; future instances use the current preference.
-        candidate.set_locale(&self.preferences.locale)?;
+        candidate.set_locale(&self.effective_text_locale)?;
         let assets = self.state_assets(&candidate);
         self.begin_prepare(Purpose::Restore, 0, assets)?;
         self.candidate = Some(candidate);
@@ -1007,12 +1281,13 @@ impl Player {
                 if self.prepare.is_some() {
                     return Ok(());
                 }
+                let restart_locale = self.locale_pending();
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = Core::new(
                     self.validated.clone(),
                     self.release.clone(),
-                    self.preferences.locale.clone(),
+                    self.effective_text_locale.clone(),
                 )?;
                 self.screen = Screen::Story;
                 self.return_screen = Screen::Story;
@@ -1022,6 +1297,9 @@ impl Player {
                 self.diagnostic = None;
                 self.status.clear();
                 self.step(CoreInput::None, budget)?;
+                if restart_locale {
+                    self.start_locale_switch()?;
+                }
             }
             UiAction::Scroll { .. } => {
                 if interaction != self.current_interaction() {
@@ -1091,6 +1369,7 @@ impl Player {
                 self.status.clear();
             }
             UiAction::Title => {
+                let restart_locale = self.locale_pending();
                 self.commands.push(AppCommand::AudioReset);
                 self.cancel_preparation();
                 self.candidate = None;
@@ -1102,6 +1381,9 @@ impl Player {
                 self.diagnostic = None;
                 self.status.clear();
                 self.begin_prepare(Purpose::Boot, 0, self.title_assets())?;
+                if restart_locale {
+                    self.start_locale_switch()?;
+                }
             }
             UiAction::ToggleAuto => {
                 self.auto = !self.auto;
@@ -1112,24 +1394,44 @@ impl Player {
                 self.skip = !self.skip;
                 self.auto = false;
             }
-            UiAction::Locale { locale } => {
-                self.core.set_locale(&locale)?;
-                self.preferences.locale = locale;
-                self.generation.language += 1;
-                self.status = if self.preferences.locale == "en" {
-                    "Applies to the next line"
-                } else {
-                    "下一段生效"
+            UiAction::UiLocale { locale } => {
+                if !self.core.program().locale_config.ui.contains_key(&locale) {
+                    return Err(Diagnostic::new(
+                        "E_LOCALE",
+                        "ui_locale",
+                        "unsupported UI locale",
+                    ));
                 }
-                .into();
+                self.preferences.ui_locale = locale;
+                self.start_locale_switch()?;
                 self.persist_preferences();
-                self.restart_preparation()?;
+            }
+            UiAction::TextLocale { locale } => {
+                if !self.core.program().locale_config.text.contains_key(&locale) {
+                    return Err(Diagnostic::new(
+                        "E_LOCALE",
+                        "text_locale",
+                        "unsupported text locale",
+                    ));
+                }
+                self.preferences.text_locale = locale;
+                self.start_locale_switch()?;
+                self.persist_preferences();
+            }
+            UiAction::LocaleRetry => {
+                self.start_locale_switch()?;
+            }
+            UiAction::LocaleCancel => {
+                self.cancel_locale_switch();
             }
             UiAction::FontSize { delta } => {
                 self.preferences.font_scale = (self.preferences.font_scale + delta).clamp(0.8, 1.5);
                 self.generation.typography += 1;
                 self.persist_preferences();
                 self.restart_preparation()?;
+                if self.locale_pending() {
+                    self.start_locale_switch()?;
+                }
             }
             UiAction::Volume { bus, delta } => {
                 let v = match bus {
@@ -1180,7 +1482,7 @@ impl Player {
                     job,
                     envelope: Box::new(envelope),
                 });
-                self.status = if self.preferences.locale == "en" {
+                self.status = if self.effective_ui_locale == "en" {
                     "Saving…"
                 } else {
                     "正在保存…"
@@ -1289,6 +1591,11 @@ impl Player {
         self.model_for(&self.core, self.screen)
     }
     fn model_for(&self, c: &Core, screen: Screen) -> UiModel {
+        self.model_for_locale(c, screen, &self.effective_ui_locale)
+    }
+    fn model_for_locale(&self, c: &Core, screen: Screen, ui_locale: &str) -> UiModel {
+        let ui_plan = &c.program().locale_config.ui[ui_locale];
+        let text_plan = &c.program().locale_config.text[&self.effective_text_locale];
         UiModel {
             title: self.title.clone(),
             screen,
@@ -1313,6 +1620,8 @@ impl Player {
                 ready: d.awaiting_advance,
                 gate: d.at_gate,
                 locale: d.locale.clone(),
+                font_plan_digest: d.font_plan_digest.clone(),
+                font_assets: c.program().locale_config.text[&d.locale].fonts.clone(),
                 emphasis: {
                     let mut offset = 0;
                     d.spans
@@ -1336,17 +1645,37 @@ impl Player {
                             id: o.id.clone(),
                             label: o.label.clone(),
                             enabled: o.enabled,
+                            locale: c.locale.clone(),
+                            font_plan_digest: c.font_plan_digest.clone(),
+                            font_assets: self.core.program().locale_config.text[&c.locale]
+                                .fonts
+                                .clone(),
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
             prefs: self.preferences.clone(),
+            ui_locale: ui_locale.into(),
+            ui_fonts: ui_plan.fonts.clone(),
+            ui_font_plan_digest: ui_plan.digest.clone(),
+            text_locale: self.effective_text_locale.clone(),
+            text_fonts: text_plan.fonts.clone(),
+            text_font_plan_digest: text_plan.digest.clone(),
+            locale_pending: self.locale_pending(),
+            locale_error: self.locale_error.clone(),
+            preflight_texts: vec![],
             theme: c.program().theme.clone(),
             history: c
                 .state()
                 .history
                 .iter()
-                .map(|h| (h.speaker.clone(), h.text.clone()))
+                .map(|h| nir_presentation::HistoryView {
+                    speaker: h.speaker.clone(),
+                    text: h.text.clone(),
+                    locale: h.locale.clone(),
+                    font_plan_digest: h.font_plan_digest.clone(),
+                    font_assets: c.program().locale_config.text[&h.locale].fonts.clone(),
+                })
                 .collect(),
             slots: self.slots.clone(),
             paused: self.paused(),
@@ -1399,6 +1728,10 @@ fn finite_clamp(v: f32, min: f32, max: f32, default: f32) -> f32 {
 impl Player {
     pub fn viewport_changed(&mut self) -> Result<()> {
         self.generation.surface += 1;
-        self.restart_preparation()
+        self.restart_preparation()?;
+        if self.locale_pending() {
+            self.start_locale_switch()?;
+        }
+        Ok(())
     }
 }

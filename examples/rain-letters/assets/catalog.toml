@@ -44,3 +44,19 @@ id = "font.reader"
 kind = "font"
 source = "source/reader.otf"
 rights = "OFL-1.1"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/Noto-OFL.txt"
+
+[[assets]]
+id = "font.latin"
+kind = "font"
+source = "fonts/ABeeZee-Regular.ttf"
+rights = "OFL-1.1; ABeeZee Project Authors"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/ABeeZee-OFL.txt"

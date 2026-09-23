@@ -145,7 +145,7 @@ test('long author content remains readable across advance, input, reflow, restor
   await last.focus(); await page.keyboard.press('Enter');
   await expect.poll(async()=>(await state(page)).choice).toBeNull();
   expect((await nextUntil(page,s=>!!s.outcome)).outcome).toBe('read_letter');
-  await act(page,{type:'settings'}); await act(page,{type:'locale',locale:'en'});
+  await act(page,{type:'settings'}); await act(page,{type:'text_locale',locale:'en'}); await act(page,{type:'ui_locale',locale:'en'});
   await act(page,{type:'font_size',delta:-.2}); await act(page,{type:'close'});
   await act(page,{type:'new_game'});
   await page.waitForFunction(()=>!!window.__nir.state().dialogue&&!window.__nir.state().loading);

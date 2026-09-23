@@ -39,6 +39,9 @@ fn ready(p: &mut Player, commands: Vec<AppCommand>) -> Vec<AppCommand> {
                 AppCommand::PreparePresentation { request } => {
                     next.extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000))
                 }
+                AppCommand::PrepareLocale { request, .. } => {
+                    next.extend(p.pump(vec![AppEvent::LocaleReady { request }], 1000))
+                }
                 _ => other.push(c),
             }
         }
@@ -251,17 +254,337 @@ fn device_loss_during_candidate_restore_keeps_the_candidate() {
 #[test]
 fn invalid_locale_does_not_replace_the_open_dialogue() {
     let mut p = playing();
-    let locale = p.preferences.locale.clone();
+    let locale = p.preferences.text_locale.clone();
     let state = p.core().snapshot();
     action(
         &mut p,
-        UiAction::Locale {
+        UiAction::TextLocale {
             locale: "missing".into(),
         },
     );
-    assert_eq!(p.preferences.locale, locale);
+    assert_eq!(p.preferences.text_locale, locale);
     assert_eq!(p.core().state().history.len(), state.history.len());
     assert!(p.error.as_ref().unwrap().contains("E_LOCALE"));
+}
+
+#[test]
+fn ui_and_text_locales_commit_independently_and_freeze_open_text() {
+    let mut p = playing();
+    let original = p.core().dialogue().unwrap().1.locale.clone();
+    let mut commands = action(
+        &mut p,
+        UiAction::UiLocale {
+            locale: "en".into(),
+        },
+    );
+    ready(&mut p, std::mem::take(&mut commands));
+    assert_eq!(p.effective_ui_locale, "en");
+    assert_eq!(p.effective_text_locale, "zh-Hans");
+    assert_eq!(p.core().dialogue().unwrap().1.locale, original);
+
+    commands = action(
+        &mut p,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    ready(&mut p, commands);
+    assert_eq!(p.effective_ui_locale, "en");
+    assert_eq!(p.effective_text_locale, "en");
+    assert_eq!(p.core().dialogue().unwrap().1.locale, original);
+
+    let original_id = p.core().dialogue().unwrap().1.text_id.clone();
+    let mut next = None;
+    for _ in 0..100 {
+        if let Some((_, d)) = p.core().dialogue() {
+            if d.text_id != original_id {
+                next = Some(d.locale.clone());
+                break;
+            }
+            let commands = p.pump(
+                vec![AppEvent::Tick {
+                    delta_us: 60_000_000,
+                }],
+                1000,
+            );
+            ready(&mut p, commands);
+            let commands = action(&mut p, UiAction::Advance);
+            ready(&mut p, commands);
+        } else if p.core().state().choice.is_some() {
+            let option = p
+                .core()
+                .state()
+                .choice
+                .as_ref()
+                .unwrap()
+                .options
+                .iter()
+                .find(|option| option.enabled)
+                .unwrap()
+                .id
+                .clone();
+            let commands = action(&mut p, UiAction::Choose { option });
+            ready(&mut p, commands);
+        } else if let Some(task) = p.core().state().tasks.values().find(|task| {
+            task.state == nir_core::TaskState::Running
+                && matches!(task.effect, nir_format::Effect::Audio { looped: false, .. })
+        }) {
+            let commands = p.pump(
+                vec![AppEvent::AudioEnded {
+                    task: task.id,
+                    session: p.generation.session,
+                }],
+                1000,
+            );
+            ready(&mut p, commands);
+        } else if p
+            .core()
+            .state()
+            .tasks
+            .values()
+            .any(|task| task.state == nir_core::TaskState::Running)
+        {
+            let commands = p.pump(
+                vec![AppEvent::Tick {
+                    delta_us: 1_000_000,
+                }],
+                1000,
+            );
+            ready(&mut p, commands);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(next.as_deref(), Some("en"));
+}
+
+#[test]
+fn locale_failure_keeps_effective_context_and_retry_uses_a_new_generation() {
+    let mut p = playing();
+    let old_ui = p.effective_ui_locale.clone();
+    let old_text = p.effective_text_locale.clone();
+    let commands = action(
+        &mut p,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    let request = commands
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    let preview = p.locale_preview(request).unwrap();
+    assert_eq!(preview.ui_locale, old_ui);
+    assert_eq!(preview.text_locale, "en");
+    assert_eq!(
+        preview.text_font_plan_digest,
+        p.core().program().locale_config.text["en"].digest
+    );
+    p.pump(
+        vec![AppEvent::LocaleFailed {
+            request,
+            message: "E_FONT_PLAN".into(),
+        }],
+        1000,
+    );
+    assert_eq!(p.effective_ui_locale, old_ui);
+    assert_eq!(p.effective_text_locale, old_text);
+    assert_eq!(p.core().dialogue().unwrap().1.locale, old_text);
+    assert!(p.model().locale_error.is_some());
+    assert!(
+        p.error.is_none(),
+        "language errors must not fault the story session"
+    );
+    p.pump(vec![AppEvent::LocaleReady { request }], 1000);
+    assert_eq!(
+        p.effective_text_locale, old_text,
+        "late success after a failed attempt is ignored"
+    );
+
+    let retry = action(&mut p, UiAction::LocaleRetry);
+    let retried = retry
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(retried > request);
+    ready(&mut p, retry);
+    assert_eq!(p.effective_text_locale, "en");
+
+    let next = action(
+        &mut p,
+        UiAction::UiLocale {
+            locale: "en".into(),
+        },
+    );
+    let failed_request = next
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    p.pump(
+        vec![AppEvent::LocaleFailed {
+            request: failed_request,
+            message: "E_FONT_PLAN".into(),
+        }],
+        1000,
+    );
+    let cancelled = action(&mut p, UiAction::LocaleCancel);
+    ready(&mut p, cancelled);
+    assert_eq!(p.effective_ui_locale, old_ui);
+    assert_eq!(p.effective_text_locale, "en");
+    assert_eq!(p.preferences.ui_locale, old_ui);
+    assert!(!p.paused());
+}
+
+#[test]
+fn locale_resource_failure_isolated_from_story_preparation() {
+    let mut p = playing();
+    let before = p.core().snapshot();
+    let commands = action(
+        &mut p,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    let request = commands
+        .iter()
+        .find_map(|command| match command {
+            AppCommand::GetAssets {
+                request, assets, ..
+            } if assets == &["font.reader".to_owned()] => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(p.accepts_resource(request));
+    assert!(!commands
+        .iter()
+        .any(|command| matches!(command, AppCommand::PrepareLocale { .. })));
+    let failure = p.pump(
+        vec![AppEvent::AssetFailed {
+            request,
+            message: "E_FONT_FETCH".into(),
+        }],
+        1000,
+    );
+    assert!(failure.iter().any(
+        |command| matches!(command, AppCommand::CancelAssets { request: id } if *id == request)
+    ));
+    assert_eq!(
+        serde_json::to_value(p.core().snapshot()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+    assert_eq!(p.effective_text_locale, "zh-Hans");
+    assert!(p.error.is_none());
+    assert!(!p.paused());
+    assert!(!p.accepts_resource(request));
+    p.pump(
+        vec![AppEvent::AssetReady {
+            request,
+            asset: "font.reader".into(),
+        }],
+        1000,
+    );
+    assert_eq!(p.effective_text_locale, "zh-Hans");
+    let retry = action(&mut p, UiAction::LocaleRetry);
+    ready(&mut p, retry);
+    assert_eq!(p.effective_text_locale, "en");
+}
+
+#[test]
+fn device_recovery_reissues_pending_locale_with_a_new_resource_generation() {
+    let mut p = playing();
+    let commands = action(
+        &mut p,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    let old_request = commands
+        .iter()
+        .find_map(|command| match command {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(p.paused());
+    let lost = p.pump(vec![AppEvent::DeviceLost], 1000);
+    assert!(lost.iter().any(
+        |command| matches!(command, AppCommand::CancelAssets { request } if *request == old_request)
+    ));
+    assert!(!p.accepts_resource(old_request));
+    let commands = p.pump(vec![AppEvent::DeviceReady], 1000);
+    let new_request = commands
+        .iter()
+        .filter_map(|command| match command {
+            AppCommand::GetAssets { request, .. } if *request != old_request => Some(*request),
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    assert!(new_request > old_request);
+    assert!(p.accepts_resource(new_request));
+    p.pump(
+        vec![AppEvent::AssetReady {
+            request: old_request,
+            asset: "font.reader".into(),
+        }],
+        1000,
+    );
+    ready(&mut p, commands);
+    assert_eq!(p.effective_text_locale, "en");
+    assert_eq!(p.core().dialogue().unwrap().1.locale, "zh-Hans");
+    assert!(p.paused(), "device recovery keeps its own pause owner");
+}
+
+#[test]
+fn latest_locale_candidate_wins_out_of_order_completion() {
+    let mut p = playing();
+    let first = action(
+        &mut p,
+        UiAction::TextLocale {
+            locale: "en".into(),
+        },
+    );
+    let first_request = first
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    let latest = action(
+        &mut p,
+        UiAction::UiLocale {
+            locale: "en".into(),
+        },
+    );
+    let latest_request = latest
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(latest_request > first_request);
+    p.pump(
+        vec![AppEvent::LocaleReady {
+            request: first_request,
+        }],
+        1000,
+    );
+    assert_eq!(p.effective_ui_locale, "zh-Hans");
+    assert_eq!(p.effective_text_locale, "zh-Hans");
+    ready(&mut p, latest);
+    assert_eq!(p.effective_ui_locale, "en");
+    assert_eq!(p.effective_text_locale, "en");
 }
 
 #[test]
@@ -656,11 +979,17 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             id: "walk".into(),
             label: "Walk".into(),
             enabled: true,
+            locale: m.text_locale.clone(),
+            font_plan_digest: m.text_font_plan_digest.clone(),
+            font_assets: m.text_fonts.clone(),
         },
         ChoiceView {
             id: "stay".into(),
             label: "Stay".into(),
             enabled: false,
+            locale: m.text_locale.clone(),
+            font_plan_digest: m.text_font_plan_digest.clone(),
+            font_assets: m.text_fonts.clone(),
         },
     ];
     let messages = Messages::default();
@@ -745,9 +1074,12 @@ fn author_auto_delay_controls_reading_after_reveal_and_pauses() {
 
 fn reading_text() -> nir_presentation::TextEngine {
     let mut engine = nir_presentation::TextEngine::default();
-    engine.add_font(
-        include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
-    );
+    engine
+        .add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
     engine
 }
 #[test]
@@ -758,7 +1090,7 @@ fn long_dialogue_browses_only_revealed_text_and_preserves_it_on_reflow() {
     m.loading = false;
     m.paused = false;
     m.prefs.font_scale = 1.5;
-    m.prefs.locale = "en".into();
+    m.ui_locale = "en".into();
     let full = "末班电车刚刚离开。雨后书简。\n".repeat(35);
     m.dialogue.as_mut().unwrap().full_text = full.clone();
     m.dialogue.as_mut().unwrap().visible_text = "末班电车刚刚离开。".into();
@@ -843,6 +1175,9 @@ fn measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions() {
                 format!("{i} 沿着河边，一起走回去。留在车站，读完这封信。")
             },
             enabled: i != 7,
+            locale: m.text_locale.clone(),
+            font_plan_digest: m.text_font_plan_digest.clone(),
+            font_assets: m.text_fonts.clone(),
         })
         .collect();
     let mut text = reading_text();
@@ -884,7 +1219,13 @@ fn history_allows_browsing_inside_a_long_entry() {
     let mut m = p.model();
     m.screen = Screen::History;
     m.loading = false;
-    m.history = vec![(String::new(), "雨后书简。\n".repeat(80))];
+    m.history = vec![nir_presentation::HistoryView {
+        speaker: String::new(),
+        text: "雨后书简。\n".repeat(80),
+        locale: "zh-Hans".into(),
+        font_plan_digest: m.text_font_plan_digest.clone(),
+        font_assets: m.text_fonts.clone(),
+    }];
     let mut text = reading_text();
     let mut reading = ReadingState::default();
     let messages = Messages::default();

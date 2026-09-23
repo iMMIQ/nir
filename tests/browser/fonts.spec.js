@@ -42,7 +42,7 @@ test('default author template renders new Chinese with compiled fonts and both r
   await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='garden_end');
   await act(page,{type:'advance'});await act(page,{type:'advance'});
   await expect.poll(async()=>(await state(page)).outcome).toBe('garden');
-  await act(page,{type:'settings'});await act(page,{type:'locale',locale:'en'});await act(page,{type:'close'});
+  await act(page,{type:'settings'});await act(page,{type:'text_locale',locale:'en'});await act(page,{type:'close'});
   await act(page,{type:'new_game'});await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='intro');
   await act(page,{type:'advance'});expect((await state(page)).dialogue.locale).toBe('en');
   await page.setViewportSize({width:390,height:600});

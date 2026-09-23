@@ -42,6 +42,7 @@ pub struct Dialogue {
     pub source_revision: u32,
     pub contract_digest: String,
     pub locale: String,
+    pub font_plan_digest: String,
     pub speaker: String,
     pub spans: Vec<FrozenSpan>,
     pub span: usize,
@@ -109,6 +110,7 @@ pub struct OfferedOption {
 pub struct OfferedChoice {
     pub id: String,
     pub locale: String,
+    pub font_plan_digest: String,
     pub interaction: u32,
     pub options: Vec<OfferedOption>,
     pub branches: BTreeMap<String, String>,
@@ -131,6 +133,7 @@ pub struct HistoryEntry {
     pub source_revision: u32,
     pub contract_digest: String,
     pub locale: String,
+    pub font_plan_digest: String,
     pub speaker: String,
     pub text: String,
 }
@@ -306,7 +309,9 @@ impl Core {
             .unwrap_or_else(|| "end".into())
     }
     pub fn set_locale(&mut self, locale: &str) -> Result<()> {
-        if !self.program().locales.contains_key(locale) {
+        if !self.program().locales.contains_key(locale)
+            || !self.program().locale_config.text.contains_key(locale)
+        {
             return Err(self.error("E_LOCALE", locale));
         }
         self.state.locale = locale.into();
@@ -791,6 +796,9 @@ impl Core {
                             source_revision: self.program().texts[text].source_revision,
                             contract_digest: self.program().texts[text].contract_digest.clone(),
                             locale: self.state.locale.clone(),
+                            font_plan_digest: self.program().locale_config.text[&self.state.locale]
+                                .digest
+                                .clone(),
                             speaker: if speaker.is_empty() {
                                 String::new()
                             } else {
@@ -886,6 +894,9 @@ impl Core {
                 self.state.choice = Some(OfferedChoice {
                     id: choice,
                     locale: self.state.locale.clone(),
+                    font_plan_digest: self.program().locale_config.text[&self.state.locale]
+                        .digest
+                        .clone(),
                     interaction,
                     options,
                     branches,
@@ -1020,6 +1031,7 @@ impl Core {
                     source_revision: d.source_revision,
                     contract_digest: d.contract_digest.clone(),
                     locale: d.locale.clone(),
+                    font_plan_digest: d.font_plan_digest.clone(),
                     speaker: d.speaker.clone(),
                     text: d.full_text(),
                 });
@@ -1428,6 +1440,11 @@ impl Core {
                 || h.source_revision != c.source_revision
                 || h.contract_digest != c.contract_digest
                 || !p.locales.contains_key(&h.locale)
+                || p.locale_config
+                    .text
+                    .get(&h.locale)
+                    .map(|plan| plan.digest.as_str())
+                    != Some(h.font_plan_digest.as_str())
             {
                 return Err(fail("history text identity"));
             }
@@ -1471,6 +1488,11 @@ impl Core {
             }
             if let Some(d) = &t.dialogue {
                 if !p.locales.contains_key(&d.locale)
+                    || p.locale_config
+                        .text
+                        .get(&d.locale)
+                        .map(|plan| plan.digest.as_str())
+                        != Some(d.font_plan_digest.as_str())
                     || !p.texts.contains_key(&d.text_id)
                     || d.span > d.spans.len()
                     || d.spans.len() > 8192
@@ -1562,6 +1584,11 @@ impl Core {
                 || top.op != block.ops.len()
                 || c.interaction >= s.next_id
                 || !p.locales.contains_key(&c.locale)
+                || p.locale_config
+                    .text
+                    .get(&c.locale)
+                    .map(|plan| plan.digest.as_str())
+                    != Some(c.font_plan_digest.as_str())
             {
                 return Err(fail("choice continuation mismatch"));
             }

@@ -36,6 +36,7 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 
 ```text
 game.toml                      作品身份、能力配置和输入清单
+config/locales.toml            UI/正文语言、默认值和逐语言字体计划
 game.lock                      SDK 与 CLI 的真实内容身份
 content/main/module.toml        唯一模块、入口、正文包
 content/main/story.nir.json     变量、函数、块、Cue、场景、选项
@@ -50,7 +51,7 @@ NOTICE.md                      模板许可
 schemas/                       由 SDK 生成的 JSON Schema
 ```
 
-本分支构建的 SDK 支持 `novelc -p my-story config` 查看配置值和来源；主题及默认设置编辑说明见 [作品配置](docs/PROJECT-THEMES.md)。已发布的旧版 SDK 不会自动获得新增能力。
+本分支构建的 SDK 支持 `novelc -p my-story config` 查看配置值和来源；主题及默认设置编辑说明见 [作品配置](docs/PROJECT-THEMES.md)，独立 UI/正文语言及字体计划见[语言说明](docs/LOCALE-FONTS.md)。已发布的旧版 SDK 不会自动获得新增能力。
 
 通过正文包编辑对话，保留稳定 ID、参数和 Gate 顺序。源文修改后执行 `text update --id <TextId> --meaning preserve|bump`，确认译文后执行 `text review --id <TextId> --locale en`；用 `text status` 查看待复核项。旧工程需显式迁移，见 [文本修订说明](docs/TEXT-REVISIONS.md)。最小模板会自动从母版生成所需字形；新字符超出母版覆盖时 `check` 会拒绝缺字，配置与边界见 [字体编译](docs/AUTHOR-FONTS.md)。调整逻辑时参考示例块与 [编写说明](docs/AUTHORING.md)。
 

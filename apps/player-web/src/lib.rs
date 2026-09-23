@@ -42,6 +42,7 @@ pub struct Engine {
     reading: ReadingState,
     view_sequence: (u32, u32),
     fonts: BTreeSet<String>,
+    pending_locale: Option<u32>,
     outbox: Vec<AppCommand>,
     width: f32,
     height: f32,
@@ -73,6 +74,7 @@ impl Engine {
             reading: ReadingState::default(),
             view_sequence: (0, 0),
             fonts: BTreeSet::new(),
+            pending_locale: None,
             outbox: vec![],
             width: 1280.,
             height: 720.,
@@ -111,7 +113,7 @@ impl Engine {
         id: String,
         bytes: &[u8],
     ) -> std::result::Result<bool, JsValue> {
-        if !self.player.accepts(request) {
+        if !self.player.accepts_resource(request) {
             return Ok(true);
         }
         let asset = self
@@ -148,12 +150,20 @@ impl Engine {
             }
             AssetKind::Font => {
                 if self.fonts.insert(id.clone()) {
-                    self.renderer.text.add_font(bytes.to_vec());
+                    self.renderer
+                        .text
+                        .add_font_asset(&id, bytes.to_vec())
+                        .map_err(js)?;
                 }
             }
             AssetKind::Audio => {}
         }
         self.pump(vec![AppEvent::AssetReady { request, asset: id }])?;
+        if let Some(request) = self.pending_locale {
+            if let Some(event) = self.prepare_locale_candidate(request)? {
+                self.pump(vec![event])?;
+            }
+        }
         Ok(true)
     }
     pub fn resource_fault(
@@ -398,14 +408,16 @@ impl Engine {
             }
             self.renderer.retain(&self.player.retained_assets());
         }
-        Ok(serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"locale":self.packet.locale,"ready":self.ready}).to_string())
+        Ok(serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"announcement_locale":self.packet.announcement_locale,"locale":self.packet.locale,"ready":self.ready}).to_string())
     }
     pub fn needs_clock(&self) -> bool {
         self.ready && self.player.needs_clock()
     }
     pub fn state(&self) -> String {
         let c = self.player.core();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.preferences.locale,"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+        let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
+        let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.model().locale_error,"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
     }
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
@@ -480,6 +492,11 @@ impl Engine {
                             message: e.to_string(),
                         }),
                     }
+                } else if let AppCommand::PrepareLocale { request, .. } = command {
+                    self.pending_locale = Some(request);
+                    if let Some(event) = self.prepare_locale_candidate(request)? {
+                        events.push(event);
+                    }
                 } else {
                     if let AppCommand::CancelAssets { request } = &command {
                         self.renderer.cancel_upload(*request);
@@ -494,5 +511,52 @@ impl Engine {
             self.work_remaining -= self.player.work_used();
         }
         Ok(())
+    }
+
+    /// Locale preferences can arrive while the boot resource job is still
+    /// loading fonts. Keep the candidate paused and shape it only after every
+    /// face in both candidate plans has been installed in the renderer.
+    fn prepare_locale_candidate(
+        &mut self,
+        request: u32,
+    ) -> std::result::Result<Option<AppEvent>, JsValue> {
+        if !self.player.accepts_locale(request) {
+            if self.pending_locale == Some(request) {
+                self.pending_locale = None;
+            }
+            return Ok(None);
+        }
+        let config = &self.player.core().program().locale_config;
+        let Some(candidate) = self.player.locale_preview(request) else {
+            self.pending_locale = None;
+            return Ok(None);
+        };
+        let required_fonts: Vec<_> = config.ui[&candidate.ui_locale]
+            .fonts
+            .iter()
+            .chain(&config.text[&candidate.text_locale].fonts)
+            .cloned()
+            .collect();
+        if required_fonts.iter().any(|font| !self.fonts.contains(font)) {
+            return Ok(None);
+        }
+        self.pending_locale = None;
+        let preview = ReadingState::default().project(
+            &candidate,
+            (self.player.generation.session, request),
+            self.width,
+            self.height,
+            &self.messages,
+            &mut self.renderer.text,
+        );
+        Ok(Some(
+            match self.renderer.prepare(&preview, self.dpr, true) {
+                Ok(()) => AppEvent::LocaleReady { request },
+                Err(error) => AppEvent::LocaleFailed {
+                    request,
+                    message: error.to_string(),
+                },
+            },
+        ))
     }
 }

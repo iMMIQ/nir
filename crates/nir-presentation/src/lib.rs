@@ -25,6 +25,8 @@ pub struct DialogueView {
     pub ready: bool,
     pub gate: bool,
     pub locale: String,
+    pub font_plan_digest: String,
+    pub font_assets: Vec<String>,
     pub emphasis: Vec<(usize, usize)>,
 }
 #[derive(Debug, Clone)]
@@ -32,6 +34,17 @@ pub struct ChoiceView {
     pub id: String,
     pub label: String,
     pub enabled: bool,
+    pub locale: String,
+    pub font_plan_digest: String,
+    pub font_assets: Vec<String>,
+}
+#[derive(Debug, Clone)]
+pub struct HistoryView {
+    pub speaker: String,
+    pub text: String,
+    pub locale: String,
+    pub font_plan_digest: String,
+    pub font_assets: Vec<String>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct SlotView {
@@ -49,8 +62,17 @@ pub struct UiModel {
     pub dialogue: Option<DialogueView>,
     pub choices: Vec<ChoiceView>,
     pub prefs: Preferences,
+    pub ui_locale: String,
+    pub ui_fonts: Vec<String>,
+    pub ui_font_plan_digest: String,
+    pub text_locale: String,
+    pub text_fonts: Vec<String>,
+    pub text_font_plan_digest: String,
+    pub locale_pending: bool,
+    pub locale_error: Option<String>,
+    pub preflight_texts: Vec<TextRun>,
     pub theme: Theme,
-    pub history: Vec<(String, String)>,
+    pub history: Vec<HistoryView>,
     pub slots: Vec<SlotView>,
     pub paused: bool,
     pub loading: bool,
@@ -83,6 +105,10 @@ pub struct TextRun {
     pub scroll: f32,
     pub clip: Option<[f32; 4]>,
     pub region: Option<ScrollRegion>,
+    pub locale: String,
+    pub font_assets: Vec<String>,
+    pub font_plan_digest: String,
+    pub preflight_only: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticNode {
@@ -91,6 +117,7 @@ pub struct SemanticNode {
     pub action: UiAction,
     pub enabled: bool,
     pub rect: [f32; 4],
+    pub locale: String,
 }
 #[derive(Debug, Default)]
 pub struct DrawPacket {
@@ -98,7 +125,10 @@ pub struct DrawPacket {
     pub texts: Vec<TextRun>,
     pub semantics: Vec<SemanticNode>,
     pub announcement: String,
+    pub announcement_locale: String,
     pub locale: String,
+    pub font_assets: Vec<String>,
+    pub font_plan_digest: String,
     pub width: f32,
     pub height: f32,
     pub stage_size: [u32; 2],
@@ -127,6 +157,64 @@ impl Default for Messages {
     }
 }
 impl Messages {
+    pub fn preflight(&self, locale: &str) -> Vec<String> {
+        [
+            "new-game",
+            "continue",
+            "menu",
+            "close",
+            "settings",
+            "history",
+            "saves",
+            "save",
+            "load",
+            "rollback",
+            "exit",
+            "auto",
+            "skip",
+            "language",
+            "language-zh",
+            "language-en",
+            "ui-language",
+            "text-language",
+            "language-active",
+            "language-pending",
+            "language-failed",
+            "language-cancel",
+            "language-applied",
+            "font-size",
+            "music",
+            "voice",
+            "sfx",
+            "motion",
+            "export",
+            "import",
+            "retry",
+            "loading",
+            "paused",
+            "ending",
+            "empty-slot",
+            "saved",
+            "saving",
+            "read-failed",
+            "error-prepare",
+            "error-storage",
+            "error-render",
+            "error-content",
+            "error-host",
+            "scroll-back",
+            "scroll-forward",
+            "title-hint",
+            "gate-hint",
+            "advance-hint",
+            "reveal-hint",
+            "history-back",
+            "history-forward",
+        ]
+        .into_iter()
+        .map(|id| self.text(locale, id))
+        .collect()
+    }
     pub fn diagnostic(&self, diagnostic: &Diagnostic, locale: &str) -> String {
         let key = match diagnostic.details.as_ref().map(|d| &d.domain) {
             Some(ErrorDomain::Prepare) => "error-prepare",
@@ -173,6 +261,10 @@ impl DrawPacket {
             scroll: 0.,
             clip: None,
             region: None,
+            locale: self.locale.clone(),
+            font_assets: self.font_assets.clone(),
+            font_plan_digest: self.font_plan_digest.clone(),
+            preflight_only: false,
         });
     }
     fn button(
@@ -202,6 +294,7 @@ impl DrawPacket {
             action,
             enabled: true,
             rect: r,
+            locale: self.locale.clone(),
         });
     }
     pub fn hit(&self, x: f32, y: f32) -> Option<UiAction> {
@@ -320,11 +413,13 @@ fn project_measured(
         width,
         height,
         stage_size: [m.stage[0] as u32, m.stage[1] as u32],
-        locale: m.prefs.locale.clone(),
+        locale: m.ui_locale.clone(),
+        font_assets: m.ui_fonts.clone(),
+        font_plan_digest: m.ui_font_plan_digest.clone(),
         ..Default::default()
     };
     let t = &m.theme;
-    let msg = |id| messages.text(&m.prefs.locale, id);
+    let msg = |id| messages.text(&m.ui_locale, id);
     let narrow = width < 650.;
     let margin = if narrow { 20. } else { 48. };
     p.rect([0., 0., width, height], t.background);
@@ -364,7 +459,7 @@ fn project_measured(
                 t.muted,
             );
             let y = (height * 0.36).max(120.);
-            let title = if m.prefs.locale == "zh-Hans" {
+            let title = if m.ui_locale == "zh-Hans" {
                 m.title.split('·').next().unwrap_or(&m.title).trim()
             } else {
                 m.title.split('·').nth(1).unwrap_or(&m.title).trim()
@@ -472,8 +567,13 @@ fn project_measured(
                     scroll: 0.,
                     clip: None,
                     region: Some(ScrollRegion::Dialogue),
+                    locale: d.locale.clone(),
+                    font_assets: d.font_assets.clone(),
+                    font_plan_digest: d.font_plan_digest.clone(),
+                    preflight_only: false,
                 });
                 p.announcement = d.full_text.clone();
+                p.announcement_locale = d.locale.clone();
                 p.dialogue_hint = Some(p.texts.len());
                 p.text(
                     msg(if d.gate {
@@ -495,6 +595,7 @@ fn project_measured(
                     action: UiAction::Advance,
                     enabled: !d.gate,
                     rect: [margin, top, width - margin * 2., h - 42.],
+                    locale: m.ui_locale.clone(),
                 });
             }
             if !m.choices.is_empty() {
@@ -538,11 +639,15 @@ fn project_measured(
                         let text = p.texts.last_mut().unwrap();
                         text.size = 16. * m.prefs.font_scale;
                         text.clip = Some(viewport);
+                        text.locale = c.locale.clone();
+                        text.font_assets = c.font_assets.clone();
+                        text.font_plan_digest = c.font_plan_digest.clone();
                         if !c.enabled {
                             text.color = t.muted;
                         }
                         let node = p.semantics.last_mut().unwrap();
                         node.enabled = c.enabled;
+                        node.locale = c.locale.clone();
                         node.rect[1] = row_y.max(y);
                         node.rect[3] = (row_y + h).min(y + view_height) - node.rect[1];
                     }
@@ -601,7 +706,7 @@ fn project_measured(
             p.text(
                 m.history
                     .last()
-                    .map(|(_, text)| text.clone())
+                    .map(|entry| entry.text.clone())
                     .unwrap_or_default(),
                 margin,
                 height * 0.31 + 64.,
@@ -655,30 +760,108 @@ fn project_measured(
                     }
                 }
                 Screen::Settings => {
-                    let yy = y + 74.;
-                    p.text(msg("language"), x, yy, w, 16., t.muted);
+                    let compact = height < 600.;
+                    let yy = if compact { y + 50. } else { y + 74. };
+                    let gap = if compact { 52. } else { 66. };
+                    p.text(msg("ui-language"), x, yy, w, 16., t.muted);
                     p.button(
                         msg("language-zh"),
-                        UiAction::Locale {
+                        UiAction::UiLocale {
                             locale: "zh-Hans".into(),
                         },
-                        [x, yy + 31., (w - 12.) / 2., 42.],
-                        m.prefs.locale == "zh-Hans",
+                        [x, yy + 20., (w - 12.) / 2., if compact { 34. } else { 40. }],
+                        m.prefs.ui_locale == "zh-Hans",
                         t,
                     );
                     p.button(
                         msg("language-en"),
-                        UiAction::Locale {
+                        UiAction::UiLocale {
                             locale: "en".into(),
                         },
-                        [x + (w + 12.) / 2., yy + 31., (w - 12.) / 2., 42.],
-                        m.prefs.locale == "en",
+                        [
+                            x + (w + 12.) / 2.,
+                            yy + 20.,
+                            (w - 12.) / 2.,
+                            if compact { 34. } else { 40. },
+                        ],
+                        m.prefs.ui_locale == "en",
                         t,
                     );
+                    let ty = yy + gap;
+                    p.text(msg("text-language"), x, ty, w, 16., t.muted);
+                    p.button(
+                        msg("language-zh"),
+                        UiAction::TextLocale {
+                            locale: "zh-Hans".into(),
+                        },
+                        [x, ty + 20., (w - 12.) / 2., if compact { 34. } else { 40. }],
+                        m.prefs.text_locale == "zh-Hans",
+                        t,
+                    );
+                    p.button(
+                        msg("language-en"),
+                        UiAction::TextLocale {
+                            locale: "en".into(),
+                        },
+                        [
+                            x + (w + 12.) / 2.,
+                            ty + 20.,
+                            (w - 12.) / 2.,
+                            if compact { 34. } else { 40. },
+                        ],
+                        m.prefs.text_locale == "en",
+                        t,
+                    );
+                    let status_y = ty + gap;
+                    let state_message = if let Some(error) = &m.locale_error {
+                        format!("{}: {error}", msg("language-failed"))
+                    } else if m.locale_pending {
+                        msg("language-pending")
+                    } else {
+                        format!(
+                            "{}: {} / {}",
+                            msg("language-active"),
+                            m.ui_locale,
+                            m.text_locale
+                        )
+                    };
+                    p.text(state_message, x, status_y, w, 13., t.muted);
+                    if m.locale_error.is_some() || m.locale_pending {
+                        if m.locale_error.is_some() {
+                            p.button(
+                                msg("retry"),
+                                UiAction::LocaleRetry,
+                                [x, status_y + 18., (w - 12.) / 2., 34.],
+                                true,
+                                t,
+                            );
+                        }
+                        p.button(
+                            msg("language-cancel"),
+                            UiAction::LocaleCancel,
+                            [
+                                if m.locale_error.is_some() {
+                                    x + (w + 12.) / 2.
+                                } else {
+                                    x
+                                },
+                                status_y + 18.,
+                                if m.locale_error.is_some() {
+                                    (w - 12.) / 2.
+                                } else {
+                                    w
+                                },
+                                34.,
+                            ],
+                            false,
+                            t,
+                        );
+                    }
+                    let controls_y = status_y + if compact { 45. } else { 58. };
                     p.text(
                         format!("{}   {:.0}%", msg("font-size"), m.prefs.font_scale * 100.),
                         x,
-                        yy + 94.,
+                        controls_y,
                         w - 145.,
                         18.,
                         t.text,
@@ -686,14 +869,24 @@ fn project_measured(
                     p.button(
                         msg("decrease"),
                         UiAction::FontSize { delta: -0.1 },
-                        [x + w - 128., yy + 86., 58., 38.],
+                        [
+                            x + w - 128.,
+                            controls_y - 8.,
+                            58.,
+                            if compact { 32. } else { 38. },
+                        ],
                         false,
                         t,
                     );
                     p.button(
                         msg("increase"),
                         UiAction::FontSize { delta: 0.1 },
-                        [x + w - 58., yy + 86., 58., 38.],
+                        [
+                            x + w - 58.,
+                            controls_y - 8.,
+                            58.,
+                            if compact { 32. } else { 38. },
+                        ],
                         false,
                         t,
                     );
@@ -705,7 +898,9 @@ fn project_measured(
                     .into_iter()
                     .enumerate()
                     {
-                        let ry = yy + 147. + i as f32 * 52.;
+                        let ry = controls_y
+                            + if compact { 43. } else { 61. }
+                            + i as f32 * if compact { 37. } else { 52. };
                         p.text(
                             format!("{}   {:.0}%", msg(key), v * 100.),
                             x,
@@ -717,14 +912,14 @@ fn project_measured(
                         p.button(
                             msg("decrease"),
                             UiAction::Volume { bus, delta: -0.1 },
-                            [x + w - 128., ry - 7., 58., 38.],
+                            [x + w - 128., ry - 7., 58., if compact { 32. } else { 38. }],
                             false,
                             t,
                         );
                         p.button(
                             msg("increase"),
                             UiAction::Volume { bus, delta: 0.1 },
-                            [x + w - 58., ry - 7., 58., 38.],
+                            [x + w - 58., ry - 7., 58., if compact { 32. } else { 38. }],
                             false,
                             t,
                         );
@@ -736,7 +931,12 @@ fn project_measured(
                             if m.prefs.reduced_motion { "ON" } else { "OFF" }
                         ),
                         UiAction::ReducedMotion,
-                        [x, yy + 300., w, 42.],
+                        [
+                            x,
+                            controls_y + if compact { 160. } else { 214. },
+                            w,
+                            if compact { 34. } else { 42. },
+                        ],
                         m.prefs.reduced_motion,
                         t,
                     );
@@ -792,7 +992,7 @@ fn project_measured(
                     );
                 }
                 Screen::History => {
-                    let text = m
+                    let entries = m
                         .history
                         .iter()
                         .rev()
@@ -801,29 +1001,44 @@ fn project_measured(
                         .collect::<Vec<_>>()
                         .into_iter()
                         .rev()
-                        .map(|(s, t)| {
-                            if s.is_empty() {
-                                t.clone()
-                            } else {
-                                format!("{s}  /  {t}")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    p.texts.push(TextRun {
-                        text,
-                        visible: None,
-                        x,
-                        y: y + 76.,
-                        width: w,
-                        height: (height - y - 276.).max(40.),
-                        size: if narrow { 16. } else { 18. },
-                        color: t.text,
-                        emphasis: vec![],
-                        scroll: 0.,
-                        clip: None,
-                        region: Some(ScrollRegion::History),
-                    });
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let scrollable_entry = entries
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, entry)| entry.text.len())
+                        .map(|(index, _)| index);
+                    let row_height = ((height - y - 276.).max(60.) / 3.).max(40.);
+                    for (i, entry) in entries.iter().enumerate() {
+                        let text = if entry.speaker.is_empty() {
+                            entry.text.clone()
+                        } else {
+                            format!("{}  /  {}", entry.speaker, entry.text)
+                        };
+                        p.texts.push(TextRun {
+                            text,
+                            visible: None,
+                            x,
+                            y: y + 76. + i as f32 * row_height,
+                            width: w,
+                            height: row_height - 8.,
+                            size: if narrow { 16. } else { 18. },
+                            color: t.text,
+                            emphasis: vec![],
+                            scroll: 0.,
+                            clip: (scrollable_entry == Some(i)).then_some([
+                                x,
+                                y + 76. + i as f32 * row_height,
+                                w,
+                                row_height - 8.,
+                            ]),
+                            region: (scrollable_entry == Some(i)).then_some(ScrollRegion::History),
+                            locale: entry.locale.clone(),
+                            font_assets: entry.font_assets.clone(),
+                            font_plan_digest: entry.font_plan_digest.clone(),
+                            preflight_only: false,
+                        });
+                    }
                     p.button(
                         msg("history-back"),
                         UiAction::HistoryPage { delta: 3 },
@@ -863,7 +1078,7 @@ fn project_measured(
             t.accent,
         );
     }
-    if !m.status.is_empty() {
+    if !m.status.is_empty() && !matches!(m.screen, Screen::Settings) {
         p.text(&m.status, margin, 65., width - 2. * margin, 13., t.accent);
     }
     if let Some(error) = &m.fault {
@@ -881,6 +1096,10 @@ fn project_measured(
             scroll: 0.,
             clip: None,
             region: None,
+            locale: m.ui_locale.clone(),
+            font_assets: m.ui_fonts.clone(),
+            font_plan_digest: m.ui_font_plan_digest.clone(),
+            preflight_only: false,
         });
         if m.fault_recovery.contains(&Recovery::Retry) {
             p.button(
@@ -899,6 +1118,7 @@ fn project_measured(
             t,
         );
     }
+    p.texts.extend(m.preflight_texts.clone());
     p
 }
 
@@ -907,6 +1127,24 @@ pub struct TextEngine {
     pub fonts: cosmic_text::FontSystem,
     pub buffers: std::collections::BTreeMap<String, cosmic_text::Buffer>,
     pub shapes: u64,
+    families: std::collections::BTreeMap<String, &'static str>,
+    configured_plan: String,
+    next_compat_font: u32,
+    pub missing_font: Option<String>,
+}
+struct ExplicitFallback {
+    families: Vec<&'static str>,
+}
+impl cosmic_text::Fallback for ExplicitFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &self.families
+    }
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+    fn script_fallback(&self, _script: unicode_script::Script, _locale: &str) -> &[&'static str] {
+        &self.families
+    }
 }
 impl Default for TextEngine {
     fn default() -> Self {
@@ -915,29 +1153,62 @@ impl Default for TextEngine {
             fonts: cosmic_text::FontSystem::new_with_locale_and_db("zh-Hans".into(), db),
             buffers: Default::default(),
             shapes: 0,
+            families: Default::default(),
+            configured_plan: String::new(),
+            next_compat_font: 0,
+            missing_font: None,
         }
     }
 }
 impl TextEngine {
     pub fn add_font(&mut self, bytes: Vec<u8>) {
+        let id = format!("@compat-font-{}", self.next_compat_font);
+        self.next_compat_font = self.next_compat_font.saturating_add(1);
+        self.add_font_asset(&id, bytes)
+            .expect("valid explicit font asset");
+    }
+    pub fn add_font_asset(
+        &mut self,
+        asset: &str,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let before: std::collections::BTreeSet<_> = self.fonts.db().faces().map(|f| f.id).collect();
         self.fonts.db_mut().load_font_data(bytes);
-        let name = self
+        let family = self
             .fonts
             .db()
             .faces()
-            .next()
-            .and_then(|face| face.families.first().map(|f| f.0.clone()));
-        if let Some(name) = name {
-            self.fonts.db_mut().set_sans_serif_family(name);
+            .find(|face| !before.contains(&face.id))
+            .and_then(|face| face.families.first().map(|f| f.0.clone()))
+            .ok_or_else(|| format!("E_FONT: no font face in asset {asset}"))?;
+        if self
+            .families
+            .iter()
+            .any(|(other, name)| other != asset && *name == family)
+        {
+            return Err(format!(
+                "E_FONT_FAMILY_AMBIGUOUS: duplicate family {family}"
+            ));
+        }
+        let static_family: &'static str = Box::leak(family.clone().into_boxed_str());
+        self.families.insert(asset.into(), static_family);
+        // This default is only used by isolated presentation tests with no plan.
+        if self.families.len() == 1 {
+            self.fonts.db_mut().set_sans_serif_family(family);
         }
         self.buffers.clear();
+        self.configured_plan.clear();
+        Ok(())
     }
     pub fn key(run: &TextRun) -> String {
         format!(
-            "{}:{}:{}:{:?}:{}",
+            "{}:{}:{}:{}:{}:{:?}:{:?}:{}",
             run.size.to_bits(),
             run.width.to_bits(),
             run.height.to_bits(),
+            run.locale,
+            run.font_plan_digest,
+            run.font_assets,
             run.emphasis,
             run.text
         )
@@ -960,15 +1231,63 @@ impl TextEngine {
         offsets
     }
     pub fn layout(&mut self, packet: &DrawPacket) {
+        self.missing_font = None;
         for r in &packet.texts {
             let key = Self::key(r);
             if !self.buffers.contains_key(&key) {
+                let explicit: Vec<_> = r
+                    .font_assets
+                    .iter()
+                    .filter_map(|id| self.families.get(id).copied())
+                    .collect();
+                if !r.font_assets.is_empty() && explicit.len() != r.font_assets.len() {
+                    let missing = r
+                        .font_assets
+                        .iter()
+                        .find(|id| !self.families.contains_key(*id))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.missing_font = Some(format!(
+                        "E_FONT_PLAN: font asset {missing} was not prepared"
+                    ));
+                    // A missing face must never reach cosmic-text shaping: an
+                    // empty font database panics instead of reporting an error.
+                    continue;
+                }
+                if explicit.is_empty() {
+                    self.missing_font =
+                        Some("E_FONT_PLAN: text run has no explicit font plan".into());
+                    continue;
+                }
+                let signature = format!("{}:{}:{:?}", r.locale, r.font_plan_digest, explicit);
+                if self.configured_plan != signature && !explicit.is_empty() {
+                    let old = std::mem::replace(
+                        &mut self.fonts,
+                        cosmic_text::FontSystem::new_with_locale_and_db(
+                            "en".into(),
+                            cosmic_text::fontdb::Database::new(),
+                        ),
+                    );
+                    let (_, db) = old.into_locale_and_db();
+                    self.fonts = cosmic_text::FontSystem::new_with_locale_and_db_and_fallback(
+                        r.locale.clone(),
+                        db,
+                        ExplicitFallback {
+                            families: explicit.clone(),
+                        },
+                    );
+                    self.configured_plan = signature;
+                }
+                let primary = explicit.first().copied();
                 let mut b = cosmic_text::Buffer::new(
                     &mut self.fonts,
                     cosmic_text::Metrics::new(r.size, r.size * 1.5),
                 );
                 b.set_size(&mut self.fonts, Some(r.width), None);
-                let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif);
+                let attrs = match primary {
+                    Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
+                    None => cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif),
+                };
                 if r.emphasis.is_empty() {
                     b.set_text(
                         &mut self.fonts,
@@ -1017,6 +1336,61 @@ impl TextEngine {
 #[cfg(test)]
 mod scene_tests {
     use super::*;
+
+    #[test]
+    fn missing_explicit_font_reports_error_before_shaping() {
+        let mut text = TextEngine::default();
+        let mut packet = DrawPacket {
+            locale: "zh-Hans".into(),
+            font_assets: vec!["font.reader".into()],
+            font_plan_digest: "plan-a".into(),
+            ..Default::default()
+        };
+        packet.text("雨后", 0., 0., 300., 18., [1.; 4]);
+        text.layout(&packet);
+        assert!(text
+            .missing_font
+            .as_deref()
+            .unwrap()
+            .contains("font.reader"));
+        assert!(text.buffers.is_empty());
+        text.add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
+        text.layout(&packet);
+        assert!(text.missing_font.is_none());
+        assert_eq!(text.shapes, 1);
+    }
+
+    #[test]
+    fn text_shape_cache_is_scoped_to_locale_and_font_plan() {
+        let mut text = TextEngine::default();
+        text.add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
+        let mut packet = DrawPacket {
+            width: 320.,
+            height: 180.,
+            locale: "zh-Hans".into(),
+            font_assets: vec!["font.reader".into()],
+            font_plan_digest: "plan-a".into(),
+            ..Default::default()
+        };
+        packet.text("雨后", 0., 0., 300., 18., [1.; 4]);
+        text.layout(&packet);
+        assert_eq!(text.shapes, 1);
+        packet.texts[0].font_plan_digest = "plan-b".into();
+        text.layout(&packet);
+        assert_eq!(text.shapes, 2);
+        packet.texts[0].locale = "en".into();
+        text.layout(&packet);
+        assert_eq!(text.shapes, 3);
+    }
+
     fn node(id: &str, parent: Option<&str>, order: i32) -> Node {
         Node {
             id: id.into(),

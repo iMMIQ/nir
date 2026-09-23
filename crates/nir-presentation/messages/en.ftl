@@ -40,6 +40,13 @@ scroll-forward = Page down
 
 language-zh = 简体中文
 language-en = English
+ui-language = Interface language
+text-language = Story language
+language-active = Active
+language-pending = Preparing language and fonts…
+language-failed = Language preparation failed
+language-cancel = Keep active languages
+language-applied = Language and fonts are ready
 decrease = −
 increase = +
 history-back = ←

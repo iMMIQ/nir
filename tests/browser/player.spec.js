@@ -12,7 +12,11 @@ async function boot(page) {
 }
 async function start(page) {
   await page.keyboard.press('Space');
-  await page.waitForFunction(() => window.__nir.state().dialogue && !window.__nir.state().loading);
+  const result=await page.waitForFunction(() => {
+    try {const state=window.__nir.state();return state.dialogue&&!state.loading?true:false;}
+    catch(error) {return `Engine state failed: ${error}; ${document.querySelector('#shell-message')?.textContent||''}`;}
+  });
+  const value=await result.jsonValue();if(value!==true)throw new Error(value);
 }
 async function advanceUntil(page, predicate, route) {
   for (let n = 0; n < 150; n++) {
@@ -73,7 +77,7 @@ test('save commit, refresh restore, locale boundary, history and rollback', asyn
   await page.waitForFunction(() => window.__nir.state().screen==='Story' && window.__nir.state().paused && !window.__nir.state().loading);
   expect((await state(page)).dialogue).toEqual(saved.dialogue);
   expect((await state(page)).tick_us).toBe(saved.tick_us);
-  await act(page,{type:'settings'}); await act(page,{type:'locale',locale:'en'});
+  await act(page,{type:'settings'}); await act(page,{type:'text_locale',locale:'en'});
   expect((await state(page)).dialogue.locale).toBe('zh-Hans');
   await act(page,{type:'font_size',delta:.2});
   await page.screenshot({path:'reports/settings.png'});
@@ -93,6 +97,54 @@ test('save commit, refresh restore, locale boundary, history and rollback', asyn
     await page.waitForFunction(() => !!window.__nir.state().dialogue && !window.__nir.state().loading);
   }
   expect((await state(page)).dialogue.id).toBe(saved.dialogue.id);
+});
+
+test('UI and story locales are independent and use their own font plans', async ({ page }) => {
+  await boot(page); await start(page);
+  const first = await state(page);
+  expect(first.dialogue.locale).toBe('zh-Hans');
+  await act(page,{type:'settings'});
+  await act(page,{type:'text_locale',locale:'en'});
+  await page.waitForFunction(()=>window.__nir.state().text_locale==='en'&&!window.__nir.state().locale_pending);
+  let current=await state(page);
+  expect(current.ui_locale).toBe('zh-Hans');
+  expect(current.dialogue.locale).toBe('zh-Hans');
+  expect(current.ui_fonts).toEqual(['font.reader']);
+  expect(current.text_fonts).toEqual(['font.latin','font.reader']);
+  await act(page,{type:'close'});
+  const english=await advanceUntil(page,s=>s.dialogue?.id!==first.dialogue.id&&s.dialogue?.locale==='en');
+  expect(english.dialogue.locale).toBe('en');
+  expect(await page.evaluate(()=>document.documentElement.lang)).toBe('zh-Hans');
+  expect(await page.locator('#announcement').getAttribute('lang')).toBe('en');
+  await page.screenshot({path:'reports/locale-zh-ui-en-text.png'});
+
+  const choice=await advanceUntil(page,s=>!!s.choice);
+  expect(choice.choice.locale).toBe('en');
+  expect(choice.choice.font_plan_digest).toBe(choice.text_font_plan_digest);
+  await act(page,{type:'settings'});
+  await act(page,{type:'text_locale',locale:'zh-Hans'});
+  await page.waitForFunction(()=>window.__nir.state().text_locale==='zh-Hans'&&!window.__nir.state().locale_pending);
+  current=await state(page);
+  expect(current.choice.locale).toBe('en');
+  expect(current.ui_locale).toBe('zh-Hans');
+
+  await act(page,{type:'ui_locale',locale:'en'});
+  await page.waitForFunction(()=>window.__nir.state().ui_locale==='en'&&!window.__nir.state().locale_pending);
+  current=await state(page);
+  expect(current.text_locale).toBe('zh-Hans');
+  expect(current.choice.locale).toBe('en');
+  expect(await page.evaluate(()=>document.documentElement.lang)).toBe('en');
+  expect(await page.locator('#actions button[lang="en"]').count()).toBeGreaterThan(0);
+  await page.screenshot({path:'reports/locale-en-ui-frozen-en-choice.png'});
+  expect(current.error).toBeNull();
+  const frozenChoice=current.choice;
+  await page.setViewportSize({width:390,height:844});
+  await page.waitForTimeout(150);
+  expect((await state(page)).choice).toEqual(frozenChoice);
+  const labels=await page.locator('#actions button').allTextContents();
+  expect(labels).toContain('简体中文');
+  expect(labels).toContain('English');
+  expectPainted(await page.screenshot({path:'reports/locale-narrow-settings.png'}));
 });
 
 test('independent pauses, viewport changes, touch and actual device recovery', async ({ page }) => {
@@ -153,12 +205,17 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
     await page.keyboard.press('Space');
     await page.waitForFunction(()=>!!window.__nir.state().dialogue,null,{polling:100,timeout:15000});
     const other=await context.newPage();await other.goto('about:blank');await other.bringToFront();
-    await page.waitForFunction(()=>document.hidden&&window.__nir.state().paused,null,{timeout:10000,polling:100});
-    const hidden=await state(page);await page.waitForTimeout(500);
-    expect((await state(page)).tick_us).toBe(hidden.tick_us);
+    const hidden=await page.waitForFunction(()=>{
+      try{return document.hidden&&window.__nir.state().paused?true:false;}
+      catch(error){return `disposed: ${error}; ${document.querySelector('#shell-message')?.textContent||''}`;}
+    },null,{timeout:10000,polling:100});
+    const hiddenResult=await hidden.jsonValue();
+    expect(hiddenResult).toBe(true);
+    const hiddenState=await state(page);await page.waitForTimeout(500);
+    expect((await state(page)).tick_us).toBe(hiddenState.tick_us);
     await page.bringToFront();
     await page.waitForFunction(()=>!document.hidden&&!window.__nir.state().paused,null,{timeout:10000,polling:100});
-    expect((await state(page)).session).toBe(hidden.session);
+    expect((await state(page)).session).toBe(hiddenState.session);
   } finally {await browser?.close();proc.kill('SIGTERM');}
 });
 
@@ -210,12 +267,13 @@ test('save export/import and tamper rejection preserve independent preferences',
   const downloaded=page.waitForEvent('download');await act(page,{type:'export'});
   const path=await (await downloaded).path();const bytes=await fs.readFile(path);
   const envelope=JSON.parse(bytes.toString());expect(envelope.snapshot.release).toHaveLength(64);
-  await act(page,{type:'settings'});await act(page,{type:'locale',locale:'en'});
+  await act(page,{type:'settings'});await act(page,{type:'text_locale',locale:'en'});
   let chosen=page.waitForEvent('filechooser');await act(page,{type:'import'});
   await (await chosen).setFiles({name:'save.json',mimeType:'application/json',buffer:bytes});
   await page.waitForFunction(epoch=>window.__nir.state().session>epoch&&!window.__nir.state().loading,before.session);
   const restored=await state(page);
-  expect(restored.paused).toBe(true);expect(restored.dialogue.locale).toBe('zh-Hans');expect(restored.locale).toBe('en');
+  expect(restored.paused).toBe(true);expect(restored.dialogue.locale).toBe('zh-Hans');
+  expect(restored.ui_locale).toBe('zh-Hans');expect(restored.text_locale).toBe('en');
   envelope.snapshot.variables.affection.value=999;
   chosen=page.waitForEvent('filechooser');await act(page,{type:'import'});
   await (await chosen).setFiles({name:'tampered.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(envelope))});

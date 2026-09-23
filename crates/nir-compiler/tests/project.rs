@@ -100,6 +100,94 @@ fn missing_font_glyph_rejected() {
         .to_string()
         .contains("E_FONT_COVERAGE"));
 }
+
+#[test]
+fn locale_config_is_required_and_rejects_invalid_font_plans() {
+    let d = project();
+    let game = d.path().join("game.toml");
+    let manifest = fs::read_to_string(&game).unwrap();
+    fs::write(
+        &game,
+        manifest.replace("locales = \"config/locales.toml\"\n", ""),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_LOCALE_CONFIG"));
+
+    let d = project();
+    let locales = d.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap();
+    fs::write(
+        &locales,
+        config.replacen(
+            "zh-Hans = [\"font.reader\"]",
+            "zh-Hans = [\"font.reader\", \"font.reader\"]",
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_FONT_PLAN"));
+
+    let d = project();
+    let locales = d.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap();
+    fs::write(
+        &locales,
+        config.replace("default_text = \"zh-Hans\"", "default_text = \"fr\""),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_LOCALE_CONFIG"));
+
+    let d = project();
+    let locales = d.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap();
+    fs::write(&locales, config.replace("[ui]", "unknown = true\n\n[ui]")).unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field"));
+}
+
+#[test]
+fn locale_text_plans_must_cover_all_bundles_and_only_use_fonts() {
+    let d = project();
+    let locales = d.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap();
+    let without_english_text = config.replace(
+        "[text]\nzh-Hans = [\"font.reader\"]\nen = [\"font.latin\", \"font.reader\"]",
+        "[text]\nzh-Hans = [\"font.reader\"]",
+    );
+    fs::write(&locales, without_english_text).unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_TRANSLATION"));
+
+    let d = project();
+    let locales = d.path().join("config/locales.toml");
+    let config = fs::read_to_string(&locales).unwrap();
+    fs::write(
+        &locales,
+        config.replacen(
+            "zh-Hans = [\"font.reader\"]",
+            "zh-Hans = [\"bg.station\"]",
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .unwrap_err()
+        .to_string()
+        .contains("E_FONT_PLAN"));
+}
 #[test]
 fn unsupported_module_count_rejected() {
     let d = project();

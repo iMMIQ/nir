@@ -44,6 +44,10 @@
     "game_id": {
       "type": "string"
     },
+    "locale_config": {
+      "description": "Explicit, per-surface language and ordered font plans. This is part of\nthe executable identity; older executables without it are rejected.",
+      "$ref": "#/$defs/LocaleConfig"
+    },
     "locales": {
       "type": "object",
       "additionalProperties": {
@@ -166,6 +170,7 @@
     "entry",
     "stage",
     "functions",
+    "locale_config",
     "default_locale"
   ],
   "$defs": {
@@ -706,6 +711,55 @@
       "required": [
         "entry",
         "blocks"
+      ]
+    },
+    "LocaleConfig": {
+      "type": "object",
+      "properties": {
+        "default_text": {
+          "type": "string"
+        },
+        "default_ui": {
+          "type": "string"
+        },
+        "text": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/LocaleFontPlan"
+          }
+        },
+        "ui": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/LocaleFontPlan"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "default_ui",
+        "default_text",
+        "ui",
+        "text"
+      ]
+    },
+    "LocaleFontPlan": {
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "fonts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fonts",
+        "digest"
       ]
     },
     "Micros": {

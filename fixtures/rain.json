@@ -1209,5 +1209,37 @@
       "width": 0,
       "height": 0
     }
+  },
+  "locale_config": {
+    "default_ui": "zh-Hans",
+    "default_text": "zh-Hans",
+    "ui": {
+      "zh-Hans": {
+        "fonts": [
+          "font.reader"
+        ],
+        "digest": "89bb7625b72ee2862094b970ac465bcd1fb1ec57b1a6a00cfbc09f0f2cbd0cde"
+      },
+      "en": {
+        "fonts": [
+          "font.reader"
+        ],
+        "digest": "89bb7625b72ee2862094b970ac465bcd1fb1ec57b1a6a00cfbc09f0f2cbd0cde"
+      }
+    },
+    "text": {
+      "zh-Hans": {
+        "fonts": [
+          "font.reader"
+        ],
+        "digest": "89bb7625b72ee2862094b970ac465bcd1fb1ec57b1a6a00cfbc09f0f2cbd0cde"
+      },
+      "en": {
+        "fonts": [
+          "font.reader"
+        ],
+        "digest": "89bb7625b72ee2862094b970ac465bcd1fb1ec57b1a6a00cfbc09f0f2cbd0cde"
+      }
+    }
   }
 }

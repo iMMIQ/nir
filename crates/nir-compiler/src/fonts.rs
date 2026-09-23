@@ -1,7 +1,7 @@
 //! Native-only font preparation. No font tools or system fonts are needed by authors.
 use anyhow::{anyhow, bail, Context, Result};
 use hb_subset::{Blob, FontFace, SubsetInput};
-use nir_format::{AssetKind, Program};
+use nir_format::{AssetKind, LocaleConfig, Program};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,47 +48,76 @@ pub struct FontReport {
     pub license_digest: String,
 }
 
-pub(crate) fn characters(p: &Program, title: &str) -> Result<BTreeSet<char>> {
-    let mut chars: BTreeSet<char> = (' '..='~').collect();
-    // All built-in UI locales travel with the compiler. These are source data,
-    // not a dependency on presentation/GPU. Control symbols are Fluent too.
-    for text in [
-        title,
-        include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
-        include_str!("../../nir-presentation/messages/en.ftl"),
-    ] {
-        chars.extend(text.chars());
-    }
-    fn visit(v: &serde_json::Value, chars: &mut BTreeSet<char>) {
-        match v {
-            serde_json::Value::Object(o) => {
-                if o.get("type").and_then(|v| v.as_str()) == Some("string") {
-                    if let Some(s) = o.get("value").and_then(|v| v.as_str()) {
-                        chars.extend(s.chars());
-                    }
-                }
-                // Span text, dialogue speaker, and logical text IDs (also used
-                // in save labels). Walk every expression, including call args.
-                for key in ["text", "speaker"] {
-                    if let Some(s) = o.get(key).and_then(|v| v.as_str()) {
-                        chars.extend(s.chars());
-                    }
-                }
-                for v in o.values() {
-                    visit(v, chars);
+fn collect_strings(value: &serde_json::Value, chars: &mut BTreeSet<char>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(|v| v.as_str()) == Some("string") {
+                if let Some(s) = object.get("value").and_then(|v| v.as_str()) {
+                    chars.extend(s.chars());
                 }
             }
-            serde_json::Value::Array(a) => {
-                for v in a {
-                    visit(v, chars);
+            for key in ["text", "speaker"] {
+                if let Some(s) = object.get(key).and_then(|v| v.as_str()) {
+                    chars.extend(s.chars());
                 }
             }
-            _ => {}
+            for value in object.values() {
+                collect_strings(value, chars);
+            }
         }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_strings(value, chars);
+            }
+        }
+        _ => {}
     }
-    visit(&serde_json::to_value(p)?, &mut chars);
-    chars.retain(|c| !c.is_control());
-    Ok(chars)
+}
+
+pub(crate) struct CharacterSets {
+    pub ui: BTreeMap<String, BTreeSet<char>>,
+    pub text: BTreeMap<String, BTreeSet<char>>,
+}
+
+pub(crate) fn characters_by_plan(p: &Program, title: &str) -> Result<CharacterSets> {
+    let mut common_program = p.clone();
+    common_program.locales.clear();
+    common_program.texts.clear();
+    common_program.assets.clear();
+    common_program.locale_config = LocaleConfig::default();
+    let mut common: BTreeSet<char> = (' '..='~').collect();
+    collect_strings(&serde_json::to_value(common_program)?, &mut common);
+    common.retain(|c| !c.is_control());
+    let mut ui = BTreeMap::new();
+    let mut text = BTreeMap::new();
+    for locale in p.locale_config.ui.keys() {
+        let fluent = match locale.as_str() {
+            "zh-Hans" => include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
+            "en" => include_str!("../../nir-presentation/messages/en.ftl"),
+            _ => anyhow::bail!("E_LOCALE: unsupported UI locale {locale}"),
+        };
+        let mut chars = common.clone();
+        let localized_title = if locale == "zh-Hans" {
+            title.split('·').next().unwrap_or(title).trim()
+        } else {
+            title.split('·').nth(1).unwrap_or(title).trim()
+        };
+        chars.extend(localized_title.chars());
+        chars.extend(fluent.chars());
+        chars.retain(|c| !c.is_control());
+        ui.insert(locale.clone(), chars);
+    }
+    for locale in p.locale_config.text.keys() {
+        let docs = p
+            .locales
+            .get(locale)
+            .ok_or_else(|| anyhow::anyhow!("E_TRANSLATION: {locale}"))?;
+        let mut chars = common.clone();
+        collect_strings(&serde_json::to_value(docs)?, &mut chars);
+        chars.retain(|c| !c.is_control());
+        text.insert(locale.clone(), chars);
+    }
+    Ok(CharacterSets { ui, text })
 }
 
 fn face(bytes: &[u8], index: u32) -> Result<ttf_parser::Face<'_>> {
@@ -118,26 +147,38 @@ fn missing<'a>(
         .map(|c| format!("{c} (U+{:04X})", *c as u32))
         .collect()
 }
-pub(crate) fn coverage(
+pub(crate) fn coverage_by_plan(
     p: &Program,
     media: &BTreeMap<String, Vec<u8>>,
-    chars: &BTreeSet<char>,
+    sets: &CharacterSets,
 ) -> Result<()> {
-    let fonts: Vec<_> = p
-        .assets
-        .iter()
-        .filter(|(_, a)| a.kind == AssetKind::Font)
-        .map(|(id, _)| face(&media[id], 0))
-        .collect::<Result<_>>()?;
-    if fonts.is_empty() {
-        bail!("E_FONT: register a font asset");
-    }
-    let absent = missing(chars.iter(), &fonts);
-    if !absent.is_empty() {
-        bail!(
-            "E_FONT_COVERAGE: UI/body/title/interpolation lacks {}; provide a licensed master font",
-            absent.join(", ")
-        );
+    for (surface, plans, characters) in [
+        ("ui", &p.locale_config.ui, &sets.ui),
+        ("text", &p.locale_config.text, &sets.text),
+    ] {
+        for (locale, plan) in plans {
+            let faces = plan
+                .fonts
+                .iter()
+                .map(|id| {
+                    let asset = p
+                        .assets
+                        .get(id)
+                        .ok_or_else(|| anyhow!("E_FONT_PLAN: unknown font {id}"))?;
+                    if asset.kind != AssetKind::Font {
+                        bail!("E_FONT_PLAN: {id} is not a font asset");
+                    }
+                    face(&media[id], 0)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let absent = missing(characters[locale].iter(), &faces);
+            if !absent.is_empty() {
+                bail!(
+                    "E_FONT_COVERAGE: {surface}.{locale} lacks {}; adjust its ordered font plan",
+                    absent.join(", ")
+                );
+            }
+        }
     }
     Ok(())
 }

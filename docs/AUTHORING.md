@@ -2,7 +2,7 @@
 
 先用 `novelc init my-story` 创建独立的最小双语作品；需要场景/声音/Gate 范例时用 `--template web-basic`。`game.toml` 只登记作品输入；本地输出放在 `.nir/`、`dist/`、`reports/`。程序拒绝未识别字段，扩展能力不能靠加一个任意 JSON 字段启用。
 
-作品默认偏好与对白、选项主题在独立文件配置；用 `novelc config` 查看最终值和逐字段来源，格式与限制见 [作品配置和主题契约](PROJECT-THEMES.md)。
+作品默认偏好与对白、选项主题在独立文件配置；UI 与正文语言、逐语言字体计划在 `config/locales.toml` 配置。用 `novelc config` 查看支持的最终配置值和逐字段来源，主题见[作品配置和主题契约](PROJECT-THEMES.md)，语言与字体见[独立语言上下文](LOCALE-FONTS.md)。
 
 ## 从一句对白开始
 
