@@ -45,7 +45,7 @@ window.nirDiagnostics.download()
 先构建正式 SDK 与静态目录，再使用与浏览器回归一致的 Chromium/显示后端配置：
 
 ```sh
-npm run test:performance
+bun run test:performance
 ```
 
 默认 20 次独立浏览器上下文启动、20 次同上下文暖缓存重载，以及 30 次保存恢复/返回标题循环，其中 3 次真实 GPUDevice 销毁。可用 `NIR_PERF_SAMPLES`、`NIR_PERF_CYCLES` 调整样本数；少量试跑不能替代默认基线。测试数据仅写入 `reports/`。

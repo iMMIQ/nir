@@ -17,6 +17,7 @@
             packages = with pkgs; [
               rustup
               python3
+              bun
               nodejs_24
               pkg-config
             ];

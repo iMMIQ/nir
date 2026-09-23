@@ -143,25 +143,31 @@ fn main() -> Result<()> {
             run(Command::new("python3").arg("scripts/check_architecture.py"))?
         }
         Some("test") => {
-            run(Command::new("cargo").args([
-                "test",
-                "--locked",
-                "-p",
+            let mut args = std::env::args().skip(2).peekable();
+            let quick = args.peek().is_some_and(|arg| arg == "--quick");
+            if quick {
+                args.next();
+            }
+            let mut command = Command::new("cargo");
+            command.args(["test", "--locked"]);
+            for package in [
                 "nir-core",
-                "-p",
                 "nir-content",
-                "-p",
                 "nir-assets",
-                "-p",
                 "nir-player",
-                "-p",
-                "nir-compiler",
-                "-p",
-                "novelc",
-            ]))?;
-            run(Command::new("python3").arg("scripts/check_architecture.py"))?;
+                "nir-presentation",
+            ] {
+                command.args(["-p", package]);
+            }
+            if !quick {
+                command.args(["-p", "nir-compiler", "-p", "novelc"]);
+            }
+            run(command.args(args))?;
+            if !quick {
+                run(Command::new("python3").arg("scripts/check_architecture.py"))?;
+            }
         }
-        _ => println!("cargo xtask sdk | check-architecture | test"),
+        _ => println!("cargo xtask sdk | check-architecture | test [--quick] [cargo test args...]"),
     }
     Ok(())
 }

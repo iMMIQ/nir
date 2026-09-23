@@ -1,0 +1,3 @@
+[test]
+# Browser and performance specs are owned by Playwright.
+root = "./tests/host"

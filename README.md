@@ -71,7 +71,7 @@ schemas/                       由 SDK 生成的 JSON Schema
 
 ## 从源码构建引擎与 SDK
 
-固定工具链在 `rust-toolchain.toml`，依赖锁在 `Cargo.lock` 和 `package-lock.json`。需要 Rust/rustup、Python 3、C++ 编译器、libclang（Ubuntu：`g++ libclang-dev`）、Node.js（仅浏览器测试）及桌面 Chromium。
+固定工具链在 `rust-toolchain.toml` 和 `.bun-version`，依赖锁在 `Cargo.lock` 和 `bun.lock`。需要 Rust/rustup、Python 3、C++ 编译器、libclang（Ubuntu：`g++ libclang-dev`）、Bun、Node.js（Playwright 运行时）及桌面 Chromium。
 
 NixOS 用户先进入项目开发环境（需启用 Nix 的 `nix-command` 和 `flakes`）：
 
@@ -80,7 +80,7 @@ nix develop
 cargo b
 ```
 
-`flake.lock` 固定 Nix 依赖；开发环境提供 GCC、libclang、rustup、Python 和 Node.js，并配置 bindgen 的库与头文件路径。Rust 版本仍由 `rust-toolchain.toml` 控制，首次构建时 rustup 会下载所需工具链。也可使用 `nix develop --command cargo b` 单次构建。浏览器测试所需的 Chromium 另行准备。
+`flake.lock` 固定 Nix 依赖；开发环境提供 GCC、libclang、rustup、Python、Bun 和 Node.js，并配置 bindgen 的库与头文件路径。Rust 版本仍由 `rust-toolchain.toml` 控制，首次构建时 rustup 会下载所需工具链。也可使用 `nix develop --command cargo b` 单次构建。浏览器测试所需的 Chromium 另行准备。
 
 ```sh
 rustup target add wasm32-unknown-unknown --toolchain 1.98.1
@@ -96,15 +96,16 @@ cargo xtask sdk
 ```sh
 cargo fmt --all --check
 cargo xtask test
-cargo test -p nir-presentation
 cargo clippy --workspace --all-targets --exclude player-web --exclude nir-render-wgpu --exclude nir-platform-web -- -D warnings
 cargo clippy -p player-web --target wasm32-unknown-unknown -- -D warnings
-npm ci
-npm run test:host
-TMPDIR="$PWD/target/tmp" npm run test:browser
+bun install --frozen-lockfile
+bun run test:host
+TMPDIR="$PWD/target/tmp" bun run test:browser
 python3 scripts/verify_release.py examples/rain-letters/dist/full/web
 python3 scripts/verify_sdk.py
 ```
+
+日常修改 Core/Player/展示层可先运行 `cargo xtask test --quick` 和 `bun run test:host`；编译器、字体和 CLI 的测试及架构检查仍由完整 `cargo xtask test` 执行。还可用 `cargo xtask test --quick <测试名>` 或 `bun run test:browser tests/browser/modules.spec.js` 定位验证。CI 保留完整测试，并缓存 Rust 依赖编译产物和固定版本的 wasm-bindgen CLI。迁移说明和实测结果见 [构建与测试速度](docs/BUILD-SPEED.md)。
 
 浏览器测试默认使用有窗口的 `/usr/bin/chromium`。可用 `CHROMIUM` 改路径，`NIR_CHROME_ARGS` 添加启动参数。Linux 无桌面环境可尝试 Xvfb，但必须实际检查画布截图；本机无界面模式曾出现 WebGPU 提交成功而画布空白的系统合成问题，不能把它当作通过。测试只在 `?test=1` 下启用只读状态及故障注入接口。
 

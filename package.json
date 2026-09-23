@@ -2,11 +2,12 @@
   "name": "nir-browser-tests",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.3.13",
   "type": "module",
   "scripts": {
     "test:browser": "playwright test",
     "test:browser:headed": "playwright test --headed",
-    "test:host": "node --test tests/host/*.test.js",
+    "test:host": "bun test ./tests/host",
     "test:performance": "playwright test --config playwright.performance.config.js"
   },
   "devDependencies": {
