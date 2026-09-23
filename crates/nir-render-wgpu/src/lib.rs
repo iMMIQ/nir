@@ -14,6 +14,59 @@ use std::{
     },
 };
 pub use wgpu;
+
+const MAX_PENDING_PROFILES: usize = 64;
+
+/// One CPU timing sample from the renderer.
+///
+/// `stage` is one of `prepare.layout`, `prepare.glyphs`, `vertex.build_write`,
+/// `surface.acquire`, `command.encode`, `queue.submit`, `present`, `image.convert`,
+/// or `image.write`. Times are in microseconds from the clock installed with
+/// [`Renderer::set_profiling_clock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderProfile {
+    pub stage: &'static str,
+    pub start_us: u64,
+    pub end_us: u64,
+}
+
+#[derive(Default)]
+struct ProfileCollector {
+    clock: Option<fn() -> u64>,
+    records: Vec<RenderProfile>,
+}
+
+impl ProfileCollector {
+    fn set_clock(&mut self, clock: Option<fn() -> u64>) {
+        self.records.clear();
+        self.clock = clock;
+    }
+
+    fn start(&self) -> Option<u64> {
+        if self.records.len() >= MAX_PENDING_PROFILES {
+            return None;
+        }
+        self.clock.map(|clock| clock())
+    }
+
+    fn end(&mut self, stage: &'static str, start_us: Option<u64>) {
+        if self.records.len() >= MAX_PENDING_PROFILES {
+            return;
+        }
+        if let (Some(clock), Some(start_us)) = (self.clock, start_us) {
+            self.records.push(RenderProfile {
+                stage,
+                start_us,
+                end_us: clock(),
+            });
+        }
+    }
+
+    fn take(&mut self) -> Vec<RenderProfile> {
+        std::mem::take(&mut self.records)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -59,6 +112,7 @@ pub struct Renderer {
     pub adapter_info: String,
     lost: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
+    profile: ProfileCollector,
 }
 fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::new("E_RENDER", "wgpu", message).classified(
@@ -80,6 +134,20 @@ fn srgb(v: f32) -> f32 {
         v * 12.92
     } else {
         1.055 * v.powf(1. / 2.4) - 0.055
+    }
+}
+fn premultiply_pixel(pixel: &mut [u8; 4]) {
+    match pixel[3] {
+        255 => {}
+        0 => pixel[..3].fill(0),
+        alpha => {
+            let a = alpha as f32 / 255.;
+            for channel in &mut pixel[..3] {
+                *channel = (srgb(linear(*channel as f32 / 255.) * a) * 255.)
+                    .round()
+                    .clamp(0., 255.) as u8;
+            }
+        }
     }
 }
 impl Renderer {
@@ -276,6 +344,7 @@ impl Renderer {
             adapter_info,
             lost,
             errors,
+            profile: ProfileCollector::default(),
         };
         r.upload_rgba("", 1, 1, &[255; 4]);
         if let Some(e) = r.device.pop_error_scope().await {
@@ -285,6 +354,21 @@ impl Renderer {
     }
     pub fn validation_error(&self) -> Option<String> {
         self.errors.lock().unwrap().first().cloned()
+    }
+    /// Enables CPU stage timing with a caller supplied monotonic microsecond clock.
+    /// Passing `None` disables timing and clears any pending samples.
+    pub fn set_profiling_clock(&mut self, clock: Option<fn() -> u64>) {
+        self.profile.set_clock(clock);
+    }
+    /// Returns and clears up to 64 pending CPU stage timing samples.
+    pub fn take_profile(&mut self) -> Vec<RenderProfile> {
+        self.profile.take()
+    }
+    fn profile_start(&self) -> Option<u64> {
+        self.profile.start()
+    }
+    fn profile_end(&mut self, stage: &'static str, start_us: Option<u64>) {
+        self.profile.end(stage, start_us);
     }
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
@@ -331,14 +415,12 @@ impl Renderer {
         }
         let start = upload.row as usize * stride;
         let end = start + rows as usize * stride;
+        let convert_start = self.profile.start();
         for pixel in upload.pixels[start..end].as_chunks_mut::<4>().0 {
-            let a = pixel[3] as f32 / 255.;
-            for channel in &mut pixel[..3] {
-                *channel = (srgb(linear(*channel as f32 / 255.) * a) * 255.)
-                    .round()
-                    .clamp(0., 255.) as u8;
-            }
+            premultiply_pixel(pixel);
         }
+        self.profile.end("image.convert", convert_start);
+        let write_start = self.profile.start();
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &upload.texture._texture,
@@ -362,6 +444,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        self.profile.end("image.write", write_start);
         upload.row += rows;
         self.upload_steps += 1;
         let complete = upload.row == upload.height;
@@ -464,7 +547,9 @@ impl Renderer {
             .retain(|id, _| id.is_empty() || ids.contains(id));
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
+        let layout_start = self.profile_start();
         self.text.layout(p);
+        self.profile_end("prepare.layout", layout_start);
         if let Some(error) = self.text.missing_font.take() {
             return Err(
                 Diagnostic::new("E_FONT_PLAN", "presentation.prepare", error).classified(
@@ -475,6 +560,7 @@ impl Renderer {
                 ),
             );
         }
+        let glyphs_start = self.profile_start();
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -556,17 +642,17 @@ impl Renderer {
                 });
             }
         }
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.text.fonts,
-                &mut self.atlas,
-                &self.viewport,
-                areas,
-                &mut self.swash,
-            )
-            .map_err(|e| error(e.to_string()))?;
+        let glyphs_result = self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.text.fonts,
+            &mut self.atlas,
+            &self.viewport,
+            areas,
+            &mut self.swash,
+        );
+        self.profile_end("prepare.glyphs", glyphs_start);
+        glyphs_result.map_err(|e| error(e.to_string()))?;
         Ok(())
     }
     fn offscreen(&self, w: u32, h: u32) -> Texture {
@@ -648,88 +734,123 @@ impl Renderer {
     }
     pub fn render(&mut self, p: &DrawPacket, dpr: f32) -> Result<()> {
         self.prepare(p, dpr, false)?;
-        let mut verts = vec![];
-        let append = |verts: &mut Vec<Vertex>, quads: &[nir_presentation::Quad]| {
-            for q in quads {
-                let [x, y, w, h] = q.rect;
-                let a = if q.asset.as_deref() == Some("@transition") {
-                    p.transition_layers.as_ref().unwrap().2
-                } else {
-                    q.color[3]
-                };
-                let color = [
-                    linear(q.color[0]) * a,
-                    linear(q.color[1]) * a,
-                    linear(q.color[2]) * a,
-                    a,
-                ];
-                for (dx, dy, u, v) in [
-                    (0., 0., 0., 0.),
-                    (w, 0., 1., 0.),
-                    (0., h, 0., 1.),
-                    (0., h, 0., 1.),
-                    (w, 0., 1., 0.),
-                    (w, h, 1., 1.),
-                ] {
-                    verts.push(Vertex {
-                        pos: [(x + dx) / p.width * 2. - 1., 1. - (y + dy) / p.height * 2.],
-                        uv: [u, v],
-                        color,
-                    });
+        let vertex_start = self.profile_start();
+        let vertex_result = (|| -> Result<(usize, usize)> {
+            let mut verts = vec![];
+            let append = |verts: &mut Vec<Vertex>, quads: &[nir_presentation::Quad]| {
+                for q in quads {
+                    let [x, y, w, h] = q.rect;
+                    let a = if q.asset.as_deref() == Some("@transition") {
+                        p.transition_layers.as_ref().unwrap().2
+                    } else {
+                        q.color[3]
+                    };
+                    let color = [
+                        linear(q.color[0]) * a,
+                        linear(q.color[1]) * a,
+                        linear(q.color[2]) * a,
+                        a,
+                    ];
+                    for (dx, dy, u, v) in [
+                        (0., 0., 0., 0.),
+                        (w, 0., 1., 0.),
+                        (0., h, 0., 1.),
+                        (0., h, 0., 1.),
+                        (w, 0., 1., 0.),
+                        (w, h, 1., 1.),
+                    ] {
+                        verts.push(Vertex {
+                            pos: [(x + dx) / p.width * 2. - 1., 1. - (y + dy) / p.height * 2.],
+                            uv: [u, v],
+                            color,
+                        });
+                    }
+                }
+            };
+            append(&mut verts, &p.quads);
+            let source_start = verts.len();
+            let mut target_start = source_start;
+            if let Some((a, b, _)) = &p.transition_layers {
+                append(&mut verts, a);
+                target_start = verts.len();
+                append(&mut verts, b);
+                let [w, h] = p.stage_size;
+                if !self
+                    .scratch
+                    .as_ref()
+                    .is_some_and(|(_, _, x, y)| *x == w && *y == h)
+                {
+                    self.scratch = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
                 }
             }
-        };
-        append(&mut verts, &p.quads);
-        let source_start = verts.len();
-        let mut target_start = source_start;
-        if let Some((a, b, _)) = &p.transition_layers {
-            append(&mut verts, a);
-            target_start = verts.len();
-            append(&mut verts, b);
-            let [w, h] = p.stage_size;
-            if !self
-                .scratch
-                .as_ref()
-                .is_some_and(|(_, _, x, y)| *x == w && *y == h)
-            {
-                self.scratch = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
+            if verts.len() > self.capacity {
+                return Err(error("quad capacity exceeded"));
             }
-        }
-        if verts.len() > self.capacity {
-            return Err(error("quad capacity exceeded"));
-        }
-        self.queue
-            .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
-        let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.config);
-                self.surface
-                    .get_current_texture()
-                    .map_err(|e| error(e.to_string()))?
+            self.queue
+                .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
+            Ok((source_start, target_start))
+        })();
+        self.profile_end("vertex.build_write", vertex_start);
+        let (source_start, target_start) = vertex_result?;
+
+        let acquire_start = self.profile_start();
+        let frame_result = (|| -> Result<wgpu::SurfaceTexture> {
+            match self.surface.get_current_texture() {
+                Ok(f) => Ok(f),
+                Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                    self.surface.configure(&self.device, &self.config);
+                    self.surface
+                        .get_current_texture()
+                        .map_err(|e| error(e.to_string()))
+                }
+                Err(e) => Err(error(e.to_string())),
             }
-            Err(e) => return Err(error(e.to_string())),
-        };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.format),
-            ..Default::default()
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("NIR frame"),
+        })();
+        self.profile_end("surface.acquire", acquire_start);
+        let frame = frame_result?;
+
+        let encode_start = self.profile_start();
+        let encode_result = (|| -> Result<wgpu::CommandBuffer> {
+            let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.format),
+                ..Default::default()
             });
-        if let Some((a, b, _)) = &p.transition_layers {
-            let (source, target, w, h) = self.scratch.as_ref().unwrap();
-            for (texture, quads, start) in [(source, a, source_start), (target, b, target_start)] {
-                let view = texture._texture.create_view(&Default::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("NIR frame"),
+                });
+            if let Some((a, b, _)) = &p.transition_layers {
+                let (source, target, w, h) = self.scratch.as_ref().unwrap();
+                for (texture, quads, start) in
+                    [(source, a, source_start), (target, b, target_start)]
+                {
+                    let view = texture._texture.create_view(&Default::default());
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("freeze side"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.paint(&mut pass, quads, start, p, [*w, *h])?;
+                }
+            }
+            {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("freeze side"),
+                    label: Some("scene, transition and final-resolution UI"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -737,39 +858,115 @@ impl Renderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.paint(&mut pass, quads, start, p, [*w, *h])?;
+                self.paint(
+                    &mut pass,
+                    &p.quads,
+                    0,
+                    p,
+                    [self.config.width, self.config.height],
+                )?;
+                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                self.text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .map_err(|e| error(e.to_string()))?;
             }
-        }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene, transition and final-resolution UI"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.paint(
-                &mut pass,
-                &p.quads,
-                0,
-                p,
-                [self.config.width, self.config.height],
-            )?;
-            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .map_err(|e| error(e.to_string()))?;
-        }
-        self.queue.submit(Some(encoder.finish()));
+            Ok(encoder.finish())
+        })();
+        self.profile_end("command.encode", encode_start);
+        let command_buffer = encode_result?;
+
+        let submit_start = self.profile_start();
+        self.queue.submit(Some(command_buffer));
+        self.profile_end("queue.submit", submit_start);
+        let present_start = self.profile_start();
         frame.present();
+        self.profile_end("present", present_start);
         self.submitted += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CLOCK_VALUE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_clock() -> u64 {
+        CLOCK_VALUE.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn original_premultiply_channel(channel: u8, alpha: u8) -> u8 {
+        let a = alpha as f32 / 255.;
+        (srgb(linear(channel as f32 / 255.) * a) * 255.)
+            .round()
+            .clamp(0., 255.) as u8
+    }
+
+    #[test]
+    fn pixel_premultiply_matches_original_formula_for_all_byte_pairs() {
+        for alpha in 0..=u8::MAX {
+            for channel in 0..=u8::MAX {
+                let expected = original_premultiply_channel(channel, alpha);
+                let mut pixel = [channel, channel, channel, alpha];
+                premultiply_pixel(&mut pixel);
+                assert_eq!(
+                    pixel,
+                    [expected, expected, expected, alpha],
+                    "channel {channel}, alpha {alpha}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profiler_is_idle_bounded_and_drainable_without_a_gpu() {
+        CLOCK_VALUE.store(0, Ordering::Relaxed);
+        let mut profile = ProfileCollector::default();
+
+        for _ in 0..3 {
+            let start = profile.start();
+            profile.end("disabled", start);
+        }
+        assert_eq!(CLOCK_VALUE.load(Ordering::Relaxed), 0);
+        assert!(profile.records.is_empty());
+
+        profile.set_clock(Some(test_clock));
+        for _ in 0..=MAX_PENDING_PROFILES {
+            let start = profile.start();
+            profile.end("test.stage", start);
+        }
+        assert_eq!(profile.records.len(), MAX_PENDING_PROFILES);
+        assert_eq!(
+            CLOCK_VALUE.load(Ordering::Relaxed),
+            (2 * MAX_PENDING_PROFILES) as u64
+        );
+        assert_eq!(
+            profile.records[0],
+            RenderProfile {
+                stage: "test.stage",
+                start_us: 0,
+                end_us: 1,
+            }
+        );
+
+        let records = profile.take();
+        assert_eq!(records.len(), MAX_PENDING_PROFILES);
+        assert!(profile.records.is_empty());
+
+        let start = profile.start();
+        profile.end("cleared-on-disable", start);
+        assert_eq!(profile.records.len(), 1);
+        profile.set_clock(None);
+        assert!(profile.records.is_empty());
+        let calls_before_disabled_sample = CLOCK_VALUE.load(Ordering::Relaxed);
+        let start = profile.start();
+        profile.end("disabled-again", start);
+        assert_eq!(
+            CLOCK_VALUE.load(Ordering::Relaxed),
+            calls_before_disabled_sample
+        );
+        assert!(profile.take().is_empty());
     }
 }

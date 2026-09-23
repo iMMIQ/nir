@@ -166,14 +166,14 @@ zh-Hans = "texts/zh-Hans.json"
 `;
 }
 
-function textSource(locale, kind, index) {
+function textSource(locale, kind, index, repetitions = 1) {
   const text = kind === 'lead'
     ? (locale === 'en' ? `Ready for chapter ${index + 1}?` : `第${index + 1}章 雨`)
     : (locale === 'en' ? `Chapter ${index + 1}: the road continues.` : `第${index + 1}章 雨`);
   return {
     source_revision: 1,
     contract_revision: 1,
-    spans: [{ type: 'text', id: 'body', text, emphasis: false }],
+    spans: [{ type: 'text', id: 'body', text: Array(repetitions).fill(text).join('\n'), emphasis: false }],
   };
 }
 
@@ -293,7 +293,11 @@ export async function buildScaleFixture({
   prefetchContent = false,
   capacity = false,
   port = 4192,
+  textRepetitions = 1,
 } = {}) {
+  if (!Number.isInteger(textRepetitions) || textRepetitions < 1 || textRepetitions > 100) {
+    throw new Error('textRepetitions must be an integer from 1 to 100');
+  }
   if (!Number.isInteger(moduleCount) || moduleCount < 1) {
     throw new Error(`moduleCount must be a positive integer, got ${moduleCount}`);
   }
@@ -357,7 +361,7 @@ export async function buildScaleFixture({
       });
       for (const locale of ['zh-Hans', 'en']) {
         await writeJson(path.join(base, `texts/${locale}.json`), {
-          line: textSource(locale, 'chapter', index),
+          line: textSource(locale, 'chapter', index, textRepetitions),
         });
       }
     }

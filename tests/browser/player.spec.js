@@ -301,10 +301,22 @@ test('save export/import and tamper rejection preserve independent preferences',
   const downloaded=page.waitForEvent('download');await act(page,{type:'export'});
   const path=await (await downloaded).path();const bytes=await fs.readFile(path);
   const envelope=JSON.parse(bytes.toString());expect(envelope.snapshot.release).toHaveLength(64);
-  await act(page,{type:'settings'});await act(page,{type:'text_locale',locale:'en'});
+  await act(page,{type:'settings'});
+  let releaseFont;const fontGate=new Promise(resolve=>releaseFont=resolve);
+  await page.route(/\/objects\/[^/]+\.(?:otf|ttf|woff2?)$/,async route=>{await fontGate;await route.continue().catch(()=>{});});
+  await act(page,{type:'text_locale',locale:'en'});
+  await page.waitForFunction(()=>window.__nir.state().locale_pending);
   let chosen=page.waitForEvent('filechooser');await act(page,{type:'import'});
   await (await chosen).setFiles({name:'save.json',mimeType:'application/json',buffer:bytes});
   await page.waitForFunction(epoch=>window.__nir.state().session>epoch&&!window.__nir.state().loading,before.session);
+  // Restore and locale preparation are independent. Keep the user's selected
+  // preference while its font is pending; wait for the effective locale later.
+  const pending=await state(page);
+  expect(pending.preferences.text_locale).toBe('en');
+  expect(pending.locale_pending).toBe(true);
+  expect(pending.text_locale).toBe('zh-Hans');
+  releaseFont();
+  await page.waitForFunction(()=>!window.__nir.state().locale_pending);
   const restored=await state(page);
   expect(restored.paused).toBe(true);expect(restored.dialogue.locale).toBe('zh-Hans');
   expect(restored.ui_locale).toBe('zh-Hans');expect(restored.text_locale).toBe('en');

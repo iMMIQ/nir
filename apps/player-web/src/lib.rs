@@ -5,7 +5,7 @@ use nir_format::*;
 use nir_player::{AppCommand, AppEvent, Player, SaveEnvelope};
 use nir_presentation::{DrawPacket, Messages, ReadingState, SlotView};
 use nir_render_wgpu::{wgpu, Renderer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use wasm_bindgen::prelude::*;
 fn js(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
@@ -48,9 +48,21 @@ pub struct Engine {
     height: f32,
     dpr: f32,
     ready: bool,
-    signature: String,
     work_remaining: u32,
     upload_remaining: usize,
+    visual_invalidated: bool,
+    profiling: bool,
+    profile_records: VecDeque<HostProfile>,
+}
+#[derive(Clone, Copy)]
+struct HostProfile {
+    stage: &'static str,
+    start_us: u64,
+    end_us: u64,
+}
+const MAX_PENDING_HOST_PROFILES: usize = 128;
+fn profile_clock_us() -> u64 {
+    nir_platform_web::now_us().0
 }
 #[wasm_bindgen]
 impl Engine {
@@ -86,9 +98,11 @@ impl Engine {
             height: 720.,
             dpr: 1.,
             ready: false,
-            signature: String::new(),
             work_remaining: 10_000,
             upload_remaining: 2 * 1024 * 1024,
+            visual_invalidated: true,
+            profiling: false,
+            profile_records: VecDeque::new(),
         };
         e.pump(vec![])?;
         Ok(e)
@@ -97,6 +111,52 @@ impl Engine {
     pub fn begin_turn(&mut self) {
         self.work_remaining = 10_000;
         self.upload_remaining = 2 * 1024 * 1024;
+    }
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+        self.profile_records.clear();
+        self.renderer.set_profiling_clock(if enabled {
+            Some(profile_clock_us)
+        } else {
+            None
+        });
+    }
+    pub fn take_profile(&mut self) -> String {
+        let mut records: Vec<HostProfile> = self.profile_records.drain(..).collect();
+        records.extend(
+            self.renderer
+                .take_profile()
+                .into_iter()
+                .map(|record| HostProfile {
+                    stage: record.stage,
+                    start_us: record.start_us,
+                    end_us: record.end_us,
+                }),
+        );
+        records.sort_by_key(|record| (record.start_us, record.end_us));
+        serde_json::to_string(
+            &records
+                .into_iter()
+                .map(|record| {
+                    serde_json::json!({
+                        "stage": record.stage,
+                        "start_us": record.start_us,
+                        "end_us": record.end_us,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+    pub fn text_cache_stats(&self) -> String {
+        let stats = self.renderer.text.cache_stats();
+        serde_json::json!({
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "evictions": stats.evictions,
+            "entries": stats.entries,
+        })
+        .to_string()
     }
     pub fn continue_turn(&mut self) -> std::result::Result<(), JsValue> {
         self.pump(vec![])
@@ -260,7 +320,7 @@ impl Engine {
             self.player.generation.session,
             self.player.current_interaction(),
         );
-        if self.ready
+        let navigation_packet = if self.ready
             && !self.player.is_loading()
             && session == identity.0
             && interaction == identity.1
@@ -268,7 +328,8 @@ impl Engine {
         {
             // Earlier inputs in this same owner turn may have revealed more text.
             // Navigation must use current layout, not the previous submitted frame.
-            self.packet = self.reading.project(
+            let start = self.profile_start();
+            let packet = self.reading.project(
                 &self.player.model(),
                 identity,
                 self.width,
@@ -276,7 +337,11 @@ impl Engine {
                 &self.messages,
                 &mut self.renderer.text,
             );
-        }
+            self.profile_end("projection", start);
+            Some(packet)
+        } else {
+            None
+        };
 
         if self.view_sequence.0 == session && sequence <= self.view_sequence.1 {
             return Ok(());
@@ -290,7 +355,11 @@ impl Engine {
             if !valid {
                 return Ok(());
             }
-            self.reading.scroll(region, delta, &self.packet);
+            self.reading.scroll(
+                region,
+                delta,
+                navigation_packet.as_ref().unwrap_or(&self.packet),
+            );
             self.view_sequence = (session, sequence);
         } else if action == UiAction::Advance
             && valid
@@ -300,13 +369,18 @@ impl Engine {
         {
             if let Some((_, dialogue)) = self.player.core().dialogue() {
                 if (dialogue.awaiting_advance || dialogue.at_gate)
-                    && self
-                        .packet
+                    && navigation_packet
+                        .as_ref()
+                        .unwrap_or(&self.packet)
                         .scrolls
                         .iter()
                         .any(|s| s.region == ScrollRegion::Dialogue && s.offset < s.max - 0.5)
                 {
-                    self.reading.scroll(ScrollRegion::Dialogue, 1, &self.packet);
+                    self.reading.scroll(
+                        ScrollRegion::Dialogue,
+                        1,
+                        navigation_packet.as_ref().unwrap_or(&self.packet),
+                    );
                     self.view_sequence = (session, sequence);
                     action = UiAction::Scroll {
                         region: ScrollRegion::Dialogue,
@@ -436,6 +510,7 @@ impl Engine {
             self.width = width;
             self.height = height;
             self.dpr = dpr;
+            self.visual_invalidated = true;
             self.renderer
                 .resize((width * dpr) as u32, (height * dpr) as u32);
             self.player.viewport_changed().map_err(js)?;
@@ -447,7 +522,8 @@ impl Engine {
         let waiting_for_title =
             self.player.screen == nir_presentation::Screen::Title && self.player.is_loading();
         if self.ready && !waiting_for_title {
-            self.packet = self.reading.project(
+            let projection_start = self.profile_start();
+            let projected = self.reading.project(
                 &self.player.model(),
                 (
                     self.player.generation.session,
@@ -458,17 +534,22 @@ impl Engine {
                 &self.messages,
                 &mut self.renderer.text,
             );
-            let signature = format!(
-                "{:?}:{:?}:{:?}:{}",
-                self.packet.quads, self.packet.texts, self.packet.transition_layers, dpr
-            );
-            if self.signature != signature {
+            self.profile_end("projection", projection_start);
+            let draw_start = self.profile_start();
+            let needs_render = self.visual_invalidated || !self.packet.visual_eq(&projected);
+            self.packet = projected;
+            self.profile_end("draw", draw_start);
+            if needs_render {
+                self.visual_invalidated = true;
                 self.renderer.render(&self.packet, dpr).map_err(js)?;
-                self.signature = signature;
+                self.visual_invalidated = false;
             }
             self.renderer.retain(&self.player.retained_assets());
         }
-        Ok(serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"announcement_locale":self.packet.announcement_locale,"locale":self.packet.locale,"ready":self.ready}).to_string())
+        let semantics_start = self.profile_start();
+        let semantics = serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"announcement_locale":self.packet.announcement_locale,"locale":self.packet.locale,"ready":self.ready}).to_string();
+        self.profile_end("semantics", semantics_start);
+        Ok(semantics)
     }
     pub fn needs_clock(&self) -> bool {
         self.ready && self.player.needs_clock()
@@ -478,7 +559,33 @@ impl Engine {
         let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
         let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
         let residency = self.player.content_residency();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.model().locale_error,"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+    }
+    pub fn host_state(&mut self) -> String {
+        let start = self.profile_start();
+        let c = self.player.core();
+        let result = serde_json::json!({
+            "ready": self.ready,
+            "session": self.player.generation.session,
+            "device": self.player.generation.device,
+            "interaction": self.player.current_interaction(),
+            "sequence": c.state().last_input,
+            "screen": format!("{:?}", self.player.screen),
+            "locale": self.player.effective_ui_locale,
+            "paused": self.player.paused(),
+            "loading": self.player.is_loading(),
+            "has_dialogue": c.dialogue().is_some(),
+            "frames": self.renderer.submitted,
+            "resident_bytes": self.player.memory_used(),
+            "upload_steps": self.renderer.upload_steps,
+            "turn_upload_bytes": 2 * 1024 * 1024 - self.upload_remaining,
+            "scrolls": self.packet.scrolls,
+            "pending_events": self.player.pending_events(),
+            "turn_work": 10_000 - self.work_remaining,
+        })
+        .to_string();
+        self.profile_end("compact_state", start);
+        result
     }
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
@@ -495,12 +602,32 @@ impl Engine {
     }
     pub fn replace_gpu(&mut self, replacement: GpuReplacement) -> std::result::Result<(), JsValue> {
         self.renderer = replacement.renderer;
+        self.renderer.set_profiling_clock(if self.profiling {
+            Some(profile_clock_us)
+        } else {
+            None
+        });
         self.fonts.clear();
-        self.signature.clear();
+        self.visual_invalidated = true;
         self.pump(vec![AppEvent::DeviceReady])
     }
 }
 impl Engine {
+    fn profile_start(&self) -> Option<u64> {
+        self.profiling.then(profile_clock_us)
+    }
+    fn profile_end(&mut self, stage: &'static str, start_us: Option<u64>) {
+        if let Some(start_us) = start_us {
+            if self.profile_records.len() >= MAX_PENDING_HOST_PROFILES {
+                self.profile_records.pop_front();
+            }
+            self.profile_records.push_back(HostProfile {
+                stage,
+                start_us,
+                end_us: profile_clock_us(),
+            });
+        }
+    }
     fn resource_stage(
         &mut self,
         stage: &str,
@@ -536,6 +663,7 @@ impl Engine {
             let mut events = vec![];
             for command in commands {
                 if let AppCommand::PreparePresentation { request } = command {
+                    let start = self.profile_start();
                     let preview = ReadingState::default().project(
                         &self.player.preview(),
                         (0, request),
@@ -544,6 +672,7 @@ impl Engine {
                         &self.messages,
                         &mut self.renderer.text,
                     );
+                    self.profile_end("projection", start);
                     let start = nir_platform_web::now_us();
                     let prepared = self.renderer.prepare(&preview, self.dpr, true);
                     self.resource_stage("presentation_prepare", request, "", start, 0);
@@ -606,6 +735,7 @@ impl Engine {
             return Ok(None);
         }
         self.pending_locale = None;
+        let start = self.profile_start();
         let preview = ReadingState::default().project(
             &candidate,
             (self.player.generation.session, request),
@@ -614,6 +744,7 @@ impl Engine {
             &self.messages,
             &mut self.renderer.text,
         );
+        self.profile_end("projection", start);
         Ok(Some(
             match self.renderer.prepare(&preview, self.dpr, true) {
                 Ok(()) => AppEvent::LocaleReady { request },

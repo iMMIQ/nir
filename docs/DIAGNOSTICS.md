@@ -102,3 +102,28 @@ bun run test:performance:hardware --trace=off --grep 'navigation baseline|module
 `encodedBodySize` 是 HTTP 内容编码后的正文长度，`decodedBodySize` 是解压后长度；两者与内容账本的“对象编码字节”不是同一层概念。预压缩只减少网络传输，不降低驻留预算。长尾记录需包含触发章节、预取状态、请求阶段与实际适配器，不能仅凭一次最大值断言根因。
 
 `host_work` 补充资源池活动／排队数、共享下载、内容与媒体任务、owner 回调／请求槽、音频状态，以及最多 128 条待处理内容任务身份和阶段，不包含正文。性能路线失败时在关闭上下文前导出 `performance-failure-*.json`，保留这些状态、阶段事件和资源时间线。
+
+## 交互与主线程分段计时
+
+诊断开启时，`diagnostics().performance` 独立保留累计阶段统计与最近 64 个 owner turn，超过容量只覆盖旧明细，不挤占请求事件环。`turns[].stages` 的 `start_us`、`end_us`、`duration_us` 为浏览器单调时钟的整数微秒数；这与原有事件使用十进制字符串的格式不同。`?test=1&trace=0` 关闭详细计时，完整测试状态接口仍可使用。
+
+阶段包括宿主 `wake_wait`、`event_handling`、`semantics`，Rust `compact_state`、`projection`、`draw`，以及渲染器 `prepare.layout`、`prepare.glyphs`、`vertex.build_write`、`surface.acquire`、`command.encode`、`queue.submit`、`present`。图片上传另分为 `image.convert` 和 `image.write`。`draw` 表示画面比较与替换；`semantics` 分别记录 Rust 语义序列化及 DOM 更新。事件处理可包含投影、资源准备和上传，因此 `stage_semantics` 明确为 `inclusive_non_additive`：各阶段累计耗时不能直接相加作为整轮耗时。`wake_wait` 发生在 turn 开始前；由输入产生的状态读取也可能早于它所属的记录轮次。
+
+所有 GPU API 阶段均测 CPU 调用耗时，不等待 GPU 完成。文字缓存统计反映命中、未命中、LRU 淘汰及当前项数；128 项是缓存条目数的收敛目标，单次布局的完整工作集超过该值时仍受保护，不是物理内存上限。
+
+`Engine.host_state()` 是同一 SDK 内部的精简宿主接口，包含调度、输入令牌、滚动和计数，`has_dialogue` 只表示对白存在。完整 `Engine.state()`／`window.__nir.state()` 保持兼容。宿主在引擎发生状态变更后使快照失效，不缓存跨变更的交互令牌。
+
+```sh
+bun run test:performance:hardware --trace=off --grep 'navigation baseline|module scale (shaped-32|capacity-32)|prepared interactions'
+```
+
+新增交互场景先经过 32 章，积累 66 条历史；章节对白为固定 40 行，再分别测量菜单打开／关闭、历史滚动／翻页及存档恢复各 30 次。场景使用真实输入路径浏览溢出正文，不绕过阅读语义。`performance-interactions.json` 保留原始样本、发行身份、实际适配器、阶段明细与恢复后的剧情一致性检查；没有新诊断接口的旧 SDK 仍能生成同一工作负载的耗时基线。结果见 [交互优化验证](validation/interaction/README.md)。
+
+仅在排查获取长尾时启用额外 CDP 网络事件和浏览器 trace：
+
+```sh
+NIR_PERF_NETWORK_TRACE=1 bun run test:performance:hardware --trace=off --grep 'prepared interactions'
+NIR_PERF_NETWORK_TRACE=1 NIR_PERF_DISABLE_HTTP_CACHE=1 bun run test:performance:hardware --trace=off --grep 'prepared interactions'
+```
+
+网络事件最多保留 20,000 条，报告包含截断标记；浏览器 trace 输出为 `reports/performance-interactions-trace.json.gz`。禁用缓存开关仅在网络诊断开启时生效，只作用于该测试上下文。额外追踪会改变观测开销，应单独归档，不混入正式前后基线。CDP 缓存标记、字节数及阶段时间是定位线索，不能单独证明浏览器或服务器根因。

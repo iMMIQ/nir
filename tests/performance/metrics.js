@@ -292,7 +292,7 @@ export async function measureAction(page, { label, action, expectedTextId, requi
   }, { frames: start.before.frames, textId: expectedTextId, requireReady });
   return page.evaluate(({ label, expectedTextId, eventStart, startedAtMs, before }) => {
     const capture = window.__nirPerfCapture, api = window.__nir;
-    capture.drainTrace();
+    const diagnostics = capture.drainTrace();
     const afterState = api.state(), afterMetrics = api.metrics;
     const events = capture.events.slice(eventStart);
     const inputEvent = events.find(event => event.stage === 'input_received');
@@ -317,6 +317,10 @@ export async function measureAction(page, { label, action, expectedTextId, requi
       inputAtMs: Number(inputEvent.at_us) / 1000, requestedAtMs: startedAtMs, latencyMs,
       before, after: { frames: afterState.frames, dialogueId: afterState.dialogue?.id ?? null, dialogueReady: afterState.dialogue?.ready ?? null, session: afterState.session },
       inputEvent, renderSubmitted, events, requestStats, traceIncomplete: capture.trace.incomplete,
+      performance: diagnostics?.performance ? {
+        stage_semantics: diagnostics.performance.stage_semantics,
+        turns: diagnostics.performance.turns.filter(turn => Number(turn.end_us) >= Number(inputEvent.at_us)),
+      } : null,
     };
     function atOrAfter(a, b) { return /^\d{1,20}$/.test(String(a)) && /^\d{1,20}$/.test(String(b)) && BigInt(a) >= BigInt(b); }
   }, { label, expectedTextId, eventStart: start.eventStart, startedAtMs: start.startedAtMs, before: start.before });
@@ -363,6 +367,7 @@ export async function stopCapture(page) {
       resources: resourceRows, resourceTimingsIncomplete: capture.resourceTimingsIncomplete || capture.resourceBufferFull,
       adapterProbe: { error: window.__nirAdapterProbeError || null, actualAdapters: probes },
       prefetchStats: capture.prefetchStats,
+      performance: diagnostics?.performance ?? null,
       peaks: { ...capture.peaks }, violations, traceIncomplete: capture.trace.incomplete,
       trace: { ...capture.trace, reasons: [...capture.trace.reasons] },
       finalState: { playerResidentBytes: state.resident_bytes ?? null, contentResidency: state.content_residency ?? null, wasmMemoryCapacityBytes: state.wasm_memory_bytes ?? null,

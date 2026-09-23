@@ -503,6 +503,9 @@ impl Player {
                 .any(|p| matches!(p.purpose, ContentPurpose::Locale)))
             && self.locale_error.is_none()
     }
+    pub fn locale_error(&self) -> Option<&str> {
+        self.locale_error.as_deref()
+    }
     fn invalidate_locale_candidate(&mut self) {
         self.cancel_content(true);
         if let Some(candidate) = self.locale_candidate.take() {

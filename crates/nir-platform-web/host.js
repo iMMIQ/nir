@@ -18,6 +18,41 @@ export class TraceRecorder {
     snapshot() { return {format:1,enabled:this.enabled,capacity:this.capacity,dropped:Math.max(0,this.total-this.size),events:Array.from({length:this.size},(_,i)=>({...this.rows[(this.total-this.size+i)%this.capacity]}))}; }
 }
 
+// Detailed CPU timing is opt-in with trace diagnostics. Totals are accumulated
+// per stage; turn wall time is measured separately and never summed from nested
+// stages. The turn ring stays bounded even during long diagnostic sessions.
+export class PerformanceRecorder {
+    constructor(capacity=64) {
+        this.capacity=Math.max(1,Math.min(64,Math.trunc(capacity)||64));
+        this.stages=Object.create(null);this.turns=new Array(this.capacity);
+        this.totalTurns=0;this.size=0;
+    }
+    beginTurn(startUs) { return {id:this.totalTurns+1,start_us:startUs,stages:[]}; }
+    record(stage,startUs,endUs,turn) {
+        if(!Number.isFinite(startUs)||!Number.isFinite(endUs)||endUs<startUs)return;
+        const name=String(stage).slice(0,64),start=Math.round(startUs),end=Math.round(endUs),duration=end-start;
+        let total=this.stages[name];
+        if(!total)total=this.stages[name]={count:0,total_us:0,min_us:duration,max_us:duration};
+        total.count++;total.total_us+=duration;total.min_us=Math.min(total.min_us,duration);total.max_us=Math.max(total.max_us,duration);
+        if(turn)turn.stages.push({stage:name,start_us:start,end_us:end,duration_us:duration});
+    }
+    endTurn(turn,endUs) {
+        if(!turn)return;
+        turn.end_us=endUs;turn.total_us=Math.max(0,endUs-turn.start_us);
+        turn.stages.sort((a,b)=>a.start_us-b.start_us||a.end_us-b.end_us);
+        this.turns[this.totalTurns%this.capacity]=turn;
+        this.totalTurns++;this.size=Math.min(this.size+1,this.capacity);
+    }
+    snapshot() {
+        const turns=Array.from({length:this.size},(_,i)=>{
+            const turn=this.turns[(this.totalTurns-this.size+i)%this.capacity];
+            return {id:turn.id,start_us:turn.start_us,end_us:turn.end_us,total_us:turn.total_us,stages:turn.stages.map(row=>({...row}))};
+        });
+        const stages=Object.fromEntries(Object.entries(this.stages).map(([name,value])=>[name,{...value}]));
+        return {enabled:true,turn_capacity:this.capacity,total_turns:this.totalTurns,dropped_turns:Math.max(0,this.totalTurns-this.size),stage_semantics:'inclusive_non_additive',stages,turns};
+    }
+}
+
 // Bounded owner inbox. Async producers only enqueue; they never enter Rust.
 export class OwnerInbox {
     constructor(capacity=256, inputLimit=128, controlReserve=Math.min(8,Math.floor(capacity/16)), observe=()=>{},context=()=>({})) {
@@ -367,6 +402,7 @@ export function validateAssetRequest(assets,descriptors) {
 export async function start({wasm,release,releaseDigest,executable,fetchObject,fail,startupTrace=[]}) {
     const params=new URL(location.href).searchParams;
     const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
+    const performanceStats=trace.enabled?new PerformanceRecorder(64):null;
     let traceContext={session:1,device:1};
     const observe=(stage,fields={})=>trace.record(stage,{...traceContext,...fields});
     for(const row of startupTrace)observe(row.stage,row);
@@ -392,6 +428,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     observe('preferences_loaded');
     const createStart=String(Math.round(performance.now()*1000));
     const engine=await wasm.Engine.create(executable,releaseDigest,release.title,'stage',JSON.stringify(preferences));
+    engine.set_profiling(trace.enabled);
     preferences=JSON.parse(engine.state()).preferences;
     observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
     document.title=release.title;
@@ -400,15 +437,25 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
     let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
-    let ownerTimer=null,pendingElapsed=0;
-    function hostEvent(kind,value) {engine.host_event(kind,typeof value==='string'?value:JSON.stringify(value));}
+    let ownerTimer=null,pendingElapsed=0,wakeRequestedAt=null,pendingWakeWaitStartUs=null,pendingWakeWaitEndUs=null,cachedHostState=null;
+    function invalidateHostState(){cachedHostState=null;}
+    function mutateEngine(run) {try{return run();}finally{invalidateHostState();}}
+    function hostEvent(kind,value) {mutateEngine(()=>engine.host_event(kind,typeof value==='string'?value:JSON.stringify(value)));}
     function reportHostFailure(error,operation) {
         observe('diagnostic',{domain:'host',code:'E_HOST',operation});
         // A thrown WASM call may still own its mutable Engine borrow until this
         // callback returns. Report the failure in a later owner turn.
         queueMicrotask(()=>{if(!disposed)deliver(()=>hostEvent('host_failed',String(error)),'control');});
     }
-    function wake() {if(disposed||ownerTimer!==null)return;ownerTimer=setTimeout(()=>{ownerTimer=null;frame(performance.now());},0);}
+    function wake() {
+        if(disposed||ownerTimer!==null)return;
+        if(performanceStats)wakeRequestedAt=performance.now();
+        ownerTimer=setTimeout(()=>{
+            ownerTimer=null;const now=performance.now();
+            if(performanceStats){pendingWakeWaitStartUs=Math.round(wakeRequestedAt*1000);pendingWakeWaitEndUs=Math.round(now*1000);wakeRequestedAt=null;}
+            frame(now);
+        },0);
+    }
     function deliver(fn,kind='completion',group=null) {
         if(disposed)return Promise.resolve(false);
         return new Promise(resolve=>{
@@ -439,7 +486,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function playVoice(c) {
         stopVoice(c.task);
-        const failed=e=>engine.audio_failed(c.task,c.session,String(e));
+        const failed=e=>mutateEngine(()=>engine.audio_failed(c.task,c.session,String(e)));
         const slot=inbox.reserve('completion',`audio:${c.session}:${c.task}`,{session:c.session,task:c.task});
         if(!slot){failed('E_REQUEST_CAPACITY');return;}
         const buffer=buffers.get(c.asset);
@@ -452,7 +499,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             let offset=Number(c.position_us)/1e6;if(c.looped)offset%=buffer.duration;else offset=Math.min(offset,Math.max(0,buffer.duration-.001));
             source.onended=()=>{if(!v.stopped&&!c.looped)post(slot,()=>{
                 if(voices.get(c.task)===v){voices.delete(c.task);source.disconnect();gain.disconnect();}
-                engine.audio_ended(c.task,c.session);
+                mutateEngine(()=>engine.audio_ended(c.task,c.session));
             });};
             source.start(0,offset);metrics.audioStarts++;
         } catch(e){
@@ -488,15 +535,15 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     async function prepare(c) {
         let descriptors;
         try { descriptors=validateAssetRequest(c.assets,c.descriptors); }
-        catch(error) { engine.resource_failed(c.request,String(error));return; }
+        catch(error) { mutateEngine(()=>engine.resource_failed(c.request,String(error)));return; }
         for(const [id,descriptor] of Object.entries(descriptors))assetDescriptors.set(id,descriptor);
         const terminal=inbox.reserve('completion',c.request,{session:c.session,device:c.device});
-        if(!terminal){engine.resource_failed(c.request,'E_REQUEST_CAPACITY');return;}
+        if(!terminal){mutateEngine(()=>engine.resource_failed(c.request,'E_REQUEST_CAPACITY'));return;}
         const controller=new AbortController(),signal=controller.signal;
         preparations.set(c.request,controller);
         const failed=(message,id='',stage='admission',code='E_PREPARE')=>{
             observe('resource_failed',{request:c.request,session:c.session,device:c.device,asset:id,code,operation:stage,domain:'prepare'});
-            engine.resource_fault(c.request,id,code,stage,String(message));controller.abort();
+            mutateEngine(()=>engine.resource_fault(c.request,id,code,stage,String(message)));controller.abort();
         };
         let next=0;
         async function worker(){while(next<c.assets.length&&!disposed&&!signal.aborted){
@@ -528,7 +575,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
                     while(!complete&&!signal.aborted&&!disposed&&slot.state==='pending'){
                         await post(slot,()=>{
                             if(signal.aborted)return true;
-                            try {complete=engine.resource(c.request,id,new Uint8Array(bytes));if(complete)observe('ordered_use_ready',context);return complete;}
+                            try {complete=mutateEngine(()=>engine.resource(c.request,id,new Uint8Array(bytes)));if(complete)observe('ordered_use_ready',context);return complete;}
                             catch(e){metrics.resourceFailures++;failed(e,id,stage,'E_RESOURCE_DECODE_UPLOAD');return true;}
                         },done=>done);
                     }
@@ -561,7 +608,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function skipContent(job,skipped) {
         observe('module_skipped',{request:job.request,session:job.session,code:skipped.code,bytes:skipped.totalBytes??0});
-        engine.content_skipped(job.request,skipped.code,contentDetail(skipped));
+        mutateEngine(()=>engine.content_skipped(job.request,skipped.code,contentDetail(skipped)));
     }
     function promoteContent(request,session) {
         const job=contentPreparations.get(request);
@@ -610,7 +657,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
                     job.state='delivering';
                     await post(job.terminal,()=>{
                         if(!signal.aborted&&engine.accepts_content(request)){
-                            engine.content_ready(request,bytes.map(b=>new Uint8Array(b)));
+                            mutateEngine(()=>engine.content_ready(request,bytes.map(b=>new Uint8Array(b))));
                             observe('module_delivered',{request,session,kind:job.priority,bytes:job.totalBytes});
                         }
                     });
@@ -628,7 +675,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             if(job.stageEviction)await postContentEviction(job,{post,isActive:()=>!disposed,skip:skipped=>skipContent(job,skipped)});
             else if(!signal.aborted&&!disposed)await post(job.terminal,()=>{
                 observe('module_failed',{request,session,code:'E_MODULE_PREPARE'});
-                engine.content_failed(request,String(error));
+                mutateEngine(()=>engine.content_failed(request,String(error)));
             });
             else job.terminal?.cancel();
         }finally{
@@ -640,7 +687,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     function prepareContent(c) {
         const group=`content:${c.request}`;
         const terminal=inbox.reserve('completion',group,{session:c.session});
-        if(!terminal){engine.content_failed(c.request,'E_REQUEST_CAPACITY');return;}
+        if(!terminal){mutateEngine(()=>engine.content_failed(c.request,'E_REQUEST_CAPACITY'));return;}
         const controller=new AbortController();
         const priority=c.priority==='prefetch'?'prefetch':'required';
         const job={request:c.request,session:c.session,objects:c.objects,group,priority,maxBytes:priority==='prefetch'?c.max_bytes:null,controller,signal:controller.signal,terminal,state:'starting',staged:false,cancelled:false};
@@ -710,13 +757,23 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             default:throw new Error(`E_HOST_PROTOCOL: ${c.type}`);
         }
     }}
-    function state(){return JSON.parse(engine.state());}
+    function state(){return cachedHostState||(cachedHostState=JSON.parse(engine.host_state()));}
+    function debugState(){return JSON.parse(engine.state());}
+    function finishPerformanceTurn(turn) {
+        if(!turn)return;
+        try {
+            if(!disposed){
+                const rows=JSON.parse(engine.take_profile());
+                for(const row of rows)performanceStats.record(row.stage,Number(row.start_us),Number(row.end_us),turn);
+            }
+        } finally {performanceStats.endTurn(turn,Math.round(performance.now()*1000));}
+    }
     function action(a,context=state()) {
         if(disposed||recovering)return Promise.resolve(false);
         observe('input_received',{sequence:sequence+1,session:context.session});
         unlock();if(a.type==='new_game'&&metrics.startInputMs===null)metrics.startInputMs=performance.now();
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
-        return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');engine.action(JSON.stringify(a),context.interaction,seq,context.session);},'input');
+        return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');mutateEngine(()=>engine.action(JSON.stringify(a),context.interaction,seq,context.session));},'input');
     }
     let semanticSignature='',announcement='',announcementLocale='';
     function semantics(view) {
@@ -726,31 +783,42 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function frame(now) {
         if(disposed)return;
+        const perfTurn=performanceStats?performanceStats.beginTurn(Math.round(now*1000)):null;
+        if(perfTurn&&pendingWakeWaitStartUs!==null){performanceStats.record('wake_wait',pendingWakeWaitStartUs,pendingWakeWaitEndUs,perfTurn);pendingWakeWaitStartUs=pendingWakeWaitEndUs=null;}
+        const eventStartUs=perfTurn?Math.round(performance.now()*1000):0;
         try {
-            engine.begin_turn();
-            checkDevice();if(disposed)return;
+            mutateEngine(()=>engine.begin_turn());
+            checkDevice();if(disposed){finishPerformanceTurn(perfTurn);return;}
             const before=state();traceContext={session:before.session,device:before.device};
             const elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
-            inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')&&(kind==='control'||engine.pending_events()<112)});if(disposed)return;flush();
-            if(recovering){if(inbox.hasControl)wake();return;}
+            inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')&&(kind==='control'||engine.pending_events()<112)});if(disposed){finishPerformanceTurn(perfTurn);return;}flush();
+            if(recovering){if(inbox.hasControl)wake();if(perfTurn)performanceStats.record('event_handling',eventStartUs,Math.round(performance.now()*1000),perfTurn);finishPerformanceTurn(perfTurn);return;}
             const after=state();
             if(!document.hidden&&!before.paused&&before.screen==='Story'&&!after.paused&&before.session===after.session){
                 pendingElapsed=Math.min(250000,pendingElapsed+elapsed);
-                if(!inbox.hasInput){engine.tick(pendingElapsed);pendingElapsed=0;}
+                if(!inbox.hasInput){mutateEngine(()=>engine.tick(pendingElapsed));pendingElapsed=0;}
             }else{pendingElapsed=0;}
-            engine.continue_turn();flush();
+            mutateEngine(()=>engine.continue_turn());flush();
+            if(perfTurn)performanceStats.record('event_handling',eventStartUs,Math.round(performance.now()*1000),perfTurn);
             const current=size();if(current.width!==width||current.height!==height||current.dpr!==dpr){({width,height,dpr}=current);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);}
             const submitBefore=state().frames;
-            const view=JSON.parse(engine.draw(width,height,dpr));flush();prune();semantics(view);const s=state();
+            const view=JSON.parse(mutateEngine(()=>engine.draw(width,height,dpr)));flush();prune();
+            const semanticStartUs=perfTurn?Math.round(performance.now()*1000):0;semantics(view);
+            if(perfTurn)performanceStats.record('semantics',semanticStartUs,Math.round(performance.now()*1000),perfTurn);
+            const s=state();
             if(s.frames!==submitBefore)observe('render_submitted',{session:s.session,device:s.device,frames:s.frames});
             metrics.frames=s.frames;metrics.peakResidentBytes=Math.max(metrics.peakResidentBytes,s.resident_bytes);syncContentStagingMetrics(contentStaging);
             metrics.maxTurnUploadBytes=Math.max(metrics.maxTurnUploadBytes||0,s.turn_upload_bytes);metrics.uploadSteps=s.upload_steps;
             metrics.activeRequests=inbox.slots.size;metrics.requestHighWater=inbox.reservedHighWater;metrics.acceptedRequests=inbox.accepted;metrics.completedRequests=inbox.completed;metrics.cancelledRequests=inbox.cancelled;
             metrics.inboxHighWater=inbox.highWater;metrics.maxTurnWork=Math.max(metrics.maxTurnWork||0,s.turn_work);
-            if(view.ready){shell.hidden=true;if(metrics.titleMs===null)metrics.titleMs=performance.now()-metrics.boot;if(s.dialogue&&metrics.firstLineMs===null){metrics.firstLineMs=performance.now()-metrics.boot;metrics.firstLineAfterStartMs=performance.now()-metrics.startInputMs;metrics.navigationToFirstLineMs=performance.now();observe('first_line_submitted');}}
+            if(view.ready){shell.hidden=true;if(metrics.titleMs===null)metrics.titleMs=performance.now()-metrics.boot;if(s.has_dialogue&&metrics.firstLineMs===null){metrics.firstLineMs=performance.now()-metrics.boot;metrics.firstLineAfterStartMs=performance.now()-metrics.startInputMs;metrics.navigationToFirstLineMs=performance.now();observe('first_line_submitted');}}
             if(inbox.length||engine.pending_events())wake();
             else if(engine.needs_clock()&&!document.hidden)schedule();
-        }catch(e){fail(e);dispose();}
+            finishPerformanceTurn(perfTurn);
+        }catch(e){
+            try{finishPerformanceTurn(perfTurn);}catch{}
+            fail(e);dispose();
+        }
     }
     function schedule() {if(disposed||recovering)return;if(!raf)raf=requestAnimationFrame(()=>{raf=0;wake();});}
     let down=null;
@@ -775,30 +843,35 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         if(e.key===' '||e.key==='Enter'){e.preventDefault();const s=state();action({type:s.screen==='Title'?'new_game':s.paused?'continue':'advance'});}
         else if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();document.querySelector('#actions button:not([disabled])')?.focus();}
     };
-    const onVisibility=()=>{const hidden=document.hidden;deliver(()=>engine.hidden(hidden),'control');};
+    const onVisibility=()=>{const hidden=document.hidden;deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
     const onResize=()=>schedule();
     canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',()=>down=null);window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;
         const validation=engine.gpu_error();if(validation){observe('diagnostic',{domain:'render',code:'E_GPU_VALIDATION',operation:'render'});fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
         if(!engine.device_lost())return;
-        recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;engine.begin_recovery();
+        recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;mutateEngine(()=>engine.begin_recovery());
         const recovery=inbox.reserve('control','device');
         if(!recovery){fail('E_REQUEST_CAPACITY: device recovery');dispose();return;}
         wasm.create_gpu('stage').then(gpu=>{
             if(disposed||recovery.state==='cancelled'){gpu.free();return;}
-            post(recovery,()=>{engine.replace_gpu(gpu);recovering=false;lastTime=performance.now();});
+            post(recovery,()=>{mutateEngine(()=>engine.replace_gpu(gpu));recovering=false;lastTime=performance.now();});
         },e=>post(recovery,()=>{fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}));
     }
     const poll=setInterval(()=>{if(!disposed&&!recovering)deliver(checkDevice,'control');},500);
     const testMode=new URL(location.href).searchParams.has('test'),traces=[];
-    const diagnostics=()=>({format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',gpu_time:'unmeasured',physical_memory:'unmeasured'}});
+    const disabledPerformance={enabled:false,turn_capacity:64,total_turns:0,dropped_turns:0,stage_semantics:'inclusive_non_additive',stages:{},turns:[]};
+    const diagnostics=()=>{
+        const performance=performanceStats?performanceStats.snapshot():{...disabledPerformance};
+        if(performanceStats&&!disposed)performance.text_cache=JSON.parse(engine.text_cache_stats());
+        return {format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
+    };
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
-    if(testMode)window.__nir={state,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>engine.action(JSON.stringify(a),token,seq,epoch),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>engine.hidden(v))};
+    if(testMode)window.__nir={state:debugState,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>mutateEngine(()=>engine.action(JSON.stringify(a),token,seq,epoch)),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>mutateEngine(()=>engine.hidden(v)))};
     request(()=>read('profile',namespace),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
     function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
-    window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>engine.hidden(true));}else{dispose();}});
-    window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>engine.hidden(false));}});
+    window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(true)));}else{dispose();}});
+    window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(false)));}});
 }
 
 // Author defaults < browser accessibility defaults < explicitly saved player settings.

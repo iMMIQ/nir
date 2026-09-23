@@ -84,14 +84,14 @@ pub struct UiModel {
     pub outcome: Option<String>,
     pub history_offset: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Quad {
     pub rect: [f32; 4],
     pub color: [f32; 4],
     pub asset: Option<String>,
     pub clip: Option<[f32; 4]>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextRun {
     pub text: String,
     pub visible: Option<usize>,
@@ -239,6 +239,23 @@ impl Messages {
     }
 }
 impl DrawPacket {
+    /// Compare the fields that affect drawing this packet.
+    ///
+    /// Accessibility announcements, hit targets, and scroll metadata are
+    /// intentionally excluded because callers can update them without
+    /// changing the rendered frame.
+    pub fn visual_eq(&self, other: &Self) -> bool {
+        self.quads == other.quads
+            && self.texts == other.texts
+            && self.locale == other.locale
+            && self.font_assets == other.font_assets
+            && self.font_plan_digest == other.font_plan_digest
+            && self.width == other.width
+            && self.height == other.height
+            && self.stage_size == other.stage_size
+            && self.transition_layers == other.transition_layers
+    }
+
     fn rect(&mut self, r: [f32; 4], c: [f32; 4]) {
         self.quads.push(Quad {
             rect: r,
@@ -1131,6 +1148,24 @@ pub struct TextEngine {
     configured_plan: String,
     next_compat_font: u32,
     pub missing_font: Option<String>,
+    cache_recency: std::collections::BTreeMap<String, u64>,
+    cache_clock: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
+}
+
+/// A snapshot of the CPU text-shaping cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextCacheStats {
+    /// Number of successful lookups of a buffer already in the cache.
+    pub hits: u64,
+    /// Number of lookups whose buffer was not in the cache.
+    pub misses: u64,
+    /// Number of buffers removed to enforce the cache target.
+    pub evictions: u64,
+    /// Number of buffers currently in the cache.
+    pub entries: usize,
 }
 struct ExplicitFallback {
     families: Vec<&'static str>,
@@ -1157,6 +1192,11 @@ impl Default for TextEngine {
             configured_plan: String::new(),
             next_compat_font: 0,
             missing_font: None,
+            cache_recency: Default::default(),
+            cache_clock: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
         }
     }
 }
@@ -1197,8 +1237,80 @@ impl TextEngine {
             self.fonts.db_mut().set_sans_serif_family(family);
         }
         self.buffers.clear();
+        self.cache_recency.clear();
         self.configured_plan.clear();
         Ok(())
+    }
+
+    /// Return cumulative cache counters and the current number of buffers.
+    ///
+    /// Hit, miss, and eviction counters are cumulative for the lifetime of
+    /// this engine. Loading a font invalidates all cached buffers without
+    /// resetting the counters or counting the invalidated buffers as
+    /// evictions; `entries` always reports the live buffer count.
+    pub fn cache_stats(&self) -> TextCacheStats {
+        TextCacheStats {
+            hits: self.cache_hits,
+            misses: self.cache_misses,
+            evictions: self.cache_evictions,
+            entries: self.buffers.len(),
+        }
+    }
+
+    fn touch_cache_key(&mut self, key: &str) {
+        if self.cache_clock == u64::MAX {
+            let mut oldest_first: Vec<_> = self
+                .cache_recency
+                .iter()
+                .map(|(key, age)| (key.clone(), *age))
+                .collect();
+            oldest_first.sort_by_key(|(_, age)| *age);
+            for (index, (key, _)) in oldest_first.into_iter().enumerate() {
+                self.cache_recency.insert(key, index as u64 + 1);
+            }
+            self.cache_clock = self.cache_recency.len() as u64;
+        }
+        self.cache_clock += 1;
+        self.cache_recency.insert(key.to_owned(), self.cache_clock);
+    }
+
+    fn sync_cache_recency(&mut self) {
+        self.cache_recency
+            .retain(|key, _| self.buffers.contains_key(key));
+        let untracked: Vec<_> = self
+            .buffers
+            .keys()
+            .filter(|key| !self.cache_recency.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in untracked {
+            self.touch_cache_key(&key);
+        }
+    }
+
+    fn evict_unprotected(&mut self, protected: &std::collections::BTreeSet<String>) {
+        const TARGET_ENTRIES: usize = 128;
+        // `buffers` stays public for compatibility, so reconcile direct map
+        // edits only on the uncommon over-capacity path.
+        self.sync_cache_recency();
+        let remove_count = self.buffers.len().saturating_sub(TARGET_ENTRIES);
+        if remove_count == 0 {
+            return;
+        }
+
+        let mut candidates: Vec<_> = self
+            .cache_recency
+            .iter()
+            .filter(|(key, _)| !protected.contains(*key))
+            .map(|(key, age)| (key.clone(), *age))
+            .collect();
+        candidates.sort_by_key(|(_, age)| *age);
+        for (key, _) in candidates.into_iter().take(remove_count) {
+            if self.buffers.remove(&key).is_some() {
+                self.cache_recency.remove(&key);
+                self.cache_evictions = self.cache_evictions.saturating_add(1);
+            }
+        }
     }
     pub fn key(run: &TextRun) -> String {
         format!(
@@ -1232,9 +1344,17 @@ impl TextEngine {
     }
     pub fn layout(&mut self, packet: &DrawPacket) {
         self.missing_font = None;
-        for r in &packet.texts {
-            let key = Self::key(r);
-            if !self.buffers.contains_key(&key) {
+        // Retain each formatted key for lookup and possible end-of-layout
+        // eviction, avoiding a second key allocation for active runs.
+        let packet_keys: Vec<_> = packet.texts.iter().map(Self::key).collect();
+        for (r, key) in packet.texts.iter().zip(&packet_keys) {
+            if self.buffers.contains_key(key) {
+                self.cache_hits = self.cache_hits.saturating_add(1);
+                self.touch_cache_key(key);
+                continue;
+            }
+            self.cache_misses = self.cache_misses.saturating_add(1);
+            {
                 let explicit: Vec<_> = r
                     .font_assets
                     .iter()
@@ -1322,13 +1442,17 @@ impl TextEngine {
                     );
                 }
                 b.shape_until_scroll(&mut self.fonts, false);
-                self.buffers.insert(key, b);
-                self.shapes += 1;
+                self.buffers.insert(key.clone(), b);
+                self.touch_cache_key(key);
+                self.shapes = self.shapes.saturating_add(1);
             }
         }
         if self.buffers.len() > 128 {
-            let keys: std::collections::BTreeSet<_> = packet.texts.iter().map(Self::key).collect();
-            self.buffers.retain(|k, _| keys.contains(k));
+            // Protect all runs in this packet before the first eviction. If
+            // the working set itself is oversized, it remains intact until
+            // a later layout offers less protection and the cache can shrink.
+            let protected = packet_keys.into_iter().collect();
+            self.evict_unprotected(&protected);
         }
     }
 }
@@ -1336,6 +1460,181 @@ impl TextEngine {
 #[cfg(test)]
 mod scene_tests {
     use super::*;
+
+    fn text_packet(texts: impl IntoIterator<Item = String>) -> DrawPacket {
+        let mut packet = DrawPacket {
+            locale: "zh-Hans".into(),
+            font_assets: vec!["font.reader".into()],
+            font_plan_digest: "plan-a".into(),
+            ..Default::default()
+        };
+        for text in texts {
+            packet.text(text, 0., 0., 300., 18., [1.; 4]);
+        }
+        packet
+    }
+
+    fn reader_text_engine() -> TextEngine {
+        let mut text = TextEngine::default();
+        text.add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
+        text
+    }
+
+    fn visual_packet() -> DrawPacket {
+        let mut packet = DrawPacket {
+            locale: "en".into(),
+            font_assets: vec!["font.ui".into()],
+            font_plan_digest: "ui-plan-a".into(),
+            width: 640.,
+            height: 360.,
+            stage_size: [1280, 720],
+            transition_layers: Some((
+                vec![Quad {
+                    rect: [1., 2., 30., 40.],
+                    color: [0.1, 0.2, 0.3, 1.],
+                    asset: Some("old-bg".into()),
+                    clip: None,
+                }],
+                vec![Quad {
+                    rect: [4., 5., 60., 70.],
+                    color: [0.4, 0.5, 0.6, 1.],
+                    asset: Some("new-bg".into()),
+                    clip: Some([0., 0., 640., 360.]),
+                }],
+                0.25,
+            )),
+            ..Default::default()
+        };
+        packet.rect([0., 0., 640., 360.], [0.01, 0.02, 0.03, 1.]);
+        packet.text("hello", 10., 20., 300., 18., [1.; 4]);
+        packet
+    }
+
+    #[test]
+    fn text_cache_lru_keeps_a_frequently_used_entry_hot() {
+        let mut text = reader_text_engine();
+        let hot = text_packet(["hot entry".to_owned()]);
+        let hot_key = TextEngine::key(&hot.texts[0]);
+        text.layout(&hot);
+
+        for index in 0..200 {
+            text.layout(&hot);
+            let cold = text_packet([format!("cold entry {index}")]);
+            text.layout(&cold);
+        }
+
+        let stats = text.cache_stats();
+        assert!(text.buffers.contains_key(&hot_key));
+        assert_eq!(stats.entries, 128);
+        assert_eq!(stats.hits, 200);
+        assert_eq!(stats.misses, 201);
+        assert_eq!(stats.evictions, 73);
+    }
+
+    #[test]
+    fn text_cache_protects_the_full_current_packet_then_converges() {
+        let mut text = reader_text_engine();
+        let packet = text_packet((0..140).map(|index| format!("packet entry {index}")));
+        let keys: Vec<_> = packet.texts.iter().map(TextEngine::key).collect();
+        text.layout(&packet);
+
+        assert_eq!(text.cache_stats().entries, 140);
+        assert_eq!(text.cache_stats().evictions, 0);
+        assert!(keys.iter().all(|key| text.buffers.contains_key(key)));
+
+        let mut next_packet = DrawPacket::default();
+        next_packet.texts.push(packet.texts[139].clone());
+        text.layout(&next_packet);
+
+        let stats = text.cache_stats();
+        assert_eq!(stats.entries, 128);
+        assert_eq!(stats.evictions, 12);
+        assert!(text.buffers.contains_key(&keys[139]));
+        assert!(!text.buffers.contains_key(&keys[0]));
+    }
+
+    #[test]
+    fn font_load_invalidates_buffers_but_keeps_cumulative_stats() {
+        let mut text = reader_text_engine();
+        let packet = text_packet(["font invalidation".to_owned()]);
+        text.layout(&packet);
+        assert_eq!(text.cache_stats().misses, 1);
+        assert_eq!(text.cache_stats().entries, 1);
+
+        text.add_font_asset(
+            "font.abe",
+            include_bytes!("../../../examples/rain-letters/assets/fonts/ABeeZee-Regular.ttf")
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(text.cache_stats().entries, 0);
+
+        text.layout(&packet);
+        let stats = text.cache_stats();
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.entries, 1);
+    }
+
+    #[test]
+    fn visual_equality_ignores_semantic_only_changes() {
+        let packet = visual_packet();
+        let mut semantically_changed = visual_packet();
+        semantically_changed.announcement = "accessible description".into();
+        semantically_changed.announcement_locale = "zh-Hans".into();
+        semantically_changed.semantics.push(SemanticNode {
+            id: 7,
+            label: "continue".into(),
+            action: UiAction::Advance,
+            enabled: false,
+            rect: [1., 2., 3., 4.],
+            locale: "zh-Hans".into(),
+        });
+        semantically_changed.scrolls.push(ScrollView {
+            region: ScrollRegion::Dialogue,
+            rect: [0., 0., 10., 10.],
+            offset: 4.,
+            max: 12.,
+            step: 8.,
+        });
+        semantically_changed.dialogue_hint = Some(0);
+
+        assert!(packet.visual_eq(&semantically_changed));
+    }
+
+    #[test]
+    fn visual_equality_detects_geometry_fonts_text_stage_and_transition_changes() {
+        let packet = visual_packet();
+
+        let mut changed = visual_packet();
+        changed.quads[0].color[0] += 0.1;
+        assert!(!packet.visual_eq(&changed));
+
+        let mut changed = visual_packet();
+        changed.texts[0].text.push('!');
+        assert!(!packet.visual_eq(&changed));
+
+        let mut changed = visual_packet();
+        changed.texts[0].size += 1.;
+        assert!(!packet.visual_eq(&changed));
+
+        let mut changed = visual_packet();
+        changed.font_plan_digest.push_str("-b");
+        assert!(!packet.visual_eq(&changed));
+
+        let mut changed = visual_packet();
+        changed.stage_size[0] += 1;
+        assert!(!packet.visual_eq(&changed));
+
+        let mut changed = visual_packet();
+        changed.transition_layers.as_mut().unwrap().2 = 0.5;
+        assert!(!packet.visual_eq(&changed));
+    }
 
     #[test]
     fn missing_explicit_font_reports_error_before_shaping() {
