@@ -104,6 +104,7 @@ pub struct BuildReport {
     pub game_id: String,
     pub total_bytes: u64,
     pub objects: usize,
+    pub module_packages: BTreeMap<String, ModuleBuildReport>,
     pub resources: Vec<String>,
     pub excluded_resources: Vec<String>,
     pub provenance: BTreeMap<String, String>,
@@ -111,6 +112,139 @@ pub struct BuildReport {
     pub resolved_config: crate::ResolvedConfig,
     pub fonts: BTreeMap<String, crate::FontReport>,
 }
+#[derive(Debug, Serialize)]
+pub struct ModuleBuildReport {
+    pub code: String,
+    pub code_bytes: u64,
+    pub locales: BTreeMap<String, TextBuildReport>,
+}
+#[derive(Debug, Serialize)]
+pub struct TextBuildReport {
+    pub object: String,
+    pub bytes: u64,
+}
+
+/// Write one immutable code object and one immutable text object per module
+/// and locale. The root executable keeps the index and shared tables only.
+fn package_modules(
+    out: &Path,
+    objects: &mut BTreeMap<String, Object>,
+    program: &mut Program,
+) -> Result<BTreeMap<String, ModuleBuildReport>> {
+    if program.modules.is_empty() {
+        // Older projects have one monolithic executable. Keep that release
+        // representation readable while new projects opt into module indexes.
+        return Ok(BTreeMap::new());
+    }
+
+    let mut code_owner = BTreeMap::new();
+    let mut text_owner = BTreeMap::new();
+    for (module_id, index) in &program.modules {
+        if module_id.is_empty() || index.functions.is_empty() {
+            bail!("E_MODULE: {module_id} has an empty identity or function interface");
+        }
+        for (id, signature) in &index.functions {
+            let function = program.functions.get(id).ok_or_else(|| {
+                anyhow::anyhow!("E_MODULE: {module_id} owns missing function {id}")
+            })?;
+            if FunctionSignature::from(function) != *signature
+                || code_owner.insert(id.clone(), module_id.clone()).is_some()
+            {
+                bail!("E_MODULE: invalid or duplicate function ownership for {id}");
+            }
+        }
+        for id in &index.texts {
+            if !program.texts.contains_key(id)
+                || text_owner.insert(id.clone(), module_id.clone()).is_some()
+            {
+                bail!("E_MODULE: invalid or duplicate text ownership for {id}");
+            }
+        }
+    }
+    if code_owner.len() != program.functions.len()
+        || program
+            .functions
+            .keys()
+            .any(|id| !code_owner.contains_key(id))
+        || text_owner.len() != program.texts.len()
+        || program.texts.keys().any(|id| !text_owner.contains_key(id))
+    {
+        bail!("E_MODULE: module indexes do not own every function and text contract");
+    }
+
+    let locales: Vec<String> = program.locales.keys().cloned().collect();
+    let mut reports = BTreeMap::new();
+    for (module_id, index) in &mut program.modules {
+        let functions = index
+            .functions
+            .keys()
+            .map(|id| Ok((id.clone(), program.functions[id].clone())))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let code = ModuleCode {
+            format: 1,
+            module: module_id.clone(),
+            functions,
+        };
+        let code_bytes = serde_json::to_vec(&code)?;
+        let code_hash = object(out, objects, &code_bytes, "json", "application/json")?;
+
+        let mut text_reports = BTreeMap::new();
+        let mut locale_objects = BTreeMap::new();
+        for locale in &locales {
+            if index.texts.is_empty() {
+                continue;
+            }
+            let available = &program.locales[locale];
+            let texts = index
+                .texts
+                .iter()
+                .map(|id| {
+                    available
+                        .get(id)
+                        .cloned()
+                        .map(|doc| (id.clone(), doc))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("E_MODULE_TEXT: {locale} is missing {module_id}.{id}")
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let bundle = ModuleTexts {
+                format: 1,
+                module: module_id.clone(),
+                locale: locale.clone(),
+                texts,
+            };
+            let bytes = serde_json::to_vec(&bundle)?;
+            let hash = object(out, objects, &bytes, "json", "application/json")?;
+            locale_objects.insert(locale.clone(), hash.clone());
+            text_reports.insert(
+                locale.clone(),
+                TextBuildReport {
+                    object: hash,
+                    bytes: bytes.len() as u64,
+                },
+            );
+        }
+        index.code = code_hash.clone();
+        index.locales = locale_objects;
+        reports.insert(
+            module_id.clone(),
+            ModuleBuildReport {
+                code: code_hash,
+                code_bytes: code_bytes.len() as u64,
+                locales: text_reports,
+            },
+        );
+    }
+
+    // Keep the locale keys as the immutable set of supported languages. Their
+    // documents are installed independently from the module text objects.
+    for texts in program.locales.values_mut() {
+        texts.clear();
+    }
+    Ok(reports)
+}
+
 pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildReport> {
     let p = load_project(root)?;
     let lock = if locked {
@@ -135,7 +269,20 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         };
         object(out, &mut objects, &p.media[id], ext, mime)?;
     }
-    let executable = compile(&program)?;
+    let mut executable = compile(&program)?;
+    let module_packages = package_modules(out, &mut objects, &mut program)?;
+    let game_id = program.game_id.clone();
+    executable.program = program;
+    if !module_packages.is_empty() {
+        // Executable indexes describe only the currently loaded functions.
+        // The root object starts with none; the runtime installs a module
+        // candidate and builds its indexes when that module is prepared.
+        executable.program.functions.clear();
+        executable.addresses.clear();
+        executable.resume_map.clear();
+        executable.semantic_cost_map.clear();
+    }
+    nir_content::validate_executable(&executable)?;
     let program_hash = object(
         out,
         &mut objects,
@@ -186,7 +333,7 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
     fs::write(out.join("NOTICE.txt"), &notices)?;
     let manifest = ReleaseManifest {
         format: 1,
-        game_id: program.game_id.clone(),
+        game_id: game_id.clone(),
         title: p.manifest.game.title.clone(),
         version: p.manifest.game.version.clone(),
         engine_build: lock.sdk_digest.clone(),
@@ -211,9 +358,10 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
     fs::rename(tmp, out.join("channels/stable.json"))?;
     let report = BuildReport {
         release,
-        game_id: program.game_id,
+        game_id,
         total_bytes: objects.values().map(|o| o.bytes).sum(),
         objects: objects.len(),
+        module_packages,
         resources: roots.iter().cloned().collect(),
         excluded_resources: p
             .program

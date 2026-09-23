@@ -1,5 +1,6 @@
 use nir_compiler::*;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -249,6 +250,71 @@ fn reproducible_release_lock_drift_and_corruption() {
         .to_string()
         .contains("E_LOCK_DRIFT"));
 }
+
+#[test]
+fn release_splits_module_code_and_text_without_cross_locale_invalidation() {
+    let d = project();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+
+    let first_out = d.path().join("dist/first");
+    let first = build(d.path(), sdk.path(), &first_out, true).unwrap();
+    let first_release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(first_out.join(format!("releases/{}.json", first.release))).unwrap(),
+    )
+    .unwrap();
+    let first_exe: nir_format::Executable = serde_json::from_slice(
+        &fs::read(first_out.join(&first_release.objects[&first_release.program].path)).unwrap(),
+    )
+    .unwrap();
+    nir_content::validate_executable(&first_exe).unwrap();
+    assert!(first_exe.program.functions.is_empty());
+    assert!(first_exe.program.locales.values().all(BTreeMap::is_empty));
+    let module_id = first_exe.program.modules.keys().next().unwrap().clone();
+    let first_index = &first_exe.program.modules[&module_id];
+    let first_code = first_index.code.clone();
+    let first_zh = first_index.locales["zh-Hans"].clone();
+    let first_en = first_index.locales["en"].clone();
+    for hash in [&first_code, &first_zh, &first_en] {
+        let object = &first_release.objects[hash];
+        nir_content::verify(&fs::read(first_out.join(&object.path)).unwrap(), hash).unwrap();
+    }
+    let module_code: nir_format::ModuleCode = serde_json::from_slice(
+        &fs::read(first_out.join(&first_release.objects[&first_code].path)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(module_code.module, module_id);
+    assert_eq!(module_code.functions.len(), first_index.functions.len());
+
+    let english_path = d.path().join("content/ch01/texts/en.json");
+    let mut english: serde_json::Value =
+        serde_json::from_slice(&fs::read(&english_path).unwrap()).unwrap();
+    let text_id = {
+        let (text_id, doc) = english.as_object_mut().unwrap().iter_mut().next().unwrap();
+        let revised_text = format!("{} Revised", doc["spans"][0]["text"].as_str().unwrap());
+        doc["spans"][0]["text"] = serde_json::Value::String(revised_text);
+        text_id.clone()
+    };
+    fs::write(&english_path, serde_json::to_vec_pretty(&english).unwrap()).unwrap();
+    text_review(d.path(), &text_id, "en").unwrap();
+
+    let second_out = d.path().join("dist/second");
+    let second = build(d.path(), sdk.path(), &second_out, true).unwrap();
+    let second_release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(second_out.join(format!("releases/{}.json", second.release))).unwrap(),
+    )
+    .unwrap();
+    let second_exe: nir_format::Executable = serde_json::from_slice(
+        &fs::read(second_out.join(&second_release.objects[&second_release.program].path)).unwrap(),
+    )
+    .unwrap();
+    let second_index = &second_exe.program.modules[&module_id];
+    assert_eq!(second_index.code, first_code);
+    assert_eq!(second_index.locales["zh-Hans"], first_zh);
+    assert_ne!(second_index.locales["en"], first_en);
+    assert!(first.module_packages[&module_id].locales.contains_key("en"));
+}
+
 #[test]
 fn runtime_rejects_missing_or_rewritten_index_and_recipe() {
     let p = load_project(&source()).unwrap();

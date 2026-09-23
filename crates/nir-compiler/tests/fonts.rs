@@ -347,7 +347,9 @@ fn truetype_collection_face_extraction_and_unsupported_tables() {
         }
     }
     let mut records: Vec<_> = bad[12..12 + 16 * count]
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|r| r.to_vec())
         .collect();
     records.sort_by_key(|r| r[..4].to_vec());

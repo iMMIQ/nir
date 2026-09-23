@@ -9,6 +9,16 @@ pub(crate) struct SourceIndex {
 }
 impl SourceIndex {
     pub fn fragment(&mut self, root: &Path, path: &Path, bytes: &[u8]) {
+        self.fragment_in_module(root, path, bytes, None);
+    }
+
+    pub fn fragment_in_module(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        bytes: &[u8],
+        module: Option<&str>,
+    ) {
         // Called only after strict parsing: duplicates, depth and syntax are checked there.
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return;
@@ -39,11 +49,17 @@ impl SourceIndex {
             if let Some(items) = value[table].as_object() {
                 for (id, item) in items {
                     let pointer = format!("/{table}/{}", escape(id));
+                    let logical_id = module.map_or_else(|| id.clone(), |m| format!("{m}.{id}"));
                     self.declarations
-                        .insert(format!("{table}:{id}"), source(pointer.clone()));
+                        .insert(format!("{table}:{logical_id}"), source(pointer.clone()));
                     self.declarations
-                        .entry(id.clone())
+                        .entry(logical_id.clone())
                         .or_insert_with(|| source(pointer.clone()));
+                    if module.is_none() {
+                        self.declarations
+                            .entry(id.clone())
+                            .or_insert_with(|| source(pointer.clone()));
+                    }
                     let prefix = format!("{pointer}/");
                     for (path, _) in offsets
                         .range(prefix.clone()..)
@@ -56,9 +72,26 @@ impl SourceIndex {
                         .contains(&path.rsplit('/').next().unwrap_or_default())
                         {
                             if let Some(reference) = value.pointer(path).and_then(|v| v.as_str()) {
+                                let owner = format!("{table}:{logical_id}");
                                 self.references
-                                    .entry((format!("{table}:{id}"), reference.into()))
+                                    .entry((owner.clone(), reference.into()))
                                     .or_insert_with(|| source(path.clone()));
+                                if let Some(module) = module {
+                                    let target = match path.rsplit('/').next().unwrap_or_default() {
+                                        "scene" | "cue" | "choice" | "text" | "speaker"
+                                            if !reference.starts_with(&format!("{module}.")) =>
+                                        {
+                                            format!("{module}.{reference}")
+                                        }
+                                        "function" if !reference.contains('.') => {
+                                            format!("{module}.{reference}")
+                                        }
+                                        _ => reference.to_string(),
+                                    };
+                                    self.references
+                                        .entry((owner, target))
+                                        .or_insert_with(|| source(path.clone()));
+                                }
                             }
                         }
                     }
@@ -66,15 +99,29 @@ impl SourceIndex {
                         if let Some(blocks) = item["blocks"].as_object() {
                             for (bid, block) in blocks {
                                 let bp = format!("{pointer}/blocks/{}", escape(bid));
+                                let function_id =
+                                    module.map_or_else(|| id.clone(), |m| format!("{m}.{id}"));
                                 self.declarations
-                                    .insert(format!("{id}/{bid}"), source(bp.clone()));
+                                    .insert(format!("{function_id}/{bid}"), source(bp.clone()));
+                                if module.is_none() {
+                                    self.declarations
+                                        .insert(format!("{id}/{bid}"), source(bp.clone()));
+                                }
                                 if let Some(ops) = block["ops"].as_array() {
                                     for (i, op) in ops.iter().enumerate() {
                                         if let Some(oid) = op["id"].as_str() {
-                                            self.declarations.insert(
-                                                oid.into(),
-                                                source(format!("{bp}/ops/{i}")),
+                                            let opid = module.map_or_else(
+                                                || oid.into(),
+                                                |m| format!("{m}.{oid}"),
                                             );
+                                            self.declarations
+                                                .insert(opid, source(format!("{bp}/ops/{i}")));
+                                            if module.is_none() {
+                                                self.declarations.insert(
+                                                    oid.into(),
+                                                    source(format!("{bp}/ops/{i}")),
+                                                );
+                                            }
                                         }
                                     }
                                 }

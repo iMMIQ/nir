@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const FORMAT_VERSION: u32 = 1;
 pub const SNAPSHOT_VERSION: u32 = 1;
 pub const CAPABILITIES: &[&str] = &[
+    "module.lazy.v1",
     "control.v1",
     "stage.sprite.v1",
     "stage.dissolve.v1",
@@ -230,6 +231,9 @@ pub struct Program {
     #[serde(default)]
     pub variables: BTreeMap<String, Value>,
     pub functions: BTreeMap<String, Function>,
+    /// Immutable module interfaces; bodies and text bundles may be absent until prepared.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, ModuleIndex>,
     #[serde(default)]
     pub scenes: BTreeMap<String, Vec<Node>>,
     #[serde(default)]
@@ -252,6 +256,81 @@ pub struct Program {
     pub theme: Theme,
     #[serde(default)]
     pub player: PlayerDefaults,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionSignature {
+    pub params: BTreeMap<String, ValueType>,
+    pub returns: Option<ValueType>,
+    pub entry: String,
+    pub entry_op: String,
+}
+impl From<&Function> for FunctionSignature {
+    fn from(f: &Function) -> Self {
+        Self {
+            params: f.params.clone(),
+            returns: f.returns,
+            entry: f.entry.clone(),
+            entry_op: f
+                .blocks
+                .get(&f.entry)
+                .and_then(|b| b.ops.first())
+                .map(|o| o.id.clone())
+                .unwrap_or_else(|| "@terminator".into()),
+        }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleIndex {
+    pub functions: BTreeMap<String, FunctionSignature>,
+    pub texts: BTreeSet<String>,
+    pub code: String,
+    pub locales: BTreeMap<String, String>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCode {
+    pub format: u32,
+    pub module: String,
+    pub functions: BTreeMap<String, Function>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleTexts {
+    pub format: u32,
+    pub module: String,
+    pub locale: String,
+    pub texts: BTreeMap<String, TextDoc>,
+}
+impl Program {
+    pub fn function_signature(&self, id: &str) -> Option<FunctionSignature> {
+        self.functions
+            .get(id)
+            .map(FunctionSignature::from)
+            .or_else(|| {
+                self.modules
+                    .values()
+                    .find_map(|m| m.functions.get(id).cloned())
+            })
+    }
+    pub fn function_module(&self, id: &str) -> Option<&str> {
+        self.modules
+            .iter()
+            .find(|(_, m)| m.functions.contains_key(id))
+            .map(|(id, _)| id.as_str())
+    }
+    pub fn text_module(&self, id: &str) -> Option<&str> {
+        self.modules
+            .iter()
+            .find(|(_, m)| m.texts.contains(id))
+            .map(|(id, _)| id.as_str())
+    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

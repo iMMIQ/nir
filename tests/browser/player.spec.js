@@ -27,6 +27,7 @@ async function advanceUntil(page, predicate, route) {
     else if (s.dialogue && !s.dialogue.gate) await page.keyboard.press('Space');
     await page.waitForTimeout(120);
   }
+  await fs.writeFile('reports/stalled-diagnostics.json',JSON.stringify(await page.evaluate(()=>window.__nir.diagnostics()),null,2));
   throw Error(`Story stalled: ${JSON.stringify(await state(page))}`);
 }
 test.beforeEach(async ({ page }) => {
@@ -540,7 +541,11 @@ test('author theme and player defaults run on the unchanged SDK and keep saved p
   const options=(await state(page)).choice.options;
   const chosen=buttons.filter({hasText:options[0].label});
   await chosen.focus();
-  await expect.poll(()=>page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.width))).toBe(350);
+  // Chromium/X11 can round the requested viewport by one CSS pixel at a
+  // fractional device scale. Verify the actual 20px layout margins.
+  await expect.poll(()=>page.locator('#focus-ring').evaluate(e=>({
+    left:parseFloat(e.style.left),right:innerWidth-parseFloat(e.style.left)-parseFloat(e.style.width),
+  }))).toEqual({left:20,right:20});
   const firstY=await page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.top));
   await buttons.filter({hasText:options[1].label}).focus();
   expect(await page.locator('#focus-ring').evaluate(e=>parseFloat(e.style.top))).toBe(firstY+64);

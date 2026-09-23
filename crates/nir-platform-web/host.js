@@ -172,7 +172,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     document.title=release.title;
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
-    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map();
+    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),requests=new SharedRequests(fetchObject),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map();
     let preferences=JSON.parse(engine.state()).preferences, raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
     let ownerTimer=null,pendingElapsed=0;
@@ -307,6 +307,41 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             else terminal.cancel();
         } finally {if(preparations.get(c.request)===controller)preparations.delete(c.request);}
     }
+    function cancelContent(request) {
+        inbox.cancelGroup(`content:${request}`);
+        contentPreparations.get(request)?.abort();contentPreparations.delete(request);
+    }
+    async function prepareContent(c) {
+        const group=`content:${c.request}`;
+        const terminal=inbox.reserve('completion',group,{session:c.session});
+        if(!terminal){engine.content_failed(c.request,'E_REQUEST_CAPACITY');return;}
+        const controller=new AbortController(),signal=controller.signal;
+        contentPreparations.set(c.request,controller);
+        try {
+            // Reserve a finite byte envelope before any network work. At most two
+            // content batches exist (execution/restore and locale selection).
+            const total=c.objects.reduce((n,o)=>n+(release.objects[o.hash]?.bytes??Infinity),0);
+            if(!c.objects.length||c.objects.length>128||total>16*1024*1024)throw Error('E_CONTENT_LIMIT');
+            const bytes=[];
+            for(const object of c.objects){
+                observe('module_requested',{request:c.request,session:c.session,object:object.hash});
+                bytes.push(await resourcePool.run(()=>requests.get(object.hash,signal),signal));
+                signal.throwIfAborted();
+            }
+            await post(terminal,()=>{
+                if(!signal.aborted&&engine.accepts_content(c.request)){
+                    engine.content_ready(c.request,bytes.map(b=>new Uint8Array(b)));
+                    observe('module_delivered',{request:c.request,session:c.session});
+                }
+            });
+        }catch(error){
+            if(!signal.aborted&&!disposed)await post(terminal,()=>{
+                observe('module_failed',{request:c.request,session:c.session,code:'E_MODULE_PREPARE'});
+                engine.content_failed(c.request,String(error));
+            });
+            else terminal.cancel();
+        }finally{if(contentPreparations.get(c.request)===controller)contentPreparations.delete(c.request);}
+    }
     function listSaves() {
         return request(async()=>{
             const rows=[];for(let slot=0;slot<3;slot++){const s=await read('saves',`${namespace}:${slot}`);if(s)rows.push({slot,revision:s.revision,label:s.label||`#${s.revision}`});}return rows;
@@ -351,6 +386,8 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'observation':observe(c.stage,c);break;
             case 'resource_stage':observe(c.stage,{...c,object:program.assets[c.asset]?.object});break;
             case 'diagnostic':{const d=c.diagnostic;observe('diagnostic',{code:d.code,location:d.location,...d.details,asset:d.details?.references?.[0]});break;}
+            case 'get_content':prepareContent(c);break;
+            case 'cancel_content':cancelContent(c.request);break;
             case 'get_assets':prepare(c);break;
             case 'cancel_assets':cancelPreparation(c.request);break;
             case 'audio_start':playVoice(c);break;
@@ -456,7 +493,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         hostEvent('preferences',initialPreferences(preferences,savedPreferences,program.locale_config,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
         if(profile)hostEvent('profile',profile);
     },e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
-    function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
+    function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
     window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>engine.hidden(true));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>engine.hidden(false));}});
 }

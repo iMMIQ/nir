@@ -43,6 +43,8 @@ fn runtime_preset() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Inputs {
+    #[serde(default)]
+    pub shared: Vec<String>,
     pub modules: Vec<String>,
     pub asset_catalogs: Vec<String>,
     pub theme: String,
@@ -58,13 +60,13 @@ pub struct Inputs {
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Module {
-    module_format: u32,
-    id: String,
-    sources: Vec<String>,
+    pub(crate) module_format: u32,
+    pub(crate) id: String,
+    pub(crate) sources: Vec<String>,
     pub(crate) text_contracts: String,
     #[serde(default)]
     pub(crate) text_revisions: Option<String>,
-    exports: BTreeMap<String, String>,
+    pub(crate) exports: BTreeMap<String, String>,
     pub(crate) text_bundles: BTreeMap<String, String>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -80,6 +82,13 @@ struct Fragment {
     #[serde(default)]
     cues: BTreeMap<String, Cue>,
     #[serde(default)]
+    choices: BTreeMap<String, Choice>,
+}
+struct ModuleFragments {
+    module: Module,
+    functions: BTreeMap<String, Function>,
+    scenes: BTreeMap<String, Vec<Node>>,
+    cues: BTreeMap<String, Cue>,
     choices: BTreeMap<String, Choice>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -202,6 +211,143 @@ fn merge<T>(dest: &mut BTreeMap<String, T>, src: BTreeMap<String, T>, file: &Pat
     }
     Ok(())
 }
+
+fn module_key(module: &str, id: &str, namespaced: bool) -> String {
+    if namespaced {
+        format!("{module}.{id}")
+    } else {
+        id.to_owned()
+    }
+}
+
+pub(crate) fn valid_module_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn qualify_local_refs(module: &str, f: &mut Function, namespaced: bool) {
+    if !namespaced {
+        return;
+    }
+    for block in f.blocks.values_mut() {
+        for op in &mut block.ops {
+            op.id = format!("{module}.{}", op.id);
+            match &mut op.operation {
+                Operation::TaskControl { task, .. } | Operation::DialogueContinue { task } => {
+                    *task = format!("{module}.{task}");
+                }
+                _ => {}
+            }
+        }
+        match &mut block.terminator {
+            Terminator::Activate { cue, .. } => *cue = format!("{module}.{cue}"),
+            Terminator::Interact { choice, .. } => *choice = format!("{module}.{choice}"),
+            Terminator::Await { conditions, .. } => {
+                for condition in conditions {
+                    condition.task = format!("{module}.{}", condition.task);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn qualify_cue_refs(module: &str, cue: &mut Cue, namespaced: bool) {
+    if !namespaced {
+        return;
+    }
+    for def in &mut cue.effects {
+        def.id = format!("{module}.{}", def.id);
+        match &mut def.effect {
+            Effect::StagePresent { scene, .. } => *scene = format!("{module}.{scene}"),
+            Effect::Dialogue { text, speaker, .. } => {
+                *text = format!("{module}.{text}");
+                if !speaker.is_empty() {
+                    *speaker = format!("{module}.{speaker}");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn qualify_choice_refs(module: &str, choice: &mut Choice, namespaced: bool) {
+    if namespaced {
+        for option in &mut choice.options {
+            option.text = format!("{module}.{}", option.text);
+        }
+    }
+}
+
+fn resolve_call(
+    module: &Module,
+    function: &str,
+    modules: &BTreeMap<String, Module>,
+    local_functions: &BTreeSet<String>,
+    namespaced: bool,
+) -> Result<String> {
+    if !namespaced {
+        return Ok(function.to_owned());
+    }
+    for (target_id, target) in modules {
+        if let Some((prefix, alias)) = function.split_once('.') {
+            if prefix == target_id {
+                let local = target.exports.get(alias).ok_or_else(|| {
+                    anyhow!("E_EXPORT: {target_id}.{alias} is not an exported function")
+                })?;
+                return Ok(format!("{target_id}.{local}"));
+            }
+        }
+    }
+    if local_functions.contains(function) {
+        return Ok(format!("{}.{}", module.id, function));
+    }
+    bail!("E_FUNCTION: {} has no local function {function}", module.id)
+}
+
+fn load_module_specs(root: &Path, manifest: &GameManifest) -> Result<Vec<(PathBuf, Module)>> {
+    if manifest.inputs.modules.is_empty() {
+        bail!("E_CAPABILITY: project must list at least one module");
+    }
+    if manifest.inputs.modules.len() > 4096 {
+        bail!("E_LIMIT: too many modules");
+    }
+    let mut out = Vec::new();
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for name in &manifest.inputs.modules {
+        let path = relative(root, root, name)?;
+        if !paths.insert(path.clone()) {
+            bail!("E_DUPLICATE: module file {}", path.display());
+        }
+        let module: Module = toml_file(&path)?;
+        if module.module_format != 1 || !valid_module_id(&module.id) {
+            bail!(
+                "E_MODULE: unsupported identity/format in {}",
+                path.display()
+            );
+        }
+        if !ids.insert(module.id.clone()) {
+            bail!("E_MODULE: duplicate module id {}", module.id);
+        }
+        for alias in module.exports.keys() {
+            if alias.is_empty()
+                || alias.contains('.')
+                || !alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                bail!("E_EXPORT: export names must be nonempty and contain no dot");
+            }
+        }
+        out.push((path, module));
+    }
+    Ok(out)
+}
+
 pub fn load_project(root: &Path) -> Result<LoadedProject> {
     let root = fs::canonicalize(root)?;
     let manifest: GameManifest = toml_file(&root.join("game.toml"))?;
@@ -214,9 +360,8 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     {
         bail!("E_VERSION: unsupported project/engine profile");
     }
-    if manifest.inputs.modules.len() != 1 {
-        bail!("E_CAPABILITY: this release supports exactly one module");
-    }
+    let module_specs = load_module_specs(&root, &manifest)?;
+    let namespaced = module_specs.len() > 1;
     if manifest.game.slug.is_empty()
         || !manifest
             .game
@@ -234,19 +379,18 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     if locale_config.default_text != manifest.game.source_locale {
         bail!("E_LOCALE_DEFAULT: game.source_locale must match config/locales.toml default_text");
     }
-    let module_path = relative(&root, &root, &manifest.inputs.modules[0])?;
-    let module: Module = toml_file(&module_path)?;
-    let base = module_path.parent().unwrap();
-    if module.module_format != 1 || module.id.contains('.') || module.id.is_empty() {
-        bail!("E_MODULE: unsupported identity/format");
-    }
-    let entry = module
-        .exports
-        .get("start")
-        .ok_or_else(|| anyhow!("E_EXPORT: missing start export"))?
-        .clone();
+    let entry_module = &module_specs[0].1;
+    let entry_local = entry_module.exports.get("start").ok_or_else(|| {
+        anyhow!(
+            "E_EXPORT: first module {} is missing start export",
+            entry_module.id
+        )
+    })?;
+    let entry_module_id = entry_module.id.clone();
+    let entry_local = entry_local.clone();
     let (theme, player, resolved_config) = crate::config::resolve_config(&root, &manifest)?;
-    let texts = crate::texts::compiled_texts(&root)?;
+    let texts = crate::texts::compiled_texts(&root, namespaced)?;
+    let entry = module_key(&entry_module_id, &entry_local, namespaced);
     let mut program = Program {
         format: FORMAT_VERSION,
         game_id: manifest.game.id.clone(),
@@ -256,6 +400,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         stage: manifest.stage.clone(),
         variables: BTreeMap::new(),
         functions: BTreeMap::new(),
+        modules: BTreeMap::new(),
         scenes: BTreeMap::new(),
         cues: BTreeMap::new(),
         choices: BTreeMap::new(),
@@ -269,18 +414,163 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         player,
     };
     let mut sources = crate::diagnostics::SourceIndex::default();
-    for source in &module.sources {
-        let path = relative(&root, base, source)?;
+    let mut fragment_paths = BTreeSet::new();
+    for name in &manifest.inputs.shared {
+        let path = relative(&root, &root, name)?;
+        if !fragment_paths.insert(path.clone()) {
+            bail!("E_DUPLICATE: shared fragment {}", path.display());
+        }
         let f: Fragment = json(&path)?;
         sources.fragment(&root, &path, &read(&path)?);
         if f.fragment_format != 1 {
             bail!("E_FRAGMENT: {}", path.display());
         }
+        if !f.functions.is_empty()
+            || !f.scenes.is_empty()
+            || !f.cues.is_empty()
+            || !f.choices.is_empty()
+        {
+            bail!("E_SHARED_FRAGMENT: shared fragments currently contain global variables only");
+        }
         merge(&mut program.variables, f.variables, &path)?;
-        merge(&mut program.functions, f.functions, &path)?;
-        merge(&mut program.scenes, f.scenes, &path)?;
-        merge(&mut program.cues, f.cues, &path)?;
-        merge(&mut program.choices, f.choices, &path)?;
+    }
+    let mut loaded_modules = Vec::new();
+    for (module_path, module) in module_specs {
+        let base = module_path.parent().unwrap();
+        let mut loaded = ModuleFragments {
+            module: module.clone(),
+            functions: BTreeMap::new(),
+            scenes: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            choices: BTreeMap::new(),
+        };
+        for source in &module.sources {
+            let path = relative(&root, base, source)?;
+            if !fragment_paths.insert(path.clone()) {
+                bail!(
+                    "E_DUPLICATE: fragment {} is listed more than once",
+                    path.display()
+                );
+            }
+            let f: Fragment = json(&path)?;
+            sources.fragment_in_module(
+                &root,
+                &path,
+                &read(&path)?,
+                namespaced.then_some(module.id.as_str()),
+            );
+            if f.fragment_format != 1 {
+                bail!("E_FRAGMENT: {}", path.display());
+            }
+            if namespaced && !f.variables.is_empty() {
+                bail!(
+                    "E_SHARED_VARIABLE: declare cross-module variables in inputs.shared ({})",
+                    path.display()
+                );
+            }
+            if !namespaced {
+                merge(&mut program.variables, f.variables, &path)?;
+            }
+            merge(&mut loaded.functions, f.functions, &path)?;
+            merge(&mut loaded.scenes, f.scenes, &path)?;
+            merge(&mut loaded.cues, f.cues, &path)?;
+            merge(&mut loaded.choices, f.choices, &path)?;
+        }
+        loaded_modules.push(loaded);
+    }
+    let module_map: BTreeMap<_, _> = loaded_modules
+        .iter()
+        .map(|m| (m.module.id.clone(), m.module.clone()))
+        .collect();
+    let function_names: BTreeMap<String, BTreeSet<String>> = loaded_modules
+        .iter()
+        .map(|m| (m.module.id.clone(), m.functions.keys().cloned().collect()))
+        .collect();
+    for loaded in &loaded_modules {
+        let locals = &function_names[&loaded.module.id];
+        for (alias, function) in &loaded.module.exports {
+            if !locals.contains(function) {
+                bail!(
+                    "E_EXPORT: {}.{alias} points to missing local function {function}",
+                    loaded.module.id
+                );
+            }
+        }
+    }
+    if !function_names[&entry_module_id].contains(&entry_local) {
+        bail!(
+            "E_EXPORT: {}.start points to missing local function {entry_local}",
+            entry_module_id
+        );
+    }
+    for loaded in loaded_modules {
+        let local_names = &function_names[&loaded.module.id];
+        for (id, mut function) in loaded.functions {
+            if namespaced {
+                for block in function.blocks.values_mut() {
+                    if let Terminator::Call { function: call, .. } = &mut block.terminator {
+                        *call = resolve_call(&loaded.module, call, &module_map, local_names, true)?;
+                    }
+                }
+            }
+            qualify_local_refs(&loaded.module.id, &mut function, namespaced);
+            let id = module_key(&loaded.module.id, &id, namespaced);
+            if program
+                .functions
+                .insert(id.clone(), function.clone())
+                .is_some()
+            {
+                bail!("E_DUPLICATE: function {id}");
+            }
+            program
+                .modules
+                .entry(loaded.module.id.clone())
+                .or_default()
+                .functions
+                .insert(id, FunctionSignature::from(&function));
+        }
+        for (id, nodes) in loaded.scenes {
+            let key = module_key(&loaded.module.id, &id, namespaced);
+            if program.scenes.insert(key.clone(), nodes).is_some() {
+                bail!("E_DUPLICATE: scene {key}");
+            }
+        }
+        for (id, mut cue) in loaded.cues {
+            qualify_cue_refs(&loaded.module.id, &mut cue, namespaced);
+            let key = module_key(&loaded.module.id, &id, namespaced);
+            if program.cues.insert(key.clone(), cue).is_some() {
+                bail!("E_DUPLICATE: cue {key}");
+            }
+        }
+        for (id, mut choice) in loaded.choices {
+            qualify_choice_refs(&loaded.module.id, &mut choice, namespaced);
+            let key = module_key(&loaded.module.id, &id, namespaced);
+            if program.choices.insert(key.clone(), choice).is_some() {
+                bail!("E_DUPLICATE: choice {key}");
+            }
+        }
+    }
+    for (module, texts) in texts.module_texts {
+        program.modules.entry(module).or_default().texts = texts;
+    }
+    if namespaced {
+        if let Some(scene) = &program.title_scene {
+            if !program.scenes.contains_key(scene) {
+                let matches: Vec<_> = program
+                    .scenes
+                    .keys()
+                    .filter(|id| id.rsplit('.').next() == Some(scene.as_str()))
+                    .cloned()
+                    .collect();
+                if matches.len() == 1 {
+                    program.title_scene = matches.into_iter().next();
+                } else {
+                    bail!(
+                        "E_SCENE: multi-module title_scene must identify one module scene: {scene}"
+                    );
+                }
+            }
+        }
     }
     if locale_config.text.keys().collect::<BTreeSet<_>>()
         != program.locales.keys().collect::<BTreeSet<_>>()

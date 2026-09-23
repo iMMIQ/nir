@@ -21,6 +21,66 @@ pub fn verify(bytes: &[u8], expected: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Install immutable content into an isolated candidate. The caller validates
+/// the resulting program before replacing any live execution view.
+pub fn install_module_code(p: &mut Program, bytes: &[u8], module: &str) -> Result<()> {
+    let index = p
+        .modules
+        .get(module)
+        .ok_or_else(|| Diagnostic::new("E_MODULE", module, "undeclared module"))?;
+    verify(bytes, &index.code)?;
+    let code: ModuleCode = parse(bytes, module)?;
+    if code.format != 1
+        || code.module != module
+        || code.functions.len() != index.functions.len()
+        || code
+            .functions
+            .iter()
+            .any(|(id, f)| index.functions.get(id) != Some(&FunctionSignature::from(f)))
+    {
+        return Err(Diagnostic::new(
+            "E_MODULE_INTERFACE",
+            module,
+            "module body does not match declared interface",
+        ));
+    }
+    p.functions.extend(code.functions);
+    Ok(())
+}
+pub fn install_module_texts(
+    p: &mut Program,
+    bytes: &[u8],
+    module: &str,
+    locale: &str,
+) -> Result<()> {
+    let index = p
+        .modules
+        .get(module)
+        .ok_or_else(|| Diagnostic::new("E_MODULE", module, "undeclared module"))?;
+    let hash = index
+        .locales
+        .get(locale)
+        .ok_or_else(|| Diagnostic::new("E_LOCALE", module, locale))?;
+    verify(bytes, hash)?;
+    let text: ModuleTexts = parse(bytes, module)?;
+    if text.format != 1
+        || text.module != module
+        || text.locale != locale
+        || text.texts.keys().cloned().collect::<BTreeSet<_>>() != index.texts
+    {
+        return Err(Diagnostic::new(
+            "E_MODULE_TEXT",
+            module,
+            "text bundle does not match declared ownership",
+        ));
+    }
+    p.locales
+        .get_mut(locale)
+        .ok_or_else(|| Diagnostic::new("E_LOCALE", module, locale))?
+        .extend(text.texts);
+    Ok(())
+}
 /// Check the complete, canonical index table without linking the compiler.
 pub fn validate_executable(e: &Executable) -> Result<()> {
     let bad = || {
@@ -30,6 +90,24 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
             "invalid index, recovery map, cost or recipe",
         )
     };
+    let hash = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    for module in e.program.modules.values() {
+        if module
+            .functions
+            .keys()
+            .any(|id| !e.program.functions.contains_key(id))
+            && !hash(&module.code)
+        {
+            return Err(bad());
+        }
+        for (locale, texts) in &e.program.locales {
+            if module.texts.iter().any(|id| !texts.contains_key(id))
+                && !module.locales.get(locale).is_some_and(|s| hash(s))
+            {
+                return Err(bad());
+            }
+        }
+    }
     let expected: usize = e
         .program
         .functions

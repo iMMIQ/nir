@@ -142,7 +142,7 @@ fn validate(p: &Program) -> Result<()> {
         }
     }
     if p.game_id.is_empty()
-        || !p.functions.contains_key(&p.entry)
+        || p.function_signature(&p.entry).is_none()
         || p.stage.width == 0
         || p.stage.height == 0
         || p.stage.width > 8192
@@ -150,7 +150,7 @@ fn validate(p: &Program) -> Result<()> {
     {
         return Err(err("E_PROGRAM", "program", "invalid game, entry or stage"));
     }
-    if !p.functions[&p.entry].params.is_empty() {
+    if !p.function_signature(&p.entry).unwrap().params.is_empty() {
         return Err(err("E_CALL", "entry", "entry requires arguments"));
     }
     if !p.locales.contains_key(&p.default_locale) {
@@ -202,6 +202,50 @@ fn validate(p: &Program) -> Result<()> {
             }
         }
     }
+    let mut declared_functions = BTreeSet::new();
+    let mut declared_texts = BTreeSet::new();
+    if p.modules.len() > 4096 {
+        return Err(err("E_LIMIT", "modules", "too many modules"));
+    }
+    for (id, module) in &p.modules {
+        if id.is_empty() || module.functions.is_empty() {
+            return Err(err("E_MODULE", id, "empty module identity or interface"));
+        }
+        for (fid, signature) in &module.functions {
+            if !declared_functions.insert(fid)
+                || signature.entry.is_empty()
+                || signature.entry_op.is_empty()
+                || p.functions
+                    .get(fid)
+                    .is_some_and(|f| FunctionSignature::from(f) != *signature)
+            {
+                return Err(err(
+                    "E_MODULE",
+                    fid,
+                    "duplicate or mismatched function interface",
+                ));
+            }
+        }
+        for tid in &module.texts {
+            if !declared_texts.insert(tid) || !p.texts.contains_key(tid) {
+                return Err(err("E_MODULE", tid, "duplicate or unknown text ownership"));
+            }
+        }
+    }
+    if !p.modules.is_empty()
+        && (p
+            .functions
+            .keys()
+            .any(|id| !declared_functions.contains(id))
+            || p.texts.keys().any(|id| !declared_texts.contains(id))
+            || declared_functions.len() > 4096)
+    {
+        return Err(err(
+            "E_MODULE",
+            "modules",
+            "incomplete ownership or function limit",
+        ));
+    }
     for (locale, texts) in &p.locales {
         if locale != "zh-Hans" && locale != "en" {
             return Err(err(
@@ -211,25 +255,31 @@ fn validate(p: &Program) -> Result<()> {
             ));
         }
         for (id, c) in &p.texts {
-            let d = texts
-                .get(id)
-                .ok_or_else(|| err("E_TRANSLATION", locale, id))?;
             if c.source_revision == 0
                 || c.contract_revision == 0
                 || c.meaning_revision == 0
                 || c.contract_digest != text_contract_digest(c)
-                || d.source_revision != c.source_revision
+            {
+                return Err(err("E_TEXT_REVISION", id, locale));
+            }
+            for (param, ty) in &c.params {
+                if p.variables.get(param).map(Value::ty) != Some(*ty) {
+                    return Err(err("E_TEXT_PARAM", id, param));
+                }
+            }
+            let Some(d) = texts.get(id) else {
+                if p.text_module(id).is_some() {
+                    continue;
+                }
+                return Err(err("E_TRANSLATION", locale, id));
+            };
+            if d.source_revision != c.source_revision
                 || d.contract_revision != c.contract_revision
                 || d.contract_digest != c.contract_digest
             {
                 return Err(err("E_TEXT_REVISION", id, locale));
             }
             validate_text_spans(id, c, &d.spans)?;
-            for (param, ty) in &c.params {
-                if p.variables.get(param).map(Value::ty) != Some(*ty) {
-                    return Err(err("E_TEXT_PARAM", id, param));
-                }
-            }
         }
         if texts.keys().any(|id| !p.texts.contains_key(id)) {
             return Err(err("E_TEXT_CONTRACT", locale, "unexpected text"));
@@ -444,8 +494,7 @@ fn validate(p: &Program) -> Result<()> {
                     ..
                 } => {
                     let callee = p
-                        .functions
-                        .get(function)
+                        .function_signature(function)
                         .ok_or_else(|| err("E_FUNCTION", &at, function))?;
                     if args.len() != callee.params.len() {
                         return Err(err("E_CALL", &at, "argument count"));

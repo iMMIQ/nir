@@ -331,7 +331,7 @@ impl Renderer {
         }
         let start = upload.row as usize * stride;
         let end = start + rows as usize * stride;
-        for pixel in upload.pixels[start..end].chunks_exact_mut(4) {
+        for pixel in upload.pixels[start..end].as_chunks_mut::<4>().0 {
             let a = pixel[3] as f32 / 255.;
             for channel in &mut pixel[..3] {
                 *channel = (srgb(linear(*channel as f32 / 255.) * a) * 255.)

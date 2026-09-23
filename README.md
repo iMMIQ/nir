@@ -38,7 +38,7 @@ NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放
 game.toml                      作品身份、能力配置和输入清单
 config/locales.toml            UI/正文语言、默认值和逐语言字体计划
 game.lock                      SDK 与 CLI 的真实内容身份
-content/main/module.toml        唯一模块、入口、正文包
+content/main/module.toml        模板入口模块、导出、正文包
 content/main/story.nir.json     变量、函数、块、Cue、场景、选项
 content/main/texts/             文本契约、修订记录及 zh-Hans / en 正文
 assets/catalog.toml            资源身份、路径、类型、权利信息
@@ -52,6 +52,8 @@ schemas/                       由 SDK 生成的 JSON Schema
 ```
 
 本分支构建的 SDK 支持 `novelc -p my-story config` 查看配置值和来源；主题及默认设置编辑说明见 [作品配置](docs/PROJECT-THEMES.md)，独立 UI/正文语言及字体计划见[语言说明](docs/LOCALE-FONTS.md)。已发布的旧版 SDK 不会自动获得新增能力。
+
+多章节作品可登记多个模块和共享变量，通过显式导出跨模块调用。发行包按模块拆分函数体，按模块与语言拆分正文，播放器在执行、切换语言和读档时按需获取。作者配置、并行实现流程及当前边界见 [多模块工作流](docs/MODULE-WORKFLOW.md)。
 
 通过正文包编辑对话，保留稳定 ID、参数和 Gate 顺序。源文修改后执行 `text update --id <TextId> --meaning preserve|bump`，确认译文后执行 `text review --id <TextId> --locale en`；用 `text status` 查看待复核项。旧工程需显式迁移，见 [文本修订说明](docs/TEXT-REVISIONS.md)。最小模板会自动从母版生成所需字形；新字符超出母版覆盖时 `check` 会拒绝缺字，配置与边界见 [字体编译](docs/AUTHOR-FONTS.md)。调整逻辑时参考示例块与 [编写说明](docs/AUTHORING.md)。
 
@@ -71,8 +73,17 @@ schemas/                       由 SDK 生成的 JSON Schema
 
 固定工具链在 `rust-toolchain.toml`，依赖锁在 `Cargo.lock` 和 `package-lock.json`。需要 Rust/rustup、Python 3、C++ 编译器、libclang（Ubuntu：`g++ libclang-dev`）、Node.js（仅浏览器测试）及桌面 Chromium。
 
+NixOS 用户先进入项目开发环境（需启用 Nix 的 `nix-command` 和 `flakes`）：
+
 ```sh
-rustup target add wasm32-unknown-unknown --toolchain 1.95.0
+nix develop
+cargo b
+```
+
+`flake.lock` 固定 Nix 依赖；开发环境提供 GCC、libclang、rustup、Python 和 Node.js，并配置 bindgen 的库与头文件路径。Rust 版本仍由 `rust-toolchain.toml` 控制，首次构建时 rustup 会下载所需工具链。也可使用 `nix develop --command cargo b` 单次构建。浏览器测试所需的 Chromium 另行准备。
+
+```sh
+rustup target add wasm32-unknown-unknown --toolchain 1.98.1
 cargo install wasm-bindgen-cli --version 0.2.100 --locked
 cargo xtask sdk
 ./dist/novelc -p examples/rain-letters resolve

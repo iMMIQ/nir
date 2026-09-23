@@ -197,6 +197,10 @@ pub enum CoreInput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreIntent {
+    PrepareContent {
+        module: String,
+        locale: String,
+    },
     Prepare {
         activation: u32,
         cue: String,
@@ -245,16 +249,15 @@ impl Core {
         if !p.locales.contains_key(&locale) {
             return Err(Diagnostic::new("E_LOCALE", "new", locale));
         }
+        let entry = p
+            .function_signature(&p.entry)
+            .ok_or_else(|| Diagnostic::new("E_FUNCTION", "entry", "missing interface"))?;
         let frame = Frame {
             id: 1,
             function: p.entry.clone(),
-            block: p.functions[&p.entry].entry.clone(),
+            block: entry.entry,
             op: 0,
-            op_id: p.functions[&p.entry].blocks[&p.functions[&p.entry].entry]
-                .ops
-                .first()
-                .map(|o| o.id.clone())
-                .unwrap_or_else(|| "@terminator".into()),
+            op_id: entry.entry_op,
             locals: BTreeMap::new(),
             return_to: None,
             result: None,
@@ -297,6 +300,16 @@ impl Core {
     }
     pub fn program(&self) -> &Program {
         self.program.program()
+    }
+    /// Installing verified immutable bodies does not replay any story operation.
+    pub fn replace_program(&mut self, program: ValidatedProgram) -> Result<()> {
+        if program.program().revision != self.state.revision
+            || program.program().game_id != self.state.game_id
+        {
+            return Err(self.error("E_MODULE", "content identity changed"));
+        }
+        self.program = program;
+        Ok(())
     }
     pub fn snapshot(&self) -> Snapshot {
         self.state.clone()
@@ -488,11 +501,16 @@ impl Core {
                 self.state.fault = Some(e);
             }
         }
+        let content_waiting = self
+            .intents
+            .iter()
+            .any(|i| matches!(i, CoreIntent::PrepareContent { .. }));
         CoreStep {
             work_used: limit - self.work_remaining,
             remaining_time_us: self.remaining_time_us,
             intents: std::mem::take(&mut self.intents),
-            waiting: self.state.pending.is_some()
+            waiting: content_waiting
+                || self.state.pending.is_some()
                 || self.state.waiting.is_some()
                 || self.state.choice.is_some()
                 || self.state.outcome.is_some()
@@ -595,6 +613,13 @@ impl Core {
         Ok(())
     }
     fn run(&mut self) -> Result<()> {
+        if self
+            .intents
+            .iter()
+            .any(|i| matches!(i, CoreIntent::PrepareContent { .. }))
+        {
+            return Ok(());
+        }
         while self.work_remaining > 0 {
             if self.state.pending.is_some()
                 || self.state.choice.is_some()
@@ -603,6 +628,15 @@ impl Core {
                 return Ok(());
             }
             if self.state.waiting.is_some() && !self.resolve_wait()? {
+                return Ok(());
+            }
+            // Content barriers precede semantic execution. No arguments, RNG,
+            // instance IDs or story time are consumed while a body is missing.
+            if let Some(module) = self.missing_content() {
+                self.intents.push(CoreIntent::PrepareContent {
+                    module,
+                    locale: self.state.locale.clone(),
+                });
                 return Ok(());
             }
             self.work_remaining -= 1;
@@ -626,6 +660,42 @@ impl Core {
             }
         }
         Ok(())
+    }
+    fn missing_content(&self) -> Option<String> {
+        let p = self.program();
+        let frame = self.frame();
+        if !p.functions.contains_key(&frame.function) {
+            return p.function_module(&frame.function).map(str::to_owned);
+        }
+        let block = &p.functions[&frame.function].blocks[&frame.block];
+        if frame.op < block.ops.len() {
+            return None;
+        }
+        let mut texts = vec![];
+        match &block.terminator {
+            Terminator::Call { function, .. } if !p.functions.contains_key(function) => {
+                return p.function_module(function).map(str::to_owned)
+            }
+            Terminator::Activate { cue, .. } => {
+                for effect in &p.cues[cue].effects {
+                    if let Effect::Dialogue { text, speaker, .. } = &effect.effect {
+                        texts.push(text);
+                        if !speaker.is_empty() {
+                            texts.push(speaker);
+                        }
+                    }
+                }
+            }
+            Terminator::Interact { choice, .. } => {
+                texts.extend(p.choices[choice].options.iter().map(|o| &o.text))
+            }
+            _ => {}
+        }
+        texts
+            .into_iter()
+            .find(|id| !p.locales[&self.state.locale].contains_key(*id))
+            .and_then(|id| p.text_module(id))
+            .map(str::to_owned)
     }
     fn execute_op(&mut self, op: &Operation) -> Result<()> {
         match op {
@@ -1235,6 +1305,10 @@ impl Core {
         while self.state.tick_us.0 < end
             && self.state.pending.is_none()
             && self.state.outcome.is_none()
+            && !self
+                .intents
+                .iter()
+                .any(|i| matches!(i, CoreIntent::PrepareContent { .. }))
         {
             if self.work_remaining == 0 {
                 self.remaining_time_us = end - self.state.tick_us.0;

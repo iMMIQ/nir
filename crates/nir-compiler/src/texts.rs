@@ -83,6 +83,8 @@ pub struct TextStatus {
 }
 struct Sources {
     root: PathBuf,
+    module_id: String,
+    namespaced: bool,
     source: String,
     contract_path: PathBuf,
     paths: BTreeMap<String, PathBuf>,
@@ -98,14 +100,51 @@ fn hash<T: Serialize>(value: &T) -> Result<String> {
 fn shape(c: &AuthorTextContract) -> Result<String> {
     hash(&(&c.params, &c.gates))
 }
-fn module(root: &Path) -> Result<(GameManifest, PathBuf, Module)> {
+fn modules(root: &Path) -> Result<(GameManifest, Vec<(PathBuf, Module)>)> {
     let manifest: GameManifest = toml_file(&root.join("game.toml"))?;
-    if manifest.inputs.modules.len() != 1 {
-        bail!("E_CAPABILITY: text tools require exactly one module");
+    if manifest.inputs.modules.is_empty() {
+        bail!("E_MODULE: project must list at least one module");
     }
-    let path = relative(root, root, &manifest.inputs.modules[0])?;
-    let m: Module = toml_file(&path)?;
-    Ok((manifest, path, m))
+    let mut result = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for name in &manifest.inputs.modules {
+        let path = relative(root, root, name)?;
+        let m: Module = toml_file(&path)?;
+        if m.module_format != 1 || !crate::project::valid_module_id(&m.id) {
+            bail!("E_MODULE: unsupported identity/format");
+        }
+        if !ids.insert(m.id.clone()) {
+            bail!("E_MODULE: duplicate module id {}", m.id);
+        }
+        result.push((path, m));
+    }
+    let mut text_paths = std::collections::BTreeSet::new();
+    for (module_path, module) in &result {
+        let base = module_path.parent().unwrap();
+        let mut names = vec![module.text_contracts.as_str()];
+        if let Some(revisions) = &module.text_revisions {
+            names.push(revisions);
+        }
+        names.extend(module.text_bundles.values().map(String::as_str));
+        for name in names {
+            let path = relative(root, base, name)?;
+            if !text_paths.insert(path.clone()) {
+                bail!(
+                    "E_TEXT_PATH: modules must own distinct text files ({})",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        }
+    }
+    Ok((manifest, result))
+}
+fn module(root: &Path) -> Result<(GameManifest, PathBuf, Module)> {
+    let (manifest, mut modules) = modules(root)?;
+    if modules.len() != 1 {
+        bail!("E_CAPABILITY: this operation requires a single module");
+    }
+    let (path, module) = modules.pop().unwrap();
+    Ok((manifest, path, module))
 }
 fn journal_path(root: &Path) -> Result<PathBuf> {
     let dir = root.join(".nir");
@@ -121,10 +160,21 @@ fn no_transaction(root: &Path) -> Result<()> {
     Ok(())
 }
 impl Sources {
-    fn load(root: &Path) -> Result<Self> {
+    fn load(root: &Path, requested_module: Option<&str>) -> Result<Self> {
         let root = fs::canonicalize(root)?;
         no_transaction(&root)?;
-        let (manifest, path, m) = module(&root)?;
+        let (manifest, module_entries) = modules(&root)?;
+        let namespaced = module_entries.len() > 1;
+        let (path, m) = if let Some(requested) = requested_module {
+            module_entries
+                .into_iter()
+                .find(|(_, module)| module.id == requested)
+                .ok_or_else(|| anyhow!("E_MODULE: unknown module {requested}"))?
+        } else if module_entries.len() == 1 {
+            module_entries.into_iter().next().unwrap()
+        } else {
+            bail!("E_MODULE: select a module for text revision operations");
+        };
         let base = path.parent().unwrap();
         let ledger_name=m.text_revisions.as_ref().ok_or_else(||anyhow!("E_TEXT_MIGRATION: legacy text revisions; run novelc text migrate --out NEW_DIRECTORY"))?;
         let contract_path = relative(&root, base, &m.text_contracts)?;
@@ -177,6 +227,8 @@ impl Sources {
         }
         Ok(Self {
             root,
+            module_id: m.id.clone(),
+            namespaced,
             source: manifest.game.source_locale,
             contract_path,
             paths,
@@ -192,7 +244,11 @@ impl Sources {
         let mut issue = |code: &str, id: &str, locale: &str, path: &Path, message: &str| {
             issues.push(TextIssue {
                 code: code.into(),
-                text_id: id.into(),
+                text_id: if self.namespaced {
+                    format!("{}.{}", self.module_id, id)
+                } else {
+                    id.into()
+                },
                 locale: locale.into(),
                 file: path
                     .strip_prefix(&self.root)
@@ -317,87 +373,171 @@ fn pretty<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(b)
 }
 pub fn text_status(root: &Path) -> Result<TextStatus> {
-    Sources::load(root)?.report()
+    let root = fs::canonicalize(root)?;
+    let (manifest, entries) = modules(&root)?;
+    let namespaced = entries.len() > 1;
+    let mut issues = Vec::new();
+    let mut texts = 0;
+    let mut expected_locales: Option<std::collections::BTreeSet<String>> = None;
+    for (_, module) in entries {
+        let source = Sources::load(&root, Some(&module.id))?;
+        let actual_locales: std::collections::BTreeSet<_> = source.docs.keys().cloned().collect();
+        if expected_locales
+            .as_ref()
+            .is_some_and(|expected| expected != &actual_locales)
+        {
+            bail!("E_TRANSLATION: all modules must provide the same locale bundles");
+        }
+        expected_locales = Some(actual_locales);
+        let report = source.report()?;
+        texts += report.texts;
+        issues.extend(report.issues);
+    }
+    if namespaced {
+        for issue in &mut issues {
+            // Reports from Sources already qualify each module's IDs.
+            if !issue.text_id.contains('.') {
+                bail!("E_TEXT_ID: internal module-qualified diagnostic was lost");
+            }
+        }
+    }
+    Ok(TextStatus {
+        format: 1,
+        source_locale: manifest.game.source_locale,
+        texts,
+        locales: expected_locales.map_or(0, |locales| locales.len()),
+        ready: issues.is_empty(),
+        issues,
+    })
 }
 pub(crate) struct CompiledTexts {
     pub contracts: BTreeMap<String, TextContract>,
     pub locales: BTreeMap<String, BTreeMap<String, TextDoc>>,
+    pub module_texts: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
-pub(crate) fn compiled_texts(root: &Path) -> Result<CompiledTexts> {
-    let s = Sources::load(root)?;
-    let report = s.report()?;
-    if let Some(i) = report.issues.first() {
-        let mut d = Diagnostic::new(&i.code, &i.text_id, &i.message).classified(
-            ErrorDomain::Content,
-            "text",
-            "revision",
-            vec![Recovery::FixContent],
-        );
-        if let Some(details) = &mut d.details {
-            details.source = Some(crate::diagnostics::text_source(
-                &i.file,
-                &i.pointer,
-                &s.originals[&s.root.join(&i.file)],
-            ));
-            details.references = vec![i.text_id.clone(), i.locale.clone()];
-            details.hint=Some("Run novelc text status --json; update the source revision or explicitly review the translation.".into());
-        }
-        return Err(d.into());
+pub(crate) fn compiled_texts(root: &Path, namespaced: bool) -> Result<CompiledTexts> {
+    let root = fs::canonicalize(root)?;
+    let (_, entries) = modules(&root)?;
+    if namespaced != (entries.len() > 1) {
+        bail!("E_MODULE: inconsistent namespace mode");
     }
-    let contracts: BTreeMap<_, _> = s
-        .contracts
-        .iter()
-        .map(|(id, c)| (id.clone(), c.runtime()))
-        .collect();
-    let docs = s
-        .docs
-        .into_iter()
-        .map(|(locale, docs)| {
-            (
-                locale,
-                docs.into_iter()
-                    .map(|(id, d)| {
-                        let digest = contracts[&id].contract_digest.clone();
-                        (
-                            id,
-                            TextDoc {
-                                source_revision: d.source_revision,
-                                contract_revision: d.contract_revision,
-                                contract_digest: digest,
-                                spans: d.spans,
-                            },
-                        )
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
+    let mut contracts = BTreeMap::new();
+    let mut locales: BTreeMap<String, BTreeMap<String, TextDoc>> = BTreeMap::new();
+    let mut module_texts = BTreeMap::new();
+    let mut expected_locales: Option<std::collections::BTreeSet<String>> = None;
+    for (_, module) in entries {
+        let s = Sources::load(&root, Some(&module.id))?;
+        let module_locales: std::collections::BTreeSet<_> = s.docs.keys().cloned().collect();
+        if expected_locales
+            .as_ref()
+            .is_some_and(|expected| expected != &module_locales)
+        {
+            bail!("E_TRANSLATION: all modules must provide the same locale bundles");
+        }
+        expected_locales = Some(module_locales);
+        let report = s.report()?;
+        if let Some(i) = report.issues.first() {
+            let mut d = Diagnostic::new(&i.code, &i.text_id, &i.message).classified(
+                ErrorDomain::Content,
+                "text",
+                "revision",
+                vec![Recovery::FixContent],
+            );
+            if let Some(details) = &mut d.details {
+                details.source = Some(crate::diagnostics::text_source(
+                    &i.file,
+                    &i.pointer,
+                    &s.originals[&s.root.join(&i.file)],
+                ));
+                details.references = vec![i.text_id.clone(), i.locale.clone()];
+                details.hint = Some("Run novelc text status --json; update the source revision or explicitly review the translation.".into());
+            }
+            return Err(d.into());
+        }
+        for (id, c) in &s.contracts {
+            let key = if namespaced {
+                format!("{}.{}", module.id, id)
+            } else {
+                id.clone()
+            };
+            if contracts.insert(key.clone(), c.runtime()).is_some() {
+                bail!("E_DUPLICATE: text contract {key}");
+            }
+            module_texts
+                .entry(module.id.clone())
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(key);
+        }
+        for (locale, docs) in s.docs {
+            let out = locales.entry(locale).or_default();
+            for (id, d) in docs {
+                let key = if namespaced {
+                    format!("{}.{}", module.id, id)
+                } else {
+                    id
+                };
+                let contract = contracts
+                    .get(&key)
+                    .ok_or_else(|| anyhow!("E_TEXT_CONTRACT: {key}"))?;
+                if out
+                    .insert(
+                        key.clone(),
+                        TextDoc {
+                            source_revision: d.source_revision,
+                            contract_revision: d.contract_revision,
+                            contract_digest: contract.contract_digest.clone(),
+                            spans: d.spans,
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("E_DUPLICATE: localized text {key}");
+                }
+            }
+        }
+    }
     Ok(CompiledTexts {
         contracts,
-        locales: docs,
+        locales,
+        module_texts,
     })
 }
 fn next(n: u32) -> Result<u32> {
     n.checked_add(1)
         .ok_or_else(|| anyhow!("E_TEXT_REVISION: revision overflow"))
 }
+fn load_for_text_id(root: &Path, id: &str) -> Result<(Sources, String)> {
+    let root = fs::canonicalize(root)?;
+    let (_, entries) = modules(&root)?;
+    if entries.len() == 1 {
+        let module = &entries[0].1;
+        return Ok((Sources::load(&root, Some(&module.id))?, id.to_owned()));
+    }
+    let (module_id, local_id) = id
+        .split_once('.')
+        .ok_or_else(|| anyhow!("E_TEXT_ID: multi-module text IDs use module.text form"))?;
+    if !entries.iter().any(|(_, module)| module.id == module_id) || local_id.is_empty() {
+        bail!("E_TEXT_ID: unknown module/text {id}");
+    }
+    Ok((Sources::load(&root, Some(module_id))?, local_id.to_owned()))
+}
 /// An explicit content decision; never infer meaning changes from text hashes.
 pub fn text_update(root: &Path, id: &str, meaning_changed: bool) -> Result<()> {
-    let mut s = Sources::load(root)?;
+    let (mut s, id) = load_for_text_id(root, id)?;
     let c = s
         .contracts
-        .get_mut(id)
+        .get_mut(&id)
         .ok_or_else(|| anyhow!("E_TEXT_ID: unknown contract {id}"))?;
     let d = s
         .docs
         .get_mut(&s.source)
         .unwrap()
-        .get_mut(id)
+        .get_mut(&id)
         .ok_or_else(|| anyhow!("E_TRANSLATION_MISSING: source {id}"))?;
-    validate_text_spans(id, &c.runtime(), &d.spans)?;
+    validate_text_spans(&id, &c.runtime(), &d.spans)?;
     let source_hash = hash(&d.spans)?;
     let shape_hash = shape(c)?;
-    if let Some(old) = s.ledger.texts.get(id) {
+    if let Some(old) = s.ledger.texts.get(&id) {
         if (c.source_revision, c.contract_revision, c.meaning_revision)
             != (
                 old.source_revision,
@@ -429,7 +569,7 @@ pub fn text_update(root: &Path, id: &str, meaning_changed: bool) -> Result<()> {
     d.source_revision = c.source_revision;
     d.contract_revision = c.contract_revision;
     s.ledger.texts.insert(
-        id.into(),
+        id.clone(),
         RevisionRecord {
             source_revision: c.source_revision,
             contract_revision: c.contract_revision,
@@ -443,33 +583,31 @@ pub fn text_update(root: &Path, id: &str, meaning_changed: bool) -> Result<()> {
     commit(&s.root, s.edits()?, &s.originals)
 }
 pub fn text_review(root: &Path, id: &str, locale: &str) -> Result<()> {
-    let mut s = Sources::load(root)?;
+    let (mut s, id) = load_for_text_id(root, id)?;
     if locale == s.source {
         bail!("E_TEXT_REVIEW: use text update for the source locale");
     }
     let c = s
         .contracts
-        .get(id)
+        .get(&id)
         .ok_or_else(|| anyhow!("E_TEXT_ID: unknown contract {id}"))?;
-    if s.report()?
-        .issues
-        .iter()
-        .any(|i| i.text_id == id && i.locale == s.source)
-    {
+    if s.report()?.issues.iter().any(|i| {
+        (i.text_id == id || i.text_id.ends_with(&format!(".{id}"))) && i.locale == s.source
+    }) {
         bail!("E_TEXT_SOURCE_CHANGED: record valid source {id} before reviewing translations");
     }
     let d = s
         .docs
         .get_mut(locale)
         .ok_or_else(|| anyhow!("E_LOCALE: unknown {locale}"))?
-        .get_mut(id)
+        .get_mut(&id)
         .ok_or_else(|| anyhow!("E_TRANSLATION_MISSING: {locale}/{id}"))?;
-    validate_text_spans(id, &c.runtime(), &d.spans)?;
+    validate_text_spans(&id, &c.runtime(), &d.spans)?;
     d.source_revision = c.source_revision;
     d.contract_revision = c.contract_revision;
     s.ledger
         .texts
-        .get_mut(id)
+        .get_mut(&id)
         .ok_or_else(|| anyhow!("E_TEXT_UNRECORDED: {id}"))?
         .reviewed
         .insert(locale.into(), hash(d)?);

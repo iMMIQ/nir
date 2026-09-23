@@ -6,7 +6,10 @@ use nir_format::*;
 use nir_presentation::{ChoiceView, DialogueView, Screen, SlotView, UiModel};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod content;
 mod pause;
+pub use content::ContentRequest;
+use content::{ContentPreparation, ContentPurpose};
 pub use pause::PauseToken;
 use pause::Pauses;
 
@@ -25,6 +28,14 @@ pub struct SaveEnvelope {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppCommand {
+    GetContent {
+        request: u32,
+        session: u32,
+        objects: Vec<ContentRequest>,
+    },
+    CancelContent {
+        request: u32,
+    },
     ResourceStage {
         stage: String,
         request: u32,
@@ -111,6 +122,14 @@ pub enum AppCommand {
 }
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    ContentReady {
+        request: u32,
+        objects: Vec<Vec<u8>>,
+    },
+    ContentFailed {
+        request: u32,
+        message: String,
+    },
     Action {
         action: UiAction,
         interaction: u32,
@@ -225,6 +244,7 @@ pub struct Player {
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
     prepare: Option<Preparation>,
+    content: BTreeMap<u32, ContentPreparation>,
     candidate: Option<Core>,
     device_resume: Option<Purpose>,
     ledger: BudgetLedger,
@@ -305,6 +325,7 @@ impl Player {
             save_jobs: BTreeMap::new(),
             auto_elapsed: 0,
             history_offset: 0,
+            content: BTreeMap::new(),
         };
         let assets = p.title_assets();
         p.begin_prepare(Purpose::Boot, 0, assets)?;
@@ -407,9 +428,15 @@ impl Player {
         self.accepts(request) || (self.accepts_locale(request) && self.locale_job.is_some())
     }
     pub fn locale_pending(&self) -> bool {
-        self.locale_candidate.is_some() && self.locale_error.is_none()
+        (self.locale_candidate.is_some()
+            || self
+                .content
+                .values()
+                .any(|p| matches!(p.purpose, ContentPurpose::Locale)))
+            && self.locale_error.is_none()
     }
     fn invalidate_locale_candidate(&mut self) {
+        self.cancel_content(true);
         if let Some(candidate) = self.locale_candidate.take() {
             self.commands.push(AppCommand::CancelAssets {
                 request: candidate.request,
@@ -455,6 +482,22 @@ impl Player {
             .cloned()
             .collect();
         self.invalidate_locale_candidate();
+        let mut needs = vec![];
+        if self.screen != Screen::Title && self.return_screen != Screen::Title {
+            if let Some(frame) = self.core.state().frames.last() {
+                if let Some(module) = self.core.program().function_module(&frame.function) {
+                    needs = self.content_requirements(
+                        module,
+                        Some(&self.preferences.text_locale),
+                        false,
+                    )?;
+                }
+            }
+        }
+        if !needs.is_empty() {
+            self.locale_error = None;
+            return self.begin_content(ContentPurpose::Locale, needs);
+        }
         self.request = self.request.checked_add(1).ok_or_else(|| {
             Diagnostic::new("E_LIMIT", "locale", "locale request counter overflow")
         })?;
@@ -517,6 +560,10 @@ impl Player {
     }
     pub fn is_loading(&self) -> bool {
         self.prepare.is_some()
+            || self
+                .content
+                .values()
+                .any(|p| !p.failed && !matches!(p.purpose, ContentPurpose::Locale))
     }
     fn title_nodes(&self) -> Vec<Node> {
         let p = self.validated.program();
@@ -721,6 +768,19 @@ impl Player {
         }
         for intent in output.intents {
             match intent {
+                CoreIntent::PrepareContent { module, locale } => {
+                    let needs = self.content_requirements(&module, Some(&locale), true)?;
+                    // Independent media completions may wake the VM while its
+                    // PC is at the same barrier. They do not restart a download
+                    // or implicitly retry a failed preparation.
+                    if !self
+                        .content
+                        .values()
+                        .any(|p| !matches!(p.purpose, ContentPurpose::Locale))
+                    {
+                        self.begin_content(ContentPurpose::Execution, needs)?;
+                    }
+                }
                 CoreIntent::Prepare { activation, cue } => self.begin_prepare(
                     Purpose::Activation,
                     activation,
@@ -838,7 +898,18 @@ impl Player {
         std::mem::take(&mut self.commands)
     }
     fn event(&mut self, e: AppEvent, budget: &mut u32) -> Result<()> {
+        if let AppEvent::ContentReady { request, objects } = e {
+            if let Err(error) = self.complete_content(request, objects) {
+                self.fail_content(request, error.to_string());
+            }
+            return Ok(());
+        }
+        if let AppEvent::ContentFailed { request, message } = e {
+            self.fail_content(request, message);
+            return Ok(());
+        }
         match e {
+            AppEvent::ContentReady { .. } | AppEvent::ContentFailed { .. } => unreachable!(),
             AppEvent::Action {
                 action,
                 interaction,
@@ -1260,12 +1331,28 @@ impl Player {
         self.commands.push(AppCommand::AudioPause { paused: true });
     }
     fn restore(&mut self, s: Snapshot) -> Result<()> {
+        self.restore_with_purpose(s, false)
+    }
+    fn restore_with_purpose(&mut self, s: Snapshot, rollback: bool) -> Result<()> {
+        self.cancel_content(false);
+        let needs = self.restore_content_requirements(&s)?;
+        if !needs.is_empty() {
+            return self.begin_content(ContentPurpose::Restore(Box::new(s), rollback), needs);
+        }
         let mut candidate = Core::restore(self.validated.clone(), s, &self.release)?;
         // Preferences are independent of saves. Frozen current instances retain
         // their saved language; future instances use the current preference.
         candidate.set_locale(&self.effective_text_locale)?;
         let assets = self.state_assets(&candidate);
-        self.begin_prepare(Purpose::Restore, 0, assets)?;
+        self.begin_prepare(
+            if rollback {
+                Purpose::Rollback
+            } else {
+                Purpose::Restore
+            },
+            0,
+            assets,
+        )?;
         self.candidate = Some(candidate);
         Ok(())
     }
@@ -1282,6 +1369,7 @@ impl Player {
                     return Ok(());
                 }
                 let restart_locale = self.locale_pending();
+                self.cancel_content(false);
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = Core::new(
@@ -1370,6 +1458,7 @@ impl Player {
             }
             UiAction::Title => {
                 let restart_locale = self.locale_pending();
+                self.cancel_content(false);
                 self.commands.push(AppCommand::AudioReset);
                 self.cancel_preparation();
                 self.candidate = None;
@@ -1507,8 +1596,7 @@ impl Player {
             UiAction::Rollback => {
                 if self.checkpoints.len() > 1 {
                     let s = self.checkpoints[self.checkpoints.len() - 2].clone();
-                    self.restore(s)?;
-                    self.prepare.as_mut().unwrap().purpose = Purpose::Rollback;
+                    self.restore_with_purpose(s, true)?;
                 }
             }
             UiAction::HistoryPage { delta } => {
@@ -1516,7 +1604,18 @@ impl Player {
                     .clamp(0, self.core.state().history.len().saturating_sub(1) as i64)
                     as usize;
             }
-            UiAction::Retry => self.restart_preparation()?,
+            UiAction::Retry => {
+                if let Some(job) = self
+                    .content
+                    .values()
+                    .find(|p| p.failed && !matches!(p.purpose, ContentPurpose::Locale))
+                    .cloned()
+                {
+                    self.begin_content(job.purpose, job.objects)?;
+                } else {
+                    self.restart_preparation()?;
+                }
+            }
         }
         Ok(())
     }

@@ -20,7 +20,7 @@ jobs:
           node-version: '24.21.0'
           cache: npm
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - name: Install native subsetter build prerequisites
         run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev
       - name: Native checks and host scheduling tests

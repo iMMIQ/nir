@@ -117,6 +117,7 @@ fn main() -> Result<()> {
                     "LOCALE-FONTS.md",
                     "TEXT-REVISIONS.md",
                     "PROJECT-THEMES.md",
+                    "MODULE-WORKFLOW.md",
                 ] {
                     fs::copy(Path::new("docs").join(name), docs.join(name))?;
                 }

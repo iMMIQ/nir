@@ -104,6 +104,42 @@ impl Engine {
     pub fn accepts(&self, request: u32) -> bool {
         self.player.accepts(request)
     }
+    pub fn accepts_content(&self, request: u32) -> bool {
+        self.player.accepts_content(request)
+    }
+    pub fn content_ready(
+        &mut self,
+        request: u32,
+        objects: js_sys::Array,
+    ) -> std::result::Result<(), JsValue> {
+        if !self.player.accepts_content(request) {
+            return Ok(());
+        }
+        let mut bytes = 0usize;
+        let mut data = Vec::new();
+        if objects.length() > 128 {
+            return self.content_failed(request, "E_CONTENT_LIMIT".into());
+        }
+        for object in objects.iter() {
+            let array = js_sys::Uint8Array::new(&object);
+            bytes = bytes.saturating_add(array.length() as usize);
+            if bytes > MAX_INPUT_BYTES {
+                return self.content_failed(request, "E_CONTENT_LIMIT".into());
+            }
+            data.push(array.to_vec());
+        }
+        self.pump(vec![AppEvent::ContentReady {
+            request,
+            objects: data,
+        }])
+    }
+    pub fn content_failed(
+        &mut self,
+        request: u32,
+        message: String,
+    ) -> std::result::Result<(), JsValue> {
+        self.pump(vec![AppEvent::ContentFailed { request, message }])
+    }
     pub fn retained(&self) -> String {
         serde_json::to_string(&self.player.retained_assets()).unwrap()
     }
