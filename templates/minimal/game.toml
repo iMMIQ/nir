@@ -15,6 +15,7 @@ height = 720
 modules = ["content/main/module.toml"]
 asset_catalogs = ["assets/catalog.toml"]
 theme = "theme/theme.toml"
+player = "config/player.toml"
 locales = "config/locales.toml"
 scenarios = ["tests/garden.toml", "tests/home.toml"]
 notices = ["NOTICE.md", "assets/fonts/SOURCE.md"]

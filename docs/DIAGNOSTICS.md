@@ -127,3 +127,11 @@ NIR_PERF_NETWORK_TRACE=1 NIR_PERF_DISABLE_HTTP_CACHE=1 bun run test:performance:
 ```
 
 网络事件最多保留 20,000 条，报告包含截断标记；浏览器 trace 输出为 `reports/performance-interactions-trace.json.gz`。禁用缓存开关仅在网络诊断开启时生效，只作用于该测试上下文。额外追踪会改变观测开销，应单独归档，不混入正式前后基线。CDP 缓存标记、字节数及阶段时间是定位线索，不能单独证明浏览器或服务器根因。
+
+## M3 准备与恢复诊断
+
+`object_response` 记录 fetch 返回响应头的时间，`object_downloaded` 继续覆盖完整字节读取，`object_verified` 单独记录摘要验证。下载、音频解码和 owner 上传分别有有界队列；`host_work` 增加 `decode_pool_active/waiting`、`upload_pool_active/waiting` 和最多 128 项待处理媒体阶段。调度用的近期成本估计有界且始终启用，详细阶段日志仍受 trace 开关控制。
+
+Linux 硬件入口默认移除 Playwright 的 `--disable-dev-shm-usage`，使用原生 `/dev/shm`，启动前要求至少 512 MiB 可用空间。设置 `NIR_PERF_NATIVE_SHM=0` 可复现旧的磁盘共享内存配置。`NIR_PERF_TEMP_STORAGE=memory` 则显式为整次测试建立独立 tmpfs 临时目录并在结束时清理，默认 `disk` 沿用系统或用户指定的 TMPDIR。环境报告记录实际选择；不同存储策略的结果必须分组，不能冒充引擎优化前后对照。软件 CI 保留自身默认环境。
+
+可选服务请求计时、CDP 对齐和系统 PSI 采样见 [恢复诊断](validation/interaction/restore-diagnostic.md)。长稳和媒体对照入口见 [M3 准备调度](M3-PREPARATION.md)，实测见 [M3 验证](validation/m3/README.md)。

@@ -50,6 +50,7 @@ pub struct Engine {
     ready: bool,
     work_remaining: u32,
     upload_remaining: usize,
+    upload_start_us: u64,
     visual_invalidated: bool,
     profiling: bool,
     profile_records: VecDeque<HostProfile>,
@@ -100,6 +101,7 @@ impl Engine {
             ready: false,
             work_remaining: 10_000,
             upload_remaining: 2 * 1024 * 1024,
+            upload_start_us: 0,
             visual_invalidated: true,
             profiling: false,
             profile_records: VecDeque::new(),
@@ -111,6 +113,7 @@ impl Engine {
     pub fn begin_turn(&mut self) {
         self.work_remaining = 10_000;
         self.upload_remaining = 2 * 1024 * 1024;
+        self.upload_start_us = 0;
     }
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
@@ -230,6 +233,9 @@ impl Engine {
         id: String,
         bytes: &[u8],
     ) -> std::result::Result<bool, JsValue> {
+        if self.upload_start_us == 0 {
+            self.upload_start_us = nir_platform_web::now_us().0;
+        }
         if !self.player.accepts_resource(request) {
             return Ok(true);
         }
@@ -251,6 +257,15 @@ impl Engine {
                     let result = self.renderer.prepare_image(request, &id, bytes);
                     self.resource_stage("decode_allocate", request, &id, start, bytes.len());
                     result.map_err(js)?;
+                }
+                // PNG decode is atomic. Yield before the next incremental
+                // upload step when it used this turn's soft time allowance.
+                if nir_platform_web::now_us()
+                    .0
+                    .saturating_sub(self.upload_start_us)
+                    >= 4_000
+                {
+                    return Ok(false);
                 }
                 let start = nir_platform_web::now_us();
                 let (complete, used) = self
@@ -428,6 +443,15 @@ impl Engine {
     }
     pub fn host_event(&mut self, kind: String, json: String) -> std::result::Result<(), JsValue> {
         let event = match kind.as_str() {
+            "assets_cancelled" => {
+                let v: serde_json::Value =
+                    nir_content::parse(json.as_bytes(), "assets_cancelled").map_err(js)?;
+                let request = v["request"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| js("E_HOST_PROTOCOL: invalid assets_cancelled request"))?;
+                AppEvent::AssetsCancelled { request }
+            }
             "preferences" => AppEvent::Preferences(
                 nir_content::parse(json.as_bytes(), "preferences").map_err(js)?,
             ),
@@ -490,6 +514,10 @@ impl Engine {
             }
             _ => return Err(js("E_HOST_PROTOCOL: unknown event")),
         };
+        if let AppEvent::AssetsCancelled { request } = &event {
+            self.renderer.cancel_upload(*request);
+            self.renderer.retain(&self.player.retained_assets());
+        }
         self.pump(vec![event])
     }
     pub fn draw(

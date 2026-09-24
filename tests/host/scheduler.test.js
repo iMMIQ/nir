@@ -1,6 +1,99 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ContentStagingBudget, OwnerInbox, SharedRequests, WorkPool, acquireRequiredContentStage, contentBatchEnvelope, queueContentSkip } from '../../crates/nir-platform-web/host.js';
+import { ContentStagingBudget, OwnerInbox, SharedRequests, WorkPool, acquireRequiredContentStage, awaitAbortable, contentBatchEnvelope, queueContentSkip, workPriority } from '../../crates/nir-platform-web/host.js';
+
+test('cancelled required audio wait settles even when resume never does',async()=>{
+    let rejectResume;
+    const resume=new Promise((_,reject)=>{rejectResume=reject;});
+    const controller=new AbortController();
+    const waiting=awaitAbortable(resume,controller.signal);
+    controller.abort(new Error('media cancelled'));
+    await assert.rejects(waiting,/media cancelled/);
+    rejectResume(new Error('late resume failure'));
+    await new Promise(resolve=>setImmediate(resolve));
+});
+
+test('phase queues rank all priorities and preserve FIFO without a deadline',async()=>{
+    const pool=new WorkPool(1),signal=new AbortController().signal,order=[];
+    let release;
+    const active=pool.run(()=>new Promise(resolve=>release=resolve),signal);
+    await Promise.resolve();
+    const tasks=[
+        pool.run(()=>order.push('background'),signal,{priority:'background'}),
+        pool.run(()=>order.push('speculative'),signal,{priority:'speculative'}),
+        pool.run(()=>order.push('near one'),signal,{priority:'near'}),
+        pool.run(()=>order.push('required'),signal,{priority:'required'}),
+        pool.run(()=>order.push('near two'),signal,{priority:'near'}),
+    ];
+    release();await Promise.all([active,...tasks]);
+    assert.deepEqual(order,['required','near one','near two','speculative','background']);
+    assert.equal(workPriority('prefetch'),'speculative');
+    assert.equal(workPriority(undefined),'required');
+});
+
+test('same-priority deadlines account for bounded recent p95 phase cost',async()=>{
+    let time=0;const pool=new WorkPool(1,128,()=>time),signal=new AbortController().signal,order=[];
+    pool.recordCost('slow',90);pool.recordCost('fast',5);pool.recordCost('slow',500);
+    assert.equal(pool.recentP95('slow'),500);
+    let release;
+    const active=pool.run(()=>new Promise(resolve=>release=resolve),signal);
+    await Promise.resolve();
+    const fast=pool.run(()=>order.push('fast'),signal,{priority:'near',deadline:30,phase:'fast'});
+    const slow=pool.run(()=>order.push('slow'),signal,{priority:'near',deadline:90,phase:'slow'});
+    release();await Promise.all([active,fast,slow]);
+    assert.deepEqual(order,['slow','fast']);
+});
+
+test('decode waiting does not retain a network slot',async()=>{
+    const network=new WorkPool(1),decode=new WorkPool(1),signal=new AbortController().signal;
+    const seen=[];let finishDecode;
+    const first=network.run(()=>{seen.push('fetched');return 'bytes';},signal,{phase:'fetch_verify'}).then(bytes=>decode.run(()=>{
+        seen.push('decoding');return new Promise(resolve=>finishDecode=()=>resolve(bytes));
+    },signal,{phase:'audio_decode'}));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(network.active,0);assert.equal(decode.active,1);
+    const second=network.run(()=>seen.push('second fetch'),signal,{phase:'fetch_verify'});
+    await second;assert.deepEqual(seen,['fetched','decoding','second fetch']);
+    finishDecode();await first;
+});
+
+test('shared decoder stays alive for another consumer and last cancellation waits for settlement',async()=>{
+    const decoder=new WorkPool(1);let finish,starts=0;
+    const gate=new Promise(resolve=>{finish=resolve;});
+    const shared=new SharedRequests((_,signal)=>decoder.run(()=>{starts++;return gate;},signal,{phase:'audio_decode'}));
+    const a=new AbortController(),b=new AbortController();
+    const first=shared.get('sound',a.signal,{settleOnAbort:true});
+    const second=shared.get('sound',b.signal,{settleOnAbort:true});
+    await new Promise(resolve=>setImmediate(resolve));
+    a.abort(new Error('first cancelled'));
+    await assert.rejects(first,/first cancelled/);
+    assert.equal(starts,1);assert.equal(decoder.active,1);
+    let secondSettled=false;
+    const pending=assert.rejects(second,/last cancelled/).then(()=>secondSettled=true);
+    b.abort(new Error('last cancelled'));
+    await Promise.resolve();assert.equal(secondSettled,false);
+    finish('decoded');await pending;
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(decoder.active,0);
+});
+
+test('required owner upload runs between two near upload steps',async()=>{
+    const inbox=new OwnerInbox(),pool=new WorkPool(1),signal=new AbortController().signal,order=[];
+    const nearSlot=inbox.reserve('resource','near'),requiredSlot=inbox.reserve('resource','required');
+    const near=(async()=>{
+        await pool.run(()=>nearSlot.post(()=>order.push('near first'),{terminal:false}),signal,{priority:'near',group:'near',phase:'decode_upload'});
+        await pool.run(()=>nearSlot.post(()=>order.push('near second')),signal,{priority:'near',group:'near',phase:'decode_upload'});
+    })();
+    await new Promise(resolve=>setImmediate(resolve));
+    const required=pool.run(()=>requiredSlot.post(()=>order.push('required')),signal,{priority:'required',group:'required',phase:'decode_upload'});
+    for(let i=0;i<6;i++){
+        inbox.drain({milliseconds:Infinity});
+        await new Promise(resolve=>setImmediate(resolve));
+    }
+    await Promise.all([near,required]);
+    assert.deepEqual(order,['near first','required','near second']);
+    assert.equal(inbox.used,0);
+});
 
 test('input overload leaves room for terminal completions',()=>{
     const q=new OwnerInbox(8,4),out=[];

@@ -9,7 +9,10 @@ export default {
     launchOptions: {
       ...base.use.launchOptions,
       // Playwright adds this permission by default, even with native Vulkan.
-      ignoreDefaultArgs: process.env.NIR_PERF_MODE === 'hardware' ? ['--enable-unsafe-swiftshader'] : [],
+      ignoreDefaultArgs: [
+        ...(process.env.NIR_PERF_MODE === 'hardware' ? ['--enable-unsafe-swiftshader'] : []),
+        ...(process.env.NIR_PERF_NATIVE_SHM === '1' ? ['--disable-dev-shm-usage'] : []),
+      ],
     },
   },
   workers: 1,

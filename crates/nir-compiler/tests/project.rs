@@ -476,6 +476,11 @@ fn resolves_author_configuration_with_per_field_sources() {
     assert_eq!(p.program.player.font_scale, 1.2);
     assert_eq!(p.program.player.auto_delay_us.0, 2_500_000);
     assert!(p.program.player.prefetch_content);
+    assert!(!p.program.player.prefetch_media);
+    assert_eq!(
+        p.resolved_config["player.prefetch_media"].source,
+        "builtin:web-standard"
+    );
     assert_eq!(
         p.resolved_config["player.prefetch_content"].source,
         "builtin:web-standard"
@@ -513,11 +518,16 @@ fn resolves_author_configuration_with_per_field_sources() {
     );
     fs::write(
         d.path().join("config/player.toml"),
-        "format = 1\n[defaults]\nprefetch_content = false\n",
+        "format = 1\n[defaults]\nprefetch_content = false\nprefetch_media = true\n",
     )
     .unwrap();
     let configured = load_project(d.path()).unwrap();
     assert!(!configured.program.player.prefetch_content);
+    assert!(configured.program.player.prefetch_media);
+    assert_eq!(
+        configured.resolved_config["player.prefetch_media"].source,
+        "config/player.toml#/defaults/prefetch_media"
+    );
     assert_eq!(
         configured.resolved_config["player.prefetch_content"].source,
         "config/player.toml#/defaults/prefetch_content"

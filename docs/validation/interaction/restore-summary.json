@@ -1,0 +1,94 @@
+{
+  "format": 1,
+  "scenario": "32 modules, 40 repeated text lines, 30 restores, Chromium hardware, CDP Network/Tracing and 500 ms PSI",
+  "rounds": {
+    "m3-novelc": {
+      "samples": 30,
+      "restore_median_ms": 254.05,
+      "restore_p95_ms": 13341.8,
+      "restore_max_ms": 14299,
+      "restores_over_1000_ms": 4,
+      "object_requests": 2090,
+      "live_object_responses": 107,
+      "disk_cache_object_responses": 1983,
+      "longest_object_request_ms": 13163.26,
+      "live_server_object_done_max_ms": 2.004,
+      "io_full_stall_during_sample_window_ms": 28415.4,
+      "pressure_sample_window_s": 60.49,
+      "artifact_sha256": {
+        "performance-interactions.json": "83e8dfff72a3d61f34bac0a1cf531738db9b2042e8495a99b69f4f265fc0b61b",
+        "performance-interactions-trace.json.gz": "2fc1fc7f63d8739dcf8f2848f6ecc0043f762b444cfad3656dccd5cfe4f3812a",
+        "performance-results.json": "7ec75d9f7f65e32258a82c4a8c74d4d4d57eeacc44535e6821922d5d6231ad64",
+        "performance-environment.json": "283bca15f0b8702034487255ad2a7e24d6f7cc6e05277af05482c4255ca6f944",
+        "m3-novelc-server.log": "7bcf59337078fbeca8b4033fd72f9fba6ee90edb44171e647389472a527a7886",
+        "m3-novelc-pressure.json": "2dbca51e553fc9cc1c1aa1f28ec8312baedb1f94b239b3b0b229f09776d4dd34"
+      }
+    },
+    "m3-node": {
+      "samples": 30,
+      "restore_median_ms": 263.75,
+      "restore_p95_ms": 16658.3,
+      "restore_max_ms": 19322.1,
+      "restores_over_1000_ms": 3,
+      "object_requests": 2090,
+      "live_object_responses": 107,
+      "disk_cache_object_responses": 1983,
+      "longest_object_request_ms": 16053.08,
+      "live_server_object_done_max_ms": 7.009,
+      "io_full_stall_during_sample_window_ms": 43117.09,
+      "pressure_sample_window_s": 79.36,
+      "artifact_sha256": {
+        "performance-interactions.json": "bc32465d152c6a5d73ee43c741a201369f1018a25079a22851d911ff49caf079",
+        "performance-interactions-trace.json.gz": "887a62977f72c0bd42049189dd38c54792f47df2841d09090457ddc18a219f06",
+        "performance-results.json": "291617ff297a8b46f0047901f62eaeb72ce06d016dffb0e4077d0547bbb2f331",
+        "performance-environment.json": "4a1f0cd967a82f242eb07956cb9371da90f392624d8e7f49faedbffc07c861e8",
+        "m3-node-server.log": "8c3d3fa001ffe59e273459aa54a46a1e43814b46fd0a59f52f551c6edf657807",
+        "m3-node-pressure.json": "e41192346f3d0283ade4920f120187708bea40c8e5621262268e0469f261dc27"
+      }
+    },
+    "m3-tmpfs": {
+      "samples": 30,
+      "restore_median_ms": 205.6,
+      "restore_p95_ms": 224.6,
+      "restore_max_ms": 227.9,
+      "restores_over_1000_ms": 0,
+      "object_requests": 2090,
+      "live_object_responses": 107,
+      "disk_cache_object_responses": 1983,
+      "longest_object_request_ms": 44.52,
+      "live_server_object_done_max_ms": 1.886,
+      "io_full_stall_during_sample_window_ms": 1554.25,
+      "pressure_sample_window_s": 21.07,
+      "artifact_sha256": {
+        "performance-interactions.json": "d748dffdb0706fb7a9ca5951c3ae46e44fa271a342bfd0a077b73302c2b5066b",
+        "performance-interactions-trace.json.gz": "cc0e3034cfd779fd4d7a606452c32db0eb443acf807bb6d66748e08e7c7289b8",
+        "performance-results.json": "dba3e07071fce3f9acd36196451adfb20150af7a3189c5684b4d05cfef1a7061",
+        "performance-environment.json": "5b76b49fa5701e6982af346fb960404383c0462e04b520bd7ab554d533e777ba",
+        "m3-tmpfs-server.log": "d3ea667c454aefd173e11d600990b6156ebd49b3d5c45cab2db347985c9fcf06",
+        "m3-tmpfs-pressure.json": "4dca1b23f40b45bf23edccf0e07fe6a535d6fc5ddf286398acdcf23008f5c39b"
+      }
+    },
+    "m3-native-shm": {
+      "samples": 30,
+      "restore_median_ms": 205.05,
+      "restore_p95_ms": 243.2,
+      "restore_max_ms": 333.9,
+      "restores_over_1000_ms": 0,
+      "object_requests": 2090,
+      "live_object_responses": 107,
+      "disk_cache_object_responses": 1983,
+      "longest_object_request_ms": 44.1,
+      "live_server_object_done_max_ms": 1.76,
+      "io_full_stall_during_sample_window_ms": 2482.42,
+      "pressure_sample_window_s": 21.15,
+      "artifact_sha256": {
+        "performance-interactions.json": "f649c1ea7fb099a271191510555cd2a88adac42383cc5e3612e8a30388e644fe",
+        "performance-interactions-trace.json.gz": "fbca9b0b458ef6f265a370ab4fae3e63ae6eb6ef9629740c5d2509153e7c01f2",
+        "performance-results.json": "d9d35ba0234292a79a11de662623bf0d0f81a3cc92c400538d8b9e9d71e8f064",
+        "performance-environment.json": "870d5230dae27dfcd98fadcf1759a7b493102d6c04a4aa74c33fde3f125aaf1a",
+        "m3-native-shm-server.log": "29958d143d4f4b2e202ee0f9f666ab1e062c124609b38262deb0ab8bbc585626",
+        "m3-native-shm-pressure.json": "b4da93d22aa0002a5deaf71b618f2adef57803bab3c90225ebb842a864421349"
+      }
+    }
+  }
+}

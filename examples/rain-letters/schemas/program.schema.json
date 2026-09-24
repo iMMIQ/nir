@@ -72,6 +72,7 @@
         "bgm_volume": 0.30000001192092896,
         "font_scale": 1.0,
         "prefetch_content": true,
+        "prefetch_media": false,
         "reduced_motion": false,
         "sfx_volume": 0.5,
         "voice_volume": 0.800000011920929
@@ -1150,6 +1151,10 @@
         "prefetch_content": {
           "type": "boolean",
           "default": true
+        },
+        "prefetch_media": {
+          "type": "boolean",
+          "default": false
         },
         "reduced_motion": {
           "type": "boolean",

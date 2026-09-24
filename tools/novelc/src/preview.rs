@@ -5,10 +5,35 @@ use std::{
     fs,
     io::Read,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static SERVE_TIMING: OnceLock<bool> = OnceLock::new();
+static SERVE_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+fn serve_timing() -> bool {
+    *SERVE_TIMING.get_or_init(|| std::env::var_os("NIR_SERVE_TIMING").is_some())
+}
+
+fn wall_time_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+}
+
+fn log_serve_timing(id: u64, phase: &str, path: &str, elapsed: Duration, bytes: u64) {
+    eprintln!(
+        "nir_serve id={id} phase={phase} wall_us={} elapsed_us={} bytes={bytes} path={path}",
+        wall_time_us(),
+        elapsed.as_micros(),
+    );
+}
 
 #[derive(Default)]
 struct DevStatus {
@@ -242,7 +267,13 @@ fn serve_request(
     root: &Path,
     dev: Option<&Arc<Mutex<DevStatus>>>,
 ) -> Result<()> {
-    let raw = request.url().split('?').next().unwrap_or("/");
+    let raw = request.url().split('?').next().unwrap_or("/").to_owned();
+    let timing = serve_timing();
+    let received = Instant::now();
+    let timing_id = timing.then(|| SERVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed) + 1);
+    if let Some(id) = timing_id {
+        log_serve_timing(id, "received", &raw, received.elapsed(), 0);
+    }
     if let Some(dev) = &dev {
         if raw == "/__nir_dev/status" || raw == "/__nir_dev/client.js" {
             let (body, mime) = if raw.ends_with("status") {
@@ -276,7 +307,7 @@ fn serve_request(
     } else {
         None
     };
-    if let Some(file) = resolved.filter(|p| p.starts_with(&root) && p.is_file()) {
+    if let Some(file) = resolved.filter(|p| p.starts_with(root) && p.is_file()) {
         let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
         let mime = match ext {
             "html" => "text/html; charset=utf-8",
@@ -316,24 +347,50 @@ fn serve_request(
             .filter(|_| accepts_gzip(&accepted))
             .and_then(|sidecar| fs::canonicalize(sidecar).ok())
             .filter(|sidecar| sidecar.starts_with(root) && sidecar.is_file());
+        let source = gzip.as_ref().unwrap_or(&file);
+        let bytes = if timing {
+            fs::metadata(source)?.len()
+        } else {
+            0
+        };
         let mut r = if let Some(dev) = dev.as_ref().filter(|_| ext == "html") {
             let release = dev.lock().unwrap().release.clone();
             let html = fs::read_to_string(&file)?.replace("</body>", &format!("<script src=\"/__nir_dev/client.js\" data-release=\"{release}\"></script></body>"));
             tiny_http::Response::from_string(html).boxed()
         } else {
-            tiny_http::Response::from_file(fs::File::open(gzip.as_ref().unwrap_or(&file))?).boxed()
+            tiny_http::Response::from_file(fs::File::open(source)?).boxed()
         };
         for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
+        if let Some(id) = timing_id {
+            r.add_header(tiny_http::Header::from_bytes("X-NIR-Serve-Id", id.to_string()).unwrap());
+        }
         if negotiable {
             r.add_header(tiny_http::Header::from_bytes("Vary", "Accept-Encoding").unwrap());
         }
         if gzip.is_some() {
             r.add_header(tiny_http::Header::from_bytes("Content-Encoding", "gzip").unwrap());
         }
-        let _ = request.respond(r);
+        if let Some(id) = timing_id {
+            log_serve_timing(id, "ready", &raw, received.elapsed(), bytes);
+        }
+        let result = request.respond(r);
+        if let Some(id) = timing_id {
+            log_serve_timing(
+                id,
+                if result.is_ok() { "done" } else { "send_error" },
+                &raw,
+                received.elapsed(),
+                bytes,
+            );
+        }
+        let _ = result;
     } else {
-        let _ =
+        let result =
             request.respond(tiny_http::Response::from_string("Not found").with_status_code(404));
+        if let Some(id) = timing_id {
+            log_serve_timing(id, "not_found", &raw, received.elapsed(), 0);
+        }
+        let _ = result;
     }
     Ok(())
 }

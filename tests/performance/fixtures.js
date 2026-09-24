@@ -182,6 +182,50 @@ async function writeJson(file, value) {
   await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+// Distinct, valid fixture objects retain the example's decoded media workload.
+// PNG ancillary metadata and WAV JUNK chunks make each chapter's bytes unique.
+function crc32(bytes) {
+  let value = 0xffffffff;
+  for (const byte of bytes) {
+    value ^= byte;
+    for (let bit = 0; bit < 8; bit++) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+async function chapterMedia(project, id) {
+  const source = path.join(project, 'assets/source');
+  const png = await fs.readFile(path.join(source, 'river.png'));
+  const payload = Buffer.from(`chapter\0${id}`), tag = Buffer.from('tEXt');
+  const chunk = Buffer.alloc(payload.length + 12);
+  chunk.writeUInt32BE(payload.length); tag.copy(chunk, 4); payload.copy(chunk, 8);
+  chunk.writeUInt32BE(crc32(Buffer.concat([tag, payload])), chunk.length - 4);
+  await fs.writeFile(path.join(source, `${id}.png`), Buffer.concat([png.subarray(0, -12), chunk, png.subarray(-12)]));
+  const wav = await fs.readFile(path.join(source, 'bell.wav'));
+  const data = Buffer.from(id.padEnd(16, ' ')), junk = Buffer.alloc(8);
+  junk.write('JUNK'); junk.writeUInt32LE(data.length, 4);
+  const audio = Buffer.concat([wav, junk, data]); audio.writeUInt32LE(audio.length - 8, 4);
+  await fs.writeFile(path.join(source, `${id}.wav`), audio);
+  // The first cue needs one chapter-private descriptor. Its catalog also
+  // contains this chapter's future media metadata, without fetching that media.
+  await fs.appendFile(path.join(project, 'assets/catalog.toml'), `\n[[assets]]\nid = "media.${id}.marker"\nkind = "image"\nsource = "source/station.png"\nrights = "CC0-1.0"\nexpected_size = [1280, 720]\n`);
+  await fs.appendFile(path.join(project, 'assets/catalog.toml'), `\n[[assets]]\nid = "media.${id}.image"\nkind = "image"\nsource = "source/${id}.png"\nrights = "CC0-1.0"\nexpected_size = [1280, 720]\n\n[[assets]]\nid = "media.${id}.audio"\nkind = "audio"\nsource = "source/${id}.wav"\nrights = "CC0-1.0"\n`);
+}
+
+function withMediaCue(program, id, catalogResident) {
+  if (catalogResident) program.scenes.station[0].asset = `media.${id}.marker`;
+  const blocks = program.functions.visit.blocks;
+  blocks.wait_line.terminator.next = 'next';
+  blocks.next = { ops: [], terminator: { type: 'activate', cue: 'next', next: 'wait_next' } };
+  blocks.wait_next = { ops: [], terminator: { type: 'await', conditions: [{ task: 'next', milestone: { type: 'finished' } }], next: 'return', on_cancelled: 'return', on_failed: 'return' } };
+  program.scenes.future = [{ id: 'background', asset: `media.${id}.image`, x: 0, y: 0, width: 1280, height: 720 }];
+  program.cues.next = { effects: [
+    { id: 'stage', scope: 'scene', effect: { type: 'stage_present', scene: 'future', duration_us: '0' } },
+    { id: 'sound', scope: 'interaction', effect: { type: 'audio', asset: `media.${id}.audio`, bus: 'sfx', looped: false } },
+    { id: 'next', scope: 'interaction', effect: { type: 'dialogue', text: 'next', speaker: '', reveal_us: '0' } },
+  ] };
+  return program;
+}
+
 async function copyProject(project) {
   const example = path.resolve('examples/rain-letters');
   await fs.mkdir(path.dirname(project), { recursive: true });
@@ -206,7 +250,7 @@ async function setInputs(project, moduleIds, driverId, prefetchContent) {
 
   const playerFile = path.join(project, 'config/player.toml');
   const player = await fs.readFile(playerFile, 'utf8');
-  const configured = player.replace(
+  const configured = player.replace(/^prefetch_media\s*=.*\n?/m, '').replace(
     /^prefetch_content\s*=\s*(?:true|false)\s*$/m,
     `prefetch_content = ${prefetchContent}`,
   );
@@ -294,6 +338,9 @@ export async function buildScaleFixture({
   capacity = false,
   port = 4192,
   textRepetitions = 1,
+  mediaScenario = false,
+  prefetchMedia = false,
+  mediaCatalogResident = true,
 } = {}) {
   if (!Number.isInteger(textRepetitions) || textRepetitions < 1 || textRepetitions > 100) {
     throw new Error('textRepetitions must be an integer from 1 to 100');
@@ -305,7 +352,7 @@ export async function buildScaleFixture({
     throw new Error(`capacity fixture needs at least ${Math.floor(16 * mib / capacityPaddingBytes) + 1} modules at 640 KiB each`);
   }
 
-  const cli = path.resolve('dist/novelc');
+  const cli = path.resolve(process.env.NIR_PERF_CLI || 'dist/novelc');
   await fs.mkdir(path.resolve('target/tmp'), { recursive: true });
   const temp = await fs.mkdtemp(path.resolve('target/tmp/nir-scale-'));
   const project = path.join(temp, 'story');
@@ -320,6 +367,7 @@ export async function buildScaleFixture({
     const leadTextId = `${driverId}.${driverTextLocalId}`;
     await copyProject(project);
     await setInputs(project, moduleIds, driverId, prefetchContent);
+    if (mediaScenario) await fs.appendFile(path.join(project, 'config/player.toml'), `\nprefetch_media = ${prefetchMedia}\n`);
     await writeJson(path.join(project, 'content/shared/story.nir.json'), {
       fragment_format: 1,
       variables: { visit_count: { type: 'i32', value: 0 } },
@@ -349,10 +397,12 @@ export async function buildScaleFixture({
       const base = path.join(project, 'content', id);
       await fs.mkdir(base, { recursive: true });
       await fs.writeFile(path.join(base, 'module.toml'), moduleToml(id, 'visit'));
-      await writeJson(path.join(base, 'story.nir.json'), chapterProgram());
+      if (mediaScenario) await chapterMedia(project, id);
+      await writeJson(path.join(base, 'story.nir.json'), mediaScenario ? withMediaCue(chapterProgram(), id, mediaCatalogResident) : chapterProgram());
       const contracts = {
         line: { source_revision: 1, contract_revision: 1, meaning_revision: 1, gates: [], params: {} },
       };
+      if (mediaScenario) contracts.next = { ...contracts.line };
       await writeJson(path.join(base, 'texts/contracts.json'), contracts);
       await writeJson(path.join(base, 'texts/revisions.json'), {
         format: 1,
@@ -362,6 +412,7 @@ export async function buildScaleFixture({
       for (const locale of ['zh-Hans', 'en']) {
         await writeJson(path.join(base, `texts/${locale}.json`), {
           line: textSource(locale, 'chapter', index, textRepetitions),
+          ...(mediaScenario ? { next: textSource(locale, 'chapter', index + moduleCount, textRepetitions) } : {}),
         });
       }
     }
@@ -369,6 +420,7 @@ export async function buildScaleFixture({
     // Track/review each authored text once, keeping CLI revision work linear
     // in the chapter count.
     const authoredTextIds = chapters.map(chapter => chapter.textId);
+    if (mediaScenario) authoredTextIds.push(...ids.map(id => `${id}.next`));
     authoredTextIds.unshift(leadTextId);
     for (const id of authoredTextIds) {
       await run(cli, ['-p', project, 'text', 'update', '--id', id, '--meaning', 'preserve'], { maxBuffer: 8 * 1024 * 1024 });
@@ -415,9 +467,30 @@ export async function buildScaleFixture({
     // the actual route and module semantics.
     delete semantic.revision;
     if (semantic.player) semantic.player.prefetch_content = false;
+    if (semantic.player) semantic.player.prefetch_media = false;
     const semanticDigest = digest(Buffer.from(JSON.stringify(stableJson(semantic))));
 
-    server = spawn(cli, ['serve', web, '--port', String(port)], { stdio: 'ignore' });
+    const serveMode = process.env.NIR_PERF_SERVE_MODE || 'novelc';
+    if (!['novelc', 'node'].includes(serveMode)) throw new Error(`unknown NIR_PERF_SERVE_MODE: ${serveMode}`);
+    const serveLog = process.env.NIR_PERF_SERVE_LOG || (process.env.NIR_SERVE_TIMING !== undefined
+      ? path.resolve('reports/performance-server.log') : null);
+    const serveCli = path.resolve(process.env.NIR_PERF_SERVE_CLI || cli);
+    const command = serveMode === 'node' ? process.execPath : serveCli;
+    const args = serveMode === 'node'
+      ? [path.resolve('tests/performance/static-server.mjs'), web, String(port)]
+      : ['serve', web, '--port', String(port)];
+    let log;
+    let stdio = 'ignore';
+    if (serveLog) {
+      await fs.mkdir(path.dirname(serveLog), { recursive: true });
+      log = await fs.open(serveLog, 'w');
+      stdio = ['ignore', log.fd, log.fd];
+    }
+    try {
+      server = spawn(command, args, { stdio });
+    } finally {
+      await log?.close();
+    }
     const origin = `http://127.0.0.1:${port}`;
     try {
       let ready = false;
@@ -446,6 +519,7 @@ export async function buildScaleFixture({
     const routeSteps = route.flatMap((id, routeIndex) => [
       { textId: leadTextId, moduleId: driverId, kind: 'lead-in', routeIndex },
       { textId: `${id}.line`, moduleId: id, kind: 'chapter', routeIndex },
+      ...(mediaScenario ? [{ textId: `${id}.next`, moduleId: id, kind: 'media', routeIndex }] : []),
     ]);
     return {
       cli,
@@ -454,12 +528,17 @@ export async function buildScaleFixture({
       web,
       origin,
       server,
+      serveMode,
+      serveLog,
+      serveCli: serveMode === 'novelc' ? serveCli : null,
       ...release,
       chapters: chapters.map(({ id, textId }) => ({ id, textId })),
       route,
       steps: routeSteps,
       moduleCount,
       prefetchContent,
+      prefetchMedia,
+      mediaScenario,
       capacity,
       totalContentBytes,
       semanticDigest,

@@ -1088,6 +1088,7 @@ pub struct PlayerDefaults {
     pub reduced_motion: bool,
     pub auto_delay_us: Micros,
     pub prefetch_content: bool,
+    pub prefetch_media: bool,
 }
 impl Default for PlayerDefaults {
     fn default() -> Self {
@@ -1099,6 +1100,7 @@ impl Default for PlayerDefaults {
             reduced_motion: false,
             auto_delay_us: Micros(1_200_000),
             prefetch_content: true,
+            prefetch_media: false,
         }
     }
 }

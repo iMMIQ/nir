@@ -28,7 +28,22 @@ if (mode === 'smoke') {
 
 const testFiles = mode === 'smoke' ? ['tests/performance/modules.spec.js'] : [];
 
+// Explicit diagnostic/measurement choice: never silently mix storage policies
+// in a before/after comparison or alter the user's browser profile.
+const temporaryStorage = process.env.NIR_PERF_TEMP_STORAGE || 'disk';
+if (!['disk', 'memory'].includes(temporaryStorage)) fail('NIR_PERF_TEMP_STORAGE must be disk or memory.');
+let temporaryDirectory;
+
 if (mode === 'hardware') {
+  // Match a normal Linux desktop Chromium: Playwright's disk-backed shared
+  // memory default can turn filesystem stalls into apparent fetch latency.
+  process.env.NIR_PERF_NATIVE_SHM ??= os.platform() === 'linux' ? '1' : '0';
+  if (!['0', '1'].includes(process.env.NIR_PERF_NATIVE_SHM)) fail('NIR_PERF_NATIVE_SHM must be 0 or 1.');
+  if (process.env.NIR_PERF_NATIVE_SHM === '1' && os.platform() === 'linux') {
+    const stats = await fs.statfs('/dev/shm');
+    if (stats.bavail * stats.bsize < 512 * 1024 * 1024)
+      fail('Native Chromium shared memory requires 512 MiB free in /dev/shm; use NIR_PERF_NATIVE_SHM=0 for an explicitly disk-backed comparison.');
+  }
   const chromium = await resolveChromium();
   process.env.CHROMIUM = chromium;
   const chromeArgs = process.env.NIR_CHROME_ARGS?.trim();
@@ -46,13 +61,26 @@ if (mode === 'hardware') {
       '--use-vulkan=native',
     ].join(' ');
   }
-  await writeHardwareEnvironment(chromium);
 }
 
 const playwrightCli = path.join(root, 'node_modules', '@playwright', 'test', 'cli.js');
 try {
+  if (temporaryStorage === 'memory') {
+    if (os.platform() !== 'linux') throw Error('Memory temporary storage currently requires Linux /dev/shm.');
+    const stats = await fs.statfs('/dev/shm');
+    if (stats.bavail * stats.bsize < 512 * 1024 * 1024) throw Error('Memory temporary storage requires at least 512 MiB free in /dev/shm.');
+    temporaryDirectory = await fs.mkdtemp('/dev/shm/nir-performance-');
+    process.env.TMPDIR = temporaryDirectory;
+  }
+  if (mode === 'hardware') await writeHardwareEnvironment(process.env.CHROMIUM);
+} catch (error) {
+  if (temporaryDirectory) await fs.rm(temporaryDirectory, { recursive: true, force: true });
+  fail(`Performance environment setup failed: ${error.message}`);
+}
+try {
   await fs.access(playwrightCli);
 } catch {
+  if (temporaryDirectory) await fs.rm(temporaryDirectory, { recursive: true, force: true });
   fail('Playwright is not installed. Run `bun install --frozen-lockfile` first.');
 }
 
@@ -70,12 +98,15 @@ if (!process.env.DISPLAY) {
   executableArgs = ['-a', '-s', '-screen 0 1920x1080x24', '--', command, ...commandArgs];
 }
 
-const result = await run(executable, executableArgs, {
-  cwd: root,
-  env: process.env,
-  stdio: 'inherit',
-});
-process.exitCode = result;
+try {
+  process.exitCode = await run(executable, executableArgs, {
+    cwd: root,
+    env: process.env,
+    stdio: 'inherit',
+  });
+} finally {
+  if (temporaryDirectory) await fs.rm(temporaryDirectory, { recursive: true, force: true });
+}
 
 async function resolveChromium() {
   const requested = process.env.CHROMIUM?.trim();
@@ -126,6 +157,7 @@ async function writeHardwareEnvironment(chromium) {
     '--query-gpu=name,driver_version,pci.bus_id',
     '--format=csv,noheader',
   ]);
+  const temporaryFs = await fs.statfs(os.tmpdir()).catch(() => null);
   const report = {
     format: 1,
     mode: 'hardware',
@@ -149,6 +181,13 @@ async function writeHardwareEnvironment(chromium) {
       path: chromium,
       version: chromiumVersion.stdout.trim() || null,
       args: process.env.NIR_CHROME_ARGS,
+      nativeSharedMemory: process.env.NIR_PERF_NATIVE_SHM === '1',
+      temporaryDirectory: os.tmpdir(),
+      temporaryStorage,
+      temporaryFilesystem: temporaryFs ? {
+        type: temporaryFs.type,
+        availableBytes: temporaryFs.bavail * temporaryFs.bsize,
+      } : null,
     },
     gpuDriver: nvidia.code === 0
       ? { source: 'nvidia-smi', available: true, devices: nvidia.stdout.trim().split(/\r?\n/).filter(Boolean) }

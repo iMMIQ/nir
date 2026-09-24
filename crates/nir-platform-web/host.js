@@ -246,29 +246,60 @@ export async function queueContentSkip(job,envelope,{post,skip,isActive=()=>true
     return true;
 }
 
-// Global admission across preparation generations, including uncancellable decoders.
+const WORK_PRIORITIES={required:0,near:1,speculative:2,prefetch:2,background:3};
+export function workPriority(value){return Object.hasOwn(WORK_PRIORITIES,value)?(value==='prefetch'?'speculative':value):'required';}
+
+export function awaitAbortable(promise,signal) {
+    if(signal.aborted)return Promise.reject(signal.reason);
+    return new Promise((resolve,reject)=>{
+        const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason);};
+        signal.addEventListener('abort',abort,{once:true});
+        Promise.resolve(promise).then(value=>{signal.removeEventListener('abort',abort);resolve(value);},error=>{signal.removeEventListener('abort',abort);reject(error);});
+    });
+}
+
+// Each pool owns one bounded phase. An aborted running task keeps its place
+// until the underlying operation settles, including uncancellable decoders.
+// Only scheduling estimates are always on: at most eight phases, 32 numbers
+// each. Detailed turn and stage traces remain opt-in above.
 export class WorkPool {
-    constructor(limit=4, capacity=128){this.limit=limit;this.capacity=capacity;this.active=0;this.waiting=[];this.sequence=0;}
-    run(work,signal,{priority='required',group=null}={}){
+    constructor(limit=4, capacity=128, now=()=>performance.now()){this.limit=limit;this.capacity=capacity;this.now=now;this.active=0;this.waiting=[];this.sequence=0;this.costs=new Map();}
+    run(work,signal,{priority='required',group=null,deadline=null,phase='work'}={}){
         if(signal.aborted)return Promise.reject(signal.reason);
         if(this.waiting.length>=this.capacity)return Promise.reject(new Error('E_RESOURCE_QUEUE'));
         return new Promise((resolve,reject)=>{
-            const item={work,signal,resolve,reject,priority:priority==='prefetch'?1:0,group,sequence:this.sequence++};
+            const item={work,signal,resolve,reject,priority:WORK_PRIORITIES[workPriority(priority)],group,sequence:this.sequence++,deadline:Number.isFinite(deadline)?deadline:null,phase};
             item.abort=()=>{const index=this.waiting.indexOf(item);if(index>=0){this.waiting.splice(index,1);reject(signal.reason);}};
             signal.addEventListener('abort',item.abort,{once:true});this.waiting.push(item);this.drain();
         });
     }
-    promoteGroup(group){
+    promoteGroup(group,priority='required'){
         let promoted=0;
-        for(const item of this.waiting)if(item.group===group&&item.priority!==0){item.priority=0;promoted++;}
+        const rank=WORK_PRIORITIES[workPriority(priority)];
+        for(const item of this.waiting)if(item.group===group&&item.priority>rank){item.priority=rank;promoted++;}
         if(promoted)this.drain();
         return promoted;
     }
+    recentP95(phase){
+        const samples=this.costs.get(phase);
+        if(!samples?.length)return 0;
+        const sorted=[...samples].sort((a,b)=>a-b);
+        return sorted[Math.ceil(sorted.length*.95)-1];
+    }
+    recordCost(phase,elapsed){
+        if(!Number.isFinite(elapsed))return;
+        let samples=this.costs.get(phase);
+        if(!samples){if(this.costs.size===8)return;samples=[];this.costs.set(phase,samples);}
+        if(samples.length===32)samples.shift();
+        samples.push(Math.max(0,elapsed));
+    }
     drain(){
-        this.waiting.sort((a,b)=>a.priority-b.priority||a.sequence-b.sequence);
+        this.waiting.sort((a,b)=>a.priority-b.priority||
+            (a.deadline===null?(b.deadline===null?0:1):b.deadline===null?-1:(a.deadline-this.recentP95(a.phase))-(b.deadline-this.recentP95(b.phase)))||a.sequence-b.sequence);
         while(this.active<this.limit&&this.waiting.length){
             const item=this.waiting.shift();item.signal.removeEventListener('abort',item.abort);this.active++;
-            Promise.resolve().then(()=>{item.signal.throwIfAborted();return item.work();}).then(item.resolve,item.reject).finally(()=>{this.active--;this.drain();});
+            const start=this.now();
+            Promise.resolve().then(()=>{item.signal.throwIfAborted();return item.work();}).then(item.resolve,item.reject).finally(()=>{this.recordCost(item.phase,this.now()-start);this.active--;this.drain();});
         }
     }
 }
@@ -276,13 +307,13 @@ export class WorkPool {
 // A fetch belongs to its consumers, so cancelling one does not cancel another.
 export class SharedRequests {
     constructor(load){this.load=load;this.jobs=new Map();}
-    get(key,signal,{settleOnAbort=false}={}) {
+    get(key,signal,{settleOnAbort=false,context=null}={}) {
         if(signal.aborted)return Promise.reject(signal.reason);
         let job=this.jobs.get(key);
         if(!job){
             const controller=new AbortController();
-            job={controller,consumers:0};
-            job.promise=Promise.resolve().then(()=>this.load(key,controller.signal)).finally(()=>{
+            job={controller,consumers:0,context};
+            job.promise=Promise.resolve().then(()=>this.load(key,controller.signal,context)).finally(()=>{
                 if(this.jobs.get(key)===job)this.jobs.delete(key);
             });
             this.jobs.set(key,job);
@@ -329,7 +360,7 @@ export async function fetchContentBatch(job,{pool,requests,fetched=new Map(),obs
                 const data=await pool.run(()=>{
                     observe('module_fetch_started',{...context,kind:job.priority});
                     return requests.get(object.hash,signal,{settleOnAbort:true});
-                },signal,{priority:job.priority,group:job.group});
+                },signal,{priority:job.priority,group:job.group,phase:'fetch_verify'});
                 signal.throwIfAborted();
                 fetched.set(object.hash,data);
             }
@@ -434,9 +465,10 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     document.title=release.title;
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
-    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),decodeJobs=new Map(),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
+    const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
     let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
-    const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool();
+    const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool(4),decodePool=new WorkPool(2),uploadPool=new WorkPool(1);
+    const decodeRequests=new SharedRequests((id,signal,source)=>decodePool.run(()=>audio.decodeAudioData(source.bytes.slice(0)),signal,{priority:source.priority,group:source.group,deadline:source.deadline,phase:'audio_decode'}));
     let ownerTimer=null,pendingElapsed=0,wakeRequestedAt=null,pendingWakeWaitStartUs=null,pendingWakeWaitEndUs=null,cachedHostState=null;
     function invalidateHostState(){cachedHostState=null;}
     function mutateEngine(run) {try{return run();}finally{invalidateHostState();}}
@@ -516,14 +548,32 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             observe('bytes_cache_hit',context);return bytes;
         }
         observe('fetch_started',context);
-        const bytes=await requests.get(a.object,signal);signal.throwIfAborted();
+        const bytes=await requests.get(a.object,signal,{settleOnAbort:true});signal.throwIfAborted();
         if(bytes.byteLength!==a.bytes)throw Object.assign(new Error(`E_ASSET_SIZE: ${id}`),{code:'E_ASSET_SIZE'});
         observe('fetch_verified',{...context,bytes:bytes.byteLength});
         bytesCache.set(a.object,bytes);return bytes;
     }
-    function cancelPreparation(request) {inbox.cancelGroup(request);const controller=preparations.get(request);controller?.abort();preparations.delete(request);}
-    function prune() {
-        if(disposed||recovering)return;
+    function cancelPreparation(request) {
+        inbox.cancelGroup(request);
+        const job=preparations.get(request);
+        const acknowledge=()=>deliver(()=>{prune(true);hostEvent('assets_cancelled',{request});},'control');
+        if(job){
+            if(job.cancelAckQueued)return;
+            job.cancelAckQueued=true;job.controller.abort();
+            // The final consumer of an uncancellable decoder waits for its
+            // actual settlement before Rust may release the retired budget.
+            job.done.then(acknowledge);
+        }else acknowledge();
+    }
+    function promotePreparation(request,session) {
+        const job=preparations.get(request);
+        if(!job||job.session!==session||job.signal.aborted)return false;
+        job.priority='required';
+        resourcePool.promoteGroup(request);decodePool.promoteGroup(request);uploadPool.promoteGroup(request);
+        return true;
+    }
+    function prune(force=false) {
+        if(disposed||(recovering&&!force))return;
         const retained=JSON.parse(engine.retained_descriptors());
         for(const [id,descriptor] of Object.entries(retained))assetDescriptors.set(id,descriptor);
         const keep=new Set(Object.keys(retained));for(const v of voices.values())keep.add(v.asset);
@@ -540,7 +590,10 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         const terminal=inbox.reserve('completion',c.request,{session:c.session,device:c.device});
         if(!terminal){mutateEngine(()=>engine.resource_failed(c.request,'E_REQUEST_CAPACITY'));return;}
         const controller=new AbortController(),signal=controller.signal;
-        preparations.set(c.request,controller);
+        let resolveDone;
+        const done=new Promise(resolve=>resolveDone=resolve);
+        const job={controller,signal,session:c.session,priority:workPriority(c.priority),deadline:Number.isFinite(c.deadline_ms)?c.deadline_ms:null,nodes:new Map(),done,resolveDone,cancelAckQueued:false};
+        preparations.set(c.request,job);
         const failed=(message,id='',stage='admission',code='E_PREPARE')=>{
             observe('resource_failed',{request:c.request,session:c.session,device:c.device,asset:id,code,operation:stage,domain:'prepare'});
             mutateEngine(()=>engine.resource_fault(c.request,id,code,stage,String(message)));controller.abort();
@@ -550,37 +603,46 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             const id=c.assets[next++],slot=inbox.reserve('resource',c.request,{session:c.session,device:c.device});
             if(!slot){await post(terminal,()=>failed('E_REQUEST_CAPACITY'));return;}
             const descriptor=descriptors[id];
+            // The awaited stages are the node's dependencies: verified bytes
+            // precede audio decode, then owner upload, then readiness.
+            const node={asset:id,stage:'fetch_verify'};job.nodes.set(id,node);
             let stage='fetch';const context={request:c.request,session:c.session,device:c.device,asset:id,object:descriptor?.object};
             observe('resource_queued',context);
             try {
-                await resourcePool.run(async()=>{
+                const bytes=await resourcePool.run(async()=>{
                     observe('resource_admitted',context);
-                    const bytes=await asset(id,descriptor,signal,context);signal.throwIfAborted();
-                    if(descriptor.kind==='audio'){
-                        stage='audio_decode';observe('audio_decode_started',context);
-                        if(!buffers.has(id)){
-                            if(!decodeJobs.has(id))decodeJobs.set(id,audio.decodeAudioData(bytes.slice(0)).finally(()=>decodeJobs.delete(id)));
-                            const buffer=await decodeJobs.get(id);signal.throwIfAborted();buffers.set(id,buffer);
-                        }
-                        observe('audio_decode_ready',context);
-                        // Preparation itself pauses audio. A resume overtaken
-                        // by suspend may remain pending until preparation ends;
-                        // decoding/admission must not wait on that cycle.
-                        if(unlocked&&!audioPaused)await unlocked;
-                        signal.throwIfAborted();
-                        if(audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
+                    return asset(id,descriptor,signal,context);
+                },signal,{priority:job.priority,group:c.request,deadline:job.deadline,phase:'fetch_verify'});
+                signal.throwIfAborted();
+                if(descriptor.kind==='audio'){
+                    node.stage=stage='audio_decode';observe('audio_decode_started',context);
+                    if(!buffers.has(id)){
+                        const shared=decodeRequests.jobs.get(id);
+                        if(shared)decodePool.promoteGroup(shared.context.group,job.priority);
+                        const buffer=await decodeRequests.get(id,signal,{settleOnAbort:true,context:{bytes,priority:job.priority,group:c.request,deadline:job.deadline}});
+                        signal.throwIfAborted();buffers.set(id,buffer);
                     }
-                    stage='decode_upload';
-                    let complete=false;
-                    while(!complete&&!signal.aborted&&!disposed&&slot.state==='pending'){
-                        await post(slot,()=>{
-                            if(signal.aborted)return true;
-                            try {complete=mutateEngine(()=>engine.resource(c.request,id,new Uint8Array(bytes)));if(complete)observe('ordered_use_ready',context);return complete;}
-                            catch(e){metrics.resourceFailures++;failed(e,id,stage,'E_RESOURCE_DECODE_UPLOAD');return true;}
-                        },done=>done);
-                    }
-                },signal);
+                    observe('audio_decode_ready',context);
+                    // Decoding is valid while the context is suspended. Only
+                    // required playback needs an unlocked context, and a
+                    // cancelled request must not wait for resume to settle.
+                    if(job.priority==='required'&&unlocked&&!audioPaused)await awaitAbortable(unlocked,signal);
+                    signal.throwIfAborted();
+                    if(job.priority==='required'&&audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
+                }
+                node.stage=stage='decode_upload';
+                let complete=false;
+                while(!complete&&!signal.aborted&&!disposed&&slot.state==='pending'){
+                    // Re-admit each bounded owner step. A synchronous PNG
+                    // decode remains atomic inside its one owner callback.
+                    await uploadPool.run(()=>post(slot,()=>{
+                        if(signal.aborted)return true;
+                        try {complete=mutateEngine(()=>engine.resource(c.request,id,new Uint8Array(bytes)));if(complete){node.stage='ready';observe('ordered_use_ready',context);}return complete;}
+                        catch(e){metrics.resourceFailures++;failed(e,id,stage,'E_RESOURCE_DECODE_UPLOAD');return true;}
+                    },done=>done),signal,{priority:job.priority,group:c.request,deadline:job.deadline,phase:'decode_upload'});
+                }
             }catch(e){
+                node.stage='failed';
                 if(!signal.aborted&&!disposed){metrics.resourceFailures++;await post(slot,()=>failed(e,id,stage,typeof e?.code==='string'?e.code:stage==='fetch'?'E_RESOURCE_FETCH':'E_AUDIO_DECODE'));}
             } finally {if(signal.aborted||disposed)slot.cancel();}
         }}
@@ -588,7 +650,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             await Promise.all(Array.from({length:Math.min(4,c.assets.length)},worker));
             if(!signal.aborted&&!disposed)await post(terminal,()=>{});
             else terminal.cancel();
-        } finally {if(preparations.get(c.request)===controller)preparations.delete(c.request);}
+        } finally {if(preparations.get(c.request)===job)preparations.delete(c.request);job.resolveDone();}
     }
     function cancelContent(request) {
         const job=contentPreparations.get(request);
@@ -742,6 +804,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'cancel_content':cancelContent(c.request);break;
             case 'promote_content':promoteContent(c.request,c.session);break;
             case 'get_assets':prepare(c);break;
+            case 'promote_assets':promotePreparation(c.request,c.session);break;
             case 'cancel_assets':cancelPreparation(c.request);break;
             case 'audio_start':playVoice(c);break;
             case 'audio_stop':stopVoice(c.task);break;
@@ -864,7 +927,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const diagnostics=()=>{
         const performance=performanceStats?performanceStats.snapshot():{...disabledPerformance};
         if(performanceStats&&!disposed)performance.text_cache=JSON.parse(engine.text_cache_stats());
-        return {format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
+        return {format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,decode_pool_active:decodePool.active,decode_pool_waiting:decodePool.waiting.length,upload_pool_active:uploadPool.active,upload_pool_waiting:uploadPool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_media:[...preparations].slice(0,128).map(([request,job])=>({request,session:job.session,priority:job.priority,aborted:job.signal.aborted,stages:[...job.nodes.values()].slice(0,128).map(node=>({asset:node.asset,stage:node.stage}))})),pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
     };
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state:debugState,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>mutateEngine(()=>engine.action(JSON.stringify(a),token,seq,epoch)),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>mutateEngine(()=>engine.hidden(v)))};

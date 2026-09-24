@@ -1,11 +1,19 @@
 import { test, expect } from '@playwright/test';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { buildScaleFixture, closeScaleFixture } from './fixtures.js';
 import { distribution, installAdapterProbe, assertHardwareAdapter } from './metrics.js';
 
 const samples = 30;
 const networkTrace = process.env.NIR_PERF_NETWORK_TRACE === '1';
 const disableHttpCache = process.env.NIR_PERF_DISABLE_HTTP_CACHE === '1';
+const pressureLog = process.env.NIR_PERF_PRESSURE_LOG;
+function pressureTotals(text) {
+  return Object.fromEntries(text.trim().split('\n').map(line => {
+    const [kind] = line.split(' ');
+    return [kind, Number(line.match(/\btotal=(\d+)/)?.[1])];
+  }));
+}
 const act = (page, action) => page.evaluate(action => window.__nir.action(action), action);
 async function settled(page, screen) {
   await page.waitForFunction(screen => {
@@ -47,6 +55,19 @@ test('prepared interactions with long history', async ({ browser }) => {
   await installAdapterProbe(context);
   const page = await context.newPage(), errors = [];
   const network = [], maxNetworkEvents = 20000;
+  const pressure = [];
+  let pressurePending;
+  const samplePressure = () => {
+    if (!pressureLog || pressurePending) return pressurePending;
+    pressurePending = Promise.all([
+      fs.readFile('/proc/pressure/io', 'utf8'), fs.readFile('/proc/pressure/memory', 'utf8'),
+    ]).then(([io, memory]) => pressure.push({ wallTime: Date.now() / 1000,
+      io: pressureTotals(io), memory: pressureTotals(memory) }))
+      .finally(() => { pressurePending = undefined; });
+    return pressurePending;
+  };
+  await samplePressure();
+  const pressureTimer = pressureLog ? setInterval(samplePressure, 500) : undefined;
   let cdp;
   if (networkTrace) {
     await context.addInitScript(() => performance.setResourceTimingBufferSize(20000));
@@ -54,9 +75,11 @@ test('prepared interactions with long history', async ({ browser }) => {
     await cdp.send('Network.enable');
     if (disableHttpCache) await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
     const record = row => { if (network.length < maxNetworkEvents) network.push(row); };
-    cdp.on('Network.requestWillBeSent', e => record({ type: 'request', id: e.requestId, at: e.timestamp, url: new URL(e.request.url).pathname }));
+    cdp.on('Network.requestWillBeSent', e => record({ type: 'request', id: e.requestId, at: e.timestamp,
+      wallTime: e.wallTime, url: new URL(e.request.url).pathname }));
     cdp.on('Network.responseReceived', e => record({ type: 'response', id: e.requestId, at: e.timestamp,
       status: e.response.status, timing: e.response.timing, fromDiskCache: e.response.fromDiskCache,
+      serveId: Object.entries(e.response.headers ?? {}).find(([name]) => name.toLowerCase() === 'x-nir-serve-id')?.[1],
       connectionId: e.response.connectionId, connectionReused: e.response.connectionReused }));
     cdp.on('Network.loadingFinished', e => record({ type: 'finished', id: e.requestId, at: e.timestamp, encodedBytes: e.encodedDataLength }));
     cdp.on('Network.loadingFailed', e => record({ type: 'failed', id: e.requestId, at: e.timestamp, cancelled: e.canceled, error: e.errorText }));
@@ -64,7 +87,10 @@ test('prepared interactions with long history', async ({ browser }) => {
   }
   page.on('pageerror', error => errors.push(String(error)));
   const report = { format: 1, samples, moduleCount: 32, textRepetitions: 40,
-    instrumentation: { runtimeDiagnostics: true, playwrightTrace: test.info().project.use.trace, networkTrace, disableHttpCache: networkTrace && disableHttpCache },
+    instrumentation: { runtimeDiagnostics: true, playwrightTrace: test.info().project.use.trace,
+      networkTrace, disableHttpCache: networkTrace && disableHttpCache,
+      serveMode: fixture.serveMode, serveCli: fixture.serveCli,
+      serveLog: fixture.serveLog, pressureLog },
     mode: process.env.NIR_PERF_MODE, gpuTime: 'unmeasured', status: 'incomplete', runs: {} };
   try {
     await page.goto(`${fixture.origin}/?test=1`);
@@ -136,6 +162,13 @@ test('prepared interactions with long history', async ({ browser }) => {
     report.failure = await page.evaluate(() => ({ state: window.__nir?.state(), diagnostics: window.__nir?.diagnostics() })).catch(() => null);
     throw error;
   } finally {
+    if (pressureTimer) clearInterval(pressureTimer);
+    await pressurePending;
+    await samplePressure();
+    if (pressureLog) {
+      await fs.mkdir(path.dirname(pressureLog), { recursive: true });
+      await fs.writeFile(pressureLog, JSON.stringify({ format: 1, sampleIntervalMs: 500, samples: pressure }, null, 2));
+    }
     if (cdp) {
       report.network = network;
       report.networkTruncated = network.length >= maxNetworkEvents;

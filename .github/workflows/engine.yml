@@ -84,6 +84,7 @@ jobs:
           export CHROMIUM
           mkdir -p target/tmp
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance:smoke
+          NIR_PERF_LONGRUN_SECONDS=120 TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance --trace=off --grep 'M3 sustained'
       - name: Performance baselines and module scale
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:

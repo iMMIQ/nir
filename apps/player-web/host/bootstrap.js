@@ -19,6 +19,7 @@ try {
     const fetchObject=async(id,signal,observe=()=>{})=>{
         const o=release.objects[id],url=objectUrl(id),start_us=String(Math.round(performance.now()*1000));
         const r=await fetch(url,{signal});if(!r.ok)throw Object.assign(new Error(`E_HTTP: ${r.status}`),{code:'E_HTTP'});
+        observe('object_response',{object:id,start_us,end_us:String(Math.round(performance.now()*1000))});
         const bytes=await r.arrayBuffer(),downloaded_us=String(Math.round(performance.now()*1000));
         observe('object_downloaded',{object:id,bytes:bytes.byteLength,start_us,end_us:downloaded_us});
         if(bytes.byteLength!==o.bytes||await hash(bytes)!==id)throw Object.assign(new Error(`E_OBJECT_DIGEST: ${id}`),{code:'E_OBJECT_DIGEST'});

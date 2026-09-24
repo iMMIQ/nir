@@ -1125,3 +1125,45 @@ fn prefetch_prediction_stops_at_uncertain_or_terminal_control_flow() {
             .is_none());
     }
 }
+
+#[test]
+fn media_prediction_reads_one_resident_cue_without_advancing_vm() {
+    let core = prediction_fixture(
+        0,
+        Some(Terminator::Activate {
+            cue: "intro".into(),
+            next: "end_stay".into(),
+        }),
+    );
+    let before = serde_json::to_vec(core.state()).unwrap();
+    assert_eq!(core.predict_next_cue().as_deref(), Some("intro"));
+    assert_eq!(core.predict_next_cue().as_deref(), Some("intro"));
+    assert_eq!(serde_json::to_vec(core.state()).unwrap(), before);
+}
+
+#[test]
+fn media_prediction_stops_at_control_flow_that_needs_execution() {
+    for stop in [
+        Terminator::Branch {
+            condition: Expr::Const {
+                value: Value::Bool(true),
+            },
+            yes: "probe1".into(),
+            no: "probe1".into(),
+        },
+        Terminator::Call {
+            function: "future.main".into(),
+            args: BTreeMap::new(),
+            next: "end_stay".into(),
+            result: None,
+        },
+        Terminator::Goto {
+            target: "probe0".into(),
+        },
+        Terminator::Return { value: None },
+    ] {
+        assert!(prediction_fixture(1, Some(stop))
+            .predict_next_cue()
+            .is_none());
+    }
+}

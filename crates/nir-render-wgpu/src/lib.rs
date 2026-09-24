@@ -794,18 +794,16 @@ impl Renderer {
         let (source_start, target_start) = vertex_result?;
 
         let acquire_start = self.profile_start();
-        let frame_result = (|| -> Result<wgpu::SurfaceTexture> {
-            match self.surface.get_current_texture() {
-                Ok(f) => Ok(f),
-                Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                    self.surface.configure(&self.device, &self.config);
-                    self.surface
-                        .get_current_texture()
-                        .map_err(|e| error(e.to_string()))
-                }
-                Err(e) => Err(error(e.to_string())),
+        let frame_result = match self.surface.get_current_texture() {
+            Ok(f) => Ok(f),
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                self.surface
+                    .get_current_texture()
+                    .map_err(|e| error(e.to_string()))
             }
-        })();
+            Err(e) => Err(error(e.to_string())),
+        };
         self.profile_end("surface.acquire", acquire_start);
         let frame = frame_result?;
 

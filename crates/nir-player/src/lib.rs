@@ -22,6 +22,14 @@ pub enum ContentPriority {
     Required,
     Prefetch,
 }
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparePriority {
+    Required,
+    Near,
+    Speculative,
+    Background,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +89,11 @@ pub enum AppCommand {
         device: u32,
         assets: Vec<String>,
         descriptors: BTreeMap<String, Asset>,
+        priority: PreparePriority,
+    },
+    PromoteAssets {
+        request: u32,
+        session: u32,
     },
     CancelAssets {
         request: u32,
@@ -172,6 +185,9 @@ pub enum AppEvent {
         request: u32,
         diagnostic: Box<Diagnostic>,
     },
+    AssetsCancelled {
+        request: u32,
+    },
     PresentationReady {
         request: u32,
     },
@@ -226,10 +242,18 @@ enum Purpose {
 }
 struct Preparation {
     request: u32,
+    promoted_from: Option<u32>,
+    assets: BTreeSet<String>,
     purpose: Purpose,
     job: PrepareJob,
     preflight: bool,
     failed: bool,
+}
+struct MediaLookahead {
+    request: u32,
+    fingerprint: String,
+    assets: BTreeSet<String>,
+    job: PrepareJob,
 }
 #[derive(Debug, Clone)]
 struct LocaleCandidate {
@@ -273,6 +297,11 @@ pub struct Player {
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
     prepare: Option<Preparation>,
+    media_lookahead: Option<MediaLookahead>,
+    media_retired: BTreeMap<u32, PrepareJob>,
+    deferred_prepare: Option<(Generation, Purpose, u32, BTreeSet<String>)>,
+    deferred_locale: Option<u32>,
+    media_attempted: Option<String>,
     content: BTreeMap<u32, ContentPreparation>,
     content_leases: Vec<nir_core::ContentLease>,
     restore_work: Option<RestoreWork>,
@@ -378,6 +407,11 @@ impl Player {
             inbox: VecDeque::new(),
             work_used: 0,
             prepare: None,
+            media_lookahead: None,
+            media_retired: BTreeMap::new(),
+            deferred_prepare: None,
+            deferred_locale: None,
+            media_attempted: None,
             candidate: None,
             device_resume: None,
             ledger,
@@ -493,7 +527,16 @@ impl Player {
                 .is_some_and(|c| c.request == request)
     }
     pub fn accepts_resource(&self, request: u32) -> bool {
-        self.accepts(request) || (self.accepts_locale(request) && self.locale_job.is_some())
+        self.accepts(request)
+            || self
+                .prepare
+                .as_ref()
+                .is_some_and(|p| p.promoted_from == Some(request) && !p.failed)
+            || (self.accepts_locale(request) && self.locale_job.is_some())
+            || self
+                .media_lookahead
+                .as_ref()
+                .is_some_and(|p| p.request == request)
     }
     pub fn locale_pending(&self) -> bool {
         (self.locale_candidate.is_some()
@@ -507,6 +550,7 @@ impl Player {
         self.locale_error.as_deref()
     }
     fn invalidate_locale_candidate(&mut self) {
+        self.deferred_locale = None;
         self.cancel_content(true);
         if let Some(candidate) = self.locale_candidate.take() {
             self.commands.push(AppCommand::CancelAssets {
@@ -519,6 +563,7 @@ impl Player {
         if !self.accepts_locale(request) {
             return;
         }
+        self.deferred_locale = None;
         self.locale_job = None;
         self.locale_error = Some(message);
         self.pauses.remove("locale");
@@ -528,6 +573,7 @@ impl Player {
             .text(&self.effective_ui_locale, "language-failed");
     }
     fn start_locale_switch(&mut self) -> Result<()> {
+        self.deferred_locale = None;
         let config = &self.core.program().locale_config;
         if !config.ui.contains_key(&self.preferences.ui_locale)
             || !config.text.contains_key(&self.preferences.text_locale)
@@ -596,9 +642,18 @@ impl Player {
                     device: self.generation.device,
                     descriptors: self.describe_assets(&fonts)?,
                     assets: fonts.into_iter().collect(),
+                    priority: PreparePriority::Required,
                 });
             }
-            Err(error) => self.locale_failed(candidate.request, error.to_string()),
+            Err(error) => {
+                if self.media_lookahead.is_some() || !self.media_retired.is_empty() {
+                    self.cancel_media_lookahead();
+                    self.deferred_locale = Some(candidate.request);
+                    self.observe("locale_waiting_for_media_cancel", Some(candidate.request));
+                } else {
+                    self.locale_failed(candidate.request, error.to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -725,7 +780,10 @@ impl Player {
             a.extend(self.state_assets(c));
         }
         if let Some(prep) = &self.prepare {
-            a.extend(prep.job.missing.clone());
+            a.extend(prep.assets.iter().cloned());
+        }
+        if let Some(spec) = &self.media_lookahead {
+            a.extend(spec.assets.iter().cloned());
         }
         a
     }
@@ -827,6 +885,9 @@ impl Player {
         activation: u32,
         mut assets: BTreeSet<String>,
     ) -> Result<()> {
+        if self.deferred_prepare.take().is_some() {
+            self.pauses.remove("prepare");
+        }
         // Old and candidate resources are admitted together; never pin half a cue.
         assets.extend(if !self.story_context_active() {
             self.title_assets()
@@ -848,16 +909,53 @@ impl Player {
             .request
             .checked_add(1)
             .ok_or_else(|| Diagnostic::new("E_LIMIT", "request", "counter"))?;
-        let job = PrepareJob::new(
-            activation,
-            self.generation,
-            self.costs(&assets)?,
-            &self.ledger,
-        )?;
+        let costs = self.costs(&assets)?;
+        let job = match PrepareJob::new(activation, self.generation, costs.clone(), &self.ledger) {
+            Ok(job) => job,
+            Err(_) if self.media_lookahead.is_some() || !self.media_retired.is_empty() => {
+                self.cancel_media_lookahead();
+                self.deferred_prepare = Some((self.generation, purpose, activation, assets));
+                self.pauses.insert("prepare".into());
+                self.observe("prepare_waiting_for_media_cancel", None);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut job = job;
+        let promoted = matches!(purpose, Purpose::Activation)
+            && self.media_lookahead.as_ref().is_some_and(|s| {
+                s.job.generation == self.generation && s.assets.is_subset(&assets)
+            });
         let request = self.request;
+        let speculative_assets = self
+            .media_lookahead
+            .as_ref()
+            .map(|s| s.assets.clone())
+            .unwrap_or_default();
+        let promoted_from = if promoted {
+            let spec = self.media_lookahead.take().unwrap();
+            for ready in spec.assets.difference(&spec.job.missing) {
+                job.ready(ready, self.generation);
+            }
+            self.commands.push(AppCommand::PromoteAssets {
+                request: spec.request,
+                session: self.generation.session,
+            });
+            Some(spec.request)
+        } else {
+            self.cancel_media_lookahead();
+            None
+        };
+        let required_fetch: BTreeSet<_> = if promoted_from.is_some() {
+            assets.difference(&speculative_assets).cloned().collect()
+        } else {
+            assets.clone()
+        };
         self.cancel_preparation();
         self.prepare = Some(Preparation {
             request,
+            promoted_from,
+            assets: assets.clone(),
             purpose,
             job,
             preflight: false,
@@ -865,13 +963,25 @@ impl Player {
         });
         self.pauses.insert("prepare".into());
         self.observe("prepare_requested", Some(request));
-        self.commands.push(AppCommand::GetAssets {
-            request,
-            session: self.generation.session,
-            device: self.generation.device,
-            descriptors: self.describe_assets(&assets)?,
-            assets: assets.into_iter().collect(),
-        });
+        if !required_fetch.is_empty() {
+            self.commands.push(AppCommand::GetAssets {
+                request,
+                session: self.generation.session,
+                device: self.generation.device,
+                descriptors: self.describe_assets(&required_fetch)?,
+                assets: required_fetch.into_iter().collect(),
+                priority: PreparePriority::Required,
+            });
+        }
+        if self
+            .prepare
+            .as_ref()
+            .is_some_and(|p| p.job.missing.is_empty())
+        {
+            self.prepare.as_mut().unwrap().preflight = true;
+            self.commands
+                .push(AppCommand::PreparePresentation { request });
+        }
         Ok(())
     }
     fn cancel_preparation(&mut self) {
@@ -880,8 +990,140 @@ impl Player {
                 self.observe("prepare_cancelled", Some(p.request));
                 self.commands
                     .push(AppCommand::CancelAssets { request: p.request });
+                if let Some(old) = p.promoted_from {
+                    self.commands
+                        .push(AppCommand::CancelAssets { request: old });
+                }
             }
         }
+    }
+    fn cancel_media_lookahead(&mut self) {
+        if let Some(spec) = self.media_lookahead.take() {
+            self.commands.push(AppCommand::CancelAssets {
+                request: spec.request,
+            });
+            self.observe("media_lookahead_cancelled", Some(spec.request));
+            self.media_retired.insert(spec.request, spec.job);
+        }
+    }
+    fn maybe_prefetch_media(&mut self) {
+        let eligible = self.screen == Screen::Story
+            && self.story_context_active()
+            && !self.paused()
+            && self.prepare.is_none()
+            && self.candidate.is_none()
+            && self.restore_work.is_none()
+            && self.locale_candidate.is_none()
+            && self.preferences.ui_locale == self.effective_ui_locale
+            && self.preferences.text_locale == self.effective_text_locale
+            && !self.content.values().any(|job| {
+                !matches!(
+                    job.purpose,
+                    ContentPurpose::Locale | ContentPurpose::Prefetch
+                )
+            })
+            && self.validated.program().player.prefetch_media;
+        let cue = if eligible {
+            self.core.predict_next_cue()
+        } else {
+            None
+        };
+        let fingerprint = cue.as_ref().map(|cue| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                self.generation.session,
+                self.generation.device,
+                self.effective_text_locale,
+                self.core.location(),
+                self.core
+                    .state()
+                    .waiting
+                    .as_ref()
+                    .and_then(|w| serde_json::to_string(w).ok())
+                    .unwrap_or_default(),
+                cue
+            )
+        });
+        if self
+            .media_lookahead
+            .as_ref()
+            .is_some_and(|s| Some(&s.fingerprint) != fingerprint.as_ref())
+        {
+            self.cancel_media_lookahead();
+        }
+        if fingerprint
+            .as_ref()
+            .is_some_and(|f| self.media_attempted.as_ref() != Some(f))
+        {
+            self.media_attempted = None;
+        }
+        let Some(fingerprint) = fingerprint else {
+            return;
+        };
+        if self.media_attempted.as_ref() == Some(&fingerprint)
+            || self.media_lookahead.is_some()
+            || !self.media_retired.is_empty()
+        {
+            return;
+        }
+        self.media_attempted = Some(fingerprint.clone());
+        let cue = cue.unwrap();
+        let recipe = self.validated.cue_assets(&cue);
+        if recipe.iter().any(|id| self.validated.asset(id).is_none()) {
+            return;
+        }
+        let resident = self.retained_assets();
+        let assets: BTreeSet<_> = recipe
+            .into_iter()
+            .filter(|id| {
+                !resident.contains(id)
+                    && self
+                        .validated
+                        .asset(id)
+                        .is_some_and(|a| matches!(a.kind, AssetKind::Image | AssetKind::Audio))
+            })
+            .collect();
+        if assets.is_empty() {
+            return;
+        }
+        // Only the incremental cost of media absent from the active group is
+        // speculative. The ledger still jointly accounts for shared assets.
+        let costs = match self.costs(&assets) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let incremental: u64 = costs
+            .values()
+            .fold(0u64, |total, cost| total.saturating_add(*cost));
+        if incremental > 32 * 1024 * 1024 {
+            return;
+        }
+        let Some(request) = self.request.checked_add(1) else {
+            return;
+        };
+        let Ok(job) = PrepareJob::new(0, self.generation, costs, &self.ledger) else {
+            return;
+        };
+        self.request = request;
+        let descriptors = match self.describe_assets(&assets) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        self.media_lookahead = Some(MediaLookahead {
+            request,
+            fingerprint,
+            assets: assets.clone(),
+            job,
+        });
+        self.commands.push(AppCommand::GetAssets {
+            request,
+            session: self.generation.session,
+            device: self.generation.device,
+            assets: assets.into_iter().collect(),
+            descriptors,
+            priority: PreparePriority::Near,
+        });
+        self.observe("media_lookahead_requested", Some(request));
     }
     fn step(&mut self, input: CoreInput, budget: &mut u32) -> Result<()> {
         let before_location = self.core.location();
@@ -1122,6 +1364,7 @@ impl Player {
             }
         }
         self.maybe_prefetch_content();
+        self.maybe_prefetch_media();
         if let Err(error) = self.refresh_content_lease() {
             self.report(error, true);
         }
@@ -1220,16 +1463,21 @@ impl Player {
                 if !self.accepts_resource(request) {
                     self.observe("stale_asset_discarded", Some(request));
                 }
-                if let Some(p) = self
-                    .prepare
+                if let Some(spec) = self
+                    .media_lookahead
                     .as_mut()
-                    .filter(|p| p.request == request && !p.failed)
+                    .filter(|s| s.request == request)
                 {
+                    spec.job.ready(&asset, self.generation);
+                }
+                if let Some(p) = self.prepare.as_mut().filter(|p| {
+                    (p.request == request || p.promoted_from == Some(request)) && !p.failed
+                }) {
                     p.job.ready(&asset, self.generation);
                     if p.job.missing.is_empty() && !p.preflight {
                         p.preflight = true;
                         self.commands
-                            .push(AppCommand::PreparePresentation { request });
+                            .push(AppCommand::PreparePresentation { request: p.request });
                     }
                 }
                 if let (Some(candidate), Some(job)) =
@@ -1248,7 +1496,37 @@ impl Player {
                     }
                 }
             }
+            AppEvent::AssetsCancelled { request } => {
+                self.media_retired.remove(&request);
+                if self.media_retired.is_empty() {
+                    if let Some((generation, purpose, activation, assets)) =
+                        self.deferred_prepare.take()
+                    {
+                        self.pauses.remove("prepare");
+                        if generation == self.generation {
+                            self.begin_prepare(purpose, activation, assets)?;
+                        }
+                    }
+                    if let Some(request) = self.deferred_locale.take() {
+                        if self
+                            .locale_candidate
+                            .as_ref()
+                            .is_some_and(|c| c.request == request)
+                        {
+                            self.start_locale_switch()?;
+                        }
+                    }
+                }
+            }
             AppEvent::AssetFailed { request, message } => {
+                if self
+                    .media_lookahead
+                    .as_ref()
+                    .is_some_and(|s| s.request == request)
+                {
+                    self.cancel_media_lookahead();
+                    return Ok(());
+                }
                 if self.accepts_locale(request) {
                     self.locale_failed(request, message);
                 } else {
@@ -1262,6 +1540,14 @@ impl Player {
                 request,
                 diagnostic,
             } => {
+                if self
+                    .media_lookahead
+                    .as_ref()
+                    .is_some_and(|s| s.request == request)
+                {
+                    self.cancel_media_lookahead();
+                    return Ok(());
+                }
                 if self.accepts_locale(request) {
                     self.locale_failed(request, diagnostic.to_string());
                 } else {
@@ -1497,12 +1783,21 @@ impl Player {
         self.report(d, false);
     }
     fn asset_fault(&mut self, request: u32, mut d: Diagnostic) {
+        let request = self
+            .prepare
+            .as_ref()
+            .and_then(|p| (p.promoted_from == Some(request)).then_some(p.request))
+            .unwrap_or(request);
         if !self.accepts(request) {
             self.observe("stale_failure_discarded", Some(request));
             return;
         }
         self.prepare.as_mut().unwrap().failed = true;
         self.commands.push(AppCommand::CancelAssets { request });
+        if let Some(old) = self.prepare.as_ref().and_then(|p| p.promoted_from) {
+            self.commands
+                .push(AppCommand::CancelAssets { request: old });
+        }
         if d.details.is_none() {
             d = d.classified(
                 ErrorDomain::Prepare,
@@ -1531,6 +1826,10 @@ impl Player {
             return Ok(());
         }
         let prep = self.prepare.take().unwrap();
+        if let Some(old) = prep.promoted_from {
+            self.commands
+                .push(AppCommand::CancelAssets { request: old });
+        }
         let purpose = prep.purpose;
         let restart_locale =
             matches!(purpose, Purpose::Restore | Purpose::Rollback) && self.locale_pending();
@@ -2145,6 +2444,7 @@ impl Player {
         self.model()
     }
 }
+
 fn finite_clamp(v: f32, min: f32, max: f32, default: f32) -> f32 {
     if v.is_finite() {
         v.clamp(min, max)
@@ -2160,5 +2460,370 @@ impl Player {
             self.start_locale_switch()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    const LIMIT: u64 = 128 * 1024 * 1024;
+
+    fn player() -> Player {
+        let program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        Player::new(program, "release".into(), "Test".into()).unwrap()
+    }
+
+    fn speculative(player: &mut Player, request: u32, id: &str) {
+        let assets = BTreeSet::from([id.to_owned()]);
+        let job = PrepareJob::new(
+            0,
+            player.generation,
+            player.costs(&assets).unwrap(),
+            &player.ledger,
+        )
+        .unwrap();
+        player.media_lookahead = Some(MediaLookahead {
+            request,
+            fingerprint: "wait".into(),
+            assets,
+            job,
+        });
+        player.request = request;
+    }
+
+    fn at_intro_wait(mut program: Program) -> Player {
+        program.player.prefetch_media = true;
+        let mut player = Player::new(program, "release".into(), "Test".into()).unwrap();
+        player.cancel_preparation();
+        player.pauses.remove("prepare");
+        player.commands.clear();
+        for _ in 0..20 {
+            let input = player
+                .core
+                .state()
+                .pending
+                .as_ref()
+                .map(|pending| CoreInput::Prepared {
+                    activation: pending.id,
+                })
+                .unwrap_or(CoreInput::None);
+            player.core.step(input, 10_000);
+            assert!(player.core.state().fault.is_none());
+            if player.core.state().waiting.is_some() {
+                break;
+            }
+        }
+        assert_eq!(player.core.predict_next_cue().as_deref(), Some("enter"));
+        player.screen = Screen::Story;
+        player.return_screen = Screen::Story;
+        player
+    }
+
+    #[test]
+    fn cancelled_speculation_keeps_ledger_charge_until_host_settles() {
+        let mut player = player();
+        let before = player.memory_used();
+        let assets = BTreeSet::from(["speculative-only".to_owned()]);
+        let job = PrepareJob::new(
+            0,
+            player.generation,
+            BTreeMap::from([("speculative-only".into(), 4096)]),
+            &player.ledger,
+        )
+        .unwrap();
+        player.media_lookahead = Some(MediaLookahead {
+            request: 91,
+            fingerprint: "wait".into(),
+            assets,
+            job,
+        });
+        assert_eq!(player.memory_used(), before + 4096);
+        player.cancel_media_lookahead();
+        assert_eq!(player.memory_used(), before + 4096);
+        player
+            .event(AppEvent::AssetsCancelled { request: 91 }, &mut 100)
+            .unwrap();
+        assert_eq!(player.memory_used(), before);
+    }
+
+    #[test]
+    fn promoted_ready_media_is_not_requested_again() {
+        let mut player = player();
+        player.cancel_preparation();
+        player.commands.clear();
+        player.request = 41;
+        let id = "bg.river".to_owned();
+        let mut job = PrepareJob::new(
+            0,
+            player.generation,
+            player.costs(&BTreeSet::from([id.clone()])).unwrap(),
+            &player.ledger,
+        )
+        .unwrap();
+        assert!(job.ready(&id, player.generation));
+        player.media_lookahead = Some(MediaLookahead {
+            request: 41,
+            fingerprint: "wait".into(),
+            assets: BTreeSet::from([id.clone()]),
+            job,
+        });
+        player
+            .begin_prepare(Purpose::Activation, 7, BTreeSet::from([id.clone()]))
+            .unwrap();
+        assert!(player
+            .commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::PromoteAssets { request: 41, .. })));
+        assert!(player.commands.iter().all(|c| match c {
+            AppCommand::GetAssets { assets, .. } => !assets.contains(&id),
+            _ => true,
+        }));
+        assert!(!player.prepare.as_ref().unwrap().job.missing.contains(&id));
+        assert!(player.retained_assets().contains(&id));
+    }
+
+    #[test]
+    fn promoted_inflight_media_ready_arrives_on_original_request() {
+        let mut player = player();
+        player.cancel_preparation();
+        player.commands.clear();
+        speculative(&mut player, 41, "bg.river");
+        player
+            .begin_prepare(Purpose::Activation, 7, BTreeSet::from(["bg.river".into()]))
+            .unwrap();
+        let required_request = player.prepare.as_ref().unwrap().request;
+        assert_ne!(required_request, 41);
+        assert_eq!(player.prepare.as_ref().unwrap().promoted_from, Some(41));
+        assert!(player.accepts_resource(41));
+        player
+            .event(
+                AppEvent::AssetReady {
+                    request: 41,
+                    asset: "bg.river".into(),
+                },
+                &mut 100,
+            )
+            .unwrap();
+        assert!(!player
+            .prepare
+            .as_ref()
+            .unwrap()
+            .job
+            .missing
+            .contains("bg.river"));
+        assert!(player.retained_assets().contains("bg.river"));
+    }
+
+    #[test]
+    fn required_prepare_waits_for_cancel_ack_under_budget_pressure() {
+        let mut player = player();
+        player.cancel_preparation();
+        player.commands.clear();
+        let mut required = player.title_assets();
+        required.insert("bg.station".into());
+        let required_cost: u64 = player.costs(&required).unwrap().values().sum();
+        let fill = LIMIT - player.memory_used() - required_cost;
+        let _fill = player
+            .ledger
+            .reserve(&BTreeMap::from([("@test-fill".into(), fill)]))
+            .unwrap();
+        speculative(&mut player, 41, "audio.bell");
+        player
+            .begin_prepare(Purpose::Activation, 7, required)
+            .unwrap();
+        assert!(player.prepare.is_none());
+        assert!(player.deferred_prepare.is_some());
+        assert!(player.media_retired.contains_key(&41));
+        assert!(player
+            .commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::CancelAssets { request: 41 })));
+        player.commands.clear();
+        player
+            .event(AppEvent::AssetsCancelled { request: 40 }, &mut 100)
+            .unwrap();
+        assert!(player.prepare.is_none(), "stale ack cannot release budget");
+        player
+            .event(AppEvent::AssetsCancelled { request: 41 }, &mut 100)
+            .unwrap();
+        assert!(player.prepare.is_some());
+        assert!(player.deferred_prepare.is_none());
+        assert!(player.commands.iter().any(|c| matches!(
+            c,
+            AppCommand::GetAssets {
+                priority: PreparePriority::Required,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn title_supersedes_deferred_activation_before_ack() {
+        let mut player = player();
+        player.cancel_preparation();
+        let mut required = player.title_assets();
+        required.insert("bg.station".into());
+        let cost: u64 = player.costs(&required).unwrap().values().sum();
+        let _fill = player
+            .ledger
+            .reserve(&BTreeMap::from([(
+                "@test-fill".into(),
+                LIMIT - player.memory_used() - cost,
+            )]))
+            .unwrap();
+        speculative(&mut player, 41, "audio.bell");
+        player
+            .begin_prepare(Purpose::Activation, 7, required)
+            .unwrap();
+        assert!(player.deferred_prepare.is_some());
+        let old_session = player.generation.session;
+        player.action(UiAction::Title, 0, 0, &mut 100).unwrap();
+        assert!(player.generation.session > old_session);
+        assert!(!player.deferred_prepare.as_ref().is_some_and(
+            |(_, purpose, activation, _)| matches!(purpose, Purpose::Activation)
+                && *activation == 7
+        ));
+        player
+            .event(AppEvent::AssetsCancelled { request: 41 }, &mut 100)
+            .unwrap();
+        assert!(!player
+            .prepare
+            .as_ref()
+            .is_some_and(|p| matches!(p.purpose, Purpose::Activation)));
+    }
+
+    #[test]
+    fn locale_font_admission_retries_after_speculative_cancel() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let mut font = program.assets["font.reader"].clone();
+        font.object = "alt-font".into();
+        program.assets.insert("font.alt".into(), font);
+        let media: BTreeMap<_, _> = program
+            .assets
+            .iter()
+            .map(|(id, asset)| (id.clone(), asset.object.clone()))
+            .collect();
+        for plan in [
+            program.locale_config.ui.get_mut("en").unwrap(),
+            program.locale_config.text.get_mut("en").unwrap(),
+        ] {
+            plan.fonts = vec!["font.alt".into()];
+            plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &media);
+        }
+        let mut player = Player::new(program, "release".into(), "Test".into()).unwrap();
+        player.cancel_preparation();
+        speculative(&mut player, 41, "bg.river");
+        let font_cost = player.costs(&BTreeSet::from(["font.alt".into()])).unwrap()["font.alt"];
+        let _fill = player
+            .ledger
+            .reserve(&BTreeMap::from([(
+                "@test-fill".into(),
+                LIMIT - player.memory_used() - font_cost + 1,
+            )]))
+            .unwrap();
+        player.preferences.ui_locale = "en".into();
+        player.preferences.text_locale = "en".into();
+        player.start_locale_switch().unwrap();
+        assert!(player.deferred_locale.is_some());
+        assert!(player.media_retired.contains_key(&41));
+        assert!(player.locale_error.is_none());
+        player
+            .event(AppEvent::AssetsCancelled { request: 41 }, &mut 100)
+            .unwrap();
+        assert!(player.deferred_locale.is_none());
+        assert!(player.locale_job.is_some());
+        assert!(player.locale_error.is_none());
+    }
+
+    #[test]
+    fn oversized_next_cue_is_skipped_once_for_its_wait() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let actor = program.assets.get_mut("actor.aki").unwrap();
+        actor.width = 2048;
+        actor.height = 2048;
+        let mut player = at_intro_wait(program);
+        let before = player.request;
+        player.maybe_prefetch_media();
+        let fingerprint = player.media_attempted.clone();
+        assert!(fingerprint.is_some());
+        assert!(player.media_lookahead.is_none());
+        assert_eq!(player.request, before);
+        player.pauses.insert("hidden".into());
+        player.maybe_prefetch_media();
+        player.pauses.remove("hidden");
+        player.maybe_prefetch_media();
+        assert_eq!(player.media_attempted, fingerprint);
+        assert_eq!(player.request, before);
+    }
+
+    #[test]
+    fn failed_next_cue_is_not_retried_at_the_same_wait() {
+        let program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let mut player = at_intro_wait(program);
+        player.maybe_prefetch_media();
+        let request = player.media_lookahead.as_ref().unwrap().request;
+        assert!(player.commands.iter().any(|c| matches!(c, AppCommand::GetAssets { request: r, priority: PreparePriority::Near, .. } if *r == request)));
+        player
+            .event(
+                AppEvent::AssetFailed {
+                    request,
+                    message: "decode failed".into(),
+                },
+                &mut 100,
+            )
+            .unwrap();
+        assert!(player.media_lookahead.is_none());
+        assert!(player.media_retired.contains_key(&request));
+        player
+            .event(AppEvent::AssetsCancelled { request }, &mut 100)
+            .unwrap();
+        let before = player.request;
+        player.commands.clear();
+        player.maybe_prefetch_media();
+        assert_eq!(player.request, before);
+        assert!(!player.commands.iter().any(|c| matches!(
+            c,
+            AppCommand::GetAssets {
+                priority: PreparePriority::Near,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn device_loss_retires_inflight_media_and_discards_late_ready() {
+        let program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let mut player = at_intro_wait(program);
+        let baseline = player.memory_used();
+        player.maybe_prefetch_media();
+        let request = player.media_lookahead.as_ref().unwrap().request;
+        assert!(player.memory_used() > baseline);
+        player.pump(vec![AppEvent::DeviceLost], 1000);
+        assert!(player.media_lookahead.is_none());
+        assert!(player.media_retired.contains_key(&request));
+        assert!(player.memory_used() > baseline);
+        player.pump(
+            vec![AppEvent::AssetReady {
+                request,
+                asset: "actor.aki".into(),
+            }],
+            1000,
+        );
+        player.pump(
+            vec![AppEvent::AssetFault {
+                request,
+                diagnostic: Box::new(Diagnostic::new("E_DECODE", "media", "late decode")),
+            }],
+            1000,
+        );
+        assert!(player.error.is_none());
+        assert!(player.media_retired.contains_key(&request));
+        player.pump(vec![AppEvent::AssetsCancelled { request }], 1000);
+        assert_eq!(player.memory_used(), baseline);
     }
 }

@@ -119,6 +119,7 @@ fn main() -> Result<()> {
                     "PROJECT-THEMES.md",
                     "MODULE-WORKFLOW.md",
                     "CONTENT-RESIDENCY.md",
+                    "M3-PREPARATION.md",
                 ] {
                     fs::copy(Path::new("docs").join(name), docs.join(name))?;
                 }

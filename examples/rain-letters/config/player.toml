@@ -8,3 +8,4 @@ sfx_volume = 0.5
 reduced_motion = false
 auto_delay_us = "1200000"
 prefetch_content = true
+prefetch_media = true

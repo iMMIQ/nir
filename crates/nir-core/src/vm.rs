@@ -439,6 +439,41 @@ impl Core {
         }
         None
     }
+    /// The first cue reached through straight-line control flow after a stable
+    /// wait. This only reads resident definitions and never executes an op.
+    pub fn predict_next_cue(&self) -> Option<String> {
+        if self.state.pending.is_some()
+            || self.state.choice.is_some()
+            || self.state.fault.is_some()
+            || self.state.outcome.is_some()
+        {
+            return None;
+        }
+        let waiting = self.state.waiting.as_ref()?;
+        let frame = self.state.frames.last()?;
+        let function = self.program.program().functions.get(&frame.function)?;
+        let mut block = waiting.next.as_str();
+        let mut visited = BTreeSet::new();
+        for _ in 0..64 {
+            if !visited.insert(block) {
+                return None;
+            }
+            let body = function.blocks.get(block)?;
+            match &body.terminator {
+                Terminator::Goto { target } => block = target,
+                Terminator::Activate { cue, .. } => {
+                    return self
+                        .program
+                        .program()
+                        .cues
+                        .contains_key(cue)
+                        .then(|| cue.clone());
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
     pub fn set_locale(&mut self, locale: &str) -> Result<()> {
         if !self.program().locales.contains_key(locale)
             || !self.program().locale_config.text.contains_key(locale)
