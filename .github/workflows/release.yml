@@ -1,0 +1,108 @@
+name: Publish release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.21.0'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: .bun-version
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+      - name: Restore Rust dependencies, build artifacts and CLI tools
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Includes native/WASM targets and ~/.cargo/bin (wasm-bindgen).
+          save-if: false
+      - name: Install native subsetter build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev
+      - name: Install JS dependencies and test host scheduling
+        run: |
+          bun install --frozen-lockfile
+          bun run test:host
+      - name: Native and WASM checks
+        run: |
+          cargo fmt --all --check
+          cargo xtask test
+          cargo test --locked -p nir-render-wgpu --lib
+          cargo clippy --locked --workspace --all-targets --exclude player-web --exclude nir-render-wgpu --exclude nir-platform-web -- -D warnings
+          cargo clippy --locked -p player-web --target wasm32-unknown-unknown -- -D warnings
+      - name: Build actual SDK and engine test project
+        run: |
+          if [ "$("$HOME/.cargo/bin/wasm-bindgen" --version 2>/dev/null || true)" != 'wasm-bindgen 0.2.100' ]; then
+            cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
+          fi
+          cargo xtask sdk
+          ./dist/novelc -p examples/rain-letters resolve
+          ./dist/novelc -p examples/rain-letters check --locked
+          ./dist/novelc -p examples/rain-letters test
+          ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
+          python3 scripts/verify_release.py dist/rain-letters-web
+          python3 scripts/verify_sdk.py
+      - name: Install desktop browsers and system libraries
+        run: bunx --no-install playwright install --with-deps chromium firefox
+      - name: Chromium software WebGPU regression
+        env:
+          # Keep WebGPU and the compositor on compatible software Vulkan paths.
+          # Force X11 so a developer's Wayland session cannot bypass Xvfb.
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
+        run: |
+          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          export CHROMIUM
+          mkdir -p target/tmp
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:browser --max-failures=1
+      - name: Desktop backend acceptance
+        env:
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          export CHROMIUM
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
+      - name: Package and verify release assets
+        run: |
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$VERSION"; fi
+          test "$(dist/novelc --version)" = "novelc $VERSION"
+          python3 scripts/package.py
+          python3 scripts/verify_release.py dist/bundle/rain-letters-web
+          dist/bundle/novelc release verify --directory dist/bundle/rain-letters-web
+          python3 scripts/audit_publication.py "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz"
+          (cd dist && sha256sum --check SHA256SUMS)
+          readelf -l dist/bundle/novelc | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          TAG="v$VERSION"
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "NIR $TAG · 叙事引擎与 SDK" --notes-file "docs/releases/$TAG.md" "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz" dist/SHA256SUMS
+      - name: Retain release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence
+          path: |
+            reports/
+            dist/SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 14

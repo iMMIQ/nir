@@ -10,7 +10,7 @@ NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览
 
 ## 使用 SDK 创建作品
 
-项目尚未正式发布。按下文从源码构建 Linux x86_64 SDK 与 CLI，在生成的包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
+从 [v0.1.1 Release](https://github.com/iMMIQ/nir/releases/tag/v0.1.1) 下载 Linux x86_64 SDK 与 CLI，或按下文从源码构建，在包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
 
 构建产物为 `dist/novelc` 与 `dist/sdk/`；可以将它们一起复制到独立目录交给作者使用。
 

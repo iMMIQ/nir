@@ -1299,14 +1299,14 @@ dependencies = [
 
 [[package]]
 name = "nir-assets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nir-format",
 ]
 
 [[package]]
 name = "nir-compiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "nir-content"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nir-format",
  "serde",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "nir-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nir-format",
  "rand_chacha",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "nir-format"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "schemars",
  "serde",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "nir-platform-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "js-sys",
  "nir-format",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "nir-player"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nir-assets",
  "nir-content",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "nir-presentation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmic-text",
  "fluent-bundle",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "nir-render-wgpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "glyphon",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "novelc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1509,7 +1509,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "player-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -3096,7 +3096,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",

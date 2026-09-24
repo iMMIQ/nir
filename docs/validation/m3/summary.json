@@ -2200,7 +2200,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/target/m3-baseline/novelc",
+            "serveCli": "target/m3-baseline/novelc",
             "serveLog": null
           },
           "source": "reports/m3-before-corrected/performance-interactions.json",
@@ -3605,7 +3605,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/target/m3-baseline/novelc",
+            "serveCli": "target/m3-baseline/novelc",
             "serveLog": null
           },
           "source": "reports/m3-before-corrected-2/performance-interactions.json",
@@ -3902,7 +3902,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/target/m3-baseline/novelc",
+            "serveCli": "target/m3-baseline/novelc",
             "serveLog": null
           },
           "source": "reports/m3-before-corrected-3/performance-interactions.json",
@@ -6285,7 +6285,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/dist/novelc",
+            "serveCli": "dist/novelc",
             "serveLog": null
           },
           "source": "reports/m3-after/performance-interactions.json",
@@ -8165,7 +8165,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/dist/novelc",
+            "serveCli": "dist/novelc",
             "serveLog": null
           },
           "source": "reports/m3-after-2/performance-interactions.json",
@@ -8462,7 +8462,7 @@
             "networkTrace": false,
             "disableHttpCache": false,
             "serveMode": "novelc",
-            "serveCli": "/home/ayd/code/nir/dist/novelc",
+            "serveCli": "dist/novelc",
             "serveLog": null
           },
           "source": "reports/m3-after-3/performance-interactions.json",
