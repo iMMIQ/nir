@@ -52,6 +52,7 @@ jobs:
           ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
           python3 scripts/verify_release.py dist/rain-letters-web
           python3 scripts/verify_sdk.py
+          python3 scripts/verify_preview_connections.py
       - name: Install desktop browsers and system libraries
         run: bunx --no-install playwright install --with-deps chromium firefox
       - name: Chromium software WebGPU regression
@@ -96,6 +97,16 @@ jobs:
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           TAG="v$VERSION"
           gh release create "$TAG" --target "$GITHUB_SHA" --title "NIR $TAG · 叙事引擎与 SDK" --notes-file "docs/releases/$TAG.md" "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz" dist/SHA256SUMS
+      - name: Retain SDK on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: failed-release-sdk
+          path: |
+            dist/novelc
+            dist/sdk/
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Retain release evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

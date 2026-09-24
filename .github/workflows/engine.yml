@@ -53,6 +53,7 @@ jobs:
           ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
           python3 scripts/verify_release.py dist/rain-letters-web
           python3 scripts/verify_sdk.py
+          python3 scripts/verify_preview_connections.py
       - name: Install desktop browsers and system libraries
         run: bunx --no-install playwright install --with-deps chromium firefox
       - name: Chromium software WebGPU regression
