@@ -4,9 +4,10 @@ async function bootAndProbe(page, trace = true) {
   await page.goto(`/?test=1${trace ? '' : '&trace=0'}`);
   await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
   await page.evaluate(async () => {
-    const channel = await (await fetch('channels/stable.json')).json();
-    const release = await (await fetch(`releases/${channel.release}.json`)).json();
-    const wasm = await import(new URL(release.objects[release.engine.js].path, location.href).href);
+    const root=new URL('../../',location.href);
+    const digest=/\/releases\/([a-f0-9]{64})\//.exec(location.pathname)[1];
+    const release = await (await fetch(new URL(`releases/${digest}.json`,root))).json();
+    const wasm = await import(new URL(release.objects[release.engine.js].path, root).href);
     const original = wasm.Engine.prototype.state;
     window.__fullStateCalls = 0;
     wasm.Engine.prototype.state = function () {

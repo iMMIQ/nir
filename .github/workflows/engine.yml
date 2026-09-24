@@ -38,6 +38,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo xtask test
+          cargo test --locked -p nir-render-wgpu --lib
           cargo clippy --locked --workspace --all-targets --exclude player-web --exclude nir-render-wgpu --exclude nir-platform-web -- -D warnings
           cargo clippy --locked -p player-web --target wasm32-unknown-unknown -- -D warnings
       - name: Build actual SDK and engine test project
@@ -52,8 +53,8 @@ jobs:
           ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
           python3 scripts/verify_release.py dist/rain-letters-web
           python3 scripts/verify_sdk.py
-      - name: Install Chromium and system libraries
-        run: bunx --no-install playwright install --with-deps chromium
+      - name: Install desktop browsers and system libraries
+        run: bunx --no-install playwright install --with-deps chromium firefox
       - name: Chromium software WebGPU regression
         env:
           # Keep WebGPU and the compositor on compatible software Vulkan paths.
@@ -67,6 +68,17 @@ jobs:
           export CHROMIUM
           mkdir -p target/tmp
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:browser --max-failures=1
+      - name: Desktop backend acceptance
+        env:
+          NIR_CHROME_ARGS: >-
+            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
+            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
+            --enable-features=Vulkan --use-vulkan=swiftshader
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          export CHROMIUM
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
       - name: Module performance smoke
         if: github.event_name == 'pull_request'
         env:

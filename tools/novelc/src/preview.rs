@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nir_compiler::{build, diagnostic};
+use nir_compiler::{build_profile, diagnostic};
 use nir_format::ReleaseManifest;
 use std::{
     fs,
@@ -126,6 +126,14 @@ fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
         }
     }
     copy_atomic(&candidate.join(&release_path), &out.join(&release_path))?;
+    for (name, hash) in [
+        ("index.html", &manifest.launch.html),
+        ("bootstrap.js", &manifest.launch.bootstrap),
+    ] {
+        let source = candidate.join(format!("releases/{release}/{name}"));
+        nir_content::verify(&fs::read(&source)?, hash)?;
+        copy_atomic(&source, &out.join(format!("releases/{release}/{name}")))?;
+    }
     for name in ["index.html", "bootstrap.js", "NOTICE.txt"] {
         copy_atomic(&candidate.join(name), &out.join(name))?;
     }
@@ -142,7 +150,7 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
     let out = root.join("dist/full/web");
     // An edit during the initial build must still be noticed by the first watch turn.
     let initial_fingerprint = fingerprint(&root)?;
-    let initial = build(&root, &sdk, &out, true)?;
+    let initial = build_profile(&root, &sdk, &out, "dev", true, true)?;
     let status = Arc::new(Mutex::new(DevStatus {
         release: initial.release,
         ..Default::default()
@@ -178,7 +186,7 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
                 continue;
             }
             let candidate = root.join(".nir/preview-candidate");
-            let result = build(&root, &sdk, &candidate, true);
+            let result = build_profile(&root, &sdk, &candidate, "dev", true, true);
             // Edits during compilation require another stable build before promotion.
             if fingerprint(&root).ok().as_ref() != Some(&current) {
                 pending = None;
@@ -318,6 +326,7 @@ fn serve_request(
             "png" => "image/png",
             "wav" => "audio/wav",
             "otf" => "font/otf",
+            "ttf" => "font/ttf",
             _ => "application/octet-stream",
         };
         let cache = if path
@@ -353,13 +362,7 @@ fn serve_request(
         } else {
             0
         };
-        let mut r = if let Some(dev) = dev.as_ref().filter(|_| ext == "html") {
-            let release = dev.lock().unwrap().release.clone();
-            let html = fs::read_to_string(&file)?.replace("</body>", &format!("<script src=\"/__nir_dev/client.js\" data-release=\"{release}\"></script></body>"));
-            tiny_http::Response::from_string(html).boxed()
-        } else {
-            tiny_http::Response::from_file(fs::File::open(source)?).boxed()
-        };
+        let mut r = tiny_http::Response::from_file(fs::File::open(source)?).boxed();
         for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
         if let Some(id) = timing_id {
             r.add_header(tiny_http::Header::from_bytes("X-NIR-Serve-Id", id.to_string()).unwrap());
@@ -401,6 +404,15 @@ mod tests {
     use std::{io::Write, net::TcpStream};
 
     fn get(root: &Path, path: &str, encoding: Option<&str>) -> (String, Vec<u8>) {
+        get_with_dev(root, path, encoding, None)
+    }
+
+    fn get_with_dev(
+        root: &Path,
+        path: &str,
+        encoding: Option<&str>,
+        dev: Option<Arc<Mutex<DevStatus>>>,
+    ) -> (String, Vec<u8>) {
         let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let root = root.to_path_buf();
@@ -409,7 +421,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
-            serve_request(request, &root, None).unwrap();
+            serve_request(request, &root, dev.as_ref()).unwrap();
         });
         let mut stream = TcpStream::connect(address).unwrap();
         stream
@@ -436,6 +448,29 @@ mod tests {
                 .to_lowercase(),
             response[split + 4..].to_vec(),
         )
+    }
+
+    #[test]
+    fn dev_serves_fixed_entry_bytes_without_injection() {
+        let t = Temp::new();
+        let digest = "a".repeat(64);
+        let fixed = t.0.join(format!("releases/{digest}"));
+        fs::create_dir_all(&fixed).unwrap();
+        let html = b"<!doctype html><body>hashed launch</body>";
+        fs::write(fixed.join("index.html"), html).unwrap();
+        let status = Arc::new(Mutex::new(DevStatus {
+            release: digest.clone(),
+            ..Default::default()
+        }));
+        let (headers, bytes) = get_with_dev(
+            &t.0,
+            &format!("/releases/{digest}/index.html"),
+            None,
+            Some(status),
+        );
+        assert_eq!(bytes, html);
+        assert!(headers.contains("cache-control: public, max-age=31536000, immutable"));
+        assert!(!String::from_utf8(bytes).unwrap().contains("__nir_dev"));
     }
 
     #[test]
@@ -553,7 +588,7 @@ mod tests {
         nir_compiler::resolve(&project, &sdk).unwrap();
         let candidate = t.0.join("candidate");
         let live = t.0.join("live");
-        let report = build(&project, &sdk, &candidate, true).unwrap();
+        let report = build_profile(&project, &sdk, &candidate, "dev", true, true).unwrap();
         publish(&candidate, &live, &report.release).unwrap();
         let old = fs::read(live.join("channels/stable.json")).unwrap();
         let r: ReleaseManifest = serde_json::from_slice(

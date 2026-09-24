@@ -872,28 +872,24 @@ fn add_module_payload(
     Ok(())
 }
 
-fn add_bootstrap_files(
-    closure: &mut ClosureBuilder,
-    out: &Path,
-    sdk: &Path,
-    release: &str,
-) -> Result<()> {
+fn add_bootstrap_files(closure: &mut ClosureBuilder, out: &Path, release: &str) -> Result<()> {
+    let channel = serde_json::to_vec(&serde_json::json!({"format":1,"release":release}))?;
     for (path, bytes, mime, reason) in [
         (
             "index.html".to_owned(),
-            fs::read(sdk.join("index.html"))?,
+            fs::read(out.join("index.html"))?,
             "text/html; charset=utf-8",
             "document bootstrap",
         ),
         (
             "bootstrap.js".to_owned(),
-            fs::read(sdk.join("bootstrap.js"))?,
+            fs::read(out.join("bootstrap.js"))?,
             "text/javascript",
             "release channel and runtime bootstrap",
         ),
         (
             "channels/stable.json".to_owned(),
-            fs::read(out.join("channels/stable.json"))?,
+            channel,
             "application/json",
             "selected release channel pointer",
         ),
@@ -903,6 +899,18 @@ fn add_bootstrap_files(
             "application/json",
             "immutable release object index",
         ),
+        (
+            format!("releases/{release}/index.html"),
+            fs::read(out.join(format!("releases/{release}/index.html")))?,
+            "text/html; charset=utf-8",
+            "fixed release document",
+        ),
+        (
+            format!("releases/{release}/bootstrap.js"),
+            fs::read(out.join(format!("releases/{release}/bootstrap.js")))?,
+            "text/javascript",
+            "fixed release bootstrap",
+        ),
     ] {
         closure.add_file(&path, &bytes, mime, reason);
     }
@@ -911,7 +919,6 @@ fn add_bootstrap_files(
 
 fn dependency_report(
     out: &Path,
-    sdk: &Path,
     release: &str,
     program_hash: &str,
     engine: &EngineFiles,
@@ -973,7 +980,7 @@ fn dependency_report(
             ] {
                 add_consumer_catalogs(&mut boot_builder, objects, runtime, &consumer)?;
             }
-            add_bootstrap_files(&mut boot_builder, out, sdk, release)?;
+            add_bootstrap_files(&mut boot_builder, out, release)?;
 
             let mut entry_builder = boot_builder.clone();
             for (module, path) in &reachable {
@@ -1062,6 +1069,30 @@ fn validate_runtime_packages(out: &Path, executable: &RuntimeExecutable) -> Resu
 }
 
 pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildReport> {
+    build_profile(
+        root,
+        sdk,
+        out,
+        if locked { "release" } else { "dev" },
+        locked,
+        true,
+    )
+}
+
+pub fn build_profile(
+    root: &Path,
+    sdk: &Path,
+    out: &Path,
+    profile: &str,
+    locked: bool,
+    promote: bool,
+) -> Result<BuildReport> {
+    if !matches!(profile, "dev" | "release") {
+        bail!("E_PROFILE: expected dev or release");
+    }
+    if profile == "release" && !locked {
+        bail!("E_RELEASE_LOCK: release builds require --locked");
+    }
     let p = load_project(root)?;
     let lock = if locked {
         check_lock(&p, sdk)?
@@ -1142,8 +1173,23 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         "text/plain; charset=utf-8",
     )?;
     fs::write(out.join("NOTICE.txt"), &notices)?;
+    let html = object(
+        out,
+        &mut objects,
+        &fs::read(sdk.join("index.html"))?,
+        "html",
+        "text/html; charset=utf-8",
+    )?;
+    let bootstrap = object(
+        out,
+        &mut objects,
+        &fs::read(sdk.join("bootstrap.js"))?,
+        "js",
+        "text/javascript",
+    )?;
     let manifest = ReleaseManifest {
         format: 1,
+        profile: profile.into(),
         game_id: game_id.clone(),
         title: p.manifest.game.title.clone(),
         version: p.manifest.game.version.clone(),
@@ -1155,25 +1201,44 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
             wasm: wasm.clone(),
             host: host.clone(),
         },
+        launch: LaunchFiles {
+            html: html.clone(),
+            bootstrap: bootstrap.clone(),
+        },
         notices: vec![notice],
     };
     nir_content::validate_release(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
     let release = nir_content::digest(&bytes);
-    fs::write(out.join(format!("releases/{release}.json")), &bytes)?;
+    let release_path = out.join(format!("releases/{release}.json"));
+    if release_path.exists() {
+        nir_content::verify(&fs::read(&release_path)?, &release)?;
+    } else {
+        fs::write(&release_path, &bytes)?;
+    }
+    let fixed = out.join(format!("releases/{release}"));
+    fs::create_dir_all(&fixed)?;
+    for (name, hash) in [("index.html", &html), ("bootstrap.js", &bootstrap)] {
+        let source = out.join(&objects[hash].path);
+        let target = fixed.join(name);
+        if target.exists() {
+            nir_content::verify(&fs::read(&target)?, hash)?;
+        } else {
+            fs::copy(source, target)?;
+        }
+    }
     for name in ["index.html", "bootstrap.js"] {
         fs::copy(sdk.join(name), out.join(name))?;
     }
-    // Atomic local channel replacement, after every referenced object exists.
-    let tmp = out.join("channels/stable.json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_vec(&serde_json::json!({"format":1,"release":release}))?,
-    )?;
-    fs::rename(tmp, out.join("channels/stable.json"))?;
+    for (hash, descriptor) in &objects {
+        let bytes = fs::read(out.join(&descriptor.path))?;
+        if bytes.len() as u64 != descriptor.bytes {
+            bail!("E_OBJECT_SIZE: {hash}");
+        }
+        nir_content::verify(&bytes, hash)?;
+    }
     let dependencies = dependency_report(
         out,
-        sdk,
         &release,
         &program_hash,
         &manifest.engine,
@@ -1218,6 +1283,15 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         reports.join("dependencies.json"),
         serde_json::to_vec_pretty(&dependencies)?,
     )?;
+    // A channel is the last write, after the complete immutable graph and reports.
+    if promote {
+        let tmp = out.join("channels/stable.json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(&serde_json::json!({"format":1,"release":report.release}))?,
+        )?;
+        fs::rename(tmp, out.join("channels/stable.json"))?;
+    }
     Ok(report)
 }
 pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {

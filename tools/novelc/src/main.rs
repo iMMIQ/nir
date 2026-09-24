@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use nir_compiler::*;
 use std::{fs, path::PathBuf};
 mod preview;
+mod release_lifecycle;
 use preview::{dev, serve};
 #[derive(Parser)]
 #[command(version, about = "NIR content compiler and Web preview")]
@@ -63,6 +64,49 @@ enum Command {
         directory: PathBuf,
         #[arg(long, default_value_t = 4173)]
         port: u16,
+    },
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+}
+#[derive(Subcommand)]
+enum ReleaseCommand {
+    Stage {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        release: Option<String>,
+    },
+    Verify {
+        #[arg(long, conflicts_with = "url", required_unless_present = "url")]
+        directory: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with = "directory",
+            required_unless_present = "directory"
+        )]
+        url: Option<String>,
+        #[arg(long)]
+        release: Option<String>,
+    },
+    Promote {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        release: String,
+        #[arg(long)]
+        expect: String,
+    },
+    Rollback {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        expect: String,
     },
 }
 #[derive(Subcommand)]
@@ -243,7 +287,14 @@ fn run(cli: Cli) -> Result<()> {
                 bail!("E_CAPABILITY: supported --target web --edition full --profile dev|release");
             }
             let out = out.unwrap_or_else(|| cli.project.join("dist/full/web"));
-            let report = build(&cli.project, &sdk, &out, locked)?;
+            let report = build_profile(
+                &cli.project,
+                &sdk,
+                &out,
+                &profile,
+                locked || profile == "release",
+                true,
+            )?;
             println!(
                 "Built {}\nRelease {}\n{} objects / {} bytes",
                 out.display(),
@@ -267,6 +318,45 @@ fn run(cli: Cli) -> Result<()> {
             dev(&cli.project, &sdk, port)?;
         }
         Command::Serve { directory, port } => serve(&directory, port)?,
+        Command::Release { command } => match command {
+            ReleaseCommand::Stage {
+                source,
+                directory,
+                release,
+            } => {
+                let digest = release_lifecycle::stage(&source, &directory, release.as_deref())?;
+                println!("Staged {digest} in {}", directory.display());
+            }
+            ReleaseCommand::Verify {
+                directory,
+                url,
+                release,
+            } => {
+                let location = match (directory, url) {
+                    (Some(path), None) => path.to_string_lossy().into_owned(),
+                    (None, Some(url)) => url,
+                    _ => bail!("E_VERIFY_LOCATION: specify --directory or --url"),
+                };
+                let report = release_lifecycle::verify(&location, release.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            ReleaseCommand::Promote {
+                directory,
+                release,
+                expect,
+            } => {
+                release_lifecycle::promote(&directory, &release, &expect)?;
+                println!("Promoted {release}");
+            }
+            ReleaseCommand::Rollback {
+                directory,
+                to,
+                expect,
+            } => {
+                release_lifecycle::promote(&directory, &to, &expect)?;
+                println!("Rolled back to {to}");
+            }
+        },
     }
     Ok(())
 }

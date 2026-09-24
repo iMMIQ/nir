@@ -249,6 +249,38 @@ fn reproducible_release_lock_drift_and_corruption() {
 }
 
 #[test]
+fn staged_release_has_hashed_fixed_launch_and_no_channel() {
+    let project = project();
+    let sdk = test_sdk();
+    resolve(project.path(), sdk.path()).unwrap();
+    let out = project.path().join("dist/staged");
+    assert!(
+        build_profile(project.path(), sdk.path(), &out, "release", false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("E_RELEASE_LOCK")
+    );
+    let report = build_profile(project.path(), sdk.path(), &out, "release", true, false).unwrap();
+    assert!(project.path().join("reports/build.json").exists());
+    assert!(project.path().join("reports/dependencies.json").exists());
+    assert!(!out.join("channels/stable.json").exists());
+    let bytes = fs::read(out.join(format!("releases/{}.json", report.release))).unwrap();
+    nir_content::verify(&bytes, &report.release).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(release.format, 1);
+    assert_eq!(release.profile, "release");
+    for (name, hash) in [
+        ("index.html", &release.launch.html),
+        ("bootstrap.js", &release.launch.bootstrap),
+    ] {
+        let fixed = fs::read(out.join(format!("releases/{}/{name}", report.release))).unwrap();
+        let object = fs::read(out.join(&release.objects[hash].path)).unwrap();
+        assert_eq!(fixed, object);
+        nir_content::verify(&fixed, hash).unwrap();
+    }
+}
+
+#[test]
 fn release_splits_runtime_packages_and_reports_locale_closures() {
     let d = project();
     let sdk = test_sdk();

@@ -76,33 +76,33 @@ async function advance(page, expectedText) {
 }
 
 async function seedPreferences(page,preferences) {
-  const namespace=`${fixture.manifest.game_id}:dev`;
+  const key=[fixture.manifest.game_id,'release'];
   await page.goto(`${fixture.origin}/channels/stable.json`);
-  await page.evaluate(({namespace,value})=>new Promise((resolve,reject)=>{
-    const request=indexedDB.open('nir-player-v1',1);
+  await page.evaluate(({key,value})=>new Promise((resolve,reject)=>{
+    const request=indexedDB.open('nir-player-isolated-v1',1);
     request.onupgradeneeded=()=>{for(const store of ['saves','preferences','profile'])if(!request.result.objectStoreNames.contains(store))request.result.createObjectStore(store);};
     request.onerror=()=>reject(request.error);
     request.onsuccess=()=>{
       const db=request.result,tx=db.transaction('preferences','readwrite');
-      tx.objectStore('preferences').put(value,namespace);
+      tx.objectStore('preferences').put(value,key);
       tx.oncomplete=()=>{db.close();resolve();};
       tx.onabort=tx.onerror=()=>{db.close();reject(tx.error);};
     };
-  }),{namespace,value:preferences});
+  }),{key,value:preferences});
 }
 
-async function readSavedEnvelope(page,namespace,slot) {
+async function readSavedEnvelope(page,gameId,releaseDigest,slot) {
   return page.evaluate(({key})=>new Promise((resolve,reject)=>{
-    const request=indexedDB.open('nir-player-v1',1);
+    const request=indexedDB.open('nir-player-isolated-v1',1);
     request.onerror=()=>reject(request.error);
     request.onsuccess=()=>{
       const db=request.result,tx=db.transaction('saves','readonly'),get=tx.objectStore('saves').get(key);
       let value;
-      get.onsuccess=()=>{value=get.result;};
+      get.onsuccess=()=>{value=get.result?.envelope;};
       tx.oncomplete=()=>{db.close();resolve(value);};
       tx.onabort=tx.onerror=()=>{db.close();reject(tx.error||get.error);};
     };
-  }),{key:`${namespace}:${slot}`});
+  }),{key:[gameId,'release',releaseDigest,slot]});
 }
 
 const expectedText = (chapter, locale) => locale === 'en'
@@ -244,7 +244,7 @@ test('startup and module calls fetch only the selected chapter and language; cha
   await action(page, { type: 'saves' });
   await action(page, { type: 'save', slot: 0 });
   await page.waitForFunction(() => /已保存|Saved/.test(window.__nir.state().status));
-  const saved=await readSavedEnvelope(page,`${fixture.manifest.game_id}:dev`,0);
+  const saved=await readSavedEnvelope(page,fixture.manifest.game_id,fixture.channel.release,0);
   const frozenDialogues=Object.values(saved.snapshot.tasks).map(task=>task.dialogue).filter(Boolean);
   expect(frozenDialogues).toEqual(expect.arrayContaining([
     expect.objectContaining({text_id:'ch01.line',locale:'zh-Hans'}),

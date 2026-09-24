@@ -430,14 +430,105 @@ export function validateAssetRequest(assets,descriptors) {
 }
 
 // Platform adapter only. Narrative, reading policy, visual UI and layout live in Rust.
-export async function start({wasm,release,releaseDigest,executable,fetchObject,fail,startupTrace=[]}) {
+export const SAVE_DATABASE='nir-player-isolated-v1';
+export const saveKey=(gameId,profile,digest,slot)=>[gameId,profile,digest,slot];
+export const profileKey=(gameId,profile)=>[gameId,profile];
+const releaseDigestPattern=/^[0-9a-f]{64}$/;
+
+export async function openSaveDatabase(indexedDBFactory=indexedDB) {
+    const db=await new Promise((resolve,reject)=>{
+        const r=indexedDBFactory.open(SAVE_DATABASE,1);
+        r.onupgradeneeded=()=>{
+            const database=r.result;
+            if(!database.objectStoreNames.contains('saves'))database.createObjectStore('saves');
+            for(const name of ['preferences','profile'])if(!database.objectStoreNames.contains(name))database.createObjectStore(name);
+        };
+        r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);
+    });
+    db.onversionchange=()=>db.close();
+    return db;
+}
+
+export function readSaveRecord(db,key) {
+    return new Promise((resolve,reject)=>{
+        const tx=db.transaction('saves','readonly'),r=tx.objectStore('saves').get(key);let value;
+        r.onsuccess=()=>{value=r.result;};tx.oncomplete=()=>resolve(value);
+        tx.onabort=tx.onerror=()=>reject(tx.error||r.error);
+    });
+}
+
+export function listHistoryRecords(db,gameId,profile) {
+    return new Promise((resolve,reject)=>{
+        const rows=[],tx=db.transaction('saves','readonly');
+        const range=IDBKeyRange.bound([gameId,profile],[gameId,profile,[]],false,true);
+        const cursor=tx.objectStore('saves').openCursor(range);
+        cursor.onsuccess=()=>{if(cursor.result){rows.push(cursor.result.value);cursor.result.continue();}};
+        tx.oncomplete=()=>resolve(rows.sort((a,b)=>b.saved_at-a.saved_at||a.slot-b.slot));
+        tx.onabort=tx.onerror=()=>reject(tx.error||cursor.error);
+    });
+}
+
+export function commitSaveRecord(db,key,envelope,metadata,expectedRevision) {
+    return new Promise((resolve,reject)=>{
+        const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(key);
+        let conflict=false,writeError=null;
+        r.onsuccess=()=>{try{
+            if((r.result?.envelope?.revision||0)!==expectedRevision){conflict=true;tx.abort();return;}
+            store.put({...metadata,envelope,saved_at:Date.now(),label:new Date().toLocaleString()},key);
+        }catch(e){writeError=e;tx.abort();}};
+        tx.oncomplete=resolve;
+        tx.onabort=()=>reject(writeError||new Error(conflict?'E_SAVE_CONFLICT: another tab changed this slot. Reopen the save menu.':`E_STORAGE: ${tx.error}`));
+        tx.onerror=()=>{};
+    });
+}
+
+export async function validateHistoryTarget({releaseRoot,digest,gameId,profile,fetchImpl=fetch,subtle=crypto.subtle}) {
+    if(!releaseDigestPattern.test(digest))return {available:false,status:'Invalid release digest'};
+    const root=new URL(releaseRoot,location.href),manifest=new URL(`releases/${digest}.json`,root),entry=new URL(`releases/${digest}/index.html`,root);
+    if(root.origin!==location.origin||manifest.origin!==root.origin||entry.origin!==root.origin||!manifest.pathname.startsWith(root.pathname)||!entry.pathname.startsWith(root.pathname))
+        return {available:false,status:'Release is outside this site'};
+    try{
+        const response=await fetchImpl(manifest,{cache:'no-cache'});
+        if(!response.ok)return {available:false,status:'Release resources unavailable'};
+        const bytes=await response.arrayBuffer();
+        const sha256=async value=>Array.from(new Uint8Array(await subtle.digest('SHA-256',value)),x=>x.toString(16).padStart(2,'0')).join('');
+        const actual=await sha256(bytes);
+        if(actual!==digest)return {available:false,status:'Release verification failed'};
+        const release=JSON.parse(new TextDecoder().decode(bytes));
+        if(release.format!==1||release.game_id!==gameId||release.profile!==profile)return {available:false,status:'Different game or profile'};
+        if(!releaseDigestPattern.test(release.launch?.html))return {available:false,status:'Release player verification failed'};
+        const entryResponse=await fetchImpl(entry,{cache:'no-cache'});
+        if(!entryResponse.ok)return {available:false,status:'Release player unavailable'};
+        if(await sha256(await entryResponse.arrayBuffer())!==release.launch.html)return {available:false,status:'Release player verification failed'};
+        return {available:true,status:'Available',url:entry.href};
+    }catch{return {available:false,status:'Release resources unavailable'};}
+}
+
+export async function initializeBackend({requested='auto',probe,create,replaceCanvas}) {
+    if(!['auto','webgpu','webgl2'].includes(requested))throw new Error('E_RENDER_BACKEND: expected auto, webgpu or webgl2');
+    let selected=requested,fallbackReason=null;
+    if(selected==='auto'){
+        try{selected=await probe();if(selected==='webgl2')fallbackReason='WebGPU adapter unavailable';}
+        catch(error){selected='webgl2';fallbackReason=String(error);}
+    }
+    try{return {engine:await create(selected),fallbackReason};}
+    catch(error){
+        if(requested!=='auto'||selected!=='webgpu')throw error;
+        fallbackReason=String(error);replaceCanvas();
+        return {engine:await create('webgl2'),fallbackReason};
+    }
+}
+
+export async function start({wasm,release,releaseDigest,releaseRoot,executable,fetchObject,fail,startupTrace=[]}) {
     const params=new URL(location.href).searchParams;
     const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
     const performanceStats=trace.enabled?new PerformanceRecorder(64):null;
     let traceContext={session:1,device:1};
     const observe=(stage,fields={})=>trace.record(stage,{...traceContext,...fields});
     for(const row of startupTrace)observe(row.stage,row);
-    const canvas=document.querySelector('#stage'), shell=document.querySelector('#shell');
+    let canvas=document.querySelector('#stage');
+    const shell=document.querySelector('#shell');
+    const replaceCanvas=()=>{const next=canvas.cloneNode(false);canvas.replaceWith(next);canvas=next;};
     const program=parseRuntimeProgram(executable);
     const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null,contentStagingBytes:0,peakContentStagingBytes:0,contentStagingBudgetBytes:CONTENT_STAGING_LIMIT,contentStagingReservations:0,contentStagingWaiters:0};
     const syncContentStagingMetrics=budget=>{
@@ -449,20 +540,66 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     };
     const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=innerWidth,height=innerHeight;return {width,height,dpr};};
     let {width,height,dpr}=size();canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
-    const namespace=release.game_id+(location.hostname==='localhost'||location.hostname==='127.0.0.1'?':dev':'');
-    const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('nir-player-v1',1);r.onupgradeneeded=()=>{for(const store of ['saves','preferences','profile'])if(!r.result.objectStoreNames.contains(store))r.result.createObjectStore(store);};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
-    db.onversionchange=()=>db.close();
+    if(!['dev','release'].includes(release.profile)||!releaseDigestPattern.test(releaseDigest))throw new Error('E_RELEASE_IDENTITY');
+    const sharedKey=profileKey(release.game_id,release.profile);
+    const slotKey=slot=>saveKey(release.game_id,release.profile,releaseDigest,slot);
+    const db=await openSaveDatabase();
     const read=(store,key)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readonly');const r=tx.objectStore(store).get(key);let value;r.onsuccess=()=>{value=r.result;};tx.oncomplete=()=>resolve(value);tx.onabort=tx.onerror=()=>reject(tx.error||r.error);});
     const write=(store,key,value)=>new Promise((resolve,reject)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(value,key);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});
-    const savedPreferences=await read('preferences',namespace);
+    const savedPreferences=await read('preferences',sharedKey);
     let preferences=initialRuntimePreferences(program,savedPreferences,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches);
     observe('preferences_loaded');
     const createStart=String(Math.round(performance.now()*1000));
-    const engine=await wasm.Engine.create(executable,releaseDigest,release.title,'stage',JSON.stringify(preferences));
+    let initialized;
+    try{initialized=await initializeBackend({requested:params.get('backend')||'auto',probe:()=>wasm.probe_backend(),
+        create:backend=>wasm.Engine.create(executable,releaseDigest,release.title,'stage',JSON.stringify(preferences),backend),replaceCanvas});}
+    catch(error){db.close();throw error;}
+    const {engine,fallbackReason}=initialized;
+    const activeBackend=engine.backend();
     engine.set_profiling(trace.enabled);
     preferences=JSON.parse(engine.state()).preferences;
     observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
     document.title=release.title;
+    const historyStyle=document.createElement('style');
+    historyStyle.textContent=`#nir-history-button,#nir-dev-banner{position:fixed;z-index:4;font:14px system-ui,sans-serif}#nir-history-button{top:12px;right:12px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:4px;cursor:pointer}#nir-dev-banner{top:12px;left:12px;padding:7px 10px;background:#9d6823;color:#fff;border-radius:4px;pointer-events:none}#nir-history-panel{position:fixed;z-index:6;inset:0;background:#071b20ed;color:#f2f2e9;overflow:auto;padding:clamp(18px,4vw,48px);font:15px system-ui,sans-serif}#nir-history-panel[hidden]{display:none}#nir-history-panel .nir-history-inner{max-width:900px;margin:auto}#nir-history-panel h2{font-size:24px;font-weight:500}#nir-history-panel button{margin:3px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:3px;cursor:pointer}#nir-history-panel button:disabled{opacity:.45;cursor:default}#nir-history-panel table{width:100%;border-collapse:collapse}#nir-history-panel th,#nir-history-panel td{text-align:left;border-bottom:1px solid #5d7474;padding:10px 6px;vertical-align:top}#nir-history-panel code{overflow-wrap:anywhere}#nir-history-panel .nir-history-status{min-width:115px}`;
+    document.head.append(historyStyle);
+    const historyButton=document.createElement('button');historyButton.id='nir-history-button';historyButton.type='button';historyButton.textContent='发行存档 / Save history';historyButton.onclick=()=>{if(state().screen==='Story')void action({type:'menu'});historyPanel.hidden=false;document.querySelector('#actions').inert=true;historyClose.focus();void refreshHistory();};document.body.append(historyButton);
+    let devBanner=null;
+    if(release.profile==='dev'){devBanner=document.createElement('div');devBanner.id='nir-dev-banner';devBanner.textContent='Development build · saves are isolated';document.body.append(devBanner);}
+    const historyPanel=document.createElement('section');historyPanel.id='nir-history-panel';historyPanel.hidden=true;historyPanel.setAttribute('role','dialog');historyPanel.setAttribute('aria-modal','true');historyPanel.setAttribute('aria-label','Save history');
+    const historyInner=document.createElement('div');historyInner.className='nir-history-inner';
+    const historyHeading=document.createElement('h2');historyHeading.textContent='发行存档 / Save history';historyInner.append(historyHeading);
+    const historyClose=document.createElement('button');historyClose.type='button';historyClose.textContent='关闭 / Close';historyClose.onclick=()=>{historyPanel.hidden=true;document.querySelector('#actions').inert=false;historyButton.focus();};historyInner.append(historyClose);
+    const historyMessage=document.createElement('p');historyMessage.setAttribute('role','status');historyInner.append(historyMessage);
+    const historyTable=document.createElement('table'),historyBody=document.createElement('tbody');historyTable.innerHTML='<thead><tr><th>Release / version</th><th>Slot</th><th>Saved</th><th>Status</th><th>Actions</th></tr></thead>';historyTable.append(historyBody);historyInner.append(historyTable);historyPanel.append(historyInner);document.body.append(historyPanel);
+    historyPanel.addEventListener('keydown',e=>{e.stopPropagation();if(e.key==='Escape'){e.preventDefault();historyClose.click();}else if(e.key==='Tab'){const buttons=[...historyPanel.querySelectorAll('button:not(:disabled)')];const first=buttons[0],last=buttons.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}}});
+    function downloadSaveRecord(record){
+        const url=URL.createObjectURL(new Blob([JSON.stringify(record.envelope)],{type:'application/json'}));
+        const a=document.createElement('a');a.href=url;a.download=`${record.gameId}-${record.releaseDigest.slice(0,12)}-slot-${record.slot}.nir-save.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    }
+    let historyGeneration=0;
+    async function refreshHistory(){
+        const generation=++historyGeneration;historyMessage.textContent='Checking saved releases…';historyBody.replaceChildren();
+        try{
+            const records=await listHistoryRecords(db,release.game_id,release.profile);
+            if(generation!==historyGeneration||disposed)return;
+            if(!records.length){historyMessage.textContent='No saves for this game and profile.';return;}
+            historyMessage.textContent=`${records.length} saved slot${records.length===1?'':'s'}`;
+            const targets=new Map();
+            for(const record of records){
+                if(!targets.has(record.releaseDigest))targets.set(record.releaseDigest,validateHistoryTarget({releaseRoot,digest:record.releaseDigest,gameId:release.game_id,profile:release.profile}));
+                const row=document.createElement('tr');
+                const identity=document.createElement('td');const digest=document.createElement('code');digest.textContent=record.releaseDigest;identity.append(document.createTextNode(`${record.version||'Version unknown'} · `),digest);
+                const slot=document.createElement('td');slot.textContent=String(record.slot+1);
+                const date=document.createElement('td');date.textContent=record.saved_at?new Date(record.saved_at).toLocaleString():'Unknown';
+                const status=document.createElement('td');status.className='nir-history-status';status.textContent='Checking…';
+                const actions=document.createElement('td');const exportButton=document.createElement('button');exportButton.type='button';exportButton.textContent='Export';exportButton.onclick=()=>downloadSaveRecord(record);actions.append(exportButton);
+                const openButton=document.createElement('button');openButton.type='button';openButton.textContent='Open release';openButton.disabled=true;actions.append(openButton);
+                row.append(identity,slot,date,status,actions);historyBody.append(row);
+                void targets.get(record.releaseDigest).then(target=>{if(generation!==historyGeneration||disposed)return;status.textContent=target.status;if(target.available){openButton.disabled=false;openButton.onclick=()=>{const targetUrl=new URL(target.url);targetUrl.search=location.search;location.assign(targetUrl.href);};}},()=>{if(generation===historyGeneration)status.textContent='Release resources unavailable';});
+            }
+        }catch(error){if(generation===historyGeneration)historyMessage.textContent=`Unable to read save history: ${error}`;}
+    }
     const AudioContext=window.AudioContext||window.webkitAudioContext;
     const audio=new AudioContext();let unlocked=null,audioPaused=true;
     const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
@@ -758,22 +895,18 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     }
     function listSaves() {
         return request(async()=>{
-            const rows=[];for(let slot=0;slot<3;slot++){const s=await read('saves',`${namespace}:${slot}`);if(s)rows.push({slot,revision:s.revision,label:s.label||`#${s.revision}`});}return rows;
+            const rows=[];for(let slot=0;slot<3;slot++){const s=await readSaveRecord(db,slotKey(slot));if(s)rows.push({slot,revision:s.envelope.revision,label:s.label||`#${s.envelope.revision}`});}return rows;
         },rows=>hostEvent('slots',rows),e=>hostEvent('load_failed',String(e)),{group:'slots',replace:true});
     }
     function save(c) {
         const context={request:c.job,session:state().session,operation:'save'};observe('storage_started',context);
-        return request(()=>new Promise((resolve,reject)=>{
-            const tx=db.transaction('saves','readwrite'),store=tx.objectStore('saves'),r=store.get(`${namespace}:${c.slot}`);let conflict=false,writeError=null;
-            r.onsuccess=()=>{try{const current=r.result;if((current?.revision||0)!==c.expected_revision){conflict=true;tx.abort();return;}const record={...c.envelope,label:new Date().toLocaleString(),saved_at:Date.now()};store.put(record,`${namespace}:${c.slot}`);}catch(e){writeError=e;tx.abort();}};
-            tx.oncomplete=resolve;tx.onabort=()=>reject(writeError||new Error(conflict?'E_SAVE_CONFLICT: another tab changed this slot. Reopen the save menu.':`E_STORAGE: ${tx.error}`));tx.onerror=()=>{};
-        }),()=>{observe('storage_committed',context);hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision});},
+        const metadata={gameId:release.game_id,profile:release.profile,releaseDigest,slot:c.slot,version:release.version||'',title:release.title||''};
+        return request(()=>commitSaveRecord(db,slotKey(c.slot),c.envelope,metadata,c.expected_revision),()=>{observe('storage_committed',context);hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision});if(historyPanel&&!historyPanel.hidden)void refreshHistory();},
             e=>{const code=e?.name==='QuotaExceededError'?'E_STORAGE_QUOTA':String(e).includes('E_SAVE_CONFLICT')?'E_SAVE_CONFLICT':'E_STORAGE';observe('diagnostic',{...context,domain:'storage',code});hostEvent('save_failed',{job:c.job,code,message:String(e)});},{group:`save:${c.job}`});
     }
-    const envelope=(record)=>{const {label,saved_at,...e}=record;return e;};
     function load(slot) {
         const session=state().session;
-        return request(async()=>{const s=await read('saves',`${namespace}:${slot}`);if(!s)throw new Error('E_SAVE_MISSING');return envelope(s);},
+        return request(async()=>{const s=await readSaveRecord(db,slotKey(slot));if(!s)throw new Error('E_SAVE_MISSING');return s.envelope;},
             value=>{if(state().session===session)hostEvent('loaded',value);},
             e=>{if(state().session===session)hostEvent('load_failed',String(e));},{group:'load',replace:true});
     }
@@ -792,7 +925,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
         };
         try{input.click();}catch(e){post(slot,()=>hostEvent('load_failed',String(e)));}
     }
-    async function mergeProfile(keys) {await new Promise((resolve,reject)=>{const tx=db.transaction('profile','readwrite'),store=tx.objectStore('profile'),r=store.get(namespace);r.onsuccess=()=>store.put([...new Set([...(r.result||[]),...keys])].sort(),namespace);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});}
+    async function mergeProfile(keys) {await new Promise((resolve,reject)=>{const tx=db.transaction('profile','readwrite'),store=tx.objectStore('profile'),r=store.get(sharedKey);r.onsuccess=()=>store.put([...new Set([...(r.result||[]),...keys])].sort(),sharedKey);tx.oncomplete=resolve;tx.onabort=tx.onerror=()=>reject(tx.error);});}
     function flush() {if(disposed)return;
         if(trace.enabled){const current=state();traceContext={session:current.session,device:current.device,locale:current.locale};}
         for(const c of JSON.parse(engine.commands())){
@@ -812,7 +945,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
             case 'audio_pause':audioPaused=c.paused;if(c.paused){audio.suspend().catch(()=>{});}else if(unlocked){audio.resume().catch(e=>console.warn(e));}break;
             case 'save':save(c);break;case 'load':load(c.slot);break;case 'list_saves':listSaves();break;
             case 'apply_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`];break;
-            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;{const value=preferences;request(()=>write('preferences',namespace,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
+            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;{const value=preferences;request(()=>write('preferences',sharedKey,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
             case 'persist_profile':request(()=>mergeProfile(c.keys),()=>{},e=>hostEvent('load_failed',`E_PROFILE: ${e}`));break;
             case 'export':{const url=URL.createObjectURL(new Blob([c.json],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`${release.game_id}.nir-save.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);break;}
             case 'import':importSave();break;
@@ -896,6 +1029,7 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     };
     const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action({type:'scroll',region:view.region,delta:e.deltaY>0?1:-1});}};
     const onKey=(e)=>{
+        if(!historyPanel.hidden){if(e.key==='Escape'){e.preventDefault();historyClose.click();}return;}
         if(e.isComposing||e.repeat||e.ctrlKey||e.metaKey||e.altKey)return;
         if(e.key==='PageUp'||e.key==='PageDown'){
             const s=state(),view=s.scrolls.find(v=>v.region==='choices')||s.scrolls[0];
@@ -908,15 +1042,22 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     };
     const onVisibility=()=>{const hidden=document.hidden;deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
     const onResize=()=>schedule();
-    canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',()=>down=null);window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
+    let glContextLost=false;
+    const onCancel=()=>down=null;
+    const onGlLost=e=>{e.preventDefault();glContextLost=true;deliver(checkDevice,'control');};
+    function bindCanvas(){canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
+    function unbindCanvas(){canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
+    bindCanvas();window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;
-        const validation=engine.gpu_error();if(validation){observe('diagnostic',{domain:'render',code:'E_GPU_VALIDATION',operation:'render'});fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
-        if(!engine.device_lost())return;
+        const validation=engine.gpu_error();if(validation&&!glContextLost){observe('diagnostic',{domain:'render',code:'E_GPU_VALIDATION',operation:'render'});fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
+        if(!glContextLost&&!engine.device_lost())return;
         recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;mutateEngine(()=>engine.begin_recovery());
         const recovery=inbox.reserve('control','device');
         if(!recovery){fail('E_REQUEST_CAPACITY: device recovery');dispose();return;}
-        wasm.create_gpu('stage').then(gpu=>{
+        const backend=activeBackend;
+        if(backend==='webgl2'){unbindCanvas();replaceCanvas();bindCanvas();glContextLost=false;}
+        wasm.create_gpu('stage',backend).then(gpu=>{
             if(disposed||recovery.state==='cancelled'){gpu.free();return;}
             post(recovery,()=>{mutateEngine(()=>engine.replace_gpu(gpu));recovering=false;lastTime=performance.now();});
         },e=>post(recovery,()=>{fail(`E_DEVICE_RECOVERY: ${e}`);dispose();}));
@@ -927,12 +1068,12 @@ export async function start({wasm,release,releaseDigest,executable,fetchObject,f
     const diagnostics=()=>{
         const performance=performanceStats?performanceStats.snapshot():{...disabledPerformance};
         if(performanceStats&&!disposed)performance.text_cache=JSON.parse(engine.text_cache_stats());
-        return {format:1,release:releaseDigest,engine:release.engine.wasm,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,decode_pool_active:decodePool.active,decode_pool_waiting:decodePool.waiting.length,upload_pool_active:uploadPool.active,upload_pool_waiting:uploadPool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_media:[...preparations].slice(0,128).map(([request,job])=>({request,session:job.session,priority:job.priority,aborted:job.signal.aborted,stages:[...job.nodes.values()].slice(0,128).map(node=>({asset:node.asset,stage:node.stage}))})),pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
+        return {format:1,release:releaseDigest,engine:release.engine.wasm,backend:activeBackend,fallback_reason:fallbackReason,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,decode_pool_active:decodePool.active,decode_pool_waiting:decodePool.waiting.length,upload_pool_active:uploadPool.active,upload_pool_waiting:uploadPool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_media:[...preparations].slice(0,128).map(([request,job])=>({request,session:job.session,priority:job.priority,aborted:job.signal.aborted,stages:[...job.nodes.values()].slice(0,128).map(node=>({asset:node.asset,stage:node.stage}))})),pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
     };
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state:debugState,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>mutateEngine(()=>engine.action(JSON.stringify(a),token,seq,epoch)),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>mutateEngine(()=>engine.hidden(v)))};
-    request(()=>read('profile',namespace),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
-    function dispose(){if(disposed)return;disposed=true;clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
+    request(()=>read('profile',sharedKey),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
+    function dispose(){if(disposed)return;disposed=true;historyGeneration++;historyPanel.remove();historyButton.remove();historyStyle.remove();devBanner?.remove();clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();unbindCanvas();window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
     window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(true)));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(false)));}});
 }

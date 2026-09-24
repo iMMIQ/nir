@@ -1238,6 +1238,7 @@ impl Address {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
     pub format: u32,
+    pub profile: String,
     pub game_id: String,
     pub title: String,
     pub version: String,
@@ -1245,8 +1246,16 @@ pub struct ReleaseManifest {
     pub program: String,
     pub objects: BTreeMap<String, Object>,
     pub engine: EngineFiles,
+    pub launch: LaunchFiles,
     #[serde(default)]
     pub notices: Vec<String>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchFiles {
+    pub html: String,
+    pub bootstrap: String,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]

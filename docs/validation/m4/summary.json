@@ -1,0 +1,97 @@
+{
+  "format": 1,
+  "date": "2026-09-24",
+  "milestones": [
+    "M4.1",
+    "M4.2"
+  ],
+  "release": "69aadb5793058cf537b55db3ef5ec8d5f769419a2b956686a59581294158eeae",
+  "release_manifest_format": 1,
+  "native": {
+    "full_suite_passed": 171,
+    "subsequent_cli_tests_passed": 4,
+    "renderer_unit_tests_passed": 5,
+    "new_staging_test": "PASS",
+    "architecture": "PASS",
+    "fmt": "PASS",
+    "native_clippy": "PASS",
+    "wasm_clippy": "PASS"
+  },
+  "host": {
+    "passed": 57,
+    "failed": 0
+  },
+  "browser": {
+    "passed": 45,
+    "groups": [
+      4,
+      41
+    ],
+    "note": "Author/font group passed; remaining group rerun after fixing test URLs for pinned release entries."
+  },
+  "backends": {
+    "passed": 8,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 51729.95,
+    "matrix": [
+      "Chromium 153.0.8010.52 / WebGPU / SwiftShader",
+      "Chromium 153.0.8010.52 / WebGL2 / SwiftShader",
+      "Firefox 155 / WebGL2 / llvmpipe"
+    ],
+    "checks": [
+      "story and audio",
+      "save and reload",
+      "device/context loss",
+      "WebGPU device initialization failure fallback with new canvas",
+      "forced backend failure",
+      "RGB and transparent overlay comparison"
+    ]
+  },
+  "standalone_sdk": {
+    "status": "PASS",
+    "commands": [
+      "init",
+      "resolve",
+      "doctor",
+      "check --locked",
+      "test",
+      "build --locked"
+    ],
+    "repeat_build_same_release": true,
+    "sdk_drift_rejected": true,
+    "cargo_on_path": false,
+    "structured_source_diagnostic": true,
+    "author_theme_edit_without_engine_rebuild": true,
+    "resolved_configuration": true,
+    "minimal_template": true,
+    "new_chinese_without_external_font_tools": true,
+    "minimal_cli_path_empty": true,
+    "clean_cache_reproducible": true,
+    "source_change_and_translation_review": true,
+    "release_stage_promote_rollback": true,
+    "release_verifier_without_external_runtime": true,
+    "release_corruption_and_cas_rejected": true,
+    "remote_mime_cache_and_404_checked": true,
+    "dev_promotion_rejected": true
+  },
+  "release_validation": {
+    "format": 1,
+    "location": "dist/rain-letters-web",
+    "objects": 23,
+    "profile": "release",
+    "release": "69aadb5793058cf537b55db3ef5ec8d5f769419a2b956686a59581294158eeae",
+    "status": "PASS"
+  },
+  "environment": {
+    "os": "NixOS",
+    "display": "Xvfb",
+    "rendering": "software",
+    "firefox_libraries": "Playwright Firefox with local GTK/GL/PulseAudio runtime library paths"
+  },
+  "remaining": [
+    "M4.3 scenario preview and dev instance isolation",
+    "Safari/mobile/physical GPU acceptance",
+    "production hosting deployment exercise"
+  ]
+}

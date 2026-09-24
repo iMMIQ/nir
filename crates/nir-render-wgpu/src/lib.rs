@@ -15,6 +15,22 @@ use std::{
 };
 pub use wgpu;
 
+/// Browser rendering backend selected before a canvas context is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererBackend {
+    WebGpu,
+    WebGl2,
+}
+
+impl RendererBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WebGpu => "webgpu",
+            Self::WebGl2 => "webgl2",
+        }
+    }
+}
+
 const MAX_PENDING_PROFILES: usize = 64;
 
 /// One CPU timing sample from the renderer.
@@ -110,6 +126,7 @@ pub struct Renderer {
     swash: SwashCache,
     pub submitted: u64,
     pub adapter_info: String,
+    pub backend: RendererBackend,
     lost: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
     profile: ProfileCollector,
@@ -121,6 +138,46 @@ fn error(message: impl Into<String>) -> Diagnostic {
         "gpu",
         vec![Recovery::Reload, Recovery::Exit],
     )
+}
+fn select_surface_format(
+    formats: &[wgpu::TextureFormat],
+    backend: RendererBackend,
+) -> Result<(
+    wgpu::TextureFormat,
+    wgpu::TextureFormat,
+    Vec<wgpu::TextureFormat>,
+)> {
+    match backend {
+        RendererBackend::WebGpu => {
+            let surface_format = *formats.first().ok_or_else(|| error("no surface format"))?;
+            let format = surface_format.add_srgb_suffix();
+            let views = if format == surface_format {
+                Vec::new()
+            } else {
+                vec![format]
+            };
+            Ok((surface_format, format, views))
+        }
+        RendererBackend::WebGl2 => {
+            // WebGL2 does not offer texture view reinterpretation. Its surface
+            // presents through an sRGB conversion shader when configured as sRGB.
+            let format = formats
+                .iter()
+                .copied()
+                .find(wgpu::TextureFormat::is_srgb)
+                .ok_or_else(|| error("WebGL2 surface has no sRGB format"))?;
+            Ok((format, format, Vec::new()))
+        }
+    }
+}
+fn image_dimensions_allowed(width: u32, height: u32, max_texture_dimension: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= 8192
+        && height <= 8192
+        && (width as u64) * (height as u64) <= 32 * 1024 * 1024
+        && width <= max_texture_dimension
+        && height <= max_texture_dimension
 }
 fn linear(v: f32) -> f32 {
     if v <= 0.04045 {
@@ -156,6 +213,7 @@ impl Renderer {
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
+        backend: RendererBackend,
     ) -> Result<Self> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -172,10 +230,13 @@ impl Renderer {
         );
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("NIR WebGPU"),
+                label: Some("NIR renderer"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits: match backend {
+                    RendererBackend::WebGpu => wgpu::Limits::downlevel_defaults(),
+                    RendererBackend::WebGl2 => wgpu::Limits::downlevel_webgl2_defaults(),
+                }
+                .using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
             })
@@ -191,19 +252,16 @@ impl Renderer {
         device.on_uncaptured_error(Box::new(move |e| sink.lock().unwrap().push(e.to_string())));
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let caps = surface.get_capabilities(&adapter);
-        let surface_format = *caps
-            .formats
-            .first()
-            .ok_or_else(|| error("no surface format"))?;
-        let format = surface_format.add_srgb_suffix();
+        let (surface_format, format, view_formats) = select_surface_format(&caps.formats, backend)?;
+        let max_dimension = device.limits().max_texture_dimension_2d;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: width.max(1),
-            height: height.max(1),
+            width: width.clamp(1, max_dimension),
+            height: height.clamp(1, max_dimension),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-            view_formats: vec![format],
+            view_formats,
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
@@ -342,6 +400,7 @@ impl Renderer {
             swash: SwashCache::new(),
             submitted: 0,
             adapter_info,
+            backend,
             lost,
             errors,
             profile: ProfileCollector::default(),
@@ -461,8 +520,8 @@ impl Renderer {
                 .with_guessed_format()
                 .map_err(|e| error(e.to_string()))?;
             let (w, h) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
-            if w == 0 || h == 0 || w > 8192 || h > 8192 || w as u64 * h as u64 > 32 * 1024 * 1024 {
-                return Err(error("image dimensions exceed admission limit"));
+            if !image_dimensions_allowed(w, h, self.device.limits().max_texture_dimension_2d) {
+                return Err(error("image dimensions exceed supported texture limit"));
             }
             let pixels = image::load_from_memory(bytes)
                 .map_err(|e| error(e.to_string()))?
@@ -775,6 +834,13 @@ impl Renderer {
                 target_start = verts.len();
                 append(&mut verts, b);
                 let [w, h] = p.stage_size;
+                if w == 0
+                    || h == 0
+                    || w > self.device.limits().max_texture_dimension_2d
+                    || h > self.device.limits().max_texture_dimension_2d
+                {
+                    return Err(error("stage dimensions exceed GPU texture limit"));
+                }
                 if !self
                     .scratch
                     .as_ref()
@@ -900,6 +966,38 @@ mod profile_tests {
         (srgb(linear(channel as f32 / 255.) * a) * 255.)
             .round()
             .clamp(0., 255.) as u8
+    }
+
+    #[test]
+    fn webgl_uses_srgb_surface_without_view_reinterpretation() {
+        let formats = [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ];
+        let (surface, view, extras) =
+            select_surface_format(&formats, RendererBackend::WebGl2).unwrap();
+        assert_eq!(surface, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(view, surface);
+        assert!(extras.is_empty());
+        assert!(select_surface_format(&formats[..1], RendererBackend::WebGl2).is_err());
+    }
+
+    #[test]
+    fn webgpu_keeps_srgb_view_for_linear_surface() {
+        let (surface, view, extras) =
+            select_surface_format(&[wgpu::TextureFormat::Bgra8Unorm], RendererBackend::WebGpu)
+                .unwrap();
+        assert_eq!(surface, wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(view, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(extras, vec![view]);
+    }
+
+    #[test]
+    fn image_limits_include_adapter_limit() {
+        assert!(image_dimensions_allowed(4096, 4096, 4096));
+        assert!(!image_dimensions_allowed(4097, 1, 4096));
+        assert!(!image_dimensions_allowed(8192, 8192, 16384));
+        assert!(!image_dimensions_allowed(0, 1, 4096));
     }
 
     #[test]

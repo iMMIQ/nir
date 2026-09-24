@@ -10,7 +10,7 @@
 | nir-assets | 联合预算、去重占用、准备集合、不可复制 ReadyLease |
 | nir-presentation | Fluent、只读界面投影、场景层次、cosmic-text 排版 |
 | nir-player | 事件队列、准备提交、暂停所有权、存储作业和恢复候选 |
-| nir-render-wgpu | WebGPU 表面、线性预乘合成、转场与 glyphon |
+| nir-render-wgpu | WebGPU/WebGL2 表面、线性预乘合成、转场与 glyphon |
 | nir-platform-web | 浏览器画布接口及输入、Web Audio、IndexedDB 宿主 |
 | nir-compiler | 工程解析、验证、执行模块、场景测试、构建与锁 |
 
@@ -111,3 +111,11 @@ PauseToken 为不可复制的独立所有权对象，Drop 只释放本持有人�
 作者文本整数版本与 checked-in revisions.json 由 nir-compiler 校验；更新和人工复核只在 CLI 发生。研发阶段在 v1 上破坏性迭代，运行 Program/Executable 保持版本 1，包含生成的 contract_digest；nir-format 提供平台无关的契约摘要编码及 span 契约检查，Core 独立验证它们。哈希仅依赖 SHA-256/序列化，不引入文件系统、编译器或宿主。
 
 Snapshot 保持版本 1，但使用新结构，冻结对白/历史的源、语义、契约身份，Profile 已读键按 MeaningRevision。来源路径、人工确认摘要和修订事务日志不进入运行包。精确发行兼容仍然成立；源工程迁移不等于存档迁移。详见 [文本修订](TEXT-REVISIONS.md)。
+
+## ADR-015：发行隔离与双渲染后端
+
+release manifest v1 记录 profile 和固定启动文件摘要；根入口选择频道后进入固定发行目录。stage 不切频道，promote/rollback 使用本地串行锁、预期发行校验和原子指针替换。发行验证直接读取本地或 HTTP(S) 上的实际文件。
+
+存档按游戏、profile、发行和槽位隔离，历史续玩打开对应固定发行；偏好/Profile 按游戏及环境共享。
+
+标准 WASM 同时包含 WebGPU/WebGL2；宿主探测并完成启动回退，已绑定的画布须替换后才能改变后端。运行中设备恢复保持后端，恢复纹理和转场而不重放剧情。详细流程见 [M4](M4-RELEASE.md)。

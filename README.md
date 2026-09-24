@@ -1,18 +1,18 @@
 # NIR 叙事引擎
 
-NIR 是使用 Rust / WASM / WebGPU 实现的叙事引擎，提供浏览器播放器、作品开发工具 `novelc` 和可独立使用的 SDK。作者可以创建、检查、预览作品，并构建可部署到静态站点的发布目录；编辑作品无需重新编译引擎。
+NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览器播放器、作品开发工具 `novelc` 和可独立使用的 SDK。作者可以创建、检查、预览作品，并构建可部署到静态站点的发布目录；编辑作品无需重新编译引擎。
 
-引擎负责确定性剧情执行、场景演出、文字排版与揭示、声音协调、存读档、检查点回退、回看和语言设置。剧情推进、可视界面、文字排版和绘制均在 Rust 中；JavaScript 负责浏览器输入、文件获取、音频和本地存储。模块职责与依赖边界见 [架构说明](docs/ARCHITECTURE.md)。
+引擎负责确定性剧情执行、场景演出、文字排版与揭示、声音协调、存读档、检查点回退、回看和语言设置。剧情推进、作品可视界面、文字排版和绘制均在 Rust 中；JavaScript 负责浏览器输入、文件获取、音频、本地存储及发行存档管理。模块职责与依赖边界见 [架构说明](docs/ARCHITECTURE.md)。
 
 `examples/rain-letters/`（《雨后书简》）是随仓库提供的测试工程，用于验证引擎功能、运行两条剧情测试路线，以及演示作品工程格式。其简单图像和合成音频用于测试。
 
-这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。 当前处于研发阶段，允许在 v1 格式内破坏性迭代；版本号相同不表示兼容旧开发构建，CLI/SDK 应配套使用。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 、[诊断和性能测量](docs/DIAGNOSTICS.md) 、[作品配置和主题契约](docs/PROJECT-THEMES.md) 、[作者阅读和预览](docs/AUTHOR-READING.md) 、[字体编译和独立模板](docs/AUTHOR-FONTS.md) 与 [文本修订和翻译维护](docs/TEXT-REVISIONS.md)。
+这是六份 NIR 设计文档中一个受限能力集的实现，不代表六份规范的完整 V1。 当前处于研发阶段，协议在 v1 格式内迭代，CLI/SDK 配套使用。具体支持范围见 [能力表](docs/CAPABILITIES.md)，v0.1.0 的验证记录见 [验收报告](docs/TEST-REPORT.md)，后续调度改进见 [引擎稳定性进展](docs/ENGINE-STABILITY.md)、[请求生命周期进展](docs/REQUEST-LIFECYCLE.md) 、[诊断和性能测量](docs/DIAGNOSTICS.md) 、[作品配置和主题契约](docs/PROJECT-THEMES.md) 、[作者阅读和预览](docs/AUTHOR-READING.md) 、[字体编译和独立模板](docs/AUTHOR-FONTS.md) 与 [文本修订和翻译维护](docs/TEXT-REVISIONS.md)。
 
 ## 使用 SDK 创建作品
 
-从 [GitHub Releases](https://github.com/iMMIQ/nir/releases) 下载 Linux x86_64 SDK 与 CLI 包，解压后在包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
+项目尚未正式发布。按下文从源码构建 Linux x86_64 SDK 与 CLI，在生成的包目录运行以下命令。保留 `novelc` 与整个 `sdk/` 在同一目录，离开本仓库也能使用。编辑作品不需要安装 Rust。
 
-当前源码包含 v0.1.0 之后的改进。要使用作品配置、长内容阅读、自动预览、字体编译和翻译维护，请按下文从源码构建配套 SDK；已发布的 v0.1.0 包尚不包含这些能力。
+构建产物为 `dist/novelc` 与 `dist/sdk/`；可以将它们一起复制到独立目录交给作者使用。
 
 ```sh
 ./novelc init my-story
@@ -108,5 +108,7 @@ python3 scripts/verify_sdk.py
 日常修改 Core/Player/展示层可先运行 `cargo xtask test --quick` 和 `bun run test:host`；编译器、字体和 CLI 的测试及架构检查仍由完整 `cargo xtask test` 执行。还可用 `cargo xtask test --quick <测试名>` 或 `bun run test:browser tests/browser/modules.spec.js` 定位验证。CI 保留完整测试，并缓存 Rust 依赖编译产物和固定版本的 wasm-bindgen CLI。迁移说明和实测结果见 [构建与测试速度](docs/BUILD-SPEED.md)。
 
 浏览器测试默认使用有窗口的 `/usr/bin/chromium`。可用 `CHROMIUM` 改路径，`NIR_CHROME_ARGS` 添加启动参数。Linux 无桌面环境可尝试 Xvfb，但必须实际检查画布截图；本机无界面模式曾出现 WebGPU 提交成功而画布空白的系统合成问题，不能把它当作通过。测试只在 `?test=1` 下启用只读状态及故障注入接口。
+
+发行晋级、回滚、存档隔离和 WebGPU/WebGL2 验收见 [M4 发行与桌面渲染](docs/M4-RELEASE.md)。
 
 原始附件保存在 `docs/specs/`，仅作为设计依据。[架构决策](docs/ARCHITECTURE.md) 说明本实现的边界与取舍。代码采用 **LGPL-3.0-or-later**（GNU LGPL v3 或更高版本，见 [许可说明](LICENSE-NOTICE.md)）；原创示例图像/合成声音采用 CC0-1.0；字体及第三方代码保留各自许可。

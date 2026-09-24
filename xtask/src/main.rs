@@ -120,9 +120,16 @@ fn main() -> Result<()> {
                     "MODULE-WORKFLOW.md",
                     "CONTENT-RESIDENCY.md",
                     "M3-PREPARATION.md",
+                    "M4-RELEASE.md",
                 ] {
                     fs::copy(Path::new("docs").join(name), docs.join(name))?;
                 }
+                let validation = docs.join("validation/m4");
+                fs::create_dir_all(&validation)?;
+                fs::copy(
+                    "docs/validation/m4/summary.json",
+                    validation.join("summary.json"),
+                )?;
             }
             run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
             // A preview server may still be executing the previous CLI inode.

@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './tests/browser', timeout: 180000, expect: { timeout: 30000 },
+  testIgnore: 'backends.spec.js',
   workers: 1, fullyParallel: false,
   reporter: [['list'], ['json', { outputFile: 'reports/browser-results.json' }]],
   outputDir: 'reports/browser-artifacts',

@@ -1,19 +1,31 @@
-// Mutable entry point. All session components come from one immutable release graph.
+// The same bytes run at the mutable root and at each immutable release entry.
 const startupTrace=[];
 const mark=(stage,fields={})=>startupTrace.push({stage,start_us:String(Math.round(performance.now()*1000)),end_us:String(Math.round(performance.now()*1000)),...fields});
 mark('bootstrap_started');
-const base = new URL('./', import.meta.url);
+const fixed = /(?:^|\/)releases\/([0-9a-f]{64})\/index\.html$/.exec(location.pathname);
+const base = fixed ? new URL('../../', import.meta.url) : new URL('./', import.meta.url);
+const rootEntry = !fixed && (location.pathname === base.pathname || location.pathname === `${base.pathname}index.html`);
 const message = document.querySelector('#shell-message');
 function fail(error) {document.querySelector('#shell').hidden=false;document.querySelector('#shell-title').textContent='无法启动播放器 / Unable to start';message.textContent=String(error);const b=document.querySelector('#reload');b.hidden=false;b.onclick=()=>location.reload();console.error(error);}
 async function hash(bytes) {return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),x=>x.toString(16).padStart(2,'0')).join('');}
 async function fetchBytes(path) {const url=new URL(path,base);if(url.origin!==base.origin||!url.pathname.startsWith(base.pathname))throw new Error('E_ORIGIN: object escaped release root');const r=await fetch(url);if(!r.ok)throw new Error(`E_HTTP: ${r.status} ${path}`);return r.arrayBuffer();}
 try {
-    if(!navigator.gpu)throw new Error('E_WEBGPU: 此首版需要启用 WebGPU 的桌面 Chromium。WebGPU-capable desktop Chromium is required.');
-    const channelResponse=await fetch(new URL('channels/stable.json',base),{cache:'no-cache'});if(!channelResponse.ok)throw new Error('E_CHANNEL');
-    const channel=await channelResponse.json();if(channel.format!==1||!(/^[0-9a-f]{64}$/).test(channel.release))throw new Error('E_CHANNEL_SCHEMA');
-    mark('channel_ready');
-    const raw=await fetchBytes(`releases/${channel.release}.json`);if(await hash(raw)!==channel.release)throw new Error('E_RELEASE_DIGEST');const release=JSON.parse(new TextDecoder().decode(raw));
-    if(release.format!==1||!release.engine||!release.objects)throw new Error('E_RELEASE_SCHEMA');
+    if(!fixed && !rootEntry)throw new Error('E_ENTRY_PATH');
+    if(rootEntry){
+        const response=await fetch(new URL('channels/stable.json',base),{cache:'no-store'});
+        if(!response.ok)throw new Error(`E_CHANNEL_HTTP: ${response.status}`);
+        const channel=await response.json();
+        if(channel.format!==1||!(/^[0-9a-f]{64}$/).test(channel.release))throw new Error('E_CHANNEL_SCHEMA');
+        const target=new URL(`releases/${channel.release}/index.html`,base);target.search=location.search;target.hash=location.hash;location.replace(target);
+        // Navigation ends this bootstrap; no runtime starts from the mutable URL.
+        throw {redirect:true};
+    }
+    const releaseDigest=fixed[1];
+    const raw=await fetchBytes(`releases/${releaseDigest}.json`);if(await hash(raw)!==releaseDigest)throw new Error('E_RELEASE_DIGEST');const release=JSON.parse(new TextDecoder().decode(raw));
+    if(release.format!==1||!['dev','release'].includes(release.profile)||!release.engine||!release.objects||!release.launch)throw new Error('E_RELEASE_SCHEMA');
+    if(!(/^[0-9a-f]{64}$/).test(release.launch.html)||!(/^[0-9a-f]{64}$/).test(release.launch.bootstrap))throw new Error('E_LAUNCH_SCHEMA');
+    const launchFiles=await Promise.all(['index.html','bootstrap.js'].map(name=>fetchBytes(`releases/${releaseDigest}/${name}`)));
+    if(await hash(launchFiles[0])!==release.launch.html||await hash(launchFiles[1])!==release.launch.bootstrap)throw new Error('E_LAUNCH_DIGEST');
     mark('release_verified');
     const objectUrl=(id)=>{const o=release.objects[id];if(!o||!(/^[0-9a-f]{64}$/).test(id)||!o.path.startsWith(`objects/${id}.`)||o.path.includes('..')||o.path.includes(':')||o.path.includes('\\'))throw new Error('E_OBJECT_REFERENCE');return new URL(o.path,base);};
     const fetchObject=async(id,signal,observe=()=>{})=>{
@@ -47,5 +59,17 @@ try {
     // Instantiate only the verified bytes, including when HTTP cache supplied them.
     await wasm.default({module_or_path:wasmBytes});
     mark('wasm_initialized');
-    await host.start({wasm,release,releaseDigest:channel.release,executable:new TextDecoder().decode(executable),fetchObject,fail,startupTrace});
-} catch(error) {fail(error);}
+    await host.start({wasm,release,releaseDigest,releaseRoot:base.href,entryUrl:location.href,executable:new TextDecoder().decode(executable),fetchObject,fail,startupTrace});
+    if(release.profile==='dev'){
+        try{
+            const probe=await fetch(new URL('__nir_dev/status',base),{cache:'no-store'});
+            if(probe.ok){
+                const helper=document.createElement('script');
+                helper.src=new URL('__nir_dev/client.js',base).href;
+                helper.dataset.release=releaseDigest;
+                helper.dataset.root=base.href;
+                document.body.append(helper);
+            }
+        }catch{}
+    }
+} catch(error) {if(!error?.redirect)fail(error);}

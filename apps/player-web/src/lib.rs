@@ -4,16 +4,67 @@
 use nir_format::*;
 use nir_player::{AppCommand, AppEvent, Player, SaveEnvelope};
 use nir_presentation::{DrawPacket, Messages, ReadingState, SlotView};
-use nir_render_wgpu::{wgpu, Renderer};
+use nir_render_wgpu::{wgpu, Renderer, RendererBackend};
 use std::collections::{BTreeSet, VecDeque};
 use wasm_bindgen::prelude::*;
 fn js(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
-async fn renderer(canvas_id: &str) -> std::result::Result<Renderer, JsValue> {
+#[derive(Clone, Copy)]
+enum BackendSelection {
+    Auto,
+    WebGpu,
+    WebGl2,
+}
+impl BackendSelection {
+    fn parse(value: &str) -> std::result::Result<Self, JsValue> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "webgpu" => Ok(Self::WebGpu),
+            "webgl2" => Ok(Self::WebGl2),
+            _ => Err(js("E_RENDER_BACKEND: expected auto, webgpu, or webgl2")),
+        }
+    }
+}
+async fn selected_backend(selection: BackendSelection) -> RendererBackend {
+    match selection {
+        BackendSelection::WebGpu => RendererBackend::WebGpu,
+        BackendSelection::WebGl2 => RendererBackend::WebGl2,
+        BackendSelection::Auto => {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..Default::default()
+            });
+            if instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .is_ok()
+            {
+                RendererBackend::WebGpu
+            } else {
+                RendererBackend::WebGl2
+            }
+        }
+    }
+}
+#[wasm_bindgen]
+pub async fn probe_backend() -> String {
+    selected_backend(BackendSelection::Auto)
+        .await
+        .as_str()
+        .into()
+}
+async fn renderer(
+    canvas_id: &str,
+    selection: BackendSelection,
+) -> std::result::Result<Renderer, JsValue> {
+    let backend = selected_backend(selection).await;
     let canvas = nir_platform_web::canvas(canvas_id)?;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::BROWSER_WEBGPU,
+        backends: match backend {
+            RendererBackend::WebGpu => wgpu::Backends::BROWSER_WEBGPU,
+            RendererBackend::WebGl2 => wgpu::Backends::GL,
+        },
         ..Default::default()
     });
     let w = canvas.width();
@@ -21,16 +72,21 @@ async fn renderer(canvas_id: &str) -> std::result::Result<Renderer, JsValue> {
     let surface = instance
         .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
         .map_err(js)?;
-    Renderer::new(&instance, surface, w, h).await.map_err(js)
+    Renderer::new(&instance, surface, w, h, backend)
+        .await
+        .map_err(js)
 }
 #[wasm_bindgen]
 pub struct GpuReplacement {
     renderer: Renderer,
 }
 #[wasm_bindgen]
-pub async fn create_gpu(canvas_id: String) -> std::result::Result<GpuReplacement, JsValue> {
+pub async fn create_gpu(
+    canvas_id: String,
+    backend: String,
+) -> std::result::Result<GpuReplacement, JsValue> {
     Ok(GpuReplacement {
-        renderer: renderer(&canvas_id).await?,
+        renderer: renderer(&canvas_id, BackendSelection::parse(&backend)?).await?,
     })
 }
 #[wasm_bindgen]
@@ -73,6 +129,7 @@ impl Engine {
         title: String,
         canvas_id: String,
         preferences_json: String,
+        backend: String,
     ) -> std::result::Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let executable: RuntimeExecutable =
@@ -84,7 +141,7 @@ impl Engine {
             nir_content::parse(preferences_json.as_bytes(), "preferences").map_err(js)?;
         let player = Player::new_runtime(executable.program, release, title, Some(preferences))
             .map_err(js)?;
-        let renderer = renderer(&canvas_id).await?;
+        let renderer = renderer(&canvas_id, BackendSelection::parse(&backend)?).await?;
         let mut e = Self {
             player,
             renderer,
@@ -587,7 +644,7 @@ impl Engine {
         let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
         let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
         let residency = self.player.content_residency();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info}).to_string()
+        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).ok().map(|b| js_sys::ArrayBuffer::from(b).byte_length()),"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()}).to_string()
     }
     pub fn host_state(&mut self) -> String {
         let start = self.profile_start();
@@ -604,6 +661,7 @@ impl Engine {
             "loading": self.player.is_loading(),
             "has_dialogue": c.dialogue().is_some(),
             "frames": self.renderer.submitted,
+            "backend": self.renderer.backend.as_str(),
             "resident_bytes": self.player.memory_used(),
             "upload_steps": self.renderer.upload_steps,
             "turn_upload_bytes": 2 * 1024 * 1024 - self.upload_remaining,
@@ -618,6 +676,9 @@ impl Engine {
     pub fn gpu_error(&self) -> Option<String> {
         self.renderer.validation_error()
     }
+    pub fn backend(&self) -> String {
+        self.renderer.backend.as_str().into()
+    }
     pub fn device_lost(&self) -> bool {
         self.renderer.is_lost()
     }
@@ -629,6 +690,9 @@ impl Engine {
         self.pump(vec![AppEvent::DeviceLost])
     }
     pub fn replace_gpu(&mut self, replacement: GpuReplacement) -> std::result::Result<(), JsValue> {
+        if replacement.renderer.backend != self.renderer.backend {
+            return Err(js("E_RENDER_BACKEND: recovery must use the active backend"));
+        }
         self.renderer = replacement.renderer;
         self.renderer.set_profiling_clock(if self.profiling {
             Some(profile_clock_us)

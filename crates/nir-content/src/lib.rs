@@ -372,7 +372,7 @@ pub fn parse<T: DeserializeOwned>(bytes: &[u8], at: &str) -> Result<T> {
     })
 }
 pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
-    if r.format != 1 {
+    if r.format != 1 || !matches!(r.profile.as_str(), "dev" | "release") {
         return Err(Diagnostic::new(
             "E_VERSION",
             "release",
@@ -396,12 +396,28 @@ pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
             ));
         }
     }
-    for id in [&r.program, &r.engine.js, &r.engine.wasm, &r.engine.host]
-        .into_iter()
-        .chain(r.notices.iter())
+    for id in [
+        &r.program,
+        &r.engine.js,
+        &r.engine.wasm,
+        &r.engine.host,
+        &r.launch.html,
+        &r.launch.bootstrap,
+    ]
+    .into_iter()
+    .chain(r.notices.iter())
     {
         if !r.objects.contains_key(id) {
             return Err(Diagnostic::new("E_OBJECT", id, "release root missing"));
+        }
+    }
+    for (id, mime, ext) in [
+        (&r.launch.html, "text/html; charset=utf-8", ".html"),
+        (&r.launch.bootstrap, "text/javascript", ".js"),
+    ] {
+        let object = &r.objects[id];
+        if object.media_type != mime || !object.path.ends_with(ext) {
+            return Err(Diagnostic::new("E_LAUNCH", id, "invalid launch object"));
         }
     }
     Ok(())
