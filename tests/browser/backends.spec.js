@@ -24,7 +24,8 @@ test('backend renders Chinese, choices, transitions and audio; saves survive ref
   await expect.poll(async () => (await page.evaluate(() => window.__nir.diagnostics())).host_work.audio_state,
     { message: 'AudioContext must run after trusted input; CI requires an audio output', timeout: 10000 }).toBe('running');
   await page.waitForFunction(() => window.__nir.state().dialogue && !window.__nir.state().loading);
-  await page.keyboard.press('Space');
+  // Audio activation can outlast the typewriter animation. A second Space
+  // would then advance to the next line instead of revealing the first one.
   await expect.poll(async()=> (await state(page)).dialogue?.visible).toContain('末班电车');
   expectPainted(await page.locator('#stage').screenshot());
   await act(page, {type:'saves'});
