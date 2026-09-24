@@ -55,6 +55,14 @@ jobs:
           python3 scripts/verify_preview_connections.py
       - name: Install desktop browsers and system libraries
         run: bunx --no-install playwright install --with-deps chromium firefox
+      - name: Start virtual audio output
+        run: |
+          sudo apt-get install -y pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=nir_test rate=48000
+          pactl set-default-sink nir_test
+          pactl info
+          pactl list short sinks
       - name: Chromium software WebGPU regression
         env:
           # Keep WebGPU and the compositor on compatible software Vulkan paths.

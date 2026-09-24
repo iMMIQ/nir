@@ -21,6 +21,8 @@ test('backend renders Chinese, choices, transitions and audio; saves survive ref
   await boot(page, backend);
   expectPainted(await page.locator('#stage').screenshot());
   await page.keyboard.press('Space');
+  await expect.poll(async () => (await page.evaluate(() => window.__nir.diagnostics())).host_work.audio_state,
+    { message: 'AudioContext must run after trusted input; CI requires an audio output', timeout: 10000 }).toBe('running');
   await page.waitForFunction(() => window.__nir.state().dialogue && !window.__nir.state().loading);
   await page.keyboard.press('Space');
   await expect.poll(async()=> (await state(page)).dialogue?.visible).toContain('末班电车');
