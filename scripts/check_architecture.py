@@ -14,6 +14,9 @@ def closure(id,seen=None):
   if dep not in seen:seen.add(dep);closure(dep,seen)
  return seen
 errors=[]
+allowed['nir-engine']={'nir-format','nir-content','nir-player','nir-presentation','nir-render-wgpu'}
+allowed['player-web'].add('nir-engine')
+allowed['player-windows']={'nir-engine','nir-format','nir-content','nir-player','nir-presentation','nir-render-wgpu'}
 for id in workspace:
  name=packages[id]['name']
  if name not in allowed:errors.append(f'unknown workspace package {name}');continue
@@ -23,7 +26,7 @@ for id in workspace:
  if name in ['nir-format','nir-core','nir-content','nir-assets','nir-presentation']:
   bad=names & {'wgpu','web-sys','wasm-bindgen','nir-player','nir-compiler'}
   if bad:errors.append(f'{name} leaks {bad}')
- if name=='player-web' and names & {'nir-compiler', 'hb-subset', 'bindgen'}:errors.append('compiler linked into player')
+ if name in {'player-web','player-windows','nir-engine'} and names & {'nir-compiler', 'hb-subset', 'bindgen'}:errors.append('compiler linked into player')
 wgpus={packages[x]['version'] for x in packages if packages[x]['name']=='wgpu'}
 if len(wgpus)>1:errors.append(f'multiple wgpu versions: {wgpus}')
 if errors:raise SystemExit('\n'.join(errors))

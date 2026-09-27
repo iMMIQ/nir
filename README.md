@@ -32,6 +32,10 @@ NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览
 
 作品输出位于 `dist/full/web/`。完整上传该目录即可，可部署到子路径。保留 `NOTICE.txt`。部署时先上传对象和发行清单，最后更新 `channels/stable.json`；不要删除仍可能被旧会话引用的对象。源码目录、测试、源素材路径和本地配置不会作为运行目录复制进去。
 
+## Windows 原生发布
+
+在 Windows x64 构建 `cargo xtask sdk` 后，运行 `novelc -p my-story resolve` 和 `novelc -p my-story build --target windows --locked`。分发完整 `dist/full/windows/` 目录，玩家双击 `Game.exe`，无需浏览器或本地服务器。使用 DirectX 12 原生渲染，详见 [Windows 发布与验证](docs/WINDOWS.md)。
+
 ## 作品结构
 
 ```text

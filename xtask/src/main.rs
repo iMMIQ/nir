@@ -106,6 +106,20 @@ fn main() -> Result<()> {
                 )?;
             }
             fs::copy("crates/nir-platform-web/host.js", "dist/sdk/host.js")?;
+            if cfg!(windows) {
+                run(Command::new("cargo").args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "player-windows",
+                    "--release",
+                ]))?;
+                fs::create_dir_all("dist/sdk/windows")?;
+                fs::copy(
+                    "target/release/player-windows.exe",
+                    "dist/sdk/windows/player-windows.exe",
+                )?;
+            }
             run(Command::new("python3")
                 .args(["scripts/third_party.py", "dist/sdk/THIRD-PARTY.txt"]))?;
             copy_dir(

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = ["vendor/wgpu", "vendor/tiny_http", "vendor/hb-subset"]
-members = ["crates/*", "apps/player-web", "tools/novelc", "xtask"]
+members = ["crates/*", "apps/player-web", "apps/player-windows", "tools/novelc", "xtask"]
 default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
 
 [workspace.package]
@@ -43,6 +43,7 @@ nir-player = { path = "crates/nir-player" }
 nir-render-wgpu = { path = "crates/nir-render-wgpu" }
 nir-platform-web = { path = "crates/nir-platform-web" }
 nir-compiler = { path = "crates/nir-compiler" }
+nir-engine = { path = "crates/nir-engine" }
 
 [profile.release]
 opt-level = "s"

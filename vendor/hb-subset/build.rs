@@ -17,10 +17,14 @@ fn main() {
 }
 
 fn build_harfbuzz() -> Vec<PathBuf> {
-    cc::Build::new()
-        .cpp(true)
-        .flag("-std=c++11")
-        .warnings(false)
+    let mut build = cc::Build::new();
+    build.cpp(true).warnings(false);
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/bigobj");
+    } else {
+        build.flag("-std=c++11");
+    }
+    build
         .file("harfbuzz/src/harfbuzz-subset.cc")
         .compile("embedded-harfbuzz-subset");
 

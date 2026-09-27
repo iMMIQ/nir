@@ -1,0 +1,48 @@
+name: Native Windows player
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Native checks
+        run: |
+          cargo fmt --all --check
+          cargo test --locked -p player-windows --lib
+          cargo test --locked -p nir-player
+          cargo check --locked -p player-web --target wasm32-unknown-unknown
+          cargo clippy --locked -p player-windows --all-targets -- -D warnings
+      - name: Build SDK
+        shell: pwsh
+        run: |
+          $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+          cargo install wasm-bindgen-cli --version 0.2.100 --locked
+          cargo xtask sdk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check_architecture.py
+      - name: Package independent sample
+        run: |
+          ./dist/novelc.exe init target/windows-sample
+          ./dist/novelc.exe -p target/windows-sample resolve
+          ./dist/novelc.exe -p target/windows-sample build --target windows --locked
+          ./dist/novelc.exe -p target/windows-sample build --target web --locked
+          python scripts/verify_release.py target/windows-sample/dist/full/web
+          python scripts/verify_windows.py target/windows-sample/dist/full/windows
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-windows-evidence
+          path: |
+            reports/windows/
+            target/windows-sample/dist/full/windows/
+          retention-days: 7

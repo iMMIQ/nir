@@ -280,21 +280,31 @@ fn run(cli: Cli) -> Result<()> {
             locked,
             out,
         } => {
-            if target != "web"
+            if !matches!(target.as_str(), "web" | "windows")
                 || edition != "full"
                 || !matches!(profile.as_str(), "dev" | "release")
             {
-                bail!("E_CAPABILITY: supported --target web --edition full --profile dev|release");
+                bail!("E_CAPABILITY: supported --target web|windows --edition full --profile dev|release");
             }
-            let out = out.unwrap_or_else(|| cli.project.join("dist/full/web"));
-            let report = build_profile(
-                &cli.project,
-                &sdk,
-                &out,
-                &profile,
-                locked || profile == "release",
-                true,
-            )?;
+            let out = out.unwrap_or_else(|| cli.project.join(format!("dist/full/{target}")));
+            let report = if target == "windows" {
+                build_windows(
+                    &cli.project,
+                    &sdk,
+                    &out,
+                    &profile,
+                    locked || profile == "release",
+                )?
+            } else {
+                build_profile(
+                    &cli.project,
+                    &sdk,
+                    &out,
+                    &profile,
+                    locked || profile == "release",
+                    true,
+                )?
+            };
             println!(
                 "Built {}\nRelease {}\n{} objects / {} bytes",
                 out.display(),

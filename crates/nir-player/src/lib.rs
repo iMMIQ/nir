@@ -2322,15 +2322,20 @@ impl Player {
     fn model_for_locale(&self, c: &Core, screen: Screen, ui_locale: &str) -> UiModel {
         let ui_plan = &c.program().locale_config.ui[ui_locale];
         let text_plan = &c.program().locale_config.text[&self.effective_text_locale];
+        // Menus opened from the title use its retained background, even when
+        // Core still contains the previous story or a restore is preparing.
+        let title_context = screen == Screen::Title
+            || (self.return_screen == Screen::Title
+                && matches!(screen, Screen::Menu | Screen::Settings | Screen::Saves | Screen::History));
         UiModel {
             title: self.title.clone(),
             screen,
-            nodes: if screen == Screen::Title {
+            nodes: if title_context {
                 self.title_nodes()
             } else {
                 c.sample_scene()
             },
-            transition: if self.preferences.reduced_motion {
+            transition: if title_context || self.preferences.reduced_motion {
                 None
             } else {
                 c.transition().map(|(n, p)| (n.to_vec(), p))
@@ -2472,6 +2477,21 @@ mod media_tests {
         let program: Program =
             serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
         Player::new(program, "release".into(), "Test".into()).unwrap()
+    }
+
+    #[test]
+    fn title_menus_project_only_the_retained_title_scene() {
+        let mut program: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.title_scene = Some("station".into());
+        let mut player = at_intro_wait(program);
+        player.action(UiAction::Title, 0, 0, &mut 100).unwrap();
+        for action in [UiAction::Menu, UiAction::Settings, UiAction::Saves, UiAction::History] {
+            player.action(action, 0, 0, &mut 100).unwrap();
+            let model = player.model();
+            assert_eq!(serde_json::to_value(&model.nodes).unwrap(), serde_json::to_value(player.title_nodes()).unwrap());
+            assert!(model.transition.is_none());
+            assert!(model.nodes.iter().filter_map(|n|n.asset.as_ref()).all(|id|player.retained_assets().contains(id)));
+        }
     }
 
     fn speculative(player: &mut Player, request: u32, id: &str) {

@@ -39,6 +39,13 @@ pub fn sdk_manifest(sdk: &Path) -> Result<SdkManifest> {
             .with_context(|| format!("E_SDK_MISSING: {f}; run cargo xtask sdk"))?;
         files.insert(f.into(), nir_content::digest(&b));
     }
+    let native = sdk.join("windows/player-windows.exe");
+    if native.try_exists()? {
+        files.insert(
+            "windows/player-windows.exe".into(),
+            nir_content::digest(&fs::read(native)?),
+        );
+    }
     Ok(SdkManifest {
         format: 1,
         compiler_version: env!("CARGO_PKG_VERSION").into(),
@@ -1294,6 +1301,80 @@ pub fn build_profile(
     }
     Ok(report)
 }
+/// Reuse content lowering, then publish a native-only graph (no HTML, JS or WASM).
+pub fn build_windows(
+    root: &Path,
+    sdk: &Path,
+    out: &Path,
+    profile: &str,
+    locked: bool,
+) -> Result<BuildReport> {
+    let player = fs::read(sdk.join("windows/player-windows.exe"))
+        .context("E_SDK_WINDOWS: Windows player missing; build the SDK on Windows")?;
+    anyhow::ensure!(
+        player.starts_with(b"MZ"),
+        "E_SDK_WINDOWS: invalid PE executable"
+    );
+    let intermediate = root.join(".nir/windows-content");
+    let mut report = build_profile(root, sdk, &intermediate, profile, locked, true)?;
+    let web: ReleaseManifest = nir_content::parse(
+        &fs::read(intermediate.join(format!("releases/{}.json", report.release)))?,
+        "release",
+    )?;
+    let mut objects = web.objects;
+    for id in [
+        &web.engine.js,
+        &web.engine.host,
+        &web.engine.wasm,
+        &web.launch.html,
+        &web.launch.bootstrap,
+    ] {
+        objects.remove(id);
+    }
+    let manifest = NativeRelease {
+        format: 1,
+        game_id: web.game_id,
+        title: web.title,
+        version: web.version,
+        profile: web.profile,
+        engine_build: web.engine_build,
+        player: nir_content::digest(&player),
+        program: web.program,
+        objects,
+    };
+    let data = out.join("data");
+    fs::create_dir_all(data.join("objects"))?;
+    fs::create_dir_all(data.join("releases"))?;
+    for (id, object) in &manifest.objects {
+        let bytes = fs::read(intermediate.join(&object.path))?;
+        nir_content::verify(&bytes, id)?;
+        fs::write(data.join(&object.path), bytes)?;
+    }
+    let bytes = serde_json::to_vec(&manifest)?;
+    report.release = nir_content::digest(&bytes);
+    report.objects = manifest.objects.len();
+    report.total_bytes =
+        manifest.objects.values().map(|o| o.bytes).sum::<u64>() + player.len() as u64;
+    fs::write(
+        data.join(format!("releases/{}.json", report.release)),
+        bytes,
+    )?;
+    fs::write(out.join("Game.exe.next"), &player)?;
+    fs::rename(out.join("Game.exe.next"), out.join("Game.exe"))?;
+    fs::copy(intermediate.join("NOTICE.txt"), out.join("NOTICE.txt"))?;
+    fs::write(out.join("README.txt"), "NIR Windows native player\r\nDouble-click Game.exe. Keep the data folder and NOTICE.txt beside it.\r\nWindows 10/11 x64 with a DirectX 12 capable driver is required.\r\nNo browser, WebView2, web server or network connection is required.\r\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\r\nSaves: %LOCALAPPDATA%\\NIR\\games\\<game-id-hash>\\<profile>\\releases\\<release>\\\r\nSaves are isolated by exact release; retain older game folders to continue older saves.\r\n")?;
+    fs::write(
+        root.join("reports/windows-build.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    fs::write(
+        data.join("release.txt.next"),
+        format!("{}\n", report.release),
+    )?;
+    fs::rename(data.join("release.txt.next"), data.join("release.txt"))?;
+    Ok(report)
+}
+
 pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
     let mut entries: Vec<_> = fs::read_dir(src)?.collect::<std::io::Result<_>>()?;

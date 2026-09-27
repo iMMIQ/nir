@@ -1250,6 +1250,20 @@ pub struct ReleaseManifest {
     #[serde(default)]
     pub notices: Vec<String>,
 }
+/// Native desktop content graph. Its serialized digest is the save identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRelease {
+    pub format: u32,
+    pub game_id: String,
+    pub title: String,
+    pub version: String,
+    pub profile: String,
+    pub engine_build: String,
+    pub player: String,
+    pub program: String,
+    pub objects: BTreeMap<String, Object>,
+}
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

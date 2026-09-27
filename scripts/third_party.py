@@ -10,7 +10,7 @@ metadata = json.loads(subprocess.check_output([
 ]))
 packages = {p["id"]: p for p in metadata["packages"]}
 nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
-roots = [p["id"] for p in packages.values() if p["name"] in {"player-web", "novelc"}]
+roots = [p["id"] for p in packages.values() if p["name"] in {"player-web", "player-windows", "novelc"}]
 seen = set()
 def visit(key):
     if key in seen:
