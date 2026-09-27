@@ -139,9 +139,18 @@ pub fn relative(root: &Path, base: &Path, name: &str) -> Result<PathBuf> {
         bail!("E_PATH_ESCAPE: {}", joined.display());
     }
     if !resolved.is_file() {
-        bail!("E_FILE: {} is not a file", joined.display());
+        bail!("E_FILE: {} is not a file", resolved.display());
     }
     Ok(resolved)
+}
+// Authored and reported project paths are slash-separated on every platform;
+// Windows PathBuf display would otherwise leak backslashes into manifests,
+// journals and diagnostics that `relative` later revalidates.
+pub(crate) fn forward_slashes(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 fn read(path: &Path) -> Result<Vec<u8>> {
     let len = fs::metadata(path)?.len();
@@ -159,13 +168,13 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 }
 pub(crate) fn json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = read(path)?;
-    nir_content::parse(&bytes, &path.display().to_string()).map_err(|mut d| {
+    nir_content::parse(&bytes, &forward_slashes(path)).map_err(|mut d| {
         // Source-position reparsing belongs to author tools, never the WASM loader.
         if d.code == "E_SCHEMA" {
             if let Err(original) = serde_json::from_slice::<T>(&bytes) {
                 if let Some(details) = &mut d.details {
                     details.source = Some(SourceRef {
-                        file: path.display().to_string(),
+                        file: forward_slashes(path),
                         line: original.line(),
                         column: original.column(),
                         pointer: String::new(),
@@ -180,7 +189,7 @@ pub(crate) fn toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
     let bytes = read(path)?;
     let text = std::str::from_utf8(&bytes)?;
     toml::from_str(text).map_err(|e: toml::de::Error| {
-        let mut d = Diagnostic::new("E_TOML", path.display().to_string(), e.message()).classified(
+        let mut d = Diagnostic::new("E_TOML", forward_slashes(path), e.message()).classified(
             ErrorDomain::Content,
             "parse",
             "toml",
@@ -189,7 +198,7 @@ pub(crate) fn toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
         if let Some(span) = e.span() {
             let prefix = &bytes[..span.start];
             d.details.as_mut().unwrap().source = Some(SourceRef {
-                file: path.display().to_string(),
+                file: forward_slashes(path),
                 line: prefix.iter().filter(|b| **b == b'\n').count() + 1,
                 column: prefix.len()
                     - prefix
@@ -611,10 +620,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 bail!("E_RIGHTS: {} lacks source/permission record", source.id);
             }
             let source_path = relative(&root, path.parent().unwrap(), &source.source)?;
-            let local = source_path
-                .strip_prefix(&root)?
-                .to_string_lossy()
-                .to_string();
+            let local = forward_slashes(source_path.strip_prefix(&root)?);
             let normalized_path = local.nfc().collect::<String>().to_lowercase();
             if let Some(old) = normalized.insert(normalized_path, local.clone()) {
                 if old != local {
@@ -641,7 +647,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 let (prepared, mut report) = crate::fonts::prepare(&root, &bytes, recipe, chars)
                     .with_context(|| format!("font {} ({local})", source.id))?;
                 report.source = local.clone();
-                report.license = license_path.strip_prefix(&root)?.to_string_lossy().into();
+                report.license = forward_slashes(license_path.strip_prefix(&root)?);
                 report.license_digest = nir_content::digest(license.as_bytes());
                 font_notices.insert(source.id.clone(), license);
                 fonts.insert(source.id.clone(), report);

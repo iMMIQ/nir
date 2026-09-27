@@ -192,14 +192,17 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
   // Playwright's normal context forces all tabs visible. Attach without its
   // default emulation overrides to exercise real browser visibility instead.
   const dir=await fs.mkdtemp(`${process.env.TMPDIR || '/tmp'}/nir-visibility-`);
-  const proc=spawn(process.env.CHROMIUM || '/usr/bin/chromium',['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu',...(process.env.NIR_CHROME_ARGS||'').split(' ').filter(Boolean),'--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
+  const chromiumExecutable = process.env.CHROMIUM || (process.platform === 'win32' ? chromium.executablePath() : '/usr/bin/chromium');
+  const proc=spawn(chromiumExecutable,['--no-sandbox','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${dir}`,'--enable-unsafe-webgpu',...(process.env.NIR_CHROME_ARGS||'').split(' ').filter(Boolean),'--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','about:blank'],{stdio:'ignore'});
   let browser;
   try {
     let port;
     for(let n=0;n<100;n++){try{port=(await fs.readFile(`${dir}/DevToolsActivePort`,'utf8')).split('\n')[0];break;}catch{await new Promise(r=>setTimeout(r,100));}}
     expect(port).toBeTruthy();
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${port}`,{noDefaults:true});
-    const context=browser.contexts()[0],page=context.pages()[0];
+    const context=browser.contexts()[0];
+    let page=context.pages()[0];
+    if(!page){page=await context.newPage();} // Windows startup may not expose the initial tab over CDP yet.
     await page.goto('http://127.0.0.1:4173/?test=1');
     await page.bringToFront();
     await page.waitForFunction(()=>window.__nir?.state().ready,null,{polling:100,timeout:15000});
@@ -569,17 +572,18 @@ test('author theme and player defaults run on the unchanged SDK and keep saved p
   const {execFile}=await import('node:child_process');
   const {promisify}=await import('node:util');
   const run=promisify(execFile);
+  const cli=process.platform==='win32'?'dist/novelc.exe':'dist/novelc';
   const dir=await fs.mkdtemp('target/tmp/theme-contract-');
   const project=`${dir}/story`;
-  await run('dist/novelc',['init',project,'--template','web-basic']);
+  await run(cli,['init',project,'--template','web-basic']);
   const theme=`${project}/themes/rain/theme.toml`;
   await fs.writeFile(theme,(await fs.readFile(theme,'utf8')).replace('builtin.dialogue"','builtin.dialogue.top"').replace('builtin.choice"','builtin.choice.compact"').replace('height = 240.0','height = 260.0'));
   await fs.writeFile(`${project}/config/player.toml`,'format = 1\n[defaults]\nfont_scale = 1.2\nbgm_volume = 0.12\nreduced_motion = true\n');
-  await run('dist/novelc',['-p',project,'resolve']);
+  await run(cli,['-p',project,'resolve']);
   const lock=await fs.readFile(`${project}/game.lock`,'utf8');
-  await run('dist/novelc',['-p',project,'build','--locked','--out','dist/theme-contract-web']);
+  await run(cli,['-p',project,'build','--locked','--out','dist/theme-contract-web']);
   expect(await fs.readFile(`${project}/game.lock`,'utf8')).toBe(lock);
-  const resolved=JSON.parse((await run('dist/novelc',['-p',project,'config'])).stdout);
+  const resolved=JSON.parse((await run(cli,['-p',project,'config'])).stdout);
   expect(resolved['theme.slots.dialogue.main'].value).toBe('builtin.dialogue.top');
   await page.goto('http://127.0.0.1:4174/theme-contract-web/?test=1');
   await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);

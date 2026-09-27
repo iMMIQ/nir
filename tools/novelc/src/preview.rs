@@ -275,6 +275,10 @@ fn serve_request(
     root: &Path,
     dev: Option<&Arc<Mutex<DevStatus>>>,
 ) -> Result<()> {
+    // Windows canonicalize yields \\?\ prefixed paths; comparisons against a
+    // plain root would otherwise reject every served file.
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = canonical_root.as_path();
     let raw = request.url().split('?').next().unwrap_or("/").to_owned();
     let timing = serve_timing();
     let received = Instant::now();

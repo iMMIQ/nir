@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { expectPainted } from './pixels.js';
 
 const run = promisify(execFile);
-const cli = path.resolve('dist/novelc');
+const cli = path.resolve(process.platform==='win32'?'dist/novelc.exe':'dist/novelc');
 const state = page => page.evaluate(() => window.__nir.state());
 const act = (page, action) => page.evaluate(a => window.__nir.action(a), action);
 const view = (s, region) => s.scrolls.find(v => v.region === region);

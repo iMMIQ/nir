@@ -4,7 +4,7 @@ import path from 'node:path';
 import {execFile, spawn} from 'node:child_process';
 import {promisify} from 'node:util';
 import {expectPainted} from './pixels.js';
-const run=promisify(execFile), cli=path.resolve('dist/novelc');
+const run=promisify(execFile), cli=path.resolve(process.platform==='win32'?'dist/novelc.exe':'dist/novelc');
 const state=p=>p.evaluate(()=>window.__nir.state());
 const act=(p,a)=>p.evaluate(a=>window.__nir.action(a),a);
 const ready=p=>p.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);

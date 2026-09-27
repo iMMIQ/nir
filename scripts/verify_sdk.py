@@ -17,12 +17,13 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     root = Path(temp).resolve()
     kit = root / "kit"
     kit.mkdir()
-    shutil.copy2(source / "novelc", kit / "novelc")
+    executable = "novelc.exe" if os.name == "nt" else "novelc"
+    shutil.copy2(source / executable, kit / executable)
     shutil.copytree(source / "sdk", kit / "sdk")
-    env = {**os.environ, "PATH": "/usr/bin:/bin"}
+    env = {**os.environ, "PATH": "/usr/bin:/bin" if os.name != "nt" else ""}
     env.pop("NIR_SDK", None)
     def run(*args, success=True):
-        p = subprocess.run([str(kit / "novelc"), *args], cwd=root, env=env, text=True, capture_output=True)
+        p = subprocess.run([str(kit / executable), *args], cwd=root, env=env, text=True, capture_output=True)
         assert (p.returncode == 0) == success, p.stdout + p.stderr
         return p.stdout + p.stderr
     def verify_split_release(directory):
@@ -90,7 +91,9 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     assert "E_DIGEST" in run("release", "stage", "--source", str(source_release), "--directory", str(published), "--release", second, success=False)
     changed_path.write_bytes(original_object)
     changed_path.unlink()
-    assert "No such file" in run("release", "promote", "--directory", str(published), "--release", second, "--expect", first, success=False)
+    missing = run("release", "promote", "--directory", str(published), "--release", second, "--expect", first, success=False)
+    # NotFound text is localized on Windows; the raw errno is not.
+    assert "no such file" in missing.lower() or "(os error 2)" in missing, missing
     run("release", "stage", "--source", str(source_release), "--directory", str(published), "--release", second)
 
     # Probe server failures using GET. Correct files carry immutable cache on

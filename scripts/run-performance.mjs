@@ -89,7 +89,7 @@ const commandArgs = [playwrightCli, 'test', '--config', 'playwright.performance.
 let executable = command;
 let executableArgs = commandArgs;
 
-if (!process.env.DISPLAY) {
+if (!process.env.DISPLAY && os.platform() !== 'win32') {
   const xvfbRun = await resolveOptionalExecutable(process.env.XVFB_RUN || 'xvfb-run');
   if (!xvfbRun) {
     fail('DISPLAY is unset and xvfb-run was not found. Start a display or install/provide xvfb-run with XVFB_RUN.');

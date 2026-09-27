@@ -196,7 +196,7 @@ pub(crate) fn resolve_config(
         }
         let value = serde_json::to_value(&m)?;
         let explicit = toml_value(&path)?;
-        let source = path.strip_prefix(root)?.to_string_lossy();
+        let source = crate::project::forward_slashes(path.strip_prefix(root)?);
         for key in ["id", "base", "slots", "dialogue", "choice"] {
             record(
                 &mut resolved,
@@ -219,7 +219,7 @@ pub(crate) fn resolve_config(
         "theme.tokens",
         &value,
         &value,
-        &tokens_path.strip_prefix(root)?.to_string_lossy(),
+        &crate::project::forward_slashes(tokens_path.strip_prefix(root)?),
         "",
     );
     theme.background = tokens.background;
@@ -238,7 +238,7 @@ pub(crate) fn resolve_config(
             "player",
             &serde_json::to_value(&config.defaults)?,
             &toml_value(&path)?["defaults"],
-            &path.strip_prefix(root)?.to_string_lossy(),
+            &crate::project::forward_slashes(path.strip_prefix(root)?),
             "/defaults",
         );
         config.defaults

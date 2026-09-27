@@ -250,11 +250,7 @@ impl Sources {
                     id.into()
                 },
                 locale: locale.into(),
-                file: path
-                    .strip_prefix(&self.root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into(),
+                file: crate::project::forward_slashes(path.strip_prefix(&self.root).unwrap()),
                 pointer: format!("/{}", id.replace('~', "~0").replace('/', "~1")),
                 message: message.into(),
             });
@@ -645,7 +641,7 @@ fn commit(
             != serde_json::from_slice::<serde_json::Value>(&after)?
         {
             changes.push(Edit {
-                path: path.strip_prefix(root)?.to_string_lossy().into(),
+                path: crate::project::forward_slashes(path.strip_prefix(root)?),
                 before: String::from_utf8(before)?,
                 after: String::from_utf8(after)?,
             });
@@ -824,7 +820,9 @@ pub fn text_migrate(root: &Path, out: &Path) -> Result<()> {
     let mut module_value: toml::Value = toml_file(&module_path)?;
     module_value.as_table_mut().unwrap().insert(
         "text_revisions".into(),
-        toml::Value::String(ledger_path.strip_prefix(base)?.to_string_lossy().into()),
+        toml::Value::String(crate::project::forward_slashes(
+            ledger_path.strip_prefix(base)?,
+        )),
     );
     let stage = tempfile::tempdir_in(&parent)?;
     crate::copy_tree(&root, stage.path())?;

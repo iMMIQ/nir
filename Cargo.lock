@@ -746,8 +746,6 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hb-subset"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7340b4303dc40254307edbe53fabcdde93b0c3eb0aa85e1fd459beca9863987"
 dependencies = [
  "bindgen",
  "cc",

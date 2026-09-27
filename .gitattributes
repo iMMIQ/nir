@@ -1,0 +1,15 @@
+# Text files are committed and checked out with LF endings on every platform.
+* text=auto eol=lf
+
+# Binary assets must never go through line-ending conversion.
+*.png binary
+*.wav binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.wasm binary
+
+# Vendored upstream sources keep their checked-in bytes verbatim
+# (wgpu and tiny_http blobs are CRLF) so future patch syncing stays diffable.
+vendor/** -text

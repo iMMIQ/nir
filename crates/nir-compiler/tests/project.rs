@@ -32,6 +32,7 @@ fn rejects_path_escape() {
 #[test]
 fn rejects_symlink_escape() {
     let d = project();
+    #[cfg(unix)]
     let external = tempfile::NamedTempFile::new().unwrap();
     let path = d.path().join("assets/source/station.png");
     fs::remove_file(&path).unwrap();

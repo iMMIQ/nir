@@ -25,11 +25,7 @@ impl SourceIndex {
         };
         let mut offsets = BTreeMap::new();
         scan(bytes, &mut 0, String::new(), &mut offsets);
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let file = crate::project::forward_slashes(path.strip_prefix(root).unwrap_or(path));
         let source = |pointer: String| {
             let offset = offsets.get(&pointer).copied().unwrap_or(0);
             let prefix = &bytes[..offset];

@@ -141,7 +141,7 @@ modules = ["content/ch01/module.toml", "content/ch02/module.toml", "content/ch03
 }
 
 export async function buildModulesFixture({prefetchContent=false,port=4191}={}) {
-  const cli = path.resolve('dist/novelc');
+  const cli = path.resolve(process.platform==='win32'?'dist/novelc.exe':'dist/novelc');
   await fs.mkdir(path.resolve('target/tmp'), { recursive: true });
   const temp = await fs.mkdtemp(path.resolve('target/tmp/nir-modules-'));
   const project = path.join(temp, 'story');

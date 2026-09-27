@@ -74,8 +74,15 @@ fn main() -> Result<()> {
             let bindgen = std::env::var_os("WASM_BINDGEN")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
-                    Path::new(&std::env::var_os("HOME").unwrap_or_default())
-                        .join(".cargo/bin/wasm-bindgen")
+                    let home = std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .unwrap_or_default();
+                    let bindgen = Path::new(&home).join(".cargo/bin/wasm-bindgen");
+                    if cfg!(windows) {
+                        bindgen.with_extension("exe")
+                    } else {
+                        bindgen
+                    }
                 });
             let version = Command::new(&bindgen)
                 .arg("--version")
@@ -132,16 +139,24 @@ fn main() -> Result<()> {
                 )?;
             }
             run(Command::new("cargo").args(["build", "--locked", "-p", "novelc", "--release"]))?;
+            let novelc = if cfg!(windows) {
+                "novelc.exe"
+            } else {
+                "novelc"
+            };
             // A preview server may still be executing the previous CLI inode.
-            fs::copy("target/release/novelc", "dist/novelc.next")?;
-            fs::rename("dist/novelc.next", "dist/novelc")?;
-            run(Command::new("python3").args(["-c", "import hashlib,pathlib; pathlib.Path('dist/sdk/compiler.sha256').write_text(hashlib.sha256(pathlib.Path('dist/novelc').read_bytes()).hexdigest()+'\\n')"]))?;
-            run(Command::new("dist/novelc").args([
+            fs::copy(format!("target/release/{novelc}"), "dist/novelc.next")?;
+            fs::rename("dist/novelc.next", format!("dist/{novelc}"))?;
+            let fingerprint = format!(
+                "import hashlib,pathlib; pathlib.Path('dist/sdk/compiler.sha256').write_text(hashlib.sha256(pathlib.Path('dist/{novelc}').read_bytes()).hexdigest()+'\\n')"
+            );
+            run(Command::new("python3").args(["-c", &fingerprint]))?;
+            run(Command::new(format!("dist/{novelc}")).args([
                 "schemas",
                 "--out",
                 "dist/sdk/template/schemas",
             ]))?;
-            run(Command::new("dist/novelc").args([
+            run(Command::new(format!("dist/{novelc}")).args([
                 "schemas",
                 "--out",
                 "dist/sdk/templates/minimal/schemas",

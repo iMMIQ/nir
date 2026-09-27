@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Linux SDK regression: a connection burst must not strand keep-alive readers."""
+"""SDK regression: a connection burst must not strand keep-alive readers."""
 import concurrent.futures
+import ctypes
 import http.client
 import os
 from pathlib import Path
@@ -10,6 +11,39 @@ import subprocess
 import sys
 import tempfile
 import time
+
+WINDOWS = os.name == "nt"
+
+
+def suspend_process(pid):
+    if not WINDOWS:
+        os.kill(pid, signal.SIGSTOP)
+        os.waitpid(pid, os.WUNTRACED)
+        return
+    handle = ctypes.windll.kernel32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+    if not handle:
+        raise OSError(f"OpenProcess({pid}) failed")
+    try:
+        status = ctypes.windll.ntdll.NtSuspendProcess(handle)
+        if status != 0:
+            raise OSError(f"NtSuspendProcess failed: {status:#x}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def resume_process(pid):
+    if not WINDOWS:
+        os.kill(pid, signal.SIGCONT)
+        return
+    handle = ctypes.windll.kernel32.OpenProcess(0x0800, False, pid)
+    if not handle:
+        raise OSError(f"OpenProcess({pid}) failed")
+    try:
+        status = ctypes.windll.ntdll.NtResumeProcess(handle)
+        if status != 0:
+            raise OSError(f"NtResumeProcess failed: {status:#x}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def main():
@@ -45,15 +79,14 @@ def main():
 
             for _ in range(100):
                 # Buffer a burst in the listener before any accept worker can run.
-                os.kill(server.pid, signal.SIGSTOP)
-                os.waitpid(server.pid, os.WUNTRACED)
+                suspend_process(server.pid)
                 try:
                     for _ in range(24):
                         sock = socket.create_connection(("127.0.0.1", port), timeout=3)
                         sockets.append(sock)
                         sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 finally:
-                    os.kill(server.pid, signal.SIGCONT)
+                    resume_process(server.pid)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
                     list(pool.map(read_response, sockets))
                 for sock in sockets:
@@ -64,7 +97,10 @@ def main():
             for sock in sockets:
                 sock.close()
             if server.poll() is None:
-                os.kill(server.pid, signal.SIGCONT)
+                if WINDOWS:
+                    resume_process(server.pid)
+                else:
+                    os.kill(server.pid, signal.SIGCONT)
                 server.terminate()
                 server.wait(timeout=5)
 

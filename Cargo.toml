@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/wgpu", "vendor/tiny_http"]
+exclude = ["vendor/wgpu", "vendor/tiny_http", "vendor/hb-subset"]
 members = ["crates/*", "apps/player-web", "tools/novelc", "xtask"]
 default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
 
@@ -54,3 +54,4 @@ strip = "debuginfo"
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }
 tiny_http = { path = "vendor/tiny_http" }
+hb-subset = { path = "vendor/hb-subset" }

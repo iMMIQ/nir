@@ -4,7 +4,7 @@ import path from 'node:path';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 
-const run=promisify(execFile),cli=path.resolve('dist/novelc'),source=path.resolve('examples/rain-letters');
+const run=promisify(execFile),cli=path.resolve(process.platform==='win32'?'dist/novelc.exe':'dist/novelc'),source=path.resolve('examples/rain-letters');
 const action=(page,value)=>page.evaluate(value=>window.__nir.action(value),value);
 
 async function digest(directory){
