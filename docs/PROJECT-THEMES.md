@@ -78,7 +78,7 @@ item_height = 58.0
 
 组件共用引擎的字素簇揭示、Gate、OptionId、启用状态、命中区域和辅助语义。键盘焦点按原有动作保留。所有正常界面仍由 Rust/wgpu 绘制，DOM 只映射辅助访问。主题不能注入 Rust、JavaScript、HTML 或自定义动作。未知槽、错误组件类型与未知字段直接拒绝；越界参数报 `E_THEME_PROPS`，对比度不足报 `E_THEME_CONTRAST`。
 
-当前主题只支持这两个固定语义槽与封闭的组件清单，不是通用 UI 语言。尚未实现任意每条 Cue 的 Props、主题图片/字体资源、页面组合、标题页替换、主题包继承或第三方组件。主题资源字段会作为未知字段拒绝；标题场景资源仍由既有运行依赖收集器处理。长对白与大量选项现有按实际字体尺寸的滚动阅读，见 [作者阅读与预览](AUTHOR-READING.md)。这仍不代表无限文本、任意主题或移动真机均已验收。
+主题使用固定语义槽、封闭组件清单与下文的原图菜单配置，不是通用 UI 语言。尚未实现任意每条 Cue 的 Props、主题字体资源、任意页面组合、主题包继承或第三方组件。图片资产通过既有运行依赖收集器处理。长对白与大量选项现有按实际字体尺寸的滚动阅读，见 [作者阅读与预览](AUTHOR-READING.md)。这仍不代表无限文本、任意主题或移动真机均已验收。
 
 ## 查看实际值与来源
 
@@ -93,3 +93,29 @@ item_height = 58.0
 修改主题或默认设置后，可以继续使用同一个 `game.lock` 和配套 SDK 构建；新的运行配置会改变作品修订及发行身份。仍执行精确发行存档兼容检查。Schema 覆盖 `game`、`theme`、`theme-tokens`、`player` 和运行 `program`，数值边界、组件语义等还需运行 `check`，不能只依赖编辑器 Schema 校验。
 
 验证记录见 [本阶段测试报告](validation/project-themes/README.md)。
+
+## 原图菜单与消息框
+
+`ui.image-menu.v1` 增加封闭的图片菜单配置，用于迁移现有作品。图片通过正常资源目录登记；运行依赖、预加载、驻留与发行包校验包含所有菜单图片。菜单默认入口名为 `title`：
+
+```toml
+return_to_title = true
+
+[image_menus.title]
+background = "menu.background"
+
+[[image_menus.title.buttons]]
+id = "start"
+label = "Begin"
+asset = "menu.start"
+hover_asset = "menu.start.hover"
+rect = [416.0, 293.0, 496.0, 82.0]
+[image_menus.title.buttons.action]
+type = "new_game"
+```
+
+以上字段写在 `theme.toml` 顶层；不要放进先前示例的 `[choice]` 表内。`rect` 是设计舞台坐标，绘制与命中使用相同的居中等比缩放。按钮动作限于 `new_game/saves/settings/title/menu/entry`；`menu` 需要菜单名，`entry` 需要已声明的无参数、无返回值函数。`requires` 指定 Profile 解锁键，`locked_asset` 可替换锁定图片；缺省时锁定项变暗，运行时也检查权限。辅助语义使用 `label`，不要把文字只留在图片中。入口与图片不存在时编译失败。菜单页保留系统菜单和返回出口。
+
+对白可增加 `background`（图片资产）、`rect`（舞台坐标）、`opacity`（0–1）和 `line_height`（行高相对字号的倍数，1–2，默认 1.5）。使用 `rect` 时，字号、内边距和框体跟随舞台缩放；基础字号可为 18–64，内边距 0–32。`text.visibility.v1` 的 `DialogueVisibility { visible }` 操作控制框体与正文投影，状态随快照保存；Gate、历史和对白任务仍由 Core 管理。未配置这些字段的作品保留原有响应式阅读器布局。
+
+这些是声明式的受限菜单与皮肤能力，不允许运行主题脚本或注入任意组件。原引擎存读档界面不会因此自动移植。

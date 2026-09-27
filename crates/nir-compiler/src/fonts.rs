@@ -103,7 +103,14 @@ pub(crate) fn characters_by_plan(p: &Program, title: &str) -> Result<CharacterSe
             title.split('·').nth(1).unwrap_or(title).trim()
         };
         chars.extend(localized_title.chars());
-        chars.extend(fluent.chars());
+        // The Japanese option is only presented by projects that register it.
+        // Do not require new glyphs in existing, fixed-subset bilingual projects.
+        for line in fluent.lines() {
+            if line.starts_with("language-ja =") && !p.locale_config.text.contains_key("ja") {
+                continue;
+            }
+            chars.extend(line.chars());
+        }
         chars.retain(|c| !c.is_control());
         ui.insert(locale.clone(), chars);
     }

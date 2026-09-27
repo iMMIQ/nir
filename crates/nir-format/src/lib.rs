@@ -21,6 +21,8 @@ pub const CAPABILITIES: &[&str] = &[
     "text.gate.v1",
     "choice.v1",
     "audio.buffer.v1",
+    "ui.image-menu.v1",
+    "text.visibility.v1",
 ];
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TASKS: usize = 256;
@@ -642,6 +644,9 @@ pub struct Op {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    DialogueVisibility {
+        visible: bool,
+    },
     Assign {
         target: String,
         value: Expr,
@@ -1001,6 +1006,10 @@ pub struct Theme {
     pub dialogue: DialogueProps,
     #[serde(default)]
     pub choice: ChoiceProps,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_menus: BTreeMap<String, ImageMenu>,
+    #[serde(default)]
+    pub return_to_title: bool,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -1013,7 +1022,74 @@ impl Default for Theme {
             slots: ThemeSlots::default(),
             dialogue: DialogueProps::default(),
             choice: ChoiceProps::default(),
+            image_menus: BTreeMap::new(),
+            return_to_title: false,
         }
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageMenu {
+    pub background: String,
+    pub buttons: Vec<ImageButton>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageButton {
+    pub id: String,
+    pub label: String,
+    pub asset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_asset: Option<String>,
+    pub rect: [f32; 4],
+    pub action: ImageMenuAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageMenuAction {
+    NewGame,
+    Saves,
+    Settings,
+    Title,
+    Menu { menu: String },
+    Entry { function: String },
+}
+impl ImageMenuAction {
+    pub fn ui_action(&self) -> UiAction {
+        match self {
+            Self::NewGame => UiAction::NewGame,
+            Self::Saves => UiAction::Saves,
+            Self::Settings => UiAction::Settings,
+            Self::Title => UiAction::Title,
+            Self::Menu { menu } => UiAction::ImageMenu { menu: menu.clone() },
+            Self::Entry { function } => UiAction::ImageMenuEntry {
+                function: function.clone(),
+            },
+        }
+    }
+}
+impl Theme {
+    pub fn image_assets(&self) -> BTreeSet<String> {
+        let mut assets = BTreeSet::new();
+        if let Some(asset) = &self.dialogue.background {
+            assets.insert(asset.clone());
+        }
+        for menu in self.image_menus.values() {
+            assets.insert(menu.background.clone());
+            for button in &menu.buttons {
+                assets.insert(button.asset.clone());
+                assets.extend(button.hover_asset.clone());
+                assets.extend(button.locked_asset.clone());
+            }
+        }
+        assets
     }
 }
 /// Closed component registry implemented by the locked player SDK. Components
@@ -1052,6 +1128,10 @@ pub struct DialogueProps {
     pub height: f32,
     pub padding: f32,
     pub font_size: f32,
+    pub line_height: f32,
+    pub opacity: f32,
+    pub background: Option<String>,
+    pub rect: Option<[f32; 4]>,
 }
 impl Default for DialogueProps {
     fn default() -> Self {
@@ -1059,6 +1139,10 @@ impl Default for DialogueProps {
             height: 220.,
             padding: 24.,
             font_size: 23.,
+            line_height: 1.5,
+            opacity: 1.,
+            background: None,
+            rect: None,
         }
     }
 }
@@ -1135,6 +1219,44 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
             ));
         }
     }
+    let rect_ok = |r: &[f32; 4]| {
+        r.iter().all(|v| v.is_finite() && v.abs() <= 8192.) && r[2] > 0. && r[3] > 0.
+    };
+    if theme.dialogue.rect.as_ref().is_some_and(|r| !rect_ok(r))
+        || theme.image_menus.len() > 64
+        || (!theme.image_menus.is_empty() && !theme.image_menus.contains_key("title"))
+    {
+        return Err(Diagnostic::new(
+            "E_THEME_PROPS",
+            "theme",
+            "invalid image menu or dialogue rectangle",
+        ));
+    }
+    for (id, menu) in &theme.image_menus {
+        let mut ids = BTreeSet::new();
+        if id.is_empty() || menu.background.is_empty() || menu.buttons.len() > 256 {
+            return Err(Diagnostic::new(
+                "E_THEME_PROPS",
+                "theme.image_menus",
+                "invalid menu",
+            ));
+        }
+        for button in &menu.buttons {
+            if button.id.is_empty()
+                || !ids.insert(&button.id)
+                || button.label.is_empty()
+                || button.asset.is_empty()
+                || !rect_ok(&button.rect)
+                || matches!(&button.action, ImageMenuAction::Menu { menu } if !theme.image_menus.contains_key(menu))
+            {
+                return Err(Diagnostic::new(
+                    "E_THEME_PROPS",
+                    "theme.image_menus",
+                    "invalid button or menu target",
+                ));
+            }
+        }
+    }
     let luminance = |c: [f32; 4]| {
         let channel = |v: f32| {
             if v <= 0.04045 {
@@ -1160,9 +1282,42 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
         }
     }
     for (name, value, lo, hi) in [
-        ("dialogue.height", theme.dialogue.height, 220., 320.),
-        ("dialogue.padding", theme.dialogue.padding, 12., 32.),
-        ("dialogue.font_size", theme.dialogue.font_size, 18., 28.),
+        (
+            "dialogue.height",
+            theme.dialogue.height,
+            if theme.dialogue.rect.is_some() {
+                32.
+            } else {
+                220.
+            },
+            if theme.dialogue.rect.is_some() {
+                8192.
+            } else {
+                320.
+            },
+        ),
+        (
+            "dialogue.padding",
+            theme.dialogue.padding,
+            if theme.dialogue.rect.is_some() {
+                0.
+            } else {
+                12.
+            },
+            32.,
+        ),
+        ("dialogue.line_height", theme.dialogue.line_height, 1., 2.),
+        ("dialogue.opacity", theme.dialogue.opacity, 0., 1.),
+        (
+            "dialogue.font_size",
+            theme.dialogue.font_size,
+            18.,
+            if theme.dialogue.rect.is_some() {
+                64.
+            } else {
+                28.
+            },
+        ),
         ("choice.width", theme.choice.width, 360., 680.),
         ("choice.item_height", theme.choice.item_height, 48., 72.),
     ] {
@@ -1318,6 +1473,9 @@ impl Default for Preferences {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiAction {
     NewGame,
+    ImageMenu { menu: String },
+    ImageMenuEntry { function: String },
+    HoverImage { id: Option<String> },
     Continue,
     Advance,
     Choose { option: String },

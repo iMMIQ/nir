@@ -473,12 +473,27 @@ fn strict_parse_reports_real_line_and_preserves_old_diagnostic_wire_format() {
 fn template_font_covers_bundled_diagnostic_messages() {
     let bytes = fs::read(source().join("assets/source/reader.otf")).unwrap();
     let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+    let master = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf"),
+    )
+    .unwrap();
+    let master_face = ttf_parser::Face::parse(&master, 0).unwrap();
     for messages in [
         include_str!("../../nir-presentation/messages/en.ftl"),
         include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
     ] {
-        for c in messages.chars().filter(|c| !c.is_whitespace()) {
-            assert!(face.glyph_index(c).is_some(), "missing UI glyph: {c}");
+        for line in messages.lines() {
+            // rain-letters has no Japanese text plan and never displays this
+            // option. New imports use the minimal template's full master.
+            let face = if line.starts_with("language-ja =") {
+                &master_face
+            } else {
+                &face
+            };
+            for c in line.chars().filter(|c| !c.is_whitespace()) {
+                assert!(face.glyph_index(c).is_some(), "missing UI glyph: {c}");
+            }
         }
     }
 }

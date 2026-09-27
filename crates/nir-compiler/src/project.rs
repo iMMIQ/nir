@@ -821,6 +821,7 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
 }
 pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
+    roots.extend(p.theme.image_assets());
     // Every scene declaration is shipped in one module Static package, so its
     // media identity must be in the root index even when the scene is not the
     // current title scene. Media bytes remain lazy at runtime.

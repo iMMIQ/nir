@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import struct
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from threading import Thread
 from verify_runtime import verify_runtime
@@ -65,6 +66,42 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     fragment.write_bytes(original)
     # The default is an independent author project with its own master font.
     env["PATH"] = ""  # even Python and system font tools are unavailable to the CLI
+    # The importer is part of the same binary. Generate a neutral LSB fixture,
+    # then run the distributed CLI without Python, Cargo or game executables.
+    def u32(n):
+        return struct.pack("<I", n)
+    def cp932(s):
+        b = s.encode("cp932")
+        return u32(len(b)) + b
+    def literal(value):
+        return u32(1) + b"\x01" + cp932("____arg") + u32(1) + b"\x03" + bytes([value])
+    def command(kind, line, body):
+        return bytes([kind]) + u32(0) + b"\0\0" + u32(line) + body
+    def lsb(commands):
+        return u32(116) + b"\0" + u32(64) + u32(1) + bytes(64) + u32(len(commands)) + b"".join(commands)
+    text = "こんにちは。"
+    glyphs = b"".join(b"\x01" + u32(0xffffffff) * 2 + u32(0) +
+                      struct.pack("<H", int.from_bytes(c.encode("cp932"), "big")) + u32(0) for c in text)
+    word = b"TpWord105" + u32(0) * 3 + u32(len(text)) + glyphs
+    target = u32(1) + b"\x01" + cp932("____arg") + u32(1) + b"\x04" + cp932("message")
+    legacy = root / "legacy"
+    legacy.mkdir()
+    (legacy / "main.lsb").write_bytes(lsb([
+        command(20, 10, u32(len(word)) + word + target + literal(1) * 3),
+        command(6, 20, literal(1)),
+    ]))
+    inventory = json.loads(run("import", "inspect", str(legacy)))
+    assert inventory["scripts"][0]["commands"]["TextIns"] == 1
+    imported = json.loads(run("import", "livemaker", str(legacy), "--entry", "main.lsb", "--out", "imported"))
+    assert imported["written"] and imported["errors"] == 0 and imported["text_pages"] == 1
+    for cmd in [("resolve",), ("check", "--locked"), ("build", "--locked")]:
+        run("-p", "imported", *cmd)
+    verify_split_release(root / "imported/dist/full/web")
+    (legacy / "main.lsb").write_bytes(lsb([command(46, 12, b"")]))
+    run("import", "livemaker", str(legacy), "--entry", "main.lsb", "--out", "blocked", success=False)
+    assert not (root / "blocked").exists()
+    run("import", "livemaker", str(legacy), "--entry", "main.lsb", "--out", "draft", "--draft", success=False)
+    assert (root / "draft/MIGRATION-INCOMPLETE.txt").is_file()
     run("init", "minimal")
     for cmd in [("resolve",), ("check", "--locked"), ("test",), ("build", "--locked")]:
         run("-p", "minimal", *cmd)

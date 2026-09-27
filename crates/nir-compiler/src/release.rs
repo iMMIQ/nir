@@ -375,6 +375,12 @@ fn asset_consumers(
             }
         }
     }
+    for asset in program.theme.image_assets() {
+        consumers
+            .entry(asset)
+            .or_default()
+            .insert("bootstrap".into());
+    }
     let title_nodes = program
         .title_scene
         .as_ref()

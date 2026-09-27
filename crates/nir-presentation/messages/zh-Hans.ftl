@@ -40,6 +40,7 @@ scroll-forward = 下一页
 
 language-zh = 简体中文
 language-en = English
+language-ja = 日语
 ui-language = 界面语言
 text-language = 正文语言
 language-active = 当前生效

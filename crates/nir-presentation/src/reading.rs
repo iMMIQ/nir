@@ -157,7 +157,7 @@ impl ReadingState {
                     rect: [r.x, r.y, r.width, r.height],
                     offset: view.offset,
                     max,
-                    step: (r.height - r.size * 1.5).max(r.size * 1.5),
+                    step: (r.height - r.line_height).max(r.line_height),
                 });
             }
         }

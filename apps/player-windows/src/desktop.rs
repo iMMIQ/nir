@@ -449,15 +449,19 @@ impl Runtime {
                         }
                     }
                 }
-                Loaded::Asset { request, id, data } if self.engine.accepts_resource(request) => match data {
-                    Ok((bytes, audio)) => {
-                        if let Some(audio) = audio {
-                            self.buffers.insert(id.clone(), audio);
+                Loaded::Asset { request, id, data } if self.engine.accepts_resource(request) => {
+                    match data {
+                        Ok((bytes, audio)) => {
+                            if let Some(audio) = audio {
+                                self.buffers.insert(id.clone(), audio);
+                            }
+                            self.upload = Some((request, id, bytes));
                         }
-                        self.upload = Some((request, id, bytes));
+                        Err(message) => {
+                            engine_result(self.engine.resource_failed(request, message))?
+                        }
                     }
-                    Err(message) => engine_result(self.engine.resource_failed(request, message))?,
-                },
+                }
                 _ => {}
             }
         }
@@ -619,8 +623,15 @@ impl App {
         Ok(())
     }
     fn failed(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
-        let state = self.runtime.as_ref().map(|r|r.engine.state()).unwrap_or_default();
-        self.error = Some(error.context(format!("native step {} after {} advances; state={state}",self.smoke_step,self.advances)));
+        let state = self
+            .runtime
+            .as_ref()
+            .map(|r| r.engine.state())
+            .unwrap_or_default();
+        self.error = Some(error.context(format!(
+            "native step {} after {} advances; state={state}",
+            self.smoke_step, self.advances
+        )));
         event_loop.exit();
     }
 }
@@ -672,6 +683,7 @@ impl ApplicationHandler for App {
                 WindowEvent::CursorMoved { position, .. } => {
                     let scale = runtime.window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (position.x as f32 / scale, position.y as f32 / scale);
+                    engine_result(runtime.engine.hover(runtime.cursor.0, runtime.cursor.1))?;
                 }
                 WindowEvent::MouseInput {
                     state: ElementState::Released,
@@ -721,13 +733,13 @@ impl ApplicationHandler for App {
                             } else {
                                 UiAction::Advance
                             })?,
-                        Key::Named(NamedKey::Escape) => {
-                            runtime.input(if state["screen"] == "Story" {
+                        Key::Named(NamedKey::Escape) => runtime.input(
+                            if state["screen"] == "Story" || state["screen"] == "Title" {
                                 UiAction::Menu
                             } else {
                                 UiAction::Close
-                            })?
-                        }
+                            },
+                        )?,
                         Key::Named(NamedKey::F11) => runtime.window.set_fullscreen(
                             if runtime.window.fullscreen().is_some() {
                                 None
@@ -814,4 +826,3 @@ pub fn run() -> Result<()> {
     }
     Ok(())
 }
-

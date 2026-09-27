@@ -482,7 +482,7 @@ export function commitSaveRecord(db,key,envelope,metadata,expectedRevision) {
     });
 }
 
-export async function validateHistoryTarget({releaseRoot,digest,gameId,profile,fetchImpl=fetch,subtle=crypto.subtle}) {
+export async function validateHistoryTarget({releaseRoot,digest,gameId,profile,fetchImpl=fetch,subtle=globalThis.crypto?.subtle,sha256=async value=>Array.from(new Uint8Array(await subtle.digest('SHA-256',value)),x=>x.toString(16).padStart(2,'0')).join('')}) {
     if(!releaseDigestPattern.test(digest))return {available:false,status:'Invalid release digest'};
     const root=new URL(releaseRoot,location.href),manifest=new URL(`releases/${digest}.json`,root),entry=new URL(`releases/${digest}/index.html`,root);
     if(root.origin!==location.origin||manifest.origin!==root.origin||entry.origin!==root.origin||!manifest.pathname.startsWith(root.pathname)||!entry.pathname.startsWith(root.pathname))
@@ -491,7 +491,6 @@ export async function validateHistoryTarget({releaseRoot,digest,gameId,profile,f
         const response=await fetchImpl(manifest,{cache:'no-cache'});
         if(!response.ok)return {available:false,status:'Release resources unavailable'};
         const bytes=await response.arrayBuffer();
-        const sha256=async value=>Array.from(new Uint8Array(await subtle.digest('SHA-256',value)),x=>x.toString(16).padStart(2,'0')).join('');
         const actual=await sha256(bytes);
         if(actual!==digest)return {available:false,status:'Release verification failed'};
         const release=JSON.parse(new TextDecoder().decode(bytes));
@@ -519,7 +518,7 @@ export async function initializeBackend({requested='auto',probe,create,replaceCa
     }
 }
 
-export async function start({wasm,release,releaseDigest,releaseRoot,executable,fetchObject,fail,startupTrace=[]}) {
+export async function start({wasm,release,releaseDigest,releaseRoot,executable,fetchObject,fail,startupTrace=[],sha256}) {
     const params=new URL(location.href).searchParams;
     const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
     const performanceStats=trace.enabled?new PerformanceRecorder(64):null;
@@ -587,7 +586,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             historyMessage.textContent=`${records.length} saved slot${records.length===1?'':'s'}`;
             const targets=new Map();
             for(const record of records){
-                if(!targets.has(record.releaseDigest))targets.set(record.releaseDigest,validateHistoryTarget({releaseRoot,digest:record.releaseDigest,gameId:release.game_id,profile:release.profile}));
+                if(!targets.has(record.releaseDigest))targets.set(record.releaseDigest,validateHistoryTarget({releaseRoot,digest:record.releaseDigest,gameId:release.game_id,profile:release.profile,sha256}));
                 const row=document.createElement('tr');
                 const identity=document.createElement('td');const digest=document.createElement('code');digest.textContent=record.releaseDigest;identity.append(document.createTextNode(`${record.version||'Version unknown'} · `),digest);
                 const slot=document.createElement('td');slot.textContent=String(record.slot+1);
@@ -974,7 +973,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     let semanticSignature='',announcement='',announcementLocale='';
     function semantics(view) {
         document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
-        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
+        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{deliver(()=>mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2)),'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
         const spokenLocale=view.announcement_locale||view.locale||'zh-Hans';if(view.announcement&&(view.announcement!==announcement||spokenLocale!==announcementLocale)){announcement=view.announcement;announcementLocale=spokenLocale;const live=document.querySelector('#announcement');live.lang=spokenLocale;live.textContent=announcement;}
     }
     function frame(now) {
@@ -1027,6 +1026,9 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         else if(Math.hypot(e.clientX-down.x,dy)<20){const hit=JSON.parse(engine.hit(e.clientX,e.clientY));if(down.action&&JSON.stringify(down.action)===JSON.stringify(hit))action(down.action,down.context);}
         down=null;
     };
+    let hoverTarget;
+    const onMove=(e)=>{if(state().screen!=='Title')return;const target=engine.hit(e.clientX,e.clientY);if(target===hoverTarget)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
+    const onLeave=()=>{hoverTarget=undefined;if(state().screen==='Title')deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');};
     const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action({type:'scroll',region:view.region,delta:e.deltaY>0?1:-1});}};
     const onKey=(e)=>{
         if(!historyPanel.hidden){if(e.key==='Escape'){e.preventDefault();historyClose.click();}return;}
@@ -1045,8 +1047,8 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     let glContextLost=false;
     const onCancel=()=>down=null;
     const onGlLost=e=>{e.preventDefault();glContextLost=true;deliver(checkDevice,'control');};
-    function bindCanvas(){canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
-    function unbindCanvas(){canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
+    function bindCanvas(){canvas.addEventListener('pointermove',onMove);canvas.addEventListener('pointerleave',onLeave);canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
+    function unbindCanvas(){canvas.removeEventListener('pointermove',onMove);canvas.removeEventListener('pointerleave',onLeave);canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
     bindCanvas();window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;

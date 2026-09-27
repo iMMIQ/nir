@@ -26,18 +26,23 @@ impl SourceIndex {
         let mut offsets = BTreeMap::new();
         scan(bytes, &mut 0, String::new(), &mut offsets);
         let file = crate::project::forward_slashes(path.strip_prefix(root).unwrap_or(path));
+        // Generated migrations contain thousands of source locations. Index
+        // newlines once instead of rescanning the whole prefix per reference.
+        let line_starts: Vec<_> = std::iter::once(0)
+            .chain(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, byte)| (*byte == b'\n').then_some(i + 1)),
+            )
+            .collect();
         let source = |pointer: String| {
             let offset = offsets.get(&pointer).copied().unwrap_or(0);
-            let prefix = &bytes[..offset];
+            let line = line_starts.partition_point(|start| *start <= offset);
             SourceRef {
                 file: file.clone(),
-                line: 1 + prefix.iter().filter(|b| **b == b'\n').count(),
-                column: offset
-                    - prefix
-                        .iter()
-                        .rposition(|b| *b == b'\n')
-                        .map_or(0, |p| p + 1)
-                    + 1,
+                line,
+                column: offset - line_starts[line - 1] + 1,
                 pointer,
             }
         };

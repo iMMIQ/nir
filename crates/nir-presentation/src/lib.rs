@@ -54,18 +54,24 @@ pub struct SlotView {
 }
 #[derive(Debug, Clone)]
 pub struct UiModel {
+    pub image_menu: String,
+    pub hovered_image: Option<String>,
+    pub profile: std::collections::BTreeSet<String>,
     pub title: String,
     pub screen: Screen,
     pub nodes: Vec<Node>,
     pub transition: Option<(Vec<Node>, f32)>,
     pub stage: [f32; 2],
     pub dialogue: Option<DialogueView>,
+    pub hidden_dialogue: bool,
     pub choices: Vec<ChoiceView>,
     pub prefs: Preferences,
     pub ui_locale: String,
     pub ui_fonts: Vec<String>,
     pub ui_font_plan_digest: String,
     pub text_locale: String,
+    pub available_ui_locales: Vec<String>,
+    pub available_text_locales: Vec<String>,
     pub text_fonts: Vec<String>,
     pub text_font_plan_digest: String,
     pub locale_pending: bool,
@@ -100,6 +106,7 @@ pub struct TextRun {
     pub width: f32,
     pub height: f32,
     pub size: f32,
+    pub line_height: f32,
     pub color: [f32; 4],
     pub emphasis: Vec<(usize, usize)>,
     pub scroll: f32,
@@ -273,6 +280,7 @@ impl DrawPacket {
             width: w,
             height: size * 1.55,
             size,
+            line_height: size * 1.5,
             color: c,
             emphasis: vec![],
             scroll: 0.,
@@ -464,6 +472,75 @@ fn project_measured(
         scene(&mut p, &m.nodes, m.stage, 1.);
     }
     match m.screen {
+        Screen::Title if m.theme.image_menus.contains_key(&m.image_menu) => {
+            let menu = &m.theme.image_menus[&m.image_menu];
+            let scale = (width / m.stage[0]).min(height / m.stage[1]);
+            let ox = (width - m.stage[0] * scale) / 2.;
+            let oy = (height - m.stage[1] * scale) / 2.;
+            p.quads.push(Quad {
+                rect: [ox, oy, m.stage[0] * scale, m.stage[1] * scale],
+                color: [1.; 4],
+                asset: Some(menu.background.clone()),
+                clip: None,
+            });
+            for button in &menu.buttons {
+                let enabled = button
+                    .requires
+                    .as_ref()
+                    .is_none_or(|key| m.profile.contains(key));
+                let selected = m.hovered_image.as_deref() == Some(button.id.as_str());
+                let asset = if !enabled {
+                    button.locked_asset.as_ref()
+                } else if selected {
+                    button.hover_asset.as_ref()
+                } else {
+                    None
+                }
+                .unwrap_or(&button.asset);
+                let r = button.rect;
+                let rect = [
+                    ox + r[0] * scale,
+                    oy + r[1] * scale,
+                    r[2] * scale,
+                    r[3] * scale,
+                ];
+                let dim = if !enabled && button.locked_asset.is_none() {
+                    0.35
+                } else {
+                    1.
+                };
+                p.quads.push(Quad {
+                    rect,
+                    color: [dim, dim, dim, 1.],
+                    asset: Some(asset.clone()),
+                    clip: None,
+                });
+                p.semantics.push(SemanticNode {
+                    id: p.semantics.len() as u32,
+                    label: button.label.clone(),
+                    action: button.action.ui_action(),
+                    enabled,
+                    rect,
+                    locale: m.text_locale.clone(),
+                });
+            }
+            p.button(
+                msg("menu"),
+                UiAction::Menu,
+                [width - 104., 12., 92., 36.],
+                false,
+                t,
+            );
+            if m.image_menu != "title" {
+                p.button(
+                    msg("exit"),
+                    UiAction::Title,
+                    [width - 180., height - 54., 168., 42.],
+                    false,
+                    t,
+                );
+            }
+        }
         Screen::Title => {
             p.rect([0., 0., width, height], [0.015, 0.035, 0.04, 0.57]);
             p.rect([margin, 32., 28., 2.], t.accent);
@@ -544,41 +621,91 @@ fn project_measured(
             }
         }
         Screen::Story => {
+            if m.hidden_dialogue {
+                p.semantics.push(SemanticNode {
+                    id: p.semantics.len() as u32,
+                    label: msg("continue"),
+                    action: UiAction::Advance,
+                    enabled: true,
+                    rect: [0., 0., width, height],
+                    locale: m.ui_locale.clone(),
+                });
+            }
             if let Some(d) = &m.dialogue {
-                let h = if narrow {
+                let mut h = if narrow {
                     (height * 0.40).max(t.dialogue.height).min(330.)
                 } else {
                     t.dialogue.height
                 }
                 .min((height - 88.).max(80.));
-                let top = match t.slots.dialogue {
+                let mut top = match t.slots.dialogue {
                     DialogueComponent::Bottom => height - h - margin * 0.6,
                     DialogueComponent::Top => 64.,
                 };
-                let padding = t.dialogue.padding;
-                p.rect([margin, top, width - margin * 2., h], t.panel);
-                p.rect([margin, top, 3., h], t.accent);
+                let mut left = margin;
+                let mut box_width = width - margin * 2.;
+                let mut scale = 1.;
+                if let Some(rect) = t.dialogue.rect {
+                    scale = (width / m.stage[0]).min(height / m.stage[1]);
+                    left = (width - m.stage[0] * scale) / 2. + rect[0] * scale;
+                    top = (height - m.stage[1] * scale) / 2. + rect[1] * scale;
+                    box_width = rect[2] * scale;
+                    h = rect[3] * scale;
+                }
+                let padding = t.dialogue.padding * scale;
+                if let Some(asset) = &t.dialogue.background {
+                    p.quads.push(Quad {
+                        rect: [left, top, box_width, h],
+                        color: [1., 1., 1., t.dialogue.opacity],
+                        asset: Some(asset.clone()),
+                        clip: None,
+                    });
+                } else {
+                    p.rect([left, top, box_width, h], t.panel);
+                    p.rect([left, top, 3., h], t.accent);
+                }
                 if !d.speaker.is_empty() {
                     p.text(
                         &d.speaker,
-                        margin + padding,
+                        left + padding,
                         top + 18.,
-                        width - margin * 2. - padding * 2.,
+                        box_width - padding * 2.,
                         16.,
                         t.accent,
                     );
                 }
-                let ty = top + if d.speaker.is_empty() { 24. } else { 52. };
-                let size =
-                    (t.dialogue.font_size - if narrow { 4. } else { 0. }) * m.prefs.font_scale;
+                let ty = top
+                    + if t.dialogue.rect.is_some() {
+                        padding
+                    } else if d.speaker.is_empty() {
+                        24.
+                    } else {
+                        52.
+                    };
+                let size = (t.dialogue.font_size
+                    - if narrow && t.dialogue.rect.is_none() {
+                        4.
+                    } else {
+                        0.
+                    })
+                    * m.prefs.font_scale
+                    * scale;
                 p.texts.push(TextRun {
                     text: d.full_text.clone(),
                     visible: Some(d.visible_text.len()),
-                    x: margin + padding,
+                    x: left + padding,
                     y: ty,
-                    width: width - margin * 2. - padding * 2.,
-                    height: (top + h - 43. - ty).max(30.),
+                    width: box_width - padding * 2.,
+                    height: (top + h
+                        - if t.dialogue.rect.is_some() {
+                            padding
+                        } else {
+                            43.
+                        }
+                        - ty)
+                        .max(30.),
                     size,
+                    line_height: size * t.dialogue.line_height,
                     color: t.text,
                     emphasis: d.emphasis.clone(),
                     scroll: 0.,
@@ -591,27 +718,29 @@ fn project_measured(
                 });
                 p.announcement = d.full_text.clone();
                 p.announcement_locale = d.locale.clone();
-                p.dialogue_hint = Some(p.texts.len());
-                p.text(
-                    msg(if d.gate {
-                        "gate-hint"
-                    } else if d.ready {
-                        "advance-hint"
-                    } else {
-                        "reveal-hint"
-                    }),
-                    width - margin - 130.,
-                    top + h - 33.,
-                    110.,
-                    11.,
-                    t.muted,
-                );
+                if t.dialogue.rect.is_none() {
+                    p.dialogue_hint = Some(p.texts.len());
+                    p.text(
+                        msg(if d.gate {
+                            "gate-hint"
+                        } else if d.ready {
+                            "advance-hint"
+                        } else {
+                            "reveal-hint"
+                        }),
+                        width - margin - 130.,
+                        top + h - 33.,
+                        110.,
+                        11.,
+                        t.muted,
+                    );
+                }
                 p.semantics.push(SemanticNode {
                     id: 0,
                     label: msg("continue"),
                     action: UiAction::Advance,
                     enabled: !d.gate,
-                    rect: [margin, top, width - margin * 2., h - 42.],
+                    rect: [left, top, box_width, h],
                     locale: m.ui_locale.clone(),
                 });
             }
@@ -655,6 +784,7 @@ fn project_measured(
                         p.quads.last_mut().unwrap().clip = Some(viewport);
                         let text = p.texts.last_mut().unwrap();
                         text.size = 16. * m.prefs.font_scale;
+                        text.line_height = text.size * 1.5;
                         text.clip = Some(viewport);
                         text.locale = c.locale.clone();
                         text.font_assets = c.font_assets.clone();
@@ -781,54 +911,50 @@ fn project_measured(
                     let yy = if compact { y + 50. } else { y + 74. };
                     let gap = if compact { 52. } else { 66. };
                     p.text(msg("ui-language"), x, yy, w, 16., t.muted);
-                    p.button(
-                        msg("language-zh"),
-                        UiAction::UiLocale {
-                            locale: "zh-Hans".into(),
-                        },
-                        [x, yy + 20., (w - 12.) / 2., if compact { 34. } else { 40. }],
-                        m.prefs.ui_locale == "zh-Hans",
-                        t,
-                    );
-                    p.button(
-                        msg("language-en"),
-                        UiAction::UiLocale {
-                            locale: "en".into(),
-                        },
-                        [
-                            x + (w + 12.) / 2.,
-                            yy + 20.,
-                            (w - 12.) / 2.,
-                            if compact { 34. } else { 40. },
-                        ],
-                        m.prefs.ui_locale == "en",
-                        t,
-                    );
+                    for (row, locales, active, is_ui) in [
+                        (yy, &m.available_ui_locales, &m.prefs.ui_locale, true),
+                        (
+                            yy + gap,
+                            &m.available_text_locales,
+                            &m.prefs.text_locale,
+                            false,
+                        ),
+                    ] {
+                        if !is_ui {
+                            p.text(msg("text-language"), x, row, w, 16., t.muted);
+                        }
+                        let count = locales.len().max(1) as f32;
+                        let button_width = (w - 12. * (count - 1.)) / count;
+                        for (i, locale) in locales.iter().enumerate() {
+                            let label = match locale.as_str() {
+                                "zh-Hans" => msg("language-zh"),
+                                "ja" => msg("language-ja"),
+                                _ => msg("language-en"),
+                            };
+                            let action = if is_ui {
+                                UiAction::UiLocale {
+                                    locale: locale.clone(),
+                                }
+                            } else {
+                                UiAction::TextLocale {
+                                    locale: locale.clone(),
+                                }
+                            };
+                            p.button(
+                                label,
+                                action,
+                                [
+                                    x + i as f32 * (button_width + 12.),
+                                    row + 20.,
+                                    button_width,
+                                    if compact { 34. } else { 40. },
+                                ],
+                                active == locale,
+                                t,
+                            );
+                        }
+                    }
                     let ty = yy + gap;
-                    p.text(msg("text-language"), x, ty, w, 16., t.muted);
-                    p.button(
-                        msg("language-zh"),
-                        UiAction::TextLocale {
-                            locale: "zh-Hans".into(),
-                        },
-                        [x, ty + 20., (w - 12.) / 2., if compact { 34. } else { 40. }],
-                        m.prefs.text_locale == "zh-Hans",
-                        t,
-                    );
-                    p.button(
-                        msg("language-en"),
-                        UiAction::TextLocale {
-                            locale: "en".into(),
-                        },
-                        [
-                            x + (w + 12.) / 2.,
-                            ty + 20.,
-                            (w - 12.) / 2.,
-                            if compact { 34. } else { 40. },
-                        ],
-                        m.prefs.text_locale == "en",
-                        t,
-                    );
                     let status_y = ty + gap;
                     let state_message = if let Some(error) = &m.locale_error {
                         format!("{}: {error}", msg("language-failed"))
@@ -1040,6 +1166,7 @@ fn project_measured(
                             width: w,
                             height: row_height - 8.,
                             size: if narrow { 16. } else { 18. },
+                            line_height: if narrow { 24. } else { 27. },
                             color: t.text,
                             emphasis: vec![],
                             scroll: 0.,
@@ -1108,6 +1235,7 @@ fn project_measured(
             width: width - 2. * margin - 40.,
             height: 65.,
             size: 15.,
+            line_height: 22.5,
             color: t.text,
             emphasis: vec![],
             scroll: 0.,
@@ -1314,8 +1442,9 @@ impl TextEngine {
     }
     pub fn key(run: &TextRun) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{:?}:{:?}:{}",
+            "{}:{}:{}:{}:{}:{}:{:?}:{:?}:{}",
             run.size.to_bits(),
+            run.line_height.to_bits(),
             run.width.to_bits(),
             run.height.to_bits(),
             run.locale,
@@ -1401,7 +1530,7 @@ impl TextEngine {
                 let primary = explicit.first().copied();
                 let mut b = cosmic_text::Buffer::new(
                     &mut self.fonts,
-                    cosmic_text::Metrics::new(r.size, r.size * 1.5),
+                    cosmic_text::Metrics::new(r.size, r.line_height),
                 );
                 b.set_size(&mut self.fonts, Some(r.width), None);
                 let attrs = match primary {
@@ -1512,6 +1641,27 @@ mod scene_tests {
         packet.rect([0., 0., 640., 360.], [0.01, 0.02, 0.03, 1.]);
         packet.text("hello", 10., 20., 300., 18., [1.; 4]);
         packet
+    }
+
+    #[test]
+    fn imported_line_height_fits_four_lines_and_has_its_own_shape_key() {
+        let mut text = reader_text_engine();
+        let mut packet = text_packet(["A\nB\nC\nD".to_owned()]);
+        packet.texts[0].size = 32.;
+        packet.texts[0].line_height = 40.;
+        packet.texts[0].height = 175.;
+        text.layout(&packet);
+        let key = TextEngine::key(&packet.texts[0]);
+        let lines: Vec<_> = text.buffers[&key].layout_runs().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines.last().unwrap().line_top + lines.last().unwrap().line_height,
+            160.
+        );
+        packet.texts[0].line_height = 48.;
+        assert_ne!(key, TextEngine::key(&packet.texts[0]));
+        text.layout(&packet);
+        assert_eq!(text.cache_stats().entries, 2);
     }
 
     #[test]

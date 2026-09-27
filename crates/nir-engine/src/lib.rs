@@ -190,6 +190,27 @@ impl Engine {
     pub fn hit_action(&self, x: f32, y: f32) -> Option<UiAction> {
         self.packet.hit(x, y)
     }
+    pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), String> {
+        if self.player.screen != nir_presentation::Screen::Title {
+            return Ok(());
+        }
+        let model = self.player.model();
+        let hit = self.packet.hit(x, y);
+        let id = model
+            .theme
+            .image_menus
+            .get(&model.image_menu)
+            .and_then(|menu| {
+                menu.buttons
+                    .iter()
+                    .find(|b| Some(b.action.ui_action()) == hit)
+                    .map(|b| b.id.clone())
+            });
+        if id != model.hovered_image {
+            self.input(UiAction::HoverImage { id }, 0)?;
+        }
+        Ok(())
+    }
     pub fn focus_actions(&self) -> Vec<UiAction> {
         self.packet
             .semantics

@@ -1806,8 +1806,38 @@ fn bad_runtime(at: &str, message: &str) -> Diagnostic {
 fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+fn validate_image_menus(
+    theme: &Theme,
+    asset: impl Fn(&str) -> Option<AssetKind>,
+    function: impl Fn(&str) -> Option<FunctionSignature>,
+) -> Result<()> {
+    for id in theme.image_assets() {
+        if asset(&id) != Some(AssetKind::Image) {
+            return Err(err("E_THEME_ASSET", &id, "theme requires an image asset"));
+        }
+    }
+    for menu in theme.image_menus.values() {
+        for button in &menu.buttons {
+            if let ImageMenuAction::Entry { function: id } = &button.action {
+                if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
+                    return Err(err(
+                        "E_THEME_ENTRY",
+                        id,
+                        "menu entry must name a function without arguments or return value",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
+    validate_image_menus(
+        &root.theme,
+        |id| root.assets.get(id).map(|a| a.kind),
+        |id| root.function_signature(id).cloned(),
+    )?;
     let fail = || bad_runtime("program", "invalid runtime root index or configuration");
     if root.format != RUNTIME_FORMAT_VERSION
         || root.game_id.is_empty()
@@ -1823,7 +1853,7 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
         || root
             .locales
             .iter()
-            .any(|locale| locale != "zh-Hans" && locale != "en")
+            .any(|locale| locale != "zh-Hans" && locale != "en" && locale != "ja")
     {
         return Err(fail());
     }
@@ -2793,6 +2823,11 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         return validate_runtime_root(root);
     }
     validate_ui_config(&p.theme, &p.player)?;
+    validate_image_menus(
+        &p.theme,
+        |id| p.asset_kind(id),
+        |id| p.function_signature(id),
+    )?;
     if p.format != FORMAT_VERSION {
         return Err(err("E_VERSION", "program", "unsupported semantic version"));
     }
@@ -2910,7 +2945,7 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         ));
     }
     for (locale, texts) in p.locales.iter() {
-        if locale != "zh-Hans" && locale != "en" {
+        if locale != "zh-Hans" && locale != "en" && locale != "ja" {
             return Err(err(
                 "E_CAPABILITY",
                 locale,

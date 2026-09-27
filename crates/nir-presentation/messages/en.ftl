@@ -40,6 +40,7 @@ scroll-forward = Page down
 
 language-zh = 简体中文
 language-en = English
+language-ja = Japanese
 ui-language = Interface language
 text-language = Story language
 language-active = Active

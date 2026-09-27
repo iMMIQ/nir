@@ -19,6 +19,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect and migrate projects from other engines (offline, experimental).
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
     Schemas {
         #[arg(long, default_value = "schemas")]
         out: PathBuf,
@@ -68,6 +73,31 @@ enum Command {
     Release {
         #[command(subcommand)]
         command: ReleaseCommand,
+    },
+}
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// Inventory extracted LiveMaker LSB scripts without exporting game content.
+    Inspect { source: PathBuf },
+    /// Convert LiveMaker 116; recognized LiveNovel profiles include events, menus and media.
+    Livemaker {
+        source: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        entry: Option<String>,
+        /// Source label LineNo, not an index into the command array.
+        #[arg(long, default_value_t = 0)]
+        line: u32,
+        /// Write an incomplete migration with explicit faults at unsupported commands.
+        #[arg(long)]
+        draft: bool,
+        #[arg(long, default_value = "org.nir.imported.livemaker")]
+        game_id: String,
+        #[arg(long, default_value = "Imported LiveMaker story")]
+        title: String,
+        #[arg(long, value_parser = ["ja", "en", "zh-Hans"], default_value = "ja")]
+        locale: String,
     },
 }
 #[derive(Subcommand)]
@@ -162,6 +192,9 @@ fn run(cli: Cli) -> Result<()> {
     if matches!(
         &cli.command,
         Command::Init { .. }
+            | Command::Import {
+                command: ImportCommand::Livemaker { .. }
+            }
             | Command::Resolve
             | Command::Doctor
             | Command::Check { locked: true }
@@ -176,6 +209,43 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     match cli.command {
+        Command::Import { command } => match command {
+            ImportCommand::Inspect { source } => {
+                let report = import::inspect(&source)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.errors.is_empty() {
+                    bail!("E_IMPORT_INSPECT: some scripts could not be parsed; see report");
+                }
+            }
+            ImportCommand::Livemaker {
+                source,
+                out,
+                entry,
+                line,
+                draft,
+                game_id,
+                title,
+                locale,
+            } => {
+                let report = import::convert(
+                    &import::ImportOptions {
+                        source,
+                        out,
+                        entry,
+                        line,
+                        draft,
+                        game_id,
+                        title,
+                        locale,
+                    },
+                    &sdk,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.errors > 0 {
+                    bail!("E_IMPORT_INCOMPLETE: {} unsupported locations; project written: {}; see import report", report.errors, report.written);
+                }
+            }
+        },
         Command::Schemas { out } => write_schemas(&out)?,
         Command::Text { command } => match command {
             TextCommand::Status { json } => {

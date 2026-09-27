@@ -156,6 +156,8 @@ pub struct Snapshot {
     pub pending: Option<PendingActivation>,
     pub waiting: Option<Waiting>,
     pub choice: Option<OfferedChoice>,
+    #[serde(default)]
+    pub dialogue_hidden: bool,
     pub history: Vec<HistoryEntry>,
     pub locale: String,
     pub next_id: u32,
@@ -246,16 +248,33 @@ pub struct Core {
 }
 impl Core {
     pub fn new(program: ValidatedProgram, release: String, locale: String) -> Result<Self> {
+        let entry = program.program().entry.clone();
+        Self::new_at(program, release, locale, &entry)
+    }
+    /// Start a fresh session at a declared, parameterless entry (e.g. a replay).
+    pub fn new_at(
+        program: ValidatedProgram,
+        release: String,
+        locale: String,
+        function: &str,
+    ) -> Result<Self> {
         let p = program.program();
         if !p.locales.contains_key(&locale) {
             return Err(Diagnostic::new("E_LOCALE", "new", locale));
         }
         let entry = p
-            .function_signature(&p.entry)
+            .function_signature(function)
             .ok_or_else(|| Diagnostic::new("E_FUNCTION", "entry", "missing interface"))?;
+        if !entry.params.is_empty() || entry.returns.is_some() {
+            return Err(Diagnostic::new(
+                "E_FUNCTION",
+                function,
+                "entry must not require parameters or return a value",
+            ));
+        }
         let frame = Frame {
             id: 1,
-            function: p.entry.clone(),
+            function: function.into(),
             block: entry.entry,
             op: 0,
             op_id: entry.entry_op,
@@ -279,6 +298,7 @@ impl Core {
             pending: None,
             waiting: None,
             choice: None,
+            dialogue_hidden: false,
             history: vec![],
             locale,
             next_id: 2,
@@ -934,6 +954,7 @@ impl Core {
                     .ok_or_else(|| Diagnostic::new("E_NODE", at, node))?;
                 n.set(*property, *value);
             }
+            Operation::DialogueVisibility { visible } => self.state.dialogue_hidden = !visible,
             Operation::ProfileMerge { key } => self
                 .intents
                 .push(CoreIntent::ProfileMerge { key: key.clone() }),

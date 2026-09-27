@@ -106,6 +106,7 @@ fn main() -> Result<()> {
                 )?;
             }
             fs::copy("crates/nir-platform-web/host.js", "dist/sdk/host.js")?;
+            fs::copy("docs/IMPORT.md", "dist/sdk/IMPORT.md")?;
             if cfg!(windows) {
                 run(Command::new("cargo").args([
                     "build",

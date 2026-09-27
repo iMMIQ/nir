@@ -18,19 +18,17 @@ pub struct LocaleManifest {
 }
 impl LocaleManifest {
     pub fn resolve(&self) -> Result<LocaleConfig> {
-        let valid = |locale: &str| matches!(locale, "zh-Hans" | "en");
+        let valid_ui = |locale: &str| matches!(locale, "zh-Hans" | "en");
+        let valid_text = |locale: &str| matches!(locale, "zh-Hans" | "en" | "ja");
         if self.format != 1
-            || !valid(&self.default_ui)
-            || !valid(&self.default_text)
+            || !valid_ui(&self.default_ui)
+            || !valid_text(&self.default_text)
             || self.ui.is_empty()
             || self.text.is_empty()
-            || self
-                .ui
-                .keys()
-                .chain(self.text.keys())
-                .any(|locale| !valid(locale))
+            || self.ui.keys().any(|locale| !valid_ui(locale))
+            || self.text.keys().any(|locale| !valid_text(locale))
         {
-            bail!("E_LOCALE_CONFIG: expected format 1 and supported zh-Hans/en locale identifiers");
+            bail!("E_LOCALE_CONFIG: expected format 1; UI supports zh-Hans/en, text supports zh-Hans/en/ja");
         }
         for (surface, plans) in [("ui", &self.ui), ("text", &self.text)] {
             for (locale, fonts) in plans {
@@ -79,6 +77,10 @@ pub struct ThemeManifest {
     pub dialogue: DialogueProps,
     #[serde(default)]
     pub choice: ChoiceProps,
+    #[serde(default)]
+    pub image_menus: BTreeMap<String, ImageMenu>,
+    #[serde(default)]
+    pub return_to_title: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -197,7 +199,15 @@ pub(crate) fn resolve_config(
         let value = serde_json::to_value(&m)?;
         let explicit = toml_value(&path)?;
         let source = crate::project::forward_slashes(path.strip_prefix(root)?);
-        for key in ["id", "base", "slots", "dialogue", "choice"] {
+        for key in [
+            "id",
+            "base",
+            "slots",
+            "dialogue",
+            "choice",
+            "image_menus",
+            "return_to_title",
+        ] {
             record(
                 &mut resolved,
                 &format!("theme.{key}"),
@@ -211,6 +221,8 @@ pub(crate) fn resolve_config(
         theme.slots = m.slots;
         theme.dialogue = m.dialogue;
         theme.choice = m.choice;
+        theme.image_menus = m.image_menus;
+        theme.return_to_title = m.return_to_title;
     }
     let tokens: ThemeTokens = json(&tokens_path)?;
     let value = serde_json::to_value(&tokens)?;

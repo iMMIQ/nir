@@ -143,14 +143,20 @@ impl Engine {
         request: u32,
         objects: js_sys::Array,
     ) -> std::result::Result<(), JsValue> {
-        if !self.inner.accepts_content(request) { return Ok(()); }
+        if !self.inner.accepts_content(request) {
+            return Ok(());
+        }
         let mut total = 0usize;
         let mut data = Vec::new();
-        if objects.length() > 128 { return self.content_failed(request, "E_CONTENT_LIMIT".into()); }
+        if objects.length() > 128 {
+            return self.content_failed(request, "E_CONTENT_LIMIT".into());
+        }
         for object in objects.iter() {
             let array = js_sys::Uint8Array::new(&object);
             total = total.saturating_add(array.length() as usize);
-            if total > nir_format::MAX_INPUT_BYTES { return self.content_failed(request, "E_CONTENT_LIMIT".into()); }
+            if total > nir_format::MAX_INPUT_BYTES {
+                return self.content_failed(request, "E_CONTENT_LIMIT".into());
+            }
             data.push(array.to_vec());
         }
         self.inner.content_ready(request, data).map_err(js)
@@ -215,6 +221,9 @@ impl Engine {
         self.inner
             .action(json, interaction, sequence, session)
             .map_err(js)
+    }
+    pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), JsValue> {
+        self.inner.hover(x, y).map_err(js)
     }
     pub fn hit(&self, x: f32, y: f32) -> String {
         self.inner.hit(x, y)

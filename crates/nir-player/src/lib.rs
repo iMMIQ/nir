@@ -291,6 +291,8 @@ pub struct Player {
     pub auto: bool,
     pub skip: bool,
     pub profile: BTreeSet<String>,
+    image_menu: String,
+    hovered_image: Option<String>,
     pub slots: Vec<SlotView>,
     pauses: Pauses,
     audio_paused: bool,
@@ -396,6 +398,8 @@ impl Player {
             auto: false,
             skip: false,
             profile: BTreeSet::new(),
+            image_menu: "title".into(),
+            hovered_image: None,
             slots: (0..3)
                 .map(|slot| SlotView {
                     slot,
@@ -467,6 +471,7 @@ impl Player {
                 width: 4096.,
                 height: 64.,
                 size: 18.,
+                line_height: 27.,
                 color: [0., 0., 0., 0.],
                 emphasis: vec![],
                 scroll: 0.,
@@ -725,6 +730,7 @@ impl Player {
             .iter()
             .filter_map(|n| n.asset.clone())
             .collect();
+        a.extend(self.core.program().theme.image_assets());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         a
     }
@@ -750,6 +756,7 @@ impl Player {
         if let Some(pending) = &s.pending {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
+        a.extend(self.core.program().theme.image_assets());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         let config = &core.program().locale_config;
         for locale in s
@@ -1207,7 +1214,21 @@ impl Player {
             self.pauses.insert("fault".into());
         }
         if self.core.state().outcome.is_some() {
-            self.screen = Screen::Ended;
+            if self.core.program().theme.return_to_title {
+                let root = self
+                    .core
+                    .state()
+                    .frames
+                    .first()
+                    .map(|frame| frame.function.as_str());
+                let menu = self.core.program().theme.image_menus.iter().find_map(|(id, menu)|
+                    menu.buttons.iter().any(|button| matches!(&button.action, nir_format::ImageMenuAction::Entry { function } if Some(function.as_str()) == root)).then(|| id.clone()))
+                    .unwrap_or_else(|| "title".into());
+                self.action(UiAction::Title, 0, 0, budget)?;
+                self.image_menu = menu;
+            } else {
+                self.screen = Screen::Ended;
+            }
             self.auto = false;
             self.skip = false;
         }
@@ -1968,7 +1989,47 @@ impl Player {
         budget: &mut u32,
     ) -> Result<()> {
         match a {
-            UiAction::NewGame => {
+            UiAction::ImageMenu { menu } => {
+                let allowed = self.core.program().theme.image_menus.get(&self.image_menu).is_some_and(|current|
+                    current.buttons.iter().any(|button| matches!(&button.action, nir_format::ImageMenuAction::Menu { menu: target } if target == &menu)
+                        && button.requires.as_ref().is_none_or(|key| self.profile.contains(key))));
+                if self.screen == Screen::Title
+                    && allowed
+                    && self.core.program().theme.image_menus.contains_key(&menu)
+                {
+                    self.image_menu = menu;
+                    self.hovered_image = None;
+                }
+            }
+            UiAction::HoverImage { id } => {
+                self.hovered_image = id.filter(|id| {
+                    self.screen == Screen::Title
+                        && self
+                            .core
+                            .program()
+                            .theme
+                            .image_menus
+                            .get(&self.image_menu)
+                            .is_some_and(|menu| menu.buttons.iter().any(|button| &button.id == id))
+                });
+            }
+            UiAction::NewGame | UiAction::ImageMenuEntry { .. } => {
+                let function = match &a {
+                    UiAction::ImageMenuEntry { function } => {
+                        let allowed = self.screen == Screen::Title && self.core.program().theme.image_menus
+                            .get(&self.image_menu).is_some_and(|menu| menu.buttons.iter().any(|button|
+                                matches!(&button.action, nir_format::ImageMenuAction::Entry { function: target } if target == function)
+                                && button.requires.as_ref().is_none_or(|key| self.profile.contains(key))));
+                        if !allowed {
+                            return Ok(());
+                        }
+                        function.clone()
+                    }
+                    _ => {
+                        self.image_menu = "title".into();
+                        self.core.program().entry.clone()
+                    }
+                };
                 if self.prepare.is_some() {
                     return Ok(());
                 }
@@ -1979,10 +2040,11 @@ impl Player {
                 self.prefetch_attempted = None;
                 self.generation.session += 1;
                 self.commands.push(AppCommand::AudioReset);
-                self.core = Core::new(
+                self.core = Core::new_at(
                     self.validated.clone(),
                     self.release.clone(),
                     self.effective_text_locale.clone(),
+                    &function,
                 )?;
                 self.screen = Screen::Story;
                 self.return_screen = Screen::Story;
@@ -2068,6 +2130,8 @@ impl Player {
                 self.status.clear();
             }
             UiAction::Title => {
+                self.image_menu = "title".into();
+                self.hovered_image = None;
                 let restart_locale = self.locale_pending();
                 self.cancel_content(false);
                 self.commands.push(AppCommand::AudioReset);
@@ -2326,8 +2390,14 @@ impl Player {
         // Core still contains the previous story or a restore is preparing.
         let title_context = screen == Screen::Title
             || (self.return_screen == Screen::Title
-                && matches!(screen, Screen::Menu | Screen::Settings | Screen::Saves | Screen::History));
+                && matches!(
+                    screen,
+                    Screen::Menu | Screen::Settings | Screen::Saves | Screen::History
+                ));
         UiModel {
+            image_menu: self.image_menu.clone(),
+            hovered_image: self.hovered_image.clone(),
+            profile: self.profile.clone(),
             title: self.title.clone(),
             screen,
             nodes: if title_context {
@@ -2344,27 +2414,31 @@ impl Player {
                 c.program().stage.width as f32,
                 c.program().stage.height as f32,
             ],
-            dialogue: c.dialogue().map(|(_, d)| DialogueView {
-                full_text: d.full_text(),
-                visible_text: d.visible_text(),
-                speaker: d.speaker.clone(),
-                ready: d.awaiting_advance,
-                gate: d.at_gate,
-                locale: d.locale.clone(),
-                font_plan_digest: d.font_plan_digest.clone(),
-                font_assets: c.program().locale_config.text[&d.locale].fonts.clone(),
-                emphasis: {
-                    let mut offset = 0;
-                    d.spans
-                        .iter()
-                        .filter_map(|s| {
-                            let start = offset;
-                            offset += s.text.len();
-                            s.emphasis.then_some((start, offset))
-                        })
-                        .collect()
-                },
-            }),
+            hidden_dialogue: c.state().dialogue_hidden && c.dialogue().is_some(),
+            dialogue: c
+                .dialogue()
+                .filter(|_| !c.state().dialogue_hidden)
+                .map(|(_, d)| DialogueView {
+                    full_text: d.full_text(),
+                    visible_text: d.visible_text(),
+                    speaker: d.speaker.clone(),
+                    ready: d.awaiting_advance,
+                    gate: d.at_gate,
+                    locale: d.locale.clone(),
+                    font_plan_digest: d.font_plan_digest.clone(),
+                    font_assets: c.program().locale_config.text[&d.locale].fonts.clone(),
+                    emphasis: {
+                        let mut offset = 0;
+                        d.spans
+                            .iter()
+                            .filter_map(|s| {
+                                let start = offset;
+                                offset += s.text.len();
+                                s.emphasis.then_some((start, offset))
+                            })
+                            .collect()
+                    },
+                }),
             choices: c
                 .state()
                 .choice
@@ -2390,6 +2464,16 @@ impl Player {
             ui_fonts: ui_plan.fonts.clone(),
             ui_font_plan_digest: ui_plan.digest.clone(),
             text_locale: self.effective_text_locale.clone(),
+            available_ui_locales: ["zh-Hans", "en"]
+                .into_iter()
+                .filter(|locale| c.program().locale_config.ui.contains_key(*locale))
+                .map(str::to_owned)
+                .collect(),
+            available_text_locales: ["zh-Hans", "en", "ja"]
+                .into_iter()
+                .filter(|locale| c.program().locale_config.text.contains_key(*locale))
+                .map(str::to_owned)
+                .collect(),
             text_fonts: text_plan.fonts.clone(),
             text_font_plan_digest: text_plan.digest.clone(),
             locale_pending: self.locale_pending(),
@@ -2473,6 +2557,130 @@ mod media_tests {
     use super::*;
     const LIMIT: u64 = 128 * 1024 * 1024;
 
+    #[test]
+    fn imported_japanese_story_settings_only_offer_configured_languages() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let text = program.locales.remove("en").unwrap();
+        program.locales.clear();
+        program.locales.insert("ja".into(), text);
+        let plan = program.locale_config.text.remove("en").unwrap();
+        program.locale_config.text.clear();
+        program.locale_config.text.insert("ja".into(), plan);
+        program.locale_config.ui.remove("zh-Hans");
+        program.locale_config.default_ui = "en".into();
+        program.locale_config.default_text = "ja".into();
+        program.default_locale = "ja".into();
+        let player = Player::new(program, "release".into(), "Test".into()).unwrap();
+        let mut model = player.model();
+        model.screen = Screen::Settings;
+        assert_eq!(model.available_ui_locales, ["en"]);
+        assert_eq!(model.available_text_locales, ["ja"]);
+        let packet =
+            nir_presentation::project(&model, 1280., 720., &nir_presentation::Messages::default());
+        let language_actions: Vec<_> = packet
+            .semantics
+            .iter()
+            .filter_map(|node| match &node.action {
+                UiAction::TextLocale { locale } => Some(locale.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(language_actions, ["ja"]);
+    }
+
+    #[test]
+    fn image_menu_scales_hover_and_enforces_replay_unlocks() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.functions.insert("replay".into(), serde_json::from_value(serde_json::json!({"entry":"start","blocks":{"start":{"ops":[],"terminator":{"type":"call","function":"main","next":"end"}},"end":{"ops":[],"terminator":{"type":"end","outcome":"replay"}}}})).unwrap());
+        let button = nir_format::ImageButton {
+            id: "replay-button".into(),
+            label: "Replay".into(),
+            asset: "bg.station".into(),
+            hover_asset: Some("bg.river".into()),
+            locked_asset: None,
+            rect: [100., 100., 200., 60.],
+            action: nir_format::ImageMenuAction::Entry {
+                function: "replay".into(),
+            },
+            requires: Some("seen".into()),
+        };
+        program.theme.image_menus.insert(
+            "title".into(),
+            nir_format::ImageMenu {
+                background: "bg.station".into(),
+                buttons: vec![button],
+            },
+        );
+        let mut player = Player::new(program, "release".into(), "Test".into()).unwrap();
+        player.cancel_preparation();
+        player.pauses.remove("prepare");
+        let entry = UiAction::ImageMenuEntry {
+            function: "replay".into(),
+        };
+        player.action(entry.clone(), 0, 1, &mut 100).unwrap();
+        assert_eq!(player.screen, Screen::Title);
+        let packet = nir_presentation::project(
+            &player.model(),
+            320.,
+            240.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(packet.hit(30., 60.).is_none());
+        player.profile.insert("seen".into());
+        player
+            .action(
+                UiAction::HoverImage {
+                    id: Some("replay-button".into()),
+                },
+                0,
+                2,
+                &mut 100,
+            )
+            .unwrap();
+        let packet = nir_presentation::project(
+            &player.model(),
+            320.,
+            240.,
+            &nir_presentation::Messages::default(),
+        );
+        assert_eq!(packet.hit(30., 60.), Some(entry.clone()));
+        assert!(packet
+            .quads
+            .iter()
+            .any(|q| q.asset.as_deref() == Some("bg.river") && q.rect == [25., 55., 50., 15.]));
+        assert!(player.title_assets().contains("bg.river"));
+        player
+            .action(
+                UiAction::ImageMenuEntry {
+                    function: "not-configured".into(),
+                },
+                0,
+                3,
+                &mut 100,
+            )
+            .unwrap();
+        assert_eq!(player.screen, Screen::Title);
+        player.action(entry, 0, 4, &mut 100).unwrap();
+        assert_eq!(player.screen, Screen::Story);
+        assert_eq!(player.core.state().frames[0].function, "replay");
+    }
+
+    #[test]
+    fn image_menu_rejects_unknown_assets_and_entry_functions() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.theme.image_menus.insert(
+            "title".into(),
+            nir_format::ImageMenu {
+                background: "missing".into(),
+                buttons: vec![],
+            },
+        );
+        assert!(Player::new(program, "release".into(), "Test".into()).is_err());
+    }
+
     fn player() -> Player {
         let program: Program =
             serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
@@ -2481,16 +2689,29 @@ mod media_tests {
 
     #[test]
     fn title_menus_project_only_the_retained_title_scene() {
-        let mut program: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
         program.title_scene = Some("station".into());
         let mut player = at_intro_wait(program);
         player.action(UiAction::Title, 0, 0, &mut 100).unwrap();
-        for action in [UiAction::Menu, UiAction::Settings, UiAction::Saves, UiAction::History] {
+        for action in [
+            UiAction::Menu,
+            UiAction::Settings,
+            UiAction::Saves,
+            UiAction::History,
+        ] {
             player.action(action, 0, 0, &mut 100).unwrap();
             let model = player.model();
-            assert_eq!(serde_json::to_value(&model.nodes).unwrap(), serde_json::to_value(player.title_nodes()).unwrap());
+            assert_eq!(
+                serde_json::to_value(&model.nodes).unwrap(),
+                serde_json::to_value(player.title_nodes()).unwrap()
+            );
             assert!(model.transition.is_none());
-            assert!(model.nodes.iter().filter_map(|n|n.asset.as_ref()).all(|id|player.retained_assets().contains(id)));
+            assert!(model
+                .nodes
+                .iter()
+                .filter_map(|n| n.asset.as_ref())
+                .all(|id| player.retained_assets().contains(id)));
         }
     }
 

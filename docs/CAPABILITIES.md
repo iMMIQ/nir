@@ -5,7 +5,7 @@
 | 类别 | 当前支持 | 边界 |
 |---|---|---|
 | 逻辑 | Bool/I32/String、局部槽、纯表达式、checked 算术、函数/返回、Branch/Switch/Goto | 无浮点剧情变量、脚本扩展或任意 JS |
-| 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、ProfileMerge | Profile 为布尔事实的单调集合 |
+| 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、DialogueVisibility、ProfileMerge | Profile 为布尔事实的单调集合 |
 | 终结 | Call/Return、Activate/Await/Interact、End/Fault | 单剧情流；跨模块通过具名导出调用 |
 | 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All | 无 Runtime Worker |
 | 模块 | 多模块命名空间、导出链接、共享变量、函数体/正文哈希分包、执行与恢复前准备 | 静态目录与媒体按需准备、有界预取、租约保护及驱逐；无 Edition 或跨发行存档转换 |
@@ -15,13 +15,14 @@
 | 字体编译 | 静态 OTF/TTF/TTC face、subset/full、UI/正文逐语言有序 FontPlan、覆盖检查、共享字体字集去重、塑形闭包、内容缓存、许可打包 | 无可变/彩色字体、运行时补字；详见 [字体说明](AUTHOR-FONTS.md) 与 [语言/字体计划](LOCALE-FONTS.md) |
 | 选项 | 稳定 OptionId、可见/可用表达式、默认超时、交互实例校验 | 按实际文字高度排版和裁切滚动；旧实例和重复输入丢弃 |
 | 界面 | 标题、对白、选项、菜单、设置、回看分页与单条长记录翻阅、存读档、自动、已读快进 | Fluent 界面内嵌在 SDK |
-| 作品配置/主题 | `web-standard`、player 默认设置、字段来源报告、dialogue.main/choice.main 内置组件替换 | 固定槽、受限 Props；无任意组件、主题资源或页面组合 |
-| 语言 | zh-Hans/en 独立 UI/正文偏好与字体计划；候选准备后原子切换；正文下一实例生效，已存在的对白/选项/历史冻结身份 | 正文按模块/语言获取并校验；不提供繁简自动回退或多文字系统认证；详见 [语言/字体计划](LOCALE-FONTS.md) |
+| 作品配置/主题 | `web-standard`、player 默认设置、字段来源报告、dialogue.main/choice.main 内置组件替换 | 原图按钮菜单、解锁入口和消息框图片／舞台坐标；无任意组件或可执行主题脚本 |
+| 语言 | zh-Hans/en 界面，zh-Hans/en/ja 正文，独立偏好与字体计划；候选准备后原子切换；正文下一实例生效，已存在的对白/选项/历史冻结身份 | 正文按模块/语言获取并校验；不提供日文界面、繁简自动回退或多文字系统认证；详见 [语言/字体计划](LOCALE-FONTS.md) |
 | 音频 | PCM16 WAV、循环 BGM、短音效、合成测试语音、独立增益、手势解锁 | 无流式压缩音频、真人配音；可听性需要人工设备检查 |
 | 存储 | 按游戏/profile/发行隔离的三槽 IndexedDB、事务确认、修订冲突、导入导出、历史发行入口、独立偏好/Profile | 快照要求相同发行身份；无云同步 |
 | 恢复 | 候选先验证/准备、暂停提交、检查点回退、设备重建 | 无安全热更新 |
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告 | 无 PWA、签名/CDN 调度或高级压缩优化 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
+| 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
 | 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；移动端/Safari 实机验收后续安排 |
 
 资源账本、准备配方和缓存提供首版所需的分层准备与有界准入；已加入函数体与正文的跨模块按需获取；没有实现附件中完整的通用 DAG 调度、任意资源类型与高级缓存策略。静态声明目录已分包按需加载，字体仍为逐语言计划。v0.1.0 的实际测试列在 TEST-REPORT.md，后续有界事件队列、共享预算、独立暂停令牌、取消和分块上传的验证见 [引擎稳定性进展](ENGINE-STABILITY.md)；逐请求终态预留、迟到存读档回执及交错压力测试见 [请求生命周期进展](REQUEST-LIFECYCLE.md)。
