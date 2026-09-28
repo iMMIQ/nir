@@ -124,6 +124,7 @@ pub struct Renderer {
     pub text: TextEngine,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    menu_text_renderers: Vec<(usize, TextRenderer)>,
     viewport: Viewport,
     swash: SwashCache,
     pub submitted: u64,
@@ -330,7 +331,7 @@ impl Renderer {
         });
         let mix_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transition layout"),
-            bind_group_layouts: &[&layout, &layout],
+            bind_group_layouts: &[&layout, &layout, &layout],
             push_constant_ranges: &[],
         });
         let mix_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -400,6 +401,7 @@ impl Renderer {
             text: TextEngine::default(),
             atlas,
             text_renderer,
+            menu_text_renderers: vec![],
             viewport,
             swash: SwashCache::new(),
             submitted: 0,
@@ -611,7 +613,52 @@ impl Renderer {
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
         let layout_start = self.profile_start();
-        self.text.layout(p);
+        let paint_runs: std::borrow::Cow<'_, [nir_presentation::TextRun]> =
+            if p.texts.iter().any(|r| r.shadow.is_some()) {
+                std::borrow::Cow::Owned(
+                    p.texts
+                        .iter()
+                        .flat_map(|run| {
+                            run.shadow_run()
+                                .into_iter()
+                                .chain(std::iter::once(run.clone()))
+                        })
+                        .collect(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(&p.texts)
+            };
+        let owners: Vec<_> = p
+            .texts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| std::iter::repeat_n(i, 1 + usize::from(r.shadow.is_some())))
+            .collect();
+        let menu_indices: Vec<_> = p
+            .menu_paint
+            .iter()
+            .filter_map(|paint| match paint {
+                nir_presentation::MenuPaint::Text(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        self.menu_text_renderers.truncate(menu_indices.len());
+        for (batch, index) in menu_indices.iter().enumerate() {
+            if batch == self.menu_text_renderers.len() {
+                self.menu_text_renderers.push((
+                    *index,
+                    TextRenderer::new(
+                        &mut self.atlas,
+                        &self.device,
+                        wgpu::MultisampleState::default(),
+                        None,
+                    ),
+                ));
+            } else {
+                self.menu_text_renderers[batch].0 = *index;
+            }
+        }
+        self.text.layout_texts(&paint_runs);
         self.profile_end("prepare.layout", layout_start);
         if let Some(error) = self.text.missing_font.take() {
             return Err(
@@ -632,7 +679,14 @@ impl Renderer {
             },
         );
         let mut areas = vec![];
-        for r in &p.texts {
+        let mut menu_areas: Vec<Vec<TextArea<'_>>> = menu_indices.iter().map(|_| vec![]).collect();
+        for (run_index, r) in paint_runs.iter().enumerate() {
+            let areas =
+                if let Some(batch) = menu_indices.iter().position(|i| *i == owners[run_index]) {
+                    &mut menu_areas[batch]
+                } else {
+                    &mut areas
+                };
             if r.preflight_only {
                 continue;
             }
@@ -714,8 +768,21 @@ impl Renderer {
             areas,
             &mut self.swash,
         );
-        self.profile_end("prepare.glyphs", glyphs_start);
         glyphs_result.map_err(|e| error(e.to_string()))?;
+        for ((_, renderer), areas) in self.menu_text_renderers.iter_mut().zip(menu_areas) {
+            renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.fonts,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash,
+                )
+                .map_err(|e| error(e.to_string()))?;
+        }
+        self.profile_end("prepare.glyphs", glyphs_start);
         Ok(())
     }
     fn offscreen(&self, w: u32, h: u32) -> Texture {
@@ -783,6 +850,11 @@ impl Renderer {
                 pass.set_pipeline(&self.mix_pipeline);
                 pass.set_bind_group(0, &a.bind, &[]);
                 pass.set_bind_group(1, &b.bind, &[]);
+                let mask = self
+                    .textures
+                    .get(p.transition_style.asset().unwrap_or(""))
+                    .ok_or_else(|| error("transition mask missing"))?;
+                pass.set_bind_group(2, &mask.bind, &[]);
             } else {
                 pass.set_pipeline(&self.pipeline);
                 let texture = self
@@ -808,12 +880,16 @@ impl Renderer {
                     } else {
                         q.color[3]
                     };
-                    let color = [
-                        linear(q.color[0]) * a,
-                        linear(q.color[1]) * a,
-                        linear(q.color[2]) * a,
-                        a,
-                    ];
+                    let color = if q.asset.as_deref() == Some("@transition") {
+                        p.transition_style.parameters(a)
+                    } else {
+                        [
+                            linear(q.color[0]) * a,
+                            linear(q.color[1]) * a,
+                            linear(q.color[2]) * a,
+                            a,
+                        ]
+                    };
                     for (dx, dy, u, v) in [
                         (0., 0., 0., 0.),
                         (w, 0., 1., 0.),
@@ -926,13 +1002,32 @@ impl Renderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.paint(
-                    &mut pass,
-                    &p.quads,
-                    0,
-                    p,
-                    [self.config.width, self.config.height],
-                )?;
+                let physical = [self.config.width, self.config.height];
+                if let Some((start, end)) = p.menu_quad_range {
+                    self.paint(&mut pass, &p.quads[..start], 0, p, physical)?;
+                    for paint in &p.menu_paint {
+                        match *paint {
+                            nir_presentation::MenuPaint::Quad(i) => {
+                                self.paint(&mut pass, &p.quads[i..i + 1], i * 6, p, physical)?
+                            }
+                            nir_presentation::MenuPaint::Text(i) => {
+                                pass.set_scissor_rect(0, 0, physical[0], physical[1]);
+                                if let Some((_, renderer)) = self
+                                    .menu_text_renderers
+                                    .iter()
+                                    .find(|(index, _)| *index == i)
+                                {
+                                    renderer
+                                        .render(&self.atlas, &self.viewport, &mut pass)
+                                        .map_err(|e| error(e.to_string()))?;
+                                }
+                            }
+                        }
+                    }
+                    self.paint(&mut pass, &p.quads[end..], end * 6, p, physical)?;
+                } else {
+                    self.paint(&mut pass, &p.quads, 0, p, physical)?;
+                }
                 pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 self.text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)

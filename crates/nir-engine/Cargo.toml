@@ -10,6 +10,7 @@ nir-player.workspace = true
 nir-content.workspace = true
 nir-presentation.workspace = true
 nir-render-wgpu.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -13,6 +13,7 @@ pub struct Engine {
     renderer: Renderer,
     messages: Messages,
     packet: DrawPacket,
+    keyboard_focus: nir_presentation::KeyboardFocus,
     reading: ReadingState,
     view_sequence: (u32, u32),
     fonts: BTreeSet<String>,
@@ -68,6 +69,7 @@ impl Engine {
             renderer,
             messages: Messages::default(),
             packet: DrawPacket::default(),
+            keyboard_focus: Default::default(),
             reading: ReadingState::default(),
             view_sequence: (0, 0),
             fonts: BTreeSet::new(),
@@ -187,29 +189,215 @@ impl Engine {
             self.player.generation.session,
         )
     }
+    pub fn input_identity(&self) -> (u32, u32) {
+        (
+            self.player.generation.session,
+            self.player.current_interaction(),
+        )
+    }
+    pub fn scroll_action(
+        &self,
+        point: Option<(f32, f32)>,
+        delta: i32,
+        page: bool,
+    ) -> Option<UiAction> {
+        self.packet
+            .scrolls
+            .iter()
+            .find(|v| {
+                point.is_none_or(|(x, y)| {
+                    x >= v.rect[0]
+                        && x <= v.rect[0] + v.rect[2]
+                        && y >= v.rect[1]
+                        && y <= v.rect[1] + v.rect[3]
+                })
+            })
+            .map(|view| view.action(delta, page))
+    }
+    pub fn pointer_action(&self, x: f32, y: f32, button: u8) -> Option<UiAction> {
+        nir_presentation::pointer_action(&self.packet, &self.player.model(), x, y, button)
+    }
+    pub fn primary_action(&self) -> Option<UiAction> {
+        if let Some(node) =
+            self.keyboard_focus
+                .node(&self.packet, self.input_identity(), self.player.screen)
+        {
+            return Some(node.action.clone());
+        }
+        nir_presentation::primary_action(&self.packet, &self.player.model())
+    }
+    pub fn focus_value_action(&self, direction: u8) -> Option<UiAction> {
+        let node =
+            self.keyboard_focus
+                .node(&self.packet, self.input_identity(), self.player.screen)?;
+        nir_presentation::value_action(node, direction)
+    }
+    pub fn control_value_action(
+        &self,
+        id: u32,
+        expected: &UiAction,
+        direction: u8,
+    ) -> Option<UiAction> {
+        nir_presentation::control_value_action(&self.packet, id, expected, direction)
+    }
+    pub fn focus_control(&mut self, id: Option<u32>) {
+        self.keyboard_focus
+            .select(&self.packet, self.input_identity(), self.player.screen, id);
+        self.visual_invalidated = true;
+    }
+    pub fn navigate_focus(&mut self, direction: u8) -> Option<u32> {
+        let identity = self.input_identity();
+        let screen = self.player.screen;
+        let current = self
+            .keyboard_focus
+            .node(&self.packet, identity, screen)
+            .cloned();
+        let backwards = matches!(direction, 0 | 4);
+        if matches!(direction, 0 | 1 | 4 | 5) {
+            if let Some(current) = current {
+                let inside = |n: &nir_presentation::SemanticNode, rect: [f32; 4]| {
+                    let cy = n.rect[1] + n.rect[3] / 2.;
+                    let cx = n.rect[0] + n.rect[2] / 2.;
+                    n.enabled
+                        && !matches!(n.action, UiAction::Scroll { .. })
+                        && cx >= rect[0]
+                        && cx <= rect[0] + rect[2]
+                        && cy >= rect[1]
+                        && cy <= rect[1] + rect[3]
+                };
+                if let Some(view) = self
+                    .packet
+                    .scrolls
+                    .iter()
+                    .find(|v| inside(&current, v.rect))
+                    .cloned()
+                {
+                    let visible: Vec<_> = self
+                        .packet
+                        .semantics
+                        .iter()
+                        .filter(|n| inside(n, view.rect))
+                        .collect();
+                    let cy = current.rect[1] + current.rect[3] / 2.;
+                    let at_edge = if direction == 4 {
+                        !visible
+                            .iter()
+                            .any(|n| n.rect[1] + n.rect[3] / 2. < cy - 0.5)
+                    } else if direction == 5 {
+                        !visible
+                            .iter()
+                            .any(|n| n.rect[1] + n.rect[3] / 2. > cy + 0.5)
+                    } else if backwards {
+                        visible.first().map(|n| n.id) == Some(current.id)
+                    } else {
+                        visible.last().map(|n| n.id) == Some(current.id)
+                    };
+                    if at_edge
+                        && ((backwards && view.offset > 0.)
+                            || (!backwards && view.offset < view.max))
+                    {
+                        let old_actions: Vec<_> =
+                            visible.iter().map(|n| n.action.clone()).collect();
+                        self.reading.scroll(
+                            view.region,
+                            if backwards { -1 } else { 1 },
+                            &self.packet,
+                        );
+                        let projected = self.reading.project(
+                            &self.player.model(),
+                            identity,
+                            self.width,
+                            self.height,
+                            &self.messages,
+                            &mut self.renderer.text,
+                        );
+                        let candidates: Vec<_> = projected
+                            .semantics
+                            .iter()
+                            .filter(|n| inside(n, view.rect) && !old_actions.contains(&n.action))
+                            .collect();
+                        let next = if backwards {
+                            candidates.last()
+                        } else {
+                            candidates.first()
+                        };
+                        let id = next.map(|n| n.id).or_else(|| {
+                            projected
+                                .semantics
+                                .iter()
+                                .find(|n| n.enabled && n.action == current.action)
+                                .map(|n| n.id)
+                        });
+                        self.keyboard_focus.select(&projected, identity, screen, id);
+                        self.packet = projected;
+                        self.visual_invalidated = true;
+                        return id;
+                    }
+                }
+            }
+        }
+        let id = self
+            .keyboard_focus
+            .navigate(&self.packet, identity, screen, direction);
+        self.visual_invalidated = true;
+        id
+    }
+    pub fn focused_center(&self) -> Option<(f32, f32)> {
+        let n =
+            self.keyboard_focus
+                .node(&self.packet, self.input_identity(), self.player.screen)?;
+        Some((n.rect[0] + n.rect[2] / 2., n.rect[1] + n.rect[3] / 2.))
+    }
     pub fn hit_action(&self, x: f32, y: f32) -> Option<UiAction> {
         self.packet.hit(x, y)
     }
     pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), String> {
-        if self.player.screen != nir_presentation::Screen::Title {
-            return Ok(());
+        if self.reading.hover_history_bar(x, y) {
+            self.visual_invalidated = true;
         }
         let model = self.player.model();
-        let hit = self.packet.hit(x, y);
-        let id = model
-            .theme
-            .image_menus
-            .get(&model.image_menu)
-            .and_then(|menu| {
-                menu.buttons
-                    .iter()
-                    .find(|b| Some(b.action.ui_action()) == hit)
-                    .map(|b| b.id.clone())
-            });
+        if !model.authored_menu {
+            return Ok(());
+        }
+        let id = self
+            .packet
+            .hit_node(x, y)
+            .filter(|node| node.enabled)
+            .and_then(|node| self.packet.menu_controls.get(&node.id))
+            .cloned();
         if id != model.hovered_image {
             self.input(UiAction::HoverImage { id }, 0)?;
         }
         Ok(())
+    }
+    pub fn pointer_gesture(
+        &mut self,
+        phase: u8,
+        x: f32,
+        y: f32,
+        button: u8,
+    ) -> std::result::Result<bool, String> {
+        let identity = self.input_identity();
+        if phase == 3 || !self.ready || self.player.is_loading() {
+            let consumed =
+                self.reading
+                    .history_bar_gesture(3, x, y, button, identity, &self.packet);
+            self.visual_invalidated |= consumed;
+            return Ok(consumed);
+        }
+        let packet = self.reading.project(
+            &self.player.model(),
+            identity,
+            self.width,
+            self.height,
+            &self.messages,
+            &mut self.renderer.text,
+        );
+        let consumed = self
+            .reading
+            .history_bar_gesture(phase, x, y, button, identity, &packet);
+        self.visual_invalidated |= consumed;
+        Ok(consumed)
     }
     pub fn focus_actions(&self) -> Vec<UiAction> {
         self.packet
@@ -359,8 +547,10 @@ impl Engine {
             && !self.player.is_loading()
             && session == identity.0
             && interaction == identity.1
-            && matches!(action, UiAction::Advance | UiAction::Scroll { .. })
-        {
+            && matches!(
+                action,
+                UiAction::Advance | UiAction::Scroll { .. } | UiAction::MenuHistoryScroll { .. }
+            ) {
             // Earlier inputs in this same owner turn may have revealed more text.
             // Navigation must use current layout, not the previous submitted frame.
             let start = self.profile_start();
@@ -386,6 +576,17 @@ impl Engine {
             && sequence > self.player.core().state().last_input
             && self.reading.matches(identity)
             && !self.player.is_loading();
+        if matches!(action, UiAction::MenuHistoryScroll { .. }) {
+            if valid {
+                self.reading.scroll_menu_history(
+                    &action,
+                    navigation_packet.as_ref().unwrap_or(&self.packet),
+                );
+                self.view_sequence = (session, sequence);
+                self.visual_invalidated = true;
+            }
+            return Ok(());
+        }
         if let UiAction::Scroll { region, delta } = action {
             if !valid {
                 return Ok(());
@@ -399,6 +600,7 @@ impl Engine {
         } else if action == UiAction::Advance
             && valid
             && !self.player.paused()
+            && !self.player.interface_hidden()
             && self.player.screen == nir_presentation::Screen::Story
             && self.player.core().state().choice.is_none()
         {
@@ -443,11 +645,46 @@ impl Engine {
             delta_us: delta_us as u64,
         }])
     }
+    pub fn tick_domains(
+        &mut self,
+        story_us: u32,
+        foreground_us: u32,
+    ) -> std::result::Result<(), String> {
+        self.pump(vec![AppEvent::TickDomains {
+            story_us: story_us as u64,
+            foreground_us: foreground_us as u64,
+        }])
+    }
+    pub fn audio_positions_in(
+        &mut self,
+        domain: TimeDomain,
+        session: u32,
+        positions: Vec<AudioPosition>,
+    ) -> std::result::Result<(), String> {
+        if positions.len() > MAX_TASKS {
+            return Err("E_AUDIO_POSITION: observation limit".into());
+        }
+        self.player
+            .observe_audio_positions(domain, session, &positions)
+            .map_err(js)
+    }
     pub fn hidden(&mut self, value: bool) -> std::result::Result<(), String> {
         self.pump(vec![AppEvent::Hidden(value)])
     }
     pub fn audio_ended(&mut self, task: u32, session: u32) -> std::result::Result<(), String> {
-        self.pump(vec![AppEvent::AudioEnded { task, session }])
+        self.audio_ended_in(TimeDomain::Story, task, session)
+    }
+    pub fn audio_ended_in(
+        &mut self,
+        domain: TimeDomain,
+        task: u32,
+        session: u32,
+    ) -> std::result::Result<(), String> {
+        self.pump(vec![AppEvent::AudioEnded {
+            domain,
+            task,
+            session,
+        }])
     }
     pub fn audio_failed(
         &mut self,
@@ -455,7 +692,17 @@ impl Engine {
         session: u32,
         message: String,
     ) -> std::result::Result<(), String> {
+        self.audio_failed_in(TimeDomain::Story, task, session, message)
+    }
+    pub fn audio_failed_in(
+        &mut self,
+        domain: TimeDomain,
+        task: u32,
+        session: u32,
+        message: String,
+    ) -> std::result::Result<(), String> {
         self.pump(vec![AppEvent::AudioFailed {
+            domain,
             task,
             session,
             message,
@@ -477,6 +724,34 @@ impl Engine {
             ),
             "profile" => {
                 AppEvent::Profile(nir_content::parse(json.as_bytes(), "profile").map_err(js)?)
+            }
+            "slot_loaded" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    job: u32,
+                    envelope: Box<SaveEnvelope>,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "slot_loaded").map_err(js)?;
+                AppEvent::SlotLoaded {
+                    job: reply.job,
+                    envelope: reply.envelope,
+                }
+            }
+            "slot_load_failed" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    job: u32,
+                    message: String,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "slot_load_failed").map_err(js)?;
+                AppEvent::SlotLoadFailed {
+                    job: reply.job,
+                    message: reply.message,
+                }
             }
             "loaded" => AppEvent::Loaded {
                 envelope: Box::new(
@@ -567,11 +842,12 @@ impl Engine {
         // Title changes immediately, before its replacement media is ready.
         // Other screens still need layout updates while a cue is preparing
         // (history, scrolling and a dialogue paused at an authored gate).
-        let waiting_for_title =
-            self.player.screen == nir_presentation::Screen::Title && self.player.is_loading();
+        let waiting_for_title = (self.player.screen == nir_presentation::Screen::Title
+            || (self.player.active_menu_id().is_some() && self.player.error.is_none()))
+            && self.player.is_loading();
         if self.ready && !waiting_for_title {
             let projection_start = self.profile_start();
-            let projected = self.reading.project(
+            let mut projected = self.reading.project(
                 &self.player.model(),
                 (
                     self.player.generation.session,
@@ -582,6 +858,27 @@ impl Engine {
                 &self.messages,
                 &mut self.renderer.text,
             );
+            if let Some(node) =
+                self.keyboard_focus
+                    .node(&projected, self.input_identity(), self.player.screen)
+            {
+                let [x, y, w, h] = node.rect;
+                for rect in [
+                    [x, y, w, 2.],
+                    [x, y + h - 2., w, 2.],
+                    [x, y, 2., h],
+                    [x + w - 2., y, 2., h],
+                ] {
+                    projected.quads.push(nir_presentation::Quad {
+                        rect,
+                        color: [1., 0.85, 0.35, 1.],
+                        asset: None,
+                        clip: None,
+                    });
+                }
+            } else {
+                self.keyboard_focus.clear();
+            }
             self.profile_end("projection", projection_start);
             let draw_start = self.profile_start();
             let needs_render = self.visual_invalidated || !self.packet.visual_eq(&projected);
@@ -600,14 +897,24 @@ impl Engine {
         Ok(semantics)
     }
     pub fn needs_clock(&self) -> bool {
-        self.ready && self.player.needs_clock()
+        self.ready && (self.player.needs_clock() || self.reading.history_pending())
     }
     pub fn state(&self) -> String {
         let c = self.player.core();
         let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
         let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
         let residency = self.player.content_residency();
-        serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.screen),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()}).to_string()
+        let mut state = serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.presentation_screen()),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()});
+        state["history_scrollbar"] = serde_json::json!(self.packet.history_bar);
+        state["menu_depth"] = serde_json::json!(self.player.menu_depth());
+        state["history_pending"] = serde_json::json!(self.reading.history_pending());
+        state["history_error"] = serde_json::json!(self.reading.history_error());
+        state["interface_hidden"] = serde_json::json!(self.player.interface_hidden());
+        state["foreground_clock_us"] = serde_json::json!(self.player.foreground_clock());
+        state["foreground_paused"] =
+            serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));
+        state["dialogue_appearance"] = serde_json::json!(c.sample_dialogue_appearance());
+        state.to_string()
     }
     pub fn host_state(&mut self) -> String {
         let start = self.profile_start();
@@ -618,7 +925,7 @@ impl Engine {
             "device": self.player.generation.device,
             "interaction": self.player.current_interaction(),
             "sequence": c.state().last_input,
-            "screen": format!("{:?}", self.player.screen),
+            "screen": format!("{:?}", self.player.presentation_screen()),
             "locale": self.player.effective_ui_locale,
             "paused": self.player.paused(),
             "loading": self.player.is_loading(),
@@ -629,6 +936,8 @@ impl Engine {
             "upload_steps": self.renderer.upload_steps,
             "turn_upload_bytes": 2 * 1024 * 1024 - self.upload_remaining,
             "scrolls": self.packet.scrolls,
+            "history_scrollbar": self.packet.history_bar,
+            "menu_depth": self.player.menu_depth(),
             "pending_events": self.player.pending_events(),
             "turn_work": 10_000 - self.work_remaining,
         })

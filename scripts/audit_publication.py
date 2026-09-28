@@ -52,7 +52,9 @@ def main():
     for p in source_files():
         if p.is_symlink():
             findings.append({"file": str(p), "category": "symlink_requires_review"})
-        else:
+        elif p.exists():
+            # Git still lists tracked files removed in the working tree. They
+            # are not part of the source being prepared for the next commit.
             check(str(p), p.read_bytes(), source=True)
     for archive in args.archives:
         with tarfile.open(archive, "r:gz") as tar:

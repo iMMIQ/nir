@@ -332,7 +332,10 @@ fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
     if let Some(cue) = program.cues.get(cue_id) {
         for definition in &cue.effects {
             match &definition.effect {
-                Effect::StagePresent { scene, .. } => {
+                Effect::StagePresent {
+                    scene, transition, ..
+                } => {
+                    assets.extend(transition.asset().map(str::to_owned));
                     if let Some(nodes) = program.scenes.get(scene) {
                         assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
                     }
@@ -366,6 +369,14 @@ fn asset_consumers(
     for (cue, definition) in &program.cues {
         if let Some(module) = cue_owners.get(cue) {
             for effect in &definition.effects {
+                if let Effect::StagePresent { transition, .. } = &effect.effect {
+                    if let Some(asset) = transition.asset() {
+                        consumers
+                            .entry(asset.to_owned())
+                            .or_default()
+                            .insert(format!("module:{module}"));
+                    }
+                }
                 if let Effect::Audio { asset, .. } = &effect.effect {
                     consumers
                         .entry(asset.clone())

@@ -245,6 +245,12 @@ fn qualify_local_refs(module: &str, f: &mut Function, namespaced: bool) {
         for op in &mut block.ops {
             op.id = format!("{module}.{}", op.id);
             match &mut op.operation {
+                Operation::DialogueVoice { task, voice, .. } => {
+                    *task = format!("{module}.{task}");
+                    if let Some(voice) = voice {
+                        *voice = format!("{module}.{voice}");
+                    }
+                }
                 Operation::TaskControl { task, .. } | Operation::DialogueContinue { task } => {
                     *task = format!("{module}.{task}");
                 }
@@ -271,6 +277,7 @@ fn qualify_cue_refs(module: &str, cue: &mut Cue, namespaced: bool) {
     for def in &mut cue.effects {
         def.id = format!("{module}.{}", def.id);
         match &mut def.effect {
+            Effect::AudioStop { target, .. } => *target = format!("{module}.{target}"),
             Effect::StagePresent { scene, .. } => *scene = format!("{module}.{scene}"),
             Effect::Dialogue { text, speaker, .. } => {
                 *text = format!("{module}.{text}");
@@ -716,6 +723,204 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &asset_objects);
     }
     crate::fonts::coverage_by_plan(&program, &media, &character_sets)?;
+    // New optional semantics are advertised only when used; legacy capability
+    // inference remains unchanged until the full dependency analysis is introduced.
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(|m| !m.builtin_navigation)
+    {
+        program.requires.retain(|c| c != "ui.menu-chrome.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| matches!(def.effect, Effect::Audio { gain, .. } if gain != 1.0))
+    {
+        program.requires.retain(|cap| cap != "audio.gain.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| matches!(def.effect, Effect::AudioStop { .. }))
+    {
+        program.requires.retain(|cap| cap != "audio.stop.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| matches!(def.effect, Effect::Tween { .. }))
+    {
+        program.requires.retain(|cap| cap != "tween.target.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op.operation, Operation::DialogueVoice { .. }))
+    {
+        program
+            .requires
+            .retain(|cap| cap != "text.voice-binding.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| {
+            matches!(
+                op.operation,
+                Operation::DialogueVoice {
+                    wait: nir_format::VoiceWaitPolicy::SampledRemaining,
+                    ..
+                }
+            )
+        })
+    {
+        program.requires.retain(|cap| cap != "text.voice-timer.v1");
+    }
+    if program.player.auto_delay_policy == nir_format::AutoDelayPolicy::LengthScaled {
+        program
+            .requires
+            .retain(|cap| cap != "player.auto-delay-policy.v1");
+    }
+    if program.player.hide_policy == HidePolicy::ContinueStory {
+        program
+            .requires
+            .retain(|cap| cap != "player.hide-policy.v1");
+    }
+    if program.theme.dialogue.shadow.is_none() {
+        program.requires.retain(|cap| cap != "text.shadow.v1");
+    }
+    if !program.cues.values().flat_map(|c| &c.effects).any(
+        |d| matches!(&d.effect,Effect::StagePresent {transition,..} if transition.capability()==Some("stage.wipe.v1")),
+    ) {
+        program.requires.retain(|cap| cap != "stage.wipe.v1");
+    }
+    if !program.cues.values().flat_map(|c|&c.effects).any(|d|matches!(&d.effect,Effect::StagePresent {transition,..} if transition.asset().is_some())) {program.requires.retain(|cap|cap!="stage.mask.v1");}
+    if program
+        .theme
+        .image_menus
+        .values()
+        .all(|m| m.elements.is_empty())
+    {
+        program.requires.retain(|c| c != "ui.menu-elements.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_state)
+    {
+        program.requires.retain(|c| c != "ui.menu-state.v1");
+    }
+    if program.theme.menu_overlay.is_none()
+        && !program
+            .theme
+            .image_menus
+            .values()
+            .any(nir_format::ImageMenu::uses_services)
+    {
+        program.requires.retain(|c| c != "ui.menu-services.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_text_buttons)
+    {
+        program.requires.retain(|c| c != "ui.menu-text-button.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_stack)
+    {
+        program.requires.retain(|c| c != "ui.menu-stack.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_story)
+    {
+        program.requires.retain(|c| c != "ui.menu-story.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_reading)
+    {
+        program.requires.retain(|c| c != "ui.menu-reading.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_storage)
+    {
+        program.requires.retain(|c| c != "ui.menu-storage.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_history)
+    {
+        program.requires.retain(|c| c != "ui.menu-history.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_values)
+    {
+        program.requires.retain(|c| c != "ui.menu-values.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_navigation)
+    {
+        program.requires.retain(|c| c != "ui.menu-navigation.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_history_availability)
+    {
+        program
+            .requires
+            .retain(|c| c != "ui.menu-history-availability.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_history_flow)
+    {
+        program.requires.retain(|c| c != "ui.menu-history-flow.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_history_scrollbar)
+    {
+        program
+            .requires
+            .retain(|c| c != "ui.menu-history-scrollbar.v1");
+    }
     // Revision depends on canonical source content, never local paths or iteration order.
     program.revision = nir_content::digest(&serde_json::to_vec(&program)?);
     ValidatedProgram::new(program.clone()).map_err(|d| sources.annotate(d))?;
@@ -830,6 +1035,9 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
     }
     for cue in p.cues.values() {
         for effect in &cue.effects {
+            if let Effect::StagePresent { transition, .. } = &effect.effect {
+                roots.extend(transition.asset().map(str::to_owned));
+            }
             if let Effect::Audio { asset, .. } = &effect.effect {
                 roots.insert(asset.clone());
             }
@@ -879,6 +1087,7 @@ pub fn write_schemas(out: &Path) -> Result<()> {
             schemars::schema_for!(RuntimeExecutable),
         ),
         ("module-static", schemars::schema_for!(ModuleStatic)),
+        ("module-code", schemars::schema_for!(ModuleCode)),
         ("asset-catalog", schemars::schema_for!(AssetCatalog)),
         ("diagnostic", schemars::schema_for!(Diagnostic)),
     ];

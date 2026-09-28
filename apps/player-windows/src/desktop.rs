@@ -4,6 +4,7 @@ use nir_format::*;
 use nir_player::{AppCommand, AppEvent};
 use nir_presentation::SlotView;
 use nir_render_wgpu::{Renderer, RendererBackend};
+use player_windows::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
 use player_windows::{atomic_write, Bundle, Storage};
 use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     fs,
     io::Cursor,
     path::PathBuf,
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
 use winit::{
@@ -19,7 +20,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::{Fullscreen, Window, WindowId},
 };
 
@@ -116,8 +117,10 @@ fn worker(bundle: Arc<Bundle>) -> (mpsc::SyncSender<Job>, mpsc::Receiver<Loaded>
 }
 struct Voice {
     sink: Sink,
-    session: u32,
+    position_base: u64,
     bus: AudioBus,
+    gain: f32,
+    envelope: Envelope,
     asset: String,
 }
 struct Runtime {
@@ -131,12 +134,18 @@ struct Runtime {
     upload: Option<(u32, String, Vec<u8>)>,
     audio: Option<OutputStream>,
     buffers: BTreeMap<String, SamplesBuffer>,
-    voices: BTreeMap<u32, Voice>,
-    audio_paused: bool,
+    voices: BTreeMap<(TimeDomain, u32, u32), Voice>,
+    audio_paused: BTreeMap<TimeDomain, bool>,
     sequence: u32,
     last: Instant,
     cursor: (f32, f32),
     hidden: bool,
+    held_controls: [bool; 2],
+    modifiers: ModifiersState,
+    pointer_down: Option<(MouseButton, UiAction, (f32, f32), (u32, u32))>,
+    bar_pointer: bool,
+    focused: bool,
+    occluded: bool,
     audio_starts: usize,
 }
 impl Runtime {
@@ -169,19 +178,59 @@ impl Runtime {
             audio: OutputStreamBuilder::open_default_stream().ok(),
             buffers: BTreeMap::new(),
             voices: BTreeMap::new(),
-            audio_paused: true,
+            audio_paused: BTreeMap::from([
+                (TimeDomain::Story, true),
+                (TimeDomain::ForegroundUi, true),
+            ]),
             sequence: 0,
             last: Instant::now(),
             cursor: (0., 0.),
             hidden: false,
+            held_controls: [false; 2],
+            modifiers: ModifiersState::default(),
+            pointer_down: None,
+            bar_pointer: false,
+            focused: true,
+            occluded: false,
             audio_starts: 0,
         };
         runtime.commands()?;
         Ok(runtime)
     }
+    fn sample_audio_positions(&mut self) -> Result<()> {
+        let mut groups: std::collections::BTreeMap<u32, Vec<nir_format::AudioPosition>> =
+            std::collections::BTreeMap::new();
+        for ((domain, session, task), voice) in &self.voices {
+            if *domain == TimeDomain::Story && !voice.sink.empty() {
+                let elapsed = voice.sink.get_pos().as_micros().min(u64::MAX as u128) as u64;
+                groups
+                    .entry(*session)
+                    .or_default()
+                    .push(nir_format::AudioPosition {
+                        envelope: voice
+                            .envelope
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observation(),
+                        task: *task,
+                        position_us: nir_format::Micros(
+                            voice.position_base.saturating_add(elapsed),
+                        ),
+                    });
+            }
+        }
+        for (session, positions) in groups {
+            engine_result(
+                self.engine
+                    .audio_positions_in(TimeDomain::Story, session, positions),
+            )?;
+        }
+        Ok(())
+    }
     fn input(&mut self, action: UiAction) -> Result<()> {
         self.sequence = self.sequence.checked_add(1).context("E_INPUT_SEQUENCE")?;
         self.engine.begin_turn();
+        self.sample_audio_positions()?;
         engine_result(self.engine.input(action, self.sequence))?;
         self.commands()?;
         self.window.request_redraw();
@@ -250,14 +299,23 @@ impl Runtime {
                         ))?;
                     }
                     AppCommand::AudioStart {
+                        domain,
                         task,
                         asset,
                         bus,
                         looped,
                         position_us,
+                        gain,
+                        envelope: initial_envelope,
                         session,
                     } => {
-                        self.voices.remove(&task);
+                        let key = (domain, session, task);
+                        self.voices.remove(&key);
+                        let envelope = Arc::new(Mutex::new(Ramp::default()));
+                        envelope
+                            .lock()
+                            .unwrap()
+                            .set(initial_envelope, initial_envelope, 0);
                         let result = (|| -> Result<Sink> {
                             let stream = self
                                 .audio
@@ -266,23 +324,33 @@ impl Runtime {
                             let source =
                                 self.buffers.get(&asset).context("E_AUDIO_BUFFER")?.clone();
                             let sink = Sink::connect_new(stream.mixer());
-                            sink.set_volume(self.volume(bus));
+                            sink.set_volume(gain * self.volume(bus));
                             let duration = source.total_duration().unwrap_or_default();
                             let offset = if looped && !duration.is_zero() {
                                 position_us.0 % duration.as_micros() as u64
                             } else {
                                 position_us.0
                             };
+                            let channels = source.channels();
+                            let rate = source.sample_rate();
                             if looped {
-                                sink.append(
+                                sink.append(EnvelopeSamples::new(
                                     source
                                         .repeat_infinite()
                                         .skip_duration(Duration::from_micros(offset)),
-                                );
+                                    envelope.clone(),
+                                    channels,
+                                    rate,
+                                ));
                             } else {
-                                sink.append(source.skip_duration(Duration::from_micros(offset)));
+                                sink.append(EnvelopeSamples::new(
+                                    source.skip_duration(Duration::from_micros(offset)),
+                                    envelope.clone(),
+                                    channels,
+                                    rate,
+                                ));
                             }
-                            if self.audio_paused {
+                            if self.audio_paused.get(&domain).copied().unwrap_or(true) {
                                 sink.pause();
                             }
                             Ok(sink)
@@ -290,40 +358,69 @@ impl Runtime {
                         match result {
                             Ok(sink) => {
                                 self.voices.insert(
-                                    task,
+                                    key,
                                     Voice {
                                         sink,
-                                        session,
+                                        position_base: position_us.0,
                                         bus,
+                                        gain,
+                                        envelope,
                                         asset,
                                     },
                                 );
                                 self.audio_starts += 1;
                             }
-                            Err(e) => engine_result(self.engine.audio_failed(
+                            Err(e) => engine_result(self.engine.audio_failed_in(
+                                domain,
                                 task,
                                 session,
                                 e.to_string(),
                             ))?,
                         }
                     }
-                    AppCommand::AudioStop { task } => {
-                        self.voices.remove(&task);
+                    AppCommand::AudioEnvelope {
+                        owner,
+                        elapsed_us,
+                        domain,
+                        session,
+                        task,
+                        from,
+                        to,
+                        duration_us,
+                    } => {
+                        if let Some(voice) = self.voices.get(&(domain, session, task)) {
+                            voice
+                                .envelope
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .set_owned(owner, elapsed_us.0, from, to, duration_us.0);
+                        }
                     }
-                    AppCommand::AudioReset => self.voices.clear(),
-                    AppCommand::AudioPause { paused } => {
-                        self.audio_paused = paused;
-                        for voice in self.voices.values() {
-                            if paused {
-                                voice.sink.pause();
-                            } else {
-                                voice.sink.play();
+                    AppCommand::AudioStop {
+                        domain,
+                        session,
+                        task,
+                    } => {
+                        self.voices.remove(&(domain, session, task));
+                    }
+                    AppCommand::AudioReset { domain } => {
+                        self.voices.retain(|(d, _, _), _| *d != domain)
+                    }
+                    AppCommand::AudioPause { domain, paused } => {
+                        self.audio_paused.insert(domain, paused);
+                        for ((d, _, _), voice) in &self.voices {
+                            if *d == domain {
+                                if paused {
+                                    voice.sink.pause();
+                                } else {
+                                    voice.sink.play();
+                                }
                             }
                         }
                     }
                     AppCommand::ApplyPreferences { .. } => {
                         for voice in self.voices.values() {
-                            voice.sink.set_volume(self.volume(voice.bus));
+                            voice.sink.set_volume(voice.gain * self.volume(voice.bus));
                         }
                     }
                     AppCommand::PersistPreferences { preferences } => {
@@ -349,13 +446,20 @@ impl Runtime {
                         };
                         engine_result(self.engine.event(event))?;
                     }
-                    AppCommand::Load { slot } => {
+                    AppCommand::Load { slot, job } => {
                         let event = match self.storage.load(slot) {
-                            Ok(Some(envelope)) => AppEvent::Loaded {
+                            Ok(Some(envelope)) => AppEvent::SlotLoaded {
+                                job,
                                 envelope: Box::new(envelope),
                             },
-                            Ok(None) => AppEvent::LoadFailed("E_SAVE_MISSING".into()),
-                            Err(e) => AppEvent::LoadFailed(e.to_string()),
+                            Ok(None) => AppEvent::SlotLoadFailed {
+                                job,
+                                message: "E_SAVE_MISSING".into(),
+                            },
+                            Err(e) => AppEvent::SlotLoadFailed {
+                                job,
+                                message: e.to_string(),
+                            },
                         };
                         engine_result(self.engine.event(event))?;
                     }
@@ -476,17 +580,23 @@ impl Runtime {
             .voices
             .iter()
             .filter(|(_, v)| v.sink.empty())
-            .map(|(id, v)| (*id, v.session))
+            .map(|(id, _)| *id)
             .collect();
-        for (task, session) in ended {
-            self.voices.remove(&task);
-            engine_result(self.engine.audio_ended(task, session))?;
+        for (domain, session, task) in ended {
+            self.voices.remove(&(domain, session, task));
+            engine_result(self.engine.audio_ended_in(domain, task, session))?;
         }
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_micros().min(250_000) as u32;
-        self.last = now;
         if !self.hidden && self.engine.needs_clock() {
+            let elapsed = now
+                .duration_since(self.last)
+                .as_micros()
+                .min(u32::MAX as u128) as u32;
+            self.last += Duration::from_micros(elapsed as u64);
+            self.sample_audio_positions()?;
             engine_result(self.engine.tick(elapsed))?;
+        } else {
+            self.last = now;
         }
         engine_result(self.engine.continue_turn())?;
         self.commands()?;
@@ -670,10 +780,18 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::Occluded(hidden) | WindowEvent::Focused(hidden) => {
                     // Focus loss also pauses audio and the story clock.
-                    let hidden = match event {
-                        WindowEvent::Focused(focused) => !focused,
-                        _ => hidden,
-                    };
+                    match event {
+                        WindowEvent::Focused(focused) => runtime.focused = focused,
+                        _ => runtime.occluded = hidden,
+                    }
+                    let hidden = !runtime.focused || runtime.occluded;
+                    if hidden {
+                        runtime.engine.focus_control(None);
+                        runtime.held_controls = [false; 2];
+                        runtime.pointer_down = None;
+                        runtime.bar_pointer = false;
+                        engine_result(runtime.engine.pointer_gesture(3, 0., 0., 0))?;
+                    }
                     runtime.hidden = hidden;
                     runtime.last = Instant::now();
                     runtime.engine.begin_turn();
@@ -683,63 +801,193 @@ impl ApplicationHandler for App {
                 WindowEvent::CursorMoved { position, .. } => {
                     let scale = runtime.window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (position.x as f32 / scale, position.y as f32 / scale);
+                    if runtime.bar_pointer {
+                        engine_result(runtime.engine.pointer_gesture(
+                            1,
+                            runtime.cursor.0,
+                            runtime.cursor.1,
+                            0,
+                        ))?;
+                    }
                     engine_result(runtime.engine.hover(runtime.cursor.0, runtime.cursor.1))?;
                 }
-                WindowEvent::MouseInput {
-                    state: ElementState::Released,
-                    button: MouseButton::Left,
-                    ..
-                } => {
-                    if let Some(action) = runtime
-                        .engine
-                        .hit_action(runtime.cursor.0, runtime.cursor.1)
+                WindowEvent::ModifiersChanged(modifiers) => runtime.modifiers = modifiers.state(),
+                WindowEvent::CursorLeft { .. } => {
+                    runtime.pointer_down = None;
+                    runtime.bar_pointer = false;
+                    engine_result(runtime.engine.pointer_gesture(3, 0., 0., 0))?;
+                    engine_result(runtime.engine.hover(-1., -1.))?;
+                }
+                WindowEvent::MouseInput { state, button, .. }
+                    if matches!(button, MouseButton::Left | MouseButton::Right) =>
+                {
+                    let code = if button == MouseButton::Left { 0 } else { 2 };
+                    if button == MouseButton::Left {
+                        if state == ElementState::Pressed {
+                            runtime.engine.focus_control(None);
+                            if engine_result(runtime.engine.pointer_gesture(
+                                0,
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            ))? {
+                                runtime.bar_pointer = true;
+                                runtime.pointer_down = None;
+                                return Ok(());
+                            }
+                        } else if runtime.bar_pointer {
+                            runtime.bar_pointer = false;
+                            engine_result(runtime.engine.pointer_gesture(
+                                2,
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            ))?;
+                            return Ok(());
+                        }
+                    }
+                    let hit =
+                        runtime
+                            .engine
+                            .pointer_action(runtime.cursor.0, runtime.cursor.1, code);
+                    if state == ElementState::Pressed {
+                        runtime.engine.focus_control(None);
+                        runtime.pointer_down = hit.map(|action| {
+                            (
+                                button,
+                                action,
+                                runtime.cursor,
+                                runtime.engine.input_identity(),
+                            )
+                        });
+                    } else if let Some((pressed, action, origin, identity)) =
+                        runtime.pointer_down.take()
                     {
-                        runtime.input(action)?;
+                        if button == pressed
+                            && hit
+                                .as_ref()
+                                .is_some_and(|hit| action.same_pointer_target(hit))
+                            && runtime.engine.input_identity() == identity
+                            && (matches!(
+                                action,
+                                UiAction::MenuValue {
+                                    value: nir_format::MenuValueInput::Number(_),
+                                    ..
+                                }
+                            ) || (runtime.cursor.0 - origin.0)
+                                .hypot(runtime.cursor.1 - origin.1)
+                                < 20.)
+                        {
+                            if let Some(hit) = hit {
+                                runtime.input(hit)?;
+                            }
+                        }
                     }
                 }
-                WindowEvent::MouseInput {
-                    state: ElementState::Released,
-                    button: MouseButton::Right,
-                    ..
-                } => runtime.input(UiAction::Menu)?,
                 WindowEvent::MouseWheel { delta, .. } => {
                     let y = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
                     };
-                    let state: serde_json::Value = serde_json::from_str(&runtime.engine.state())?;
-                    let region = if state["screen"] == "History" {
-                        ScrollRegion::History
-                    } else if !state["choice"].is_null() {
-                        ScrollRegion::Choices
-                    } else {
-                        ScrollRegion::Dialogue
-                    };
-                    runtime.input(UiAction::Scroll {
-                        region,
-                        delta: if y > 0. { -1 } else { 1 },
-                    })?;
+                    if y != 0. {
+                        if let Some(action) = runtime.engine.scroll_action(
+                            Some(runtime.cursor),
+                            if y > 0. { -1 } else { 1 },
+                            false,
+                        ) {
+                            runtime.input(action)?;
+                        }
+                    }
                 }
                 WindowEvent::KeyboardInput { event, .. }
-                    if event.state == ElementState::Pressed && !event.repeat =>
+                    if event.logical_key == Key::Named(NamedKey::Control) && !event.repeat =>
+                {
+                    let index = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::ControlRight) => 1,
+                        _ => 0,
+                    };
+                    runtime.held_controls[index] = event.state == ElementState::Pressed;
+                    let pressed = runtime.held_controls.iter().any(|v| *v);
+                    if event.state == ElementState::Pressed || !pressed {
+                        runtime.input(UiAction::HoldSkip { pressed })?;
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && !runtime.modifiers.control_key()
+                        && !runtime.modifiers.alt_key()
+                        && !runtime.modifiers.super_key() =>
                 {
                     let state: serde_json::Value = serde_json::from_str(&runtime.engine.state())?;
+                    let value_direction = match event.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => Some(0),
+                        Key::Named(NamedKey::ArrowRight) => Some(1),
+                        Key::Named(NamedKey::ArrowUp) => Some(4),
+                        Key::Named(NamedKey::ArrowDown) => Some(5),
+                        Key::Named(NamedKey::Home) => Some(2),
+                        Key::Named(NamedKey::End) => Some(3),
+                        _ => None,
+                    };
+                    if let Some(action) =
+                        value_direction.and_then(|d| runtime.engine.focus_value_action(d))
+                    {
+                        runtime.input(action)?;
+                        return Ok(());
+                    }
                     match event.logical_key {
-                        Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => runtime
-                            .input(if state["screen"] == "Title" {
-                                UiAction::NewGame
-                            } else if state["paused"] == true {
-                                UiAction::Continue
+                        Key::Named(NamedKey::PageUp | NamedKey::PageDown) => {
+                            let delta = if event.logical_key == Key::Named(NamedKey::PageUp) {
+                                -1
                             } else {
-                                UiAction::Advance
-                            })?,
+                                1
+                            };
+                            if let Some(action) = runtime.engine.scroll_action(None, delta, true) {
+                                runtime.input(action)?;
+                            }
+                        }
+                        Key::Named(NamedKey::Tab)
+                        | Key::Named(NamedKey::ArrowLeft)
+                        | Key::Named(NamedKey::ArrowRight)
+                        | Key::Named(NamedKey::ArrowUp)
+                        | Key::Named(NamedKey::ArrowDown) => {
+                            let direction = match event.logical_key {
+                                Key::Named(NamedKey::Tab) => {
+                                    if runtime.modifiers.shift_key() {
+                                        0
+                                    } else {
+                                        1
+                                    }
+                                }
+                                Key::Named(NamedKey::ArrowLeft) => 2,
+                                Key::Named(NamedKey::ArrowRight) => 3,
+                                Key::Named(NamedKey::ArrowUp) => 4,
+                                _ => 5,
+                            };
+                            runtime.engine.navigate_focus(direction);
+                            if let Some((x, y)) = runtime.engine.focused_center() {
+                                engine_result(runtime.engine.hover(x, y))?;
+                                runtime.commands()?;
+                            }
+                            runtime.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
+                            if let Some(action) = runtime.engine.primary_action() {
+                                runtime.input(action)?;
+                            }
+                        }
                         Key::Named(NamedKey::Escape) => runtime.input(
-                            if state["screen"] == "Story" || state["screen"] == "Title" {
+                            if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0) {
+                                UiAction::Close
+                            } else if state["screen"] == "Story" || state["screen"] == "Title" {
                                 UiAction::Menu
                             } else {
                                 UiAction::Close
                             },
                         )?,
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("h") => {
+                            runtime.input(UiAction::ToggleInterface)?
+                        }
                         Key::Named(NamedKey::F11) => runtime.window.set_fullscreen(
                             if runtime.window.fullscreen().is_some() {
                                 None

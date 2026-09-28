@@ -1,0 +1,40 @@
+import {test,expect} from '@playwright/test';
+
+test('background advance uses shared routing and menu or editor focus consumes input',async({page})=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto('http://127.0.0.1:4199/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'}).catch(error=>{
+    if(!error.message.includes('interrupted'))throw error;
+  });
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+  await page.mouse.click(20,200);
+  expect(await page.evaluate(()=>window.__nir.state().screen)).toBe('Title');
+  await page.evaluate(()=>window.__nir.action({type:'text_speed',delta:-.75}));
+  await page.waitForFunction(()=>window.__nir.state().preferences.text_speed===.25);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().dialogue&&!window.__nir.state().loading);
+  const token=await page.evaluate(()=>window.__nir.state().interaction);
+  await page.mouse.click(20,200);
+  await page.waitForFunction(()=>window.__nir.state().dialogue?.ready);
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(token);
+  await page.mouse.click(20,200,{button:'right'});
+  await page.waitForFunction(()=>window.__nir.state().screen==='Menu');
+  await page.mouse.click(20,200);
+  await page.keyboard.press('Space');
+  expect(await page.evaluate(()=>window.__nir.state().screen)).toBe('Menu');
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(token);
+  await page.mouse.click(20,200,{button:'right'});
+  await page.waitForFunction(()=>window.__nir.state().screen==='Story');
+  await page.evaluate(()=>{const input=document.createElement('input');input.id='input-probe';document.body.append(input);input.focus();});
+  await page.keyboard.press('Space');
+  await page.keyboard.press('Enter');
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(token);
+  await page.evaluate(()=>document.querySelector('#input-probe').remove());
+  await page.mouse.move(20,200);
+  await page.mouse.down();
+  await page.mouse.move(40,400);
+  await page.mouse.up();
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(token);
+  await page.mouse.click(20,200);
+  await page.waitForFunction(t=>window.__nir.state().interaction!==t,token);
+  expect(errors).toEqual([]);
+});

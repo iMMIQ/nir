@@ -39,4 +39,7 @@ impl Pauses {
     pub fn is_empty(&self) -> bool {
         self.count.get() == 0
     }
+    pub fn is_only_named(&self, reason: &str) -> bool {
+        self.count.get() == 1 && self.named.contains_key(reason)
+    }
 }

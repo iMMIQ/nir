@@ -1,5 +1,6 @@
 //! Native package and persistence contracts, independent of window/GPU setup.
 #![forbid(unsafe_code)]
+pub mod audio_envelope;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};
 use nir_player::SaveEnvelope;

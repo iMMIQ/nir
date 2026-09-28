@@ -2,6 +2,7 @@
 //! https://pylivemaker.readthedocs.io/en/latest/livemaker.lsb.html .
 //! This reader does not execute expressions, load DLLs, or launch game binaries.
 use anyhow::{bail, ensure, Context, Result};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 pub(super) const NAMES: [&str; 64] = [
@@ -129,7 +130,7 @@ impl<'a> Reader<'a> {
             let name = self.string()?;
             let n = self.count(4096)?;
             if op == 11 {
-                self.u8()?;
+                result.functions.insert(result.operations.len(), self.u8()?);
             }
             let mut literal = None;
             let mut operands = Vec::new();
@@ -212,19 +213,35 @@ pub(super) fn decode(bytes: &[u8]) -> Result<String> {
     Ok(text.into_owned())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub(super) enum Literal {
     Int(i32),
     String(String),
     Variable(String),
     Unsupported,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub(super) struct Expression {
     pub literal: Option<Literal>,
     pub operations: Vec<(u8, String, Vec<Literal>)>,
+    pub functions: BTreeMap<usize, u8>,
 }
 impl Expression {
+    /// Recognize a bounded pure sum through compiler temporaries, without
+    /// executing source code or accepting writes to source variables.
+    pub fn is_sum_of_variables(&self, left: &str, right: &str) -> bool {
+        use super::ui_expr::{normalize, Op, Term};
+        if left == right {
+            return false;
+        }
+        let Ok(Some(Term::Apply { op: Op::Add, args })) = normalize(self) else {
+            return false;
+        };
+        matches!(args.as_slice(), [Term::Read { name: a }, Term::Read { name: b }]
+            if (a == left && b == right) || (a == right && b == left))
+    }
+
     pub fn flag(&self) -> Result<bool> {
         match &self.literal {
             Some(Literal::Int(n)) => Ok(*n != 0),
@@ -240,6 +257,50 @@ pub(super) struct Reference {
 #[derive(Clone, Debug)]
 pub(super) enum Body {
     Other,
+    Label(String),
+    Delete(Expression),
+    HistoryCall {
+        parameters: BTreeMap<String, Expression>,
+    },
+    HistoryFormat {
+        name: Expression,
+        target: Expression,
+    },
+    Cabinet {
+        properties: BTreeMap<u16, Expression>,
+        act: Expression,
+        targets: Vec<Expression>,
+    },
+    Flip {
+        parameters: BTreeMap<String, Expression>,
+        targets: Vec<Expression>,
+    },
+    Condition(Expression),
+    LoopCondition {
+        condition: Expression,
+        target: u32,
+    },
+    Variable {
+        name: String,
+        value_type: u8,
+        initial: Expression,
+        scope: u8,
+    },
+    GetProperty {
+        target: Expression,
+        property: Expression,
+        destination: String,
+    },
+    LoopUpdate {
+        expression: Expression,
+        target: Option<u32>,
+    },
+    Object(BTreeMap<u16, Expression>),
+    SetProperty {
+        target: Expression,
+        property: Expression,
+        value: Expression,
+    },
     Jump(Reference, Expression),
     Call {
         target: Reference,
@@ -263,6 +324,7 @@ pub(super) struct Command {
     pub kind: u8,
     pub indent: u32,
     pub muted: bool,
+    pub not_update: bool,
     pub line: u32,
     pub offset: usize,
     pub body: Body,
@@ -272,8 +334,9 @@ impl Command {
         NAMES[self.kind as usize]
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Script {
+    pub source_sha256: String,
     pub version: u32,
     pub commands: Vec<Command>,
 }
@@ -289,12 +352,20 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
     r.u8()?; // script flags
     let types = r.count(64)?;
     let width = r.count(256)?;
+    // Declaration masks are little-endian bit streams. Property identities
+    // are one-based; SetProp's runtime property numbers are zero-based.
     let params = (0..types)
         .map(|_| {
-            Ok(r.bytes(width)?
+            let mask = r.bytes(width)?;
+            Ok(mask
                 .iter()
-                .map(|b| b.count_ones() as usize)
-                .sum::<usize>())
+                .enumerate()
+                .flat_map(|(byte, bits)| {
+                    (0..8).filter_map(move |bit| {
+                        (bits & (1 << bit) != 0).then_some((byte * 8 + bit + 1) as u16)
+                    })
+                })
+                .collect::<Vec<_>>())
         })
         .collect::<Result<Vec<_>>>()?;
     let count = r.count(100_000)?;
@@ -309,18 +380,33 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
             );
             let indent = r.u32()?;
             let muted = r.u8()? != 0;
-            r.u8()?; // NotUpdate
+            let not_update = r.u8()? != 0;
             let line = r.u32()?;
             let mut body = Body::Other;
             match kind {
-                0 | 1 | 19 | 26 | 28 | 32 | 39 | 55 => {
+                0 | 1 => {
+                    body = Body::Condition(r.expr()?);
+                }
+                19 => {
+                    body = Body::Delete(r.expr()?);
+                }
+                26 | 28 | 39 | 55 => {
                     r.expr()?;
+                }
+                32 => {
+                    body = Body::LoopUpdate {
+                        expression: r.expr()?,
+                        target: None,
+                    };
                 }
                 14 => {
                     body = Body::Calc(r.expr()?);
                 }
                 2 | 22 | 45..=47 | 61..=63 => {}
-                3 | 16 | 27 => {
+                3 => {
+                    body = Body::Label(r.string()?);
+                }
+                16 | 27 => {
                     r.string()?;
                 }
                 4 => {
@@ -345,25 +431,55 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     body = Body::Wait(r.exprs(3)?);
                 }
                 18 => {
-                    r.exprs(3)?;
+                    body = Body::SetProperty {
+                        target: r.expr()?,
+                        property: r.expr()?,
+                        value: r.expr()?,
+                    };
                 }
                 8..=12 | 23..=25 | 30 | 36 | 37 | 42..=44 | 48..=54 | 56 => {
-                    r.exprs(params[kind as usize])?;
+                    let mut properties = BTreeMap::new();
+                    for property in &params[kind as usize] {
+                        properties.insert(*property, r.expr()?);
+                    }
+                    body = Body::Object(properties);
                 }
                 13 => {
-                    r.exprs(4)?;
-                    r.expr_array()?;
-                    r.exprs(5)?;
+                    let mut parameters = BTreeMap::new();
+                    for name in ["wipe", "time", "reverse", "act"] {
+                        parameters.insert(name.into(), r.expr()?);
+                    }
+                    let targets = r.expr_array()?;
+                    // Version 116 has two fixed, unprefixed effect parameters,
+                    // followed by Source and StopEvent; no DifferenceOnly.
+                    for name in [
+                        "delete",
+                        "parameter_0",
+                        "parameter_1",
+                        "source",
+                        "stop_event",
+                    ] {
+                        parameters.insert(name.into(), r.expr()?);
+                    }
+                    body = Body::Flip {
+                        parameters,
+                        targets,
+                    };
                 }
                 15 => {
-                    r.string()?;
-                    r.u8()?;
-                    r.expr()?;
-                    r.u8()?;
+                    body = Body::Variable {
+                        name: r.string()?,
+                        value_type: r.u8()?,
+                        initial: r.expr()?,
+                        scope: r.u8()?,
+                    };
                 }
                 17 => {
-                    r.exprs(2)?;
-                    r.string()?;
+                    body = Body::GetProperty {
+                        target: r.expr()?,
+                        property: r.expr()?,
+                        destination: r.string()?,
+                    };
                 }
                 20 => {
                     let n = r.count(16 * 1024 * 1024)?;
@@ -380,9 +496,26 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     r.exprs(4)?;
                 }
                 29 => {
-                    r.exprs(5)?;
+                    let mut parameters = BTreeMap::new();
+                    // Preserve source units: Index/Count are not NIR entry offsets.
+                    for name in ["target", "index", "count", "cut_break", "format_name"] {
+                        parameters.insert(name.into(), r.expr()?);
+                    }
+                    body = Body::HistoryCall { parameters };
                 }
-                31 | 33..=35 => {
+                31 => {
+                    body = Body::LoopCondition {
+                        condition: r.expr()?,
+                        target: r.u32()?,
+                    };
+                }
+                33 => {
+                    body = Body::LoopUpdate {
+                        expression: r.expr()?,
+                        target: Some(r.u32()?),
+                    };
+                }
+                34..=35 => {
                     r.expr()?;
                     r.u32()?;
                 }
@@ -400,12 +533,21 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     r.exprs(7)?;
                 }
                 58 => {
-                    r.exprs(2)?;
+                    body = Body::HistoryFormat {
+                        name: r.expr()?,
+                        target: r.expr()?,
+                    };
                 }
                 59 | 60 => {
-                    r.exprs(params[kind as usize])?;
-                    r.expr()?;
-                    r.expr_array()?;
+                    let mut properties = BTreeMap::new();
+                    for property in &params[kind as usize] {
+                        properties.insert(*property, r.expr()?);
+                    }
+                    body = Body::Cabinet {
+                        properties,
+                        act: r.expr()?,
+                        targets: r.expr_array()?,
+                    };
                 }
                 _ => unreachable!(),
             }
@@ -413,6 +555,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                 kind,
                 indent,
                 muted,
+                not_update,
                 line,
                 offset,
                 body,
@@ -422,7 +565,11 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
         commands.push(command);
     }
     r.done()?;
-    Ok(Script { version, commands })
+    Ok(Script {
+        source_sha256: nir_content::digest(data),
+        version,
+        commands,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -568,9 +715,108 @@ pub(super) fn startup(data: &[u8]) -> Result<String> {
     r.string()
 }
 
+/// Read the documented LPB116 settings prefix. Later project/editor sections are
+/// intentionally not interpreted or exported by the importer.
+pub(super) fn project_settings(data: &[u8]) -> Result<BTreeMap<String, Literal>> {
+    let mut r = Reader::new(data);
+    ensure!(
+        r.u32()? == 116,
+        "E_IMPORT_VERSION: supported LPB version is 116"
+    );
+    r.string()?;
+    r.bytes(16)?; // project title and reserved header
+    r.string()?;
+    r.string()?;
+    r.string()?; // startup, exit, author project directory
+    r.u32()?;
+    r.bytes(2)?;
+    r.string()?;
+    r.bytes(3)?;
+    r.string()?;
+    r.string()?; // prompts
+    let count = r.count(4096)?;
+    let mut values = BTreeMap::new();
+    for _ in 0..count {
+        let kind = r.u8()?;
+        let name = r.string()?;
+        let value = match kind {
+            1 => Literal::Int(r.i32()?),
+            2 => {
+                r.bytes(10)?;
+                Literal::Unsupported
+            }
+            3 => Literal::Int(r.u8()?.into()),
+            4 => Literal::String(r.string()?),
+            _ => bail!("E_IMPORT_SETTINGS: unsupported setting type {kind}"),
+        };
+        ensure!(
+            values.insert(name, value).is_none(),
+            "E_IMPORT_SETTINGS: duplicate setting"
+        );
+    }
+    Ok(values)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    #[test]
+    fn layout_variable_property_read_and_loop_updates_preserve_data_flow() {
+        let mut variable = vec![];
+        string(&mut variable, "width");
+        variable.push(1);
+        variable.extend(integer(16));
+        variable.push(2);
+        let mut read = integer(7);
+        read.extend(integer(5));
+        string(&mut read, "width");
+        let mut update = integer(1);
+        u32b(&mut update, 42);
+        let bytes = script(&[
+            command(15, 10, &variable),
+            command(17, 11, &read),
+            command(32, 12, &integer(0)),
+            command(33, 13, &update),
+        ]);
+        let parsed = parse(&bytes).unwrap();
+        assert!(
+            matches!(&parsed.commands[0].body, Body::Variable { name, value_type: 1, initial, scope: 2 }
+            if name == "width" && matches!(initial.literal, Some(Literal::Int(16))))
+        );
+        assert!(
+            matches!(&parsed.commands[1].body, Body::GetProperty { target, property, destination }
+            if destination == "width" && matches!(target.literal, Some(Literal::Int(7))) && matches!(property.literal, Some(Literal::Int(5))))
+        );
+        assert!(matches!(
+            &parsed.commands[2].body,
+            Body::LoopUpdate { target: None, .. }
+        ));
+        assert!(matches!(
+            &parsed.commands[3].body,
+            Body::LoopUpdate {
+                target: Some(42),
+                ..
+            }
+        ));
+        assert!(parse(&bytes[..bytes.len() - 1]).is_err());
+    }
+    #[test]
+    fn conditional_and_loop_expressions_remain_available_to_ui_lowering() {
+        let mut loop_args = integer(1);
+        u32b(&mut loop_args, 77);
+        let bytes = script(&[
+            command(0, 10, &integer(0)),
+            command(1, 11, &integer(1)),
+            command(2, 12, &[]),
+            command(31, 13, &loop_args),
+        ]);
+        let parsed = parse(&bytes).unwrap();
+        assert!(matches!(&parsed.commands[0].body, Body::Condition(e) if !e.flag().unwrap()));
+        assert!(matches!(&parsed.commands[1].body, Body::Condition(e) if e.flag().unwrap()));
+        assert!(
+            matches!(&parsed.commands[3].body, Body::LoopCondition { condition, target: 77 } if condition.flag().unwrap())
+        );
+    }
     #[test]
     fn string_temporary_is_folded_without_evaluating_source_variables() {
         let mut bytes = vec![];
@@ -632,6 +878,299 @@ pub(super) mod tests {
             b.extend(c);
         }
         b
+    }
+    pub fn integer(n: i32) -> Vec<u8> {
+        let mut out = vec![];
+        u32b(&mut out, 1);
+        out.push(1);
+        string(&mut out, "____arg");
+        u32b(&mut out, 1);
+        out.push(1);
+        out.extend(n.to_le_bytes());
+        out
+    }
+    #[test]
+    fn labels_and_deletion_targets_preserve_alignment_and_reject_truncation() {
+        let mut label = vec![];
+        string(&mut label, "return-to-parent");
+        let mut deletion = vec![];
+        u32b(&mut deletion, 1);
+        deletion.push(1);
+        string(&mut deletion, "____arg");
+        u32b(&mut deletion, 1);
+        deletion.push(4);
+        string(&mut deletion, "history-container");
+        let parsed = parse(&script(&[
+            command(3, 10, &label),
+            command(19, 11, &deletion),
+            command(6, 12, &integer(1)),
+        ]))
+        .unwrap();
+        assert!(
+            matches!(&parsed.commands[0].body, Body::Label(name) if name == "return-to-parent")
+        );
+        assert!(matches!(&parsed.commands[1].body, Body::Delete(e)
+            if matches!(&e.literal, Some(Literal::String(name)) if name == "history-container")));
+        assert!(matches!(&parsed.commands[2].body, Body::Exit(_)));
+        for (kind, args) in [(3, label), (19, deletion)] {
+            for length in 0..args.len() {
+                assert!(parse(&script(&[command(kind, 1, &args[..length])])).is_err());
+            }
+        }
+    }
+    #[test]
+    fn history_calls_preserve_parameter_order_and_empty_formatter() {
+        let mut call = vec![];
+        for n in [11, -23, 450, 0] {
+            call.extend(integer(n));
+        }
+        u32b(&mut call, 0); // empty FormatName differs from numeric zero
+        let mut format = integer(17);
+        format.extend(integer(19));
+        let bytes = script(&[
+            command(29, 10, &call),
+            command(58, 11, &format),
+            command(6, 12, &integer(1)),
+        ]);
+        let parsed = parse(&bytes).unwrap();
+        let Body::HistoryCall { parameters } = &parsed.commands[0].body else {
+            panic!()
+        };
+        assert_eq!(parameters.len(), 5);
+        for (key, expected) in [
+            ("target", 11),
+            ("index", -23),
+            ("count", 450),
+            ("cut_break", 0),
+        ] {
+            assert!(matches!(parameters[key].literal, Some(Literal::Int(n)) if n == expected));
+        }
+        assert!(parameters["format_name"].operations.is_empty());
+        assert!(parameters["format_name"].literal.is_none());
+        assert!(
+            matches!(&parsed.commands[1].body, Body::HistoryFormat { name, target }
+            if matches!(name.literal, Some(Literal::Int(17))) && matches!(target.literal, Some(Literal::Int(19))))
+        );
+        assert!(matches!(&parsed.commands[2].body, Body::Exit(_)));
+        // Every truncated command body must fail, including a missing formatter.
+        for kind_args in [(29, &call), (58, &format)] {
+            for length in 0..kind_args.1.len() {
+                assert!(
+                    parse(&script(&[command(kind_args.0, 1, &kind_args.1[..length])])).is_err()
+                );
+            }
+        }
+    }
+    #[test]
+    fn cabinet_and_flip_keep_targets_flags_and_fixed_parameter_order() {
+        let mut cabinet = integer(1);
+        u32b(&mut cabinet, 2);
+        cabinet.extend(integer(12));
+        cabinet.extend(integer(34));
+        let mut flip = vec![];
+        for n in [3, 200, 1, 0] {
+            flip.extend(integer(n));
+        }
+        u32b(&mut flip, 1);
+        flip.extend(integer(99));
+        for n in [1, 71, 72, 73, 74] {
+            flip.extend(integer(n));
+        }
+        let bytes = script(&[
+            command(59, 1, &cabinet),
+            command(60, 2, &cabinet),
+            command(13, 3, &flip),
+        ]);
+        let parsed = parse(&bytes).unwrap();
+        for c in &parsed.commands[..2] {
+            let Body::Cabinet {
+                properties,
+                act,
+                targets,
+            } = &c.body
+            else {
+                panic!()
+            };
+            assert!(properties.is_empty());
+            assert!(matches!(act.literal, Some(Literal::Int(1))));
+            assert_eq!(targets.len(), 2);
+            assert!(matches!(targets[1].literal, Some(Literal::Int(34))));
+        }
+        let Body::Flip {
+            parameters,
+            targets,
+        } = &parsed.commands[2].body
+        else {
+            panic!()
+        };
+        assert_eq!(parameters.len(), 9);
+        assert_eq!(targets.len(), 1);
+        for (name, value) in [
+            ("time", 200),
+            ("delete", 1),
+            ("parameter_0", 71),
+            ("parameter_1", 72),
+            ("source", 73),
+            ("stop_event", 74),
+        ] {
+            assert!(
+                matches!(parameters[name].literal,Some(Literal::Int(n)) if n==value),
+                "{name}"
+            );
+        }
+        assert!(parse(&bytes[..bytes.len() - 1]).is_err());
+        let mut sparse = object_script(60, &[(1, integer(4)), (43, integer(-128))]);
+        sparse.extend(integer(0));
+        u32b(&mut sparse, 0);
+        let parsed = parse(&sparse).unwrap();
+        assert!(
+            matches!(&parsed.commands[0].body,Body::Cabinet {properties,targets,..} if properties.contains_key(&43)&&targets.is_empty())
+        );
+    }
+    pub fn object_script(kind: u8, properties: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let width = 17;
+        let mut out = vec![];
+        u32b(&mut out, 116);
+        out.push(0);
+        u32b(&mut out, 64);
+        u32b(&mut out, width);
+        for command_kind in 0..64 {
+            let mut mask = vec![0; width as usize];
+            if command_kind == kind {
+                for (id, _) in properties {
+                    let bit = usize::from(*id) - 1;
+                    mask[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+            out.extend(mask);
+        }
+        let args: Vec<_> = properties
+            .iter()
+            .flat_map(|(_, value)| value.clone())
+            .collect();
+        u32b(&mut out, 1);
+        out.extend(command(kind, 17, &args));
+        out
+    }
+    #[test]
+    fn sparse_object_properties_preserve_identity_and_source_update_flags() {
+        let mut bytes = object_script(
+            51,
+            &[
+                (4, integer(37)),
+                (124, integer(0)),
+                (125, integer(1000)),
+                (128, integer(10)),
+            ],
+        );
+        let command_offset = 13 + 64 * 17 + 4;
+        bytes[command_offset + 6] = 1;
+        let parsed = parse(&bytes).unwrap();
+        let command = &parsed.commands[0];
+        assert!(command.not_update);
+        assert_eq!(command.offset, command_offset);
+        let Body::Object(properties) = &command.body else {
+            panic!()
+        };
+        assert_eq!(
+            properties.keys().copied().collect::<Vec<_>>(),
+            vec![4, 124, 125, 128]
+        );
+        assert!(matches!(properties[&125].literal, Some(Literal::Int(1000))));
+        assert!(matches!(properties[&128].literal, Some(Literal::Int(10))));
+        assert!(!properties.contains_key(&3));
+        for n in [13, command_offset, bytes.len() - 1] {
+            assert!(parse(&bytes[..n]).is_err());
+        }
+    }
+    #[test]
+    fn property_mutations_keep_runtime_zero_based_number_and_expressions() {
+        let args = [integer(7), integer(3), integer(99)].concat();
+        let parsed = parse(&script(&[command(18, 9, &args)])).unwrap();
+        let Body::SetProperty {
+            target,
+            property,
+            value,
+        } = &parsed.commands[0].body
+        else {
+            panic!()
+        };
+        assert!(matches!(target.literal, Some(Literal::Int(7))));
+        assert!(matches!(property.literal, Some(Literal::Int(3))));
+        assert!(matches!(value.literal, Some(Literal::Int(99))));
+    }
+    #[test]
+    fn expression_retains_function_identity_without_executing_it() {
+        let mut bytes = vec![];
+        u32b(&mut bytes, 1);
+        bytes.push(11);
+        string(&mut bytes, "____arg");
+        u32b(&mut bytes, 0);
+        bytes.push(37);
+        let expression = Reader::new(&bytes).expr().unwrap();
+        assert_eq!(expression.functions.get(&0), Some(&37));
+        assert!(expression.literal.is_none());
+    }
+    #[test]
+    fn pure_sum_recognizes_compiler_temporaries_but_rejects_side_effects_and_other_units() {
+        let variable = |name: &str| Literal::Variable(name.into());
+        let mut expression = Expression {
+            literal: None,
+            functions: BTreeMap::new(),
+            operations: vec![
+                (
+                    2,
+                    "____0".into(),
+                    vec![variable("delay"), variable("remaining")],
+                ),
+                (1, "____arg".into(), vec![variable("____0")]),
+            ],
+        };
+        assert!(expression.is_sum_of_variables("delay", "remaining"));
+        expression.operations[0].0 = 4;
+        assert!(!expression.is_sum_of_variables("delay", "remaining"));
+        expression.operations[0].0 = 2;
+        expression.operations[0].1 = "source_variable".into();
+        assert!(!expression.is_sum_of_variables("delay", "remaining"));
+        expression.operations[0].1 = "____source_variable".into();
+        assert!(!expression.is_sum_of_variables("delay", "remaining"));
+        expression.operations[0].1 = "____0".into();
+        expression.functions.insert(0, 1);
+        assert!(!expression.is_sum_of_variables("delay", "remaining"));
+    }
+    pub fn settings_file(settings: &[(&str, i32)]) -> Vec<u8> {
+        let mut bytes = vec![];
+        u32b(&mut bytes, 116);
+        string(&mut bytes, "Fixture");
+        bytes.extend([0; 16]);
+        for value in ["main.lsb", "", "author-project-directory"] {
+            string(&mut bytes, value);
+        }
+        u32b(&mut bytes, 0);
+        bytes.extend([0; 2]);
+        string(&mut bytes, ".wav");
+        bytes.extend([0; 3]);
+        string(&mut bytes, "");
+        string(&mut bytes, "");
+        u32b(&mut bytes, settings.len() as u32);
+        for (name, value) in settings {
+            bytes.push(1);
+            string(&mut bytes, name);
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
+    }
+    #[test]
+    fn lpb_settings_preserve_values_and_reject_duplicate_or_truncated_prefix() {
+        let bytes = settings_file(&[("Delay", 3000), ("Volume", 1000)]);
+        let values = project_settings(&bytes).unwrap();
+        assert!(matches!(values["Delay"], Literal::Int(3000)));
+        assert!(matches!(values["Volume"], Literal::Int(1000)));
+        assert!(project_settings(&bytes[..bytes.len() - 1]).is_err());
+        assert!(project_settings(&settings_file(&[("Delay", 1), ("Delay", 2)])).is_err());
+        let mut extended = bytes;
+        extended.extend([1, 2, 3]);
+        assert_eq!(project_settings(&extended).unwrap().len(), 2);
     }
     pub fn dialogue(text: &str) -> Vec<u8> {
         let mut b = b"TpWord105".to_vec();

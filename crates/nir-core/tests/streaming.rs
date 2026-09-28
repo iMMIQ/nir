@@ -12,7 +12,33 @@ fn object<T: serde::Serialize>(objects: &mut BTreeMap<String, Vec<u8>>, value: &
 }
 
 fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
+    bundled_reading(false)
+}
+
+fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
     let mut p: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    if sampled {
+        p.requires
+            .extend(["text.voice-binding.v1".into(), "text.voice-timer.v1".into()]);
+        let mut voice = p.cues["arrival"].effects[1].clone();
+        voice.id = "spoken".into();
+        p.cues.get_mut("intro").unwrap().effects.push(voice);
+        p.functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("wait_intro")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: "sampled-boundary".into(),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: Some("spoken".into()),
+                    wait: VoiceWaitPolicy::SampledRemaining,
+                },
+            });
+    }
     for (id, asset) in &mut p.assets {
         asset.object = format!("{:064x}", id.bytes().map(u64::from).sum::<u64>() + 1000);
         asset.decoded_bytes = if asset.kind == AssetKind::Image {
@@ -1165,5 +1191,208 @@ fn media_prediction_stops_at_control_flow_that_needs_execution() {
         assert!(prediction_fixture(1, Some(stop))
             .predict_next_cue()
             .is_none());
+    }
+}
+
+#[test]
+fn runtime_hide_policy_requires_its_declared_capability() {
+    let (mut root, _) = bundled();
+    root.player.hide_policy = HidePolicy::PauseStory;
+    assert_eq!(
+        ValidatedProgram::from_runtime(root.clone())
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    root.requires.push("player.hide-policy.v1".into());
+    assert!(ValidatedProgram::from_runtime(root).is_ok());
+}
+
+#[test]
+fn runtime_fixed_auto_delay_requires_its_declared_capability() {
+    let (mut root, _) = bundled();
+    root.player.auto_delay_policy = AutoDelayPolicy::Fixed;
+    root.player.auto_delay_us = Micros(0);
+    assert_eq!(
+        ValidatedProgram::from_runtime(root.clone())
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    root.requires.push("player.auto-delay-policy.v1".into());
+    assert!(ValidatedProgram::from_runtime(root).is_ok());
+}
+
+#[test]
+fn sampled_reading_code_can_arrive_before_audio_catalog() {
+    let (root, objects) = bundled_reading(true);
+    let code = vec![
+        package(
+            &root,
+            &objects,
+            ContentKey::Static {
+                module: "story".into(),
+            },
+        ),
+        package(
+            &root,
+            &objects,
+            ContentKey::Code {
+                module: "story".into(),
+            },
+        ),
+    ];
+    let view = ValidatedProgram::from_runtime(root.clone())
+        .unwrap()
+        .install_batch(code)
+        .unwrap();
+    let key = ContentKey::Catalog {
+        catalog: root.assets["audio.voice"].catalog.clone(),
+    };
+    let valid = package(&root, &objects, key);
+    view.install_batch(vec![valid.clone()]).unwrap();
+    let mut invalid = valid;
+    if let RuntimeObject::Catalog(catalog) = &mut invalid.1 {
+        catalog.assets.get_mut("audio.voice").unwrap().duration_us = Micros(0);
+    }
+    assert!(view.install_batch(vec![invalid]).is_err());
+}
+
+#[test]
+fn runtime_menu_reading_requires_its_capability() {
+    let (mut root, _) = bundled();
+    root.requires = CAPABILITIES.iter().map(|s| (*s).into()).collect();
+    root.theme.image_menus.insert("title".into(), serde_json::from_value(serde_json::json!({
+        "background":"bg.station","buttons":[],"elements":[{
+            "id":"auto","rect":[0,0,300,80],"content":{"type":"hit_region","label":"Auto","action":{"type":"reading","mode":"auto"}}
+        }]
+    })).unwrap());
+    ValidatedProgram::from_runtime(root.clone()).unwrap();
+    root.requires.retain(|c| c != "ui.menu-reading.v1");
+    let error = ValidatedProgram::from_runtime(root).unwrap_err();
+    assert_eq!(error.code, "E_CAPABILITY");
+    assert!(error.message.contains("ui.menu-reading.v1"));
+}
+
+#[test]
+fn runtime_stack_and_reading_guards_require_capabilities_without_reading_actions() {
+    let (mut root, _) = bundled();
+    root.requires = CAPABILITIES.iter().map(|s| (*s).into()).collect();
+    root.theme.image_menus.insert(
+        "title".into(),
+        serde_json::from_value(serde_json::json!({
+            "background":"bg.station","buttons":[],"elements":[{
+                "id":"list","rect":[0,0,300,80],"content":{"type":"stack","gap":10},
+                "visible_when":[{"type":"reading_available","mode":"auto","available":false}]
+            }]
+        }))
+        .unwrap(),
+    );
+    ValidatedProgram::from_runtime(root.clone()).unwrap();
+    for cap in [
+        "ui.menu-stack.v1",
+        "ui.menu-reading.v1",
+        "ui.menu-services.v1",
+        "ui.menu-state.v1",
+    ] {
+        let mut missing = root.clone();
+        missing.requires.retain(|c| c != cap);
+        let error = ValidatedProgram::from_runtime(missing).unwrap_err();
+        assert_eq!(error.code, "E_CAPABILITY");
+        assert!(error.message.contains(cap), "{error:?}");
+    }
+}
+
+#[test]
+fn runtime_text_buttons_validate_capability_style_and_text_budget() {
+    let (mut root, _) = bundled();
+    root.requires = CAPABILITIES.iter().map(|s| (*s).into()).collect();
+    root.theme.image_menus.insert("title".into(),serde_json::from_value(serde_json::json!({
+        "background":"bg.station","buttons":[],"elements":[{"id":"caption","rect":[0,0,100,40],"content":{"type":"text_button","label":"Label","size":26,"color":[1,1,1,1],"hover_color":[0,1,0,1],"disabled_color":[0,0,0,1],"action":{"type":"settings"}}}]
+    })).unwrap());
+    ValidatedProgram::from_runtime(root.clone()).unwrap();
+    let mut missing = root.clone();
+    missing.requires.retain(|c| c != "ui.menu-text-button.v1");
+    assert_eq!(
+        ValidatedProgram::from_runtime(missing).unwrap_err().code,
+        "E_CAPABILITY"
+    );
+    for case in 0..5 {
+        let mut bad = root.clone();
+        let menu = bad.theme.image_menus.get_mut("title").unwrap();
+        if case == 4 {
+            for i in 0..64 {
+                let mut e = menu.elements[0].clone();
+                e.id = format!("caption{i}");
+                menu.elements.push(e);
+            }
+        } else if let MenuContent::TextButton {
+            label,
+            size,
+            hover_color,
+            disabled_color,
+            ..
+        } = &mut menu.elements[0].content
+        {
+            match case {
+                0 => label.clear(),
+                1 => *size = 0.,
+                2 => hover_color[0] = f32::NAN,
+                _ => disabled_color[3] = 2.,
+            }
+        }
+        assert!(ValidatedProgram::from_runtime(bad).is_err(), "{case}");
+    }
+}
+
+#[test]
+fn runtime_story_exports_reject_missing_private_or_mistyped_values_and_undeclared_capability() {
+    let (mut root, _) = bundled();
+    root.requires = CAPABILITIES.iter().map(|s| (*s).into()).collect();
+    root.variables.insert("blocked".into(), Value::Bool(false));
+    root.theme.image_menus.insert("title".into(),serde_json::from_value(serde_json::json!({
+        "background":"bg.station","buttons":[],"story_exports":{"locked":"blocked"},
+        "elements":[{"id":"entry","rect":[0,0,100,40],"visible_when":[{"type":"story","name":"locked","equals":false}],"content":{"type":"hit_region","label":"Entry","action":{"type":"settings"}}}]
+    })).unwrap());
+    ValidatedProgram::from_runtime(root.clone()).unwrap();
+    for case in 0..6 {
+        let mut bad = root.clone();
+        let menu = bad.theme.image_menus.get_mut("title").unwrap();
+        match case {
+            0 => bad.requires.retain(|c| c != "ui.menu-story.v1"),
+            1 => {
+                menu.story_exports
+                    .insert("locked".into(), "undeclared".into());
+            }
+            2 => {
+                bad.variables
+                    .insert("blocked".into(), Value::String("private".into()));
+            }
+            3 => {
+                menu.elements[0].visible_when[0] = MenuCondition::Story {
+                    name: "locked".into(),
+                    equals: MenuValue::Int(0),
+                }
+            }
+            4 => {
+                menu.elements[0].visible_when[0] = MenuCondition::Story {
+                    name: "private".into(),
+                    equals: MenuValue::Bool(false),
+                }
+            }
+            _ => {
+                for i in 0..33 {
+                    menu.story_exports.insert(format!("v{i}"), "blocked".into());
+                }
+            }
+        }
+        let error = ValidatedProgram::from_runtime(bad).unwrap_err();
+        assert!(
+            matches!(
+                error.code.as_str(),
+                "E_CAPABILITY" | "E_VIEW_STORY" | "E_VIEW_STATE"
+            ),
+            "{case}: {error}"
+        );
     }
 }

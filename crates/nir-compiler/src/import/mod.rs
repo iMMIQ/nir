@@ -4,6 +4,14 @@ mod livenovel;
 mod lower;
 mod lsb;
 mod media;
+mod ui;
+mod ui_dispatch;
+mod ui_expr;
+mod ui_flow;
+mod ui_history;
+mod ui_items;
+mod ui_peek;
+mod ui_preview;
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
@@ -15,6 +23,7 @@ use std::{
 };
 
 pub use lower::{ImportDiagnostic, ImportReport, SourceLocation};
+pub use ui::UiInventory;
 
 #[derive(Debug)]
 pub struct ImportOptions {
@@ -30,6 +39,7 @@ pub struct ImportOptions {
 
 #[derive(Debug, Serialize)]
 pub struct ScriptInventory {
+    pub ui: UiInventory,
     pub path: String,
     pub sha256: String,
     pub version: u32,
@@ -216,8 +226,9 @@ pub fn inspect(source: &Path) -> Result<Inspection> {
         match source.read(&name) {
             Ok((_, script)) => {
                 let mut item = ScriptInventory {
+                    ui: UiInventory::from_script(&script),
                     path: name,
-                    sha256: nir_content::digest(&read_binary(&path)?),
+                    sha256: script.source_sha256.clone(),
                     version: script.version,
                     commands: BTreeMap::new(),
                     glyphs: BTreeMap::new(),

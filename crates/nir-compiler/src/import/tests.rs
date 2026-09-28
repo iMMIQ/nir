@@ -193,10 +193,47 @@ fn real_livenovel_conversion_and_all_routes() {
         );
     }
     let loaded = crate::load_project(&out).unwrap();
+    let defaults = lsb::project_settings(&read_binary(&source.join("live.lpb")).unwrap()).unwrap();
+    let lsb::Literal::Int(wait) = defaults["StatusAutoTextWait"] else {
+        panic!()
+    };
+    assert_eq!(
+        loaded.program.player.auto_delay_policy,
+        nir_format::AutoDelayPolicy::Fixed
+    );
+    assert_eq!(loaded.program.player.auto_delay_us.0, wait as u64 * 1000);
+    for (name, value) in [
+        ("StatusBGMVolume", loaded.program.player.bgm_volume),
+        ("StatusVoiceVolume", loaded.program.player.voice_volume),
+        ("StatusSEVolume", loaded.program.player.sfx_volume),
+    ] {
+        let lsb::Literal::Int(expected) = defaults[name] else {
+            panic!()
+        };
+        assert!((value - expected as f32 / 1000.).abs() < 0.0001);
+    }
+    let policies: Vec<_> = loaded
+        .program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .filter_map(|op| {
+            if let nir_format::Operation::DialogueVoice { wait, .. } = op.operation {
+                Some(wait)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(!policies.is_empty());
+    assert!(policies
+        .iter()
+        .all(|p| *p == nir_format::VoiceWaitPolicy::SampledRemaining));
     let validated = ValidatedProgram::new(loaded.program.clone()).unwrap();
     let entries: Vec<_> = std::iter::once(loaded.program.entry.clone())
         .chain(loaded.program.theme.image_menus.values().flat_map(|menu| {
-            menu.buttons.iter().filter_map(|b| match &b.action {
+            menu.controls().filter_map(|(_, action, _)| match action {
                 nir_format::ImageMenuAction::Entry { function } => Some(function.clone()),
                 _ => None,
             })
@@ -208,12 +245,19 @@ fn real_livenovel_conversion_and_all_routes() {
         .image_menus
         .values()
         .flat_map(|menu| {
-            menu.buttons
-                .iter()
-                .filter_map(|button| button.requires.clone())
+            menu.controls()
+                .filter_map(|(_, _, requires)| requires.map(str::to_owned))
         })
         .filter(|key| key.starts_with("lm.replay."))
         .collect();
+    assert!(
+        entries.len() > 1,
+        "source corpus must exercise replay routes"
+    );
+    assert!(
+        !expected_unlocks.is_empty(),
+        "source corpus must exercise unlock guards"
+    );
     for entry in entries {
         let mut core =
             Core::new_at(validated.clone(), "corpus".into(), "ja".into(), &entry).unwrap();

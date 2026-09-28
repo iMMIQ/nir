@@ -47,6 +47,13 @@
         "font"
       ]
     },
+    "AutoDelayPolicy": {
+      "type": "string",
+      "enum": [
+        "length_scaled",
+        "fixed"
+      ]
+    },
     "ChoiceComponent": {
       "type": "string",
       "enum": [
@@ -80,6 +87,13 @@
     "DialogueProps": {
       "type": "object",
       "properties": {
+        "background": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "font_size": {
           "type": "number",
           "format": "float",
@@ -90,10 +104,43 @@
           "format": "float",
           "default": 220.0
         },
+        "line_height": {
+          "type": "number",
+          "format": "float",
+          "default": 1.5
+        },
+        "opacity": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
         "padding": {
           "type": "number",
           "format": "float",
           "default": 24.0
+        },
+        "rect": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "shadow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextShadow"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -129,6 +176,369 @@
         "params",
         "entry",
         "entry_op"
+      ]
+    },
+    "HidePolicy": {
+      "type": "string",
+      "enum": [
+        "continue_story",
+        "pause_story"
+      ]
+    },
+    "ImageButton": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ImageMenuAction"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "hover_asset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "locked_asset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rect": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "requires": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "asset",
+        "rect",
+        "action"
+      ]
+    },
+    "ImageMenu": {
+      "type": "object",
+      "properties": {
+        "background": {
+          "type": "string"
+        },
+        "builtin_navigation": {
+          "description": "Authors can reserve the complete page for source controls. Shared\nEscape/right-click and preparation-failure exits remain available.",
+          "type": "boolean"
+        },
+        "buttons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImageButton"
+          }
+        },
+        "elements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MenuElement"
+          }
+        },
+        "locals": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/MenuLocal"
+          }
+        },
+        "story_exports": {
+          "description": "Explicit read-only aliases of bounded story scalars. Never UI write targets.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "background",
+        "buttons"
+      ]
+    },
+    "ImageMenuAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "menu": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "push_menu"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "menu"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "back"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "$ref": "#/$defs/MenuReadingMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "reading"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "delta": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "type": {
+              "type": "string",
+              "const": "history_page"
+            },
+            "window": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "window",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "slot": {
+              "$ref": "#/$defs/MenuSlot"
+            },
+            "type": {
+              "type": "string",
+              "const": "save_slot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "slot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "slot": {
+              "$ref": "#/$defs/MenuSlot"
+            },
+            "type": {
+              "type": "string",
+              "const": "load_slot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "slot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "close"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "delta": {
+              "type": "number",
+              "format": "float"
+            },
+            "field": {
+              "$ref": "#/$defs/MenuPreference"
+            },
+            "type": {
+              "type": "string",
+              "const": "adjust_preference"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "field",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "toggle_reduced_motion"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "local": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "set_local"
+            },
+            "value": {
+              "$ref": "#/$defs/MenuValue"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "local",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "new_game"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "saves"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "settings"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "title"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "menu": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "menu"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "menu"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "function": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "entry"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "function"
+          ]
+        }
       ]
     },
     "LocaleConfig": {
@@ -178,6 +588,907 @@
       "required": [
         "fonts",
         "digest"
+      ]
+    },
+    "MenuCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "history_available"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "available"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "equals": {
+              "$ref": "#/$defs/MenuValue"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "story"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name",
+            "equals"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "equals": {
+              "$ref": "#/$defs/MenuValue"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "local"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name",
+            "equals"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "present": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "profile"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "key",
+            "present"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "mode": {
+              "$ref": "#/$defs/MenuReadingMode"
+            },
+            "type": {
+              "type": "string",
+              "const": "reading_available"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "mode",
+            "available"
+          ]
+        }
+      ]
+    },
+    "MenuContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arrow_height": {
+              "type": "number",
+              "format": "float"
+            },
+            "decrease": {
+              "$ref": "#/$defs/MenuImageStates"
+            },
+            "increase": {
+              "$ref": "#/$defs/MenuImageStates"
+            },
+            "label": {
+              "type": "string"
+            },
+            "line_step": {
+              "type": "number",
+              "format": "float"
+            },
+            "thumb": {
+              "$ref": "#/$defs/MenuImageStates"
+            },
+            "thumb_height": {
+              "type": "number",
+              "format": "float"
+            },
+            "track": {
+              "$ref": "#/$defs/MenuImageStates"
+            },
+            "type": {
+              "type": "string",
+              "const": "history_scrollbar"
+            },
+            "window": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "window",
+            "label",
+            "thumb_height",
+            "arrow_height",
+            "line_step",
+            "track",
+            "thumb",
+            "decrease",
+            "increase"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binding": {
+              "$ref": "#/$defs/MenuToggleBinding"
+            },
+            "label": {
+              "type": "string"
+            },
+            "off_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "on_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "toggle"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "binding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "binding": {
+              "$ref": "#/$defs/MenuRangeBinding"
+            },
+            "label": {
+              "type": "string"
+            },
+            "max": {
+              "type": "number",
+              "format": "float"
+            },
+            "min": {
+              "type": "number",
+              "format": "float"
+            },
+            "step": {
+              "type": "number",
+              "format": "float"
+            },
+            "thumb_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thumb_width": {
+              "type": "number",
+              "format": "float",
+              "default": 20.0
+            },
+            "track_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "range"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "binding",
+            "min",
+            "max",
+            "step"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "gap": {
+              "type": "number",
+              "format": "float"
+            },
+            "line_height": {
+              "type": "number",
+              "format": "float"
+            },
+            "max_visible": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "page_step": {
+              "type": "number",
+              "format": "float"
+            },
+            "size": {
+              "type": "number",
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "const": "history_flow"
+            },
+            "wheel_step": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "size",
+            "line_height",
+            "gap",
+            "wheel_step",
+            "page_step",
+            "max_visible",
+            "color"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "limit": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "offset_local": {
+              "type": "string"
+            },
+            "row_height": {
+              "type": "number",
+              "format": "float"
+            },
+            "size": {
+              "type": "number",
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "const": "history_window"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "offset_local",
+            "limit",
+            "row_height",
+            "size",
+            "color"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "group"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Finite vertical layout of declared, visible direct children.",
+          "type": "object",
+          "properties": {
+            "gap": {
+              "type": "number",
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "const": "stack"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "gap"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "asset": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "image"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "asset"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "size": {
+              "type": "number",
+              "format": "float"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "text",
+            "size",
+            "color"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ImageMenuAction"
+            },
+            "color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "disabled_color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "hover_color": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              },
+              "maxItems": 4,
+              "minItems": 4
+            },
+            "label": {
+              "type": "string"
+            },
+            "requires": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "size": {
+              "type": "number",
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "const": "text_button"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "size",
+            "color",
+            "hover_color",
+            "disabled_color",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ImageMenuAction"
+            },
+            "asset": {
+              "type": "string"
+            },
+            "hover_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "locked_asset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requires": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "button"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "asset",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ImageMenuAction"
+            },
+            "label": {
+              "type": "string"
+            },
+            "requires": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "hit_region"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "action"
+          ]
+        }
+      ]
+    },
+    "MenuElement": {
+      "description": "Finite declarative menu content. All geometry uses the authored stage space.",
+      "type": "object",
+      "properties": {
+        "clip": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "content": {
+          "$ref": "#/$defs/MenuContent"
+        },
+        "enabled_when": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MenuCondition"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "opacity": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rect": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "scale": {
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "text_local": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_preference": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MenuPreference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text_slot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MenuSlot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "visible_when": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MenuCondition"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rect",
+        "content"
+      ]
+    },
+    "MenuImageStates": {
+      "description": "Explicit image states for a finite scrollbar part. No runtime sprite slicing.",
+      "type": "object",
+      "properties": {
+        "asset": {
+          "type": "string"
+        },
+        "disabled_asset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hover_asset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pressed_asset": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "asset"
+      ]
+    },
+    "MenuLocal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "initial": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "const": "bool"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "initial"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "initial": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "max": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "min": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "type": {
+              "type": "string",
+              "const": "int"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "initial",
+            "min",
+            "max"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "initial": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "enum"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "initial",
+            "values"
+          ]
+        }
+      ]
+    },
+    "MenuPreference": {
+      "type": "string",
+      "enum": [
+        "bgm_volume",
+        "voice_volume",
+        "sfx_volume",
+        "font_scale",
+        "text_speed",
+        "auto_wait_scale"
+      ]
+    },
+    "MenuRangeBinding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "local"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "field": {
+              "$ref": "#/$defs/MenuPreference"
+            },
+            "type": {
+              "type": "string",
+              "const": "preference"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "field"
+          ]
+        }
+      ]
+    },
+    "MenuReadingMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "skip_read",
+        "peek_story"
+      ]
+    },
+    "MenuSlot": {
+      "description": "A bounded save slot, either literal or selected by a local integer.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "slot": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "fixed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "slot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "local"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name"
+          ]
+        }
+      ]
+    },
+    "MenuToggleBinding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "local"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "reduced_motion"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "MenuValue": {
+      "description": "UI-local data never aliases VM variables or snapshot slots.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int32"
+        },
+        {
+          "type": "string"
+        }
       ]
     },
     "Micros": {
@@ -314,6 +1625,9 @@
     "PlayerDefaults": {
       "type": "object",
       "properties": {
+        "auto_delay_policy": {
+          "$ref": "#/$defs/AutoDelayPolicy"
+        },
         "auto_delay_us": {
           "$ref": "#/$defs/Micros",
           "default": "1200000"
@@ -327,6 +1641,9 @@
           "type": "number",
           "format": "float",
           "default": 1.0
+        },
+        "hide_policy": {
+          "$ref": "#/$defs/HidePolicy"
         },
         "prefetch_content": {
           "type": "boolean",
@@ -521,9 +1838,13 @@
               "width": 520.0
             },
             "dialogue": {
+              "background": null,
               "font_size": 23.0,
               "height": 220.0,
-              "padding": 24.0
+              "line_height": 1.5,
+              "opacity": 1.0,
+              "padding": 24.0,
+              "rect": null
             },
             "muted": [
               0.5799999833106995,
@@ -537,6 +1858,7 @@
               0.11999999731779099,
               0.9700000286102295
             ],
+            "return_to_title": false,
             "slots": {
               "choice.main": "builtin.choice",
               "dialogue.main": "builtin.dialogue"
@@ -638,6 +1960,34 @@
         "height"
       ]
     },
+    "TextShadow": {
+      "type": "object",
+      "properties": {
+        "color": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 4,
+          "minItems": 4
+        },
+        "offset": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "float"
+          },
+          "maxItems": 2,
+          "minItems": 2
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "offset",
+        "color"
+      ]
+    },
     "Theme": {
       "type": "object",
       "properties": {
@@ -669,10 +2019,26 @@
         "dialogue": {
           "$ref": "#/$defs/DialogueProps",
           "default": {
+            "background": null,
             "font_size": 23.0,
             "height": 220.0,
-            "padding": 24.0
+            "line_height": 1.5,
+            "opacity": 1.0,
+            "padding": 24.0,
+            "rect": null
           }
+        },
+        "image_menus": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ImageMenu"
+          }
+        },
+        "menu_overlay": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "muted": {
           "type": "array",
@@ -691,6 +2057,10 @@
           },
           "maxItems": 4,
           "minItems": 4
+        },
+        "return_to_title": {
+          "type": "boolean",
+          "default": false
         },
         "slots": {
           "$ref": "#/$defs/ThemeSlots",

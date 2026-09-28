@@ -6,8 +6,13 @@ use nir_format::*;
 use nir_presentation::{ChoiceView, DialogueView, Screen, SlotView, UiModel};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod clock;
+mod menu;
+use menu::{MenuSession, SaveConfirmation};
 mod content;
 mod pause;
+use clock::ForegroundClockDemand;
+pub use clock::ForegroundClockToken;
 pub use content::ContentRequest;
 use content::{ContentPreparation, ContentPurpose, RestoreWork};
 pub use pause::PauseToken;
@@ -107,20 +112,38 @@ pub enum AppCommand {
         text_locale: String,
     },
     AudioStart {
+        domain: TimeDomain,
         task: u32,
         asset: String,
         bus: AudioBus,
         looped: bool,
         position_us: Micros,
+        gain: f32,
+        envelope: f32,
         session: u32,
     },
+    AudioEnvelope {
+        owner: Option<u32>,
+        elapsed_us: Micros,
+        session: u32,
+        domain: TimeDomain,
+        task: u32,
+        from: f32,
+        to: f32,
+        duration_us: Micros,
+    },
     AudioStop {
+        session: u32,
+        domain: TimeDomain,
         task: u32,
     },
     AudioPause {
+        domain: TimeDomain,
         paused: bool,
     },
-    AudioReset,
+    AudioReset {
+        domain: TimeDomain,
+    },
     Save {
         slot: u32,
         expected_revision: u32,
@@ -129,6 +152,7 @@ pub enum AppCommand {
     },
     Load {
         slot: u32,
+        job: u32,
     },
     Export {
         json: String,
@@ -151,6 +175,11 @@ pub enum AppCommand {
 }
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    AudioPositions {
+        domain: TimeDomain,
+        session: u32,
+        positions: Vec<AudioPosition>,
+    },
     ContentReady {
         request: u32,
         objects: Vec<Vec<u8>>,
@@ -171,6 +200,16 @@ pub enum AppEvent {
         session: u32,
     },
     Tick {
+        delta_us: u64,
+    },
+    /// Host elapsed time after independently applying domain boundary policies.
+    TickDomains {
+        story_us: u64,
+        foreground_us: u64,
+    },
+    /// Internal continuation: this elapsed time was already charged to the UI clock.
+    #[doc(hidden)]
+    ContinueStoryTime {
         delta_us: u64,
     },
     AssetReady {
@@ -199,15 +238,25 @@ pub enum AppEvent {
         message: String,
     },
     AudioEnded {
+        domain: TimeDomain,
         task: u32,
         session: u32,
     },
     AudioFailed {
+        domain: TimeDomain,
         task: u32,
         session: u32,
         message: String,
     },
     Hidden(bool),
+    SlotLoaded {
+        job: u32,
+        envelope: Box<SaveEnvelope>,
+    },
+    SlotLoadFailed {
+        job: u32,
+        message: String,
+    },
     Loaded {
         envelope: Box<SaveEnvelope>,
     },
@@ -235,6 +284,7 @@ pub enum AppEvent {
 #[derive(Debug, Clone, Copy)]
 enum Purpose {
     Boot,
+    Menu,
     Activation,
     Restore,
     Rollback,
@@ -290,12 +340,21 @@ pub struct Player {
     pub diagnostic: Option<Diagnostic>,
     pub auto: bool,
     pub skip: bool,
+    held_skip: bool,
+    interface_hidden: bool,
+    menu_peek: bool,
     pub profile: BTreeSet<String>,
     image_menu: String,
+    menu_session: MenuSession,
+    overlay_menu: Option<String>,
+    prepared_menu: Option<(String, u32, u32, u32, u32)>,
     hovered_image: Option<String>,
     pub slots: Vec<SlotView>,
     pauses: Pauses,
-    audio_paused: bool,
+    ui_pauses: Pauses,
+    ui_clock_us: Micros,
+    ui_clock_demand: ForegroundClockDemand,
+    audio_paused: BTreeMap<TimeDomain, bool>,
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
     prepare: Option<Preparation>,
@@ -318,8 +377,13 @@ pub struct Player {
     commands: Vec<AppCommand>,
     checkpoints: Vec<Snapshot>,
     slot_revisions: BTreeMap<u32, u32>,
+    save_confirmation: Option<SaveConfirmation>,
+    slot_restore: bool,
+    slot_load: Option<(u32, u32, u32, u32)>,
     save_jobs: BTreeMap<u32, (u32, u32)>,
     auto_elapsed: u64,
+    auto_wait_delay: Option<u64>,
+    auto_anchor: Option<(u32, u32, u32)>,
     history_offset: usize,
 }
 impl Player {
@@ -358,6 +422,8 @@ impl Player {
         if !config.text.contains_key(&preferences.text_locale) {
             preferences.text_locale = config.default_text.clone();
         }
+        preferences.text_speed = finite_clamp(preferences.text_speed, 0.25, 4., 1.);
+        preferences.auto_wait_scale = finite_clamp(preferences.auto_wait_scale, 0.25, 4., 1.);
         preferences.font_scale = finite_clamp(preferences.font_scale, 0.8, 1.5, 1.);
         preferences.bgm_volume = finite_clamp(preferences.bgm_volume, 0., 1., 0.3);
         preferences.voice_volume = finite_clamp(preferences.voice_volume, 0., 1., 0.8);
@@ -372,6 +438,8 @@ impl Player {
                 + 8 * 1024 * 1024
                 + 32 * 1024 * 1024,
         )]))?;
+        let menu_session =
+            MenuSession::new(core.program().theme.image_menus.get("title"), &preferences);
         let mut p = Self {
             messages: nir_presentation::Messages::default(),
             core,
@@ -398,8 +466,14 @@ impl Player {
             diagnostic: None,
             auto: false,
             skip: false,
+            held_skip: false,
+            interface_hidden: false,
+            menu_peek: false,
             profile: BTreeSet::new(),
             image_menu: "title".into(),
+            menu_session,
+            overlay_menu: None,
+            prepared_menu: None,
             hovered_image: None,
             slots: (0..3)
                 .map(|slot| SlotView {
@@ -408,7 +482,13 @@ impl Player {
                 })
                 .collect(),
             pauses: Pauses::default(),
-            audio_paused: true,
+            ui_pauses: Pauses::default(),
+            ui_clock_us: Micros(0),
+            ui_clock_demand: ForegroundClockDemand::default(),
+            audio_paused: BTreeMap::from([
+                (TimeDomain::Story, true),
+                (TimeDomain::ForegroundUi, true),
+            ]),
             inbox: VecDeque::new(),
             work_used: 0,
             prepare: None,
@@ -427,8 +507,13 @@ impl Player {
             commands: vec![AppCommand::ListSaves],
             checkpoints: vec![],
             slot_revisions: BTreeMap::new(),
+            save_confirmation: None,
+            slot_restore: false,
+            slot_load: None,
             save_jobs: BTreeMap::new(),
             auto_elapsed: 0,
+            auto_wait_delay: None,
+            auto_anchor: None,
             history_offset: 0,
             content: BTreeMap::new(),
             content_leases: vec![],
@@ -457,6 +542,7 @@ impl Player {
             .as_ref()
             .filter(|c| c.request == request)?;
         let mut model = self.model_for_locale(&self.core, self.screen, &candidate.ui_locale);
+        model.interface_hidden = false;
         model.locale_pending = true;
         let ui_plan = &self.core.program().locale_config.ui[&candidate.ui_locale];
         let text_plan = &self.core.program().locale_config.text[&candidate.text_locale];
@@ -483,6 +569,8 @@ impl Player {
                 font_assets: fonts.to_vec(),
                 font_plan_digest: digest.into(),
                 preflight_only: true,
+                shadow: None,
+                monochrome: false,
             });
         };
         for text in self.messages.preflight(&candidate.ui_locale) {
@@ -689,16 +777,86 @@ impl Player {
     pub fn memory_used(&self) -> u64 {
         self.ledger.used()
     }
+    pub fn observe_audio_positions(
+        &mut self,
+        domain: TimeDomain,
+        session: u32,
+        positions: &[AudioPosition],
+    ) -> Result<()> {
+        if domain == TimeDomain::Story && session == self.generation.session {
+            self.core.observe_audio_positions(positions)?;
+        }
+        Ok(())
+    }
+    pub fn interface_hidden(&self) -> bool {
+        self.interface_hidden
+    }
+    pub fn presentation_screen(&self) -> Screen {
+        if self.menu_peek {
+            Screen::Story
+        } else {
+            self.screen
+        }
+    }
+    fn set_interface_hidden(&mut self, hidden: bool) {
+        if !hidden {
+            self.menu_peek = false;
+        }
+        self.interface_hidden = hidden;
+        if hidden && self.core.program().player.hide_policy == HidePolicy::PauseStory {
+            self.pauses.insert("interface-hidden".into());
+        } else {
+            self.pauses.remove("interface-hidden");
+        }
+        if hidden {
+            self.auto = false;
+            self.skip = false;
+            self.held_skip = false;
+            self.auto_elapsed = 0;
+            self.auto_wait_delay = None;
+        }
+    }
     pub fn needs_clock(&self) -> bool {
+        self.needs_story_clock()
+            || (self.ui_clock_demand.active() && !self.domain_paused(TimeDomain::ForegroundUi))
+    }
+    fn needs_story_clock(&self) -> bool {
         self.screen == Screen::Story
             && self.pauses.is_empty()
-            && (self.core.needs_clock() || self.auto || self.skip)
+            && (self.core.needs_clock() || self.auto || self.skip || self.held_skip)
     }
     fn story_context_active(&self) -> bool {
         self.screen != Screen::Title && self.return_screen != Screen::Title
     }
     pub fn paused(&self) -> bool {
         !self.pauses.is_empty()
+    }
+    pub fn domain_paused(&self, domain: TimeDomain) -> bool {
+        match domain {
+            TimeDomain::Story => self.paused(),
+            TimeDomain::ForegroundUi => !self.ui_pauses.is_empty(),
+        }
+    }
+    pub fn foreground_clock(&self) -> Micros {
+        self.ui_clock_us
+    }
+    pub fn acquire_foreground_clock(&self) -> Option<ForegroundClockToken> {
+        self.ui_clock_demand.acquire()
+    }
+    pub fn acquire_domain_pause(
+        &self,
+        domain: TimeDomain,
+        reason: impl Into<String>,
+    ) -> PauseToken {
+        match domain {
+            TimeDomain::Story => self.pauses.acquire(reason.into()),
+            TimeDomain::ForegroundUi => self.ui_pauses.acquire(reason.into()),
+        }
+    }
+    fn reset_audio(&mut self) {
+        for domain in [TimeDomain::Story, TimeDomain::ForegroundUi] {
+            self.commands.push(AppCommand::AudioReset { domain });
+        }
     }
     pub fn is_loading(&self) -> bool {
         self.prepare.is_some()
@@ -732,7 +890,7 @@ impl Player {
             .iter()
             .filter_map(|n| n.asset.clone())
             .collect();
-        a.extend(self.core.program().theme.image_assets());
+        a.extend(self.core.program().theme.title_image_assets());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         a
     }
@@ -751,6 +909,9 @@ impl Player {
                     .chain(t.target.iter())
                     .filter_map(|n| n.asset.clone()),
             );
+            if let Effect::StagePresent { transition, .. } = &t.effect {
+                a.extend(transition.asset().map(str::to_owned));
+            }
             if let Effect::Audio { asset, .. } = &t.effect {
                 a.insert(asset.clone());
             }
@@ -758,8 +919,15 @@ impl Player {
         if let Some(pending) = &s.pending {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
-        // Menus are only displayed on the title screen. Keeping their images
-        // during Story can crowd out a new voice or transition under the budget.
+        // Keep only the active overlay's images; hidden pages do not pin media.
+        if self.screen == Screen::Menu {
+            if let Some(menu) = self
+                .active_menu_id()
+                .and_then(|id| core.program().theme.image_menus.get(id))
+            {
+                a.extend(menu.image_assets());
+            }
+        }
         a.extend(core.program().theme.dialogue.background.iter().cloned());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         let config = &core.program().locale_config;
@@ -864,6 +1032,9 @@ impl Player {
         });
     }
     fn report(&mut self, mut d: Diagnostic, blocking: bool) {
+        if blocking {
+            self.set_interface_hidden(false);
+        }
         if d.details.is_none() {
             d = d.classified(
                 ErrorDomain::Core,
@@ -1166,6 +1337,7 @@ impl Player {
         self.observe("media_lookahead_requested", Some(request));
     }
     fn step(&mut self, input: CoreInput, budget: &mut u32) -> Result<()> {
+        self.core.set_text_speed(self.preferences.text_speed)?;
         let before_location = self.core.location();
         let output = self.core.step(input, *budget);
         *budget -= output.work_used;
@@ -1175,7 +1347,7 @@ impl Player {
         if output.remaining_time_us > 0 {
             self.inbox.push_front((
                 self.generation.session,
-                AppEvent::Tick {
+                AppEvent::ContinueStoryTime {
                     delta_us: output.remaining_time_us,
                 },
             ));
@@ -1204,17 +1376,42 @@ impl Player {
                     bus,
                     looped,
                     position_us,
+                    gain,
                 } => self.commands.push(AppCommand::AudioStart {
+                    domain: TimeDomain::Story,
                     task,
                     asset,
                     bus,
                     looped,
                     position_us,
+                    gain,
+                    envelope: 1.,
                     session: self.generation.session,
                 }),
-                CoreIntent::AudioStop { task } => {
-                    self.commands.push(AppCommand::AudioStop { task })
+                CoreIntent::AudioEnvelope {
+                    owner,
+                    elapsed_us,
+                    task,
+                    from,
+                    to,
+                    duration_us,
+                } => {
+                    self.commands.push(AppCommand::AudioEnvelope {
+                        owner,
+                        elapsed_us,
+                        domain: TimeDomain::Story,
+                        session: self.generation.session,
+                        task,
+                        from,
+                        to,
+                        duration_us,
+                    });
                 }
+                CoreIntent::AudioStop { task } => self.commands.push(AppCommand::AudioStop {
+                    domain: TimeDomain::Story,
+                    session: self.generation.session,
+                    task,
+                }),
                 CoreIntent::ProfileMerge { key } => {
                     if self.profile.insert(key) {
                         self.commands.push(AppCommand::PersistProfile {
@@ -1246,6 +1443,12 @@ impl Player {
             self.report(e.clone(), true);
             self.pauses.insert("fault".into());
         }
+        if self.core.state().fault.is_some()
+            || (!self.menu_peek
+                && (self.core.state().choice.is_some() || self.core.dialogue().is_none()))
+        {
+            self.set_interface_hidden(false);
+        }
         if self.core.state().outcome.is_some() {
             if self.core.program().theme.return_to_title {
                 let root = self
@@ -1255,7 +1458,7 @@ impl Player {
                     .first()
                     .map(|frame| frame.function.as_str());
                 let menu = self.core.program().theme.image_menus.iter().find_map(|(id, menu)|
-                    menu.buttons.iter().any(|button| matches!(&button.action, nir_format::ImageMenuAction::Entry { function } if Some(function.as_str()) == root)).then(|| id.clone()))
+                    menu.controls().any(|(_,action,_)| matches!(action, nir_format::ImageMenuAction::Entry { function } if Some(function.as_str()) == root)).then(|| id.clone()))
                     .unwrap_or_else(|| "title".into());
                 self.action(UiAction::Title, 0, 0, budget)?;
                 self.image_menu = menu;
@@ -1264,6 +1467,7 @@ impl Player {
             }
             self.auto = false;
             self.skip = false;
+            self.held_skip = false;
         }
         Ok(())
     }
@@ -1372,7 +1576,13 @@ impl Player {
     pub fn pump(&mut self, events: Vec<AppEvent>, budget: u32) -> Vec<AppCommand> {
         // Admission leaves room for resource, audio and storage terminal events.
         for event in events {
-            let input = matches!(event, AppEvent::Action { .. } | AppEvent::Tick { .. });
+            let input = matches!(
+                event,
+                AppEvent::Action { .. }
+                    | AppEvent::Tick { .. }
+                    | AppEvent::TickDomains { .. }
+                    | AppEvent::ContinueStoryTime { .. }
+            );
             let limit = if input {
                 INPUT_CAPACITY
             } else {
@@ -1389,14 +1599,20 @@ impl Player {
                     true,
                 );
                 self.pauses.insert("queue-overflow".into());
+                self.ui_pauses.insert("queue-overflow".into());
                 continue;
             }
             self.inbox.push_back((self.generation.session, event));
         }
         // Stable partition across retained work, so a choice beats same-turn time.
-        self.inbox
-            .make_contiguous()
-            .sort_by_key(|(_, e)| matches!(e, AppEvent::Tick { .. }));
+        self.inbox.make_contiguous().sort_by_key(|(_, e)| {
+            matches!(
+                e,
+                AppEvent::Tick { .. }
+                    | AppEvent::TickDomains { .. }
+                    | AppEvent::ContinueStoryTime { .. }
+            )
+        });
         let mut remaining = budget.min(100_000);
         let limit = remaining;
         while remaining > 0 {
@@ -1404,11 +1620,20 @@ impl Player {
                 break;
             };
             remaining -= 1;
-            if matches!(event, AppEvent::Tick { .. }) && session != self.generation.session {
+            if matches!(
+                event,
+                AppEvent::Tick { .. }
+                    | AppEvent::TickDomains { .. }
+                    | AppEvent::ContinueStoryTime { .. }
+            ) && session != self.generation.session
+            {
                 self.observe("stale_tick_discarded", None);
                 continue;
             }
-            if let Err(e) = self.event(event, &mut remaining) {
+            if let Err(e) = self
+                .event(event, &mut remaining)
+                .and_then(|_| self.sync_menu_state())
+            {
                 self.report(e, true);
             }
         }
@@ -1417,16 +1642,27 @@ impl Player {
                 self.report(e, true);
             }
         }
+        if let Err(e) = self.sync_menu_state() {
+            self.report(e, true);
+        }
+        if let Err(e) = self.prepare_active_menu() {
+            self.report(e, true);
+        }
         self.maybe_prefetch_content();
         self.maybe_prefetch_media();
         if let Err(error) = self.refresh_content_lease() {
             self.report(error, true);
         }
         self.work_used = limit - remaining;
-        let after = self.paused();
-        if self.audio_paused != after {
-            self.audio_paused = after;
-            self.commands.push(AppCommand::AudioPause { paused: after });
+        for domain in [TimeDomain::Story, TimeDomain::ForegroundUi] {
+            let after = self.domain_paused(domain);
+            if self.audio_paused.get(&domain) != Some(&after) {
+                self.audio_paused.insert(domain, after);
+                self.commands.push(AppCommand::AudioPause {
+                    domain,
+                    paused: after,
+                });
+            }
         }
         std::mem::take(&mut self.commands)
     }
@@ -1502,16 +1738,31 @@ impl Player {
                 }
             }
             AppEvent::Tick { delta_us } => {
-                if self.needs_clock() {
-                    let before = self.core.state().tick_us.0;
-                    self.step(
-                        CoreInput::Time {
-                            delta_us: delta_us.min(250_000),
-                        },
-                        budget,
-                    )?;
-                    self.read_policy(self.core.state().tick_us.0 - before, budget)?;
+                self.event(
+                    AppEvent::TickDomains {
+                        story_us: delta_us,
+                        foreground_us: delta_us,
+                    },
+                    budget,
+                )?;
+            }
+            AppEvent::TickDomains {
+                story_us,
+                foreground_us,
+            } => {
+                if !self.domain_paused(TimeDomain::ForegroundUi) {
+                    self.ui_clock_us.0 =
+                        self.ui_clock_us
+                            .0
+                            .checked_add(foreground_us)
+                            .ok_or_else(|| {
+                                Diagnostic::new("E_TIME", "clock", "foreground clock overflow")
+                            })?;
                 }
+                self.advance_story_time(story_us, budget)?;
+            }
+            AppEvent::ContinueStoryTime { delta_us } => {
+                self.advance_story_time(delta_us, budget)?;
             }
             AppEvent::AssetReady { request, asset } => {
                 if !self.accepts_resource(request) {
@@ -1640,17 +1891,22 @@ impl Player {
             AppEvent::LocaleFailed { request, message } => {
                 self.locale_failed(request, message);
             }
-            AppEvent::AudioEnded { task, session } => {
-                if session == self.generation.session {
+            AppEvent::AudioEnded {
+                domain,
+                task,
+                session,
+            } => {
+                if domain == TimeDomain::Story && session == self.generation.session {
                     self.step(CoreInput::AudioEnded { task }, budget)?;
                 }
             }
             AppEvent::AudioFailed {
+                domain,
                 task,
                 session,
                 message,
             } => {
-                if session == self.generation.session {
+                if domain == TimeDomain::Story && session == self.generation.session {
                     let mut d = Diagnostic::new("E_AUDIO", self.core.location(), &message)
                         .classified(
                             ErrorDomain::Host,
@@ -1671,11 +1927,39 @@ impl Player {
                     );
                 }
             }
+            AppEvent::AudioPositions {
+                domain,
+                session,
+                positions,
+            } => {
+                self.observe_audio_positions(domain, session, &positions)?;
+            }
             AppEvent::Hidden(hidden) => {
                 if hidden {
+                    self.held_skip = false;
                     self.pauses.insert("hidden".into());
+                    self.ui_pauses.insert("hidden".into());
                 } else {
                     self.pauses.remove("hidden");
+                    self.ui_pauses.remove("hidden");
+                }
+            }
+            AppEvent::SlotLoaded { job, envelope } => {
+                if let Some(slot) = self.accept_slot_load(job) {
+                    self.slot_restore = true;
+                    if envelope.slot != slot {
+                        return Err(Diagnostic::new(
+                            "E_SAVE_SLOT",
+                            "load",
+                            "slot does not match request",
+                        ));
+                    }
+                    self.event(AppEvent::Loaded { envelope }, budget)?;
+                }
+            }
+            AppEvent::SlotLoadFailed { job, message } => {
+                if self.accept_slot_load(job).is_some() {
+                    self.event(AppEvent::LoadFailed(message), budget)?;
                 }
             }
             AppEvent::Loaded { envelope } => {
@@ -1741,8 +2025,24 @@ impl Player {
             }
             AppEvent::SaveFault { job, diagnostic } => self.save_fault(job, *diagnostic),
             AppEvent::Slots(slots, revisions) => {
-                self.slots = slots;
-                self.slot_revisions = revisions;
+                for slot in 0..3 {
+                    let revision = revisions.get(&slot).copied().unwrap_or(0);
+                    if revision < self.slot_revisions.get(&slot).copied().unwrap_or(0) {
+                        continue;
+                    }
+                    let row = slots
+                        .iter()
+                        .find(|row| row.slot == slot)
+                        .cloned()
+                        .unwrap_or(SlotView {
+                            slot,
+                            ..Default::default()
+                        });
+                    if let Some(old) = self.slots.iter_mut().find(|row| row.slot == slot) {
+                        *old = row;
+                    }
+                    self.slot_revisions.insert(slot, revision);
+                }
             }
             AppEvent::Preferences(mut p) => {
                 let locale_config = &self.core.program().locale_config;
@@ -1752,6 +2052,8 @@ impl Player {
                 if !locale_config.text.contains_key(&p.text_locale) {
                     p.text_locale = locale_config.default_text.clone();
                 }
+                p.text_speed = finite_clamp(p.text_speed, 0.25, 4., 1.);
+                p.auto_wait_scale = finite_clamp(p.auto_wait_scale, 0.25, 4., 1.);
                 p.font_scale = finite_clamp(p.font_scale, 0.8, 1.5, 1.);
                 p.bgm_volume = finite_clamp(p.bgm_volume, 0., 1., 0.3);
                 p.voice_volume = finite_clamp(p.voice_volume, 0., 1., 0.8);
@@ -1773,7 +2075,11 @@ impl Player {
                 self.device_resume = self.prepare.as_ref().map(|p| p.purpose);
                 self.cancel_preparation();
                 self.pauses.insert("device".into());
-                self.commands.push(AppCommand::AudioPause { paused: true });
+                self.ui_pauses.insert("device".into());
+                self.commands.push(AppCommand::AudioPause {
+                    domain: TimeDomain::Story,
+                    paused: true,
+                });
             }
             AppEvent::DeviceReady => {
                 self.observe("device_ready", None);
@@ -1864,7 +2170,11 @@ impl Player {
         let message = self.messages.diagnostic(&d, &self.effective_ui_locale);
         self.report(d, true);
         self.observe("prepare_failed", Some(request));
-        if let Some(p) = &self.core.state().pending {
+        if let Some(p) = self.core.state().pending.as_ref().filter(|_| {
+            self.prepare
+                .as_ref()
+                .is_some_and(|p| matches!(p.purpose, Purpose::Activation))
+        }) {
             self.core.step(
                 CoreInput::PreparationFailed {
                     activation: p.id,
@@ -1895,9 +2205,20 @@ impl Player {
                 "generation changed",
             ));
         }
+        if self.screen == Screen::Menu {
+            if let Some(id) = self.active_menu_id() {
+                if self.core.program().theme.image_menus[id]
+                    .image_assets()
+                    .is_subset(&prep.assets)
+                {
+                    self.prepared_menu = Some(self.menu_asset_stamp(id));
+                }
+            }
+        }
         self.observe("lease_ready", Some(request));
         self.pauses.remove("prepare");
         self.pauses.remove("device");
+        self.ui_pauses.remove("device");
         self.error = None;
         self.diagnostic = None;
         let commit_location = self.core.location();
@@ -1905,7 +2226,7 @@ impl Player {
         let commit_generation = self.generation;
         self.observe("commit_started", Some(request));
         match purpose {
-            Purpose::Boot => {}
+            Purpose::Boot | Purpose::Menu => {}
             Purpose::Activation => self.step(
                 CoreInput::Prepared {
                     activation: lease.activation,
@@ -1919,8 +2240,11 @@ impl Player {
                     .ok_or_else(|| Diagnostic::new("E_RESTORE", "commit", "no candidate"))?;
                 candidate.set_locale(&self.effective_text_locale)?;
                 self.generation.session += 1;
+                self.set_interface_hidden(false);
+                self.held_skip = false;
                 self.failed_admission = None;
-                self.commands.push(AppCommand::AudioReset);
+                self.reset_audio();
+                self.slot_restore = false;
                 self.core = candidate;
                 self.restore_work = None;
                 self.touch_snapshot_content(self.core.state())?;
@@ -1937,10 +2261,12 @@ impl Player {
                 }
                 self.auto = false;
                 self.skip = false;
+                self.held_skip = false;
                 self.restart_audio();
             }
             Purpose::Device => {
                 self.pauses.remove("device");
+                self.ui_pauses.remove("device");
                 self.pauses.insert("restored".into());
                 self.restart_audio();
             }
@@ -1973,18 +2299,134 @@ impl Player {
             .values()
             .filter(|t| t.state == TaskState::Running)
         {
-            if let Effect::Audio { asset, bus, looped } = &t.effect {
+            if let Effect::Audio {
+                asset,
+                bus,
+                looped,
+                gain,
+            } = &t.effect
+            {
                 self.commands.push(AppCommand::AudioStart {
+                    domain: TimeDomain::Story,
                     task: t.id,
                     asset: asset.clone(),
                     bus: *bus,
                     looped: *looped,
-                    position_us: t.elapsed_us,
+                    gain: *gain,
+                    envelope: self.core.audio_envelope(t.id).0,
+                    position_us: t.audio_position_us.unwrap_or(t.elapsed_us),
                     session: self.generation.session,
+                });
+                let (from, to, duration_us) = self.core.audio_envelope(t.id);
+                let (owner, elapsed_us) = self.core.audio_envelope_checkpoint(t.id);
+                self.commands.push(AppCommand::AudioEnvelope {
+                    owner,
+                    elapsed_us,
+                    domain: TimeDomain::Story,
+                    session: self.generation.session,
+                    task: t.id,
+                    from,
+                    to,
+                    duration_us,
                 });
             }
         }
-        self.commands.push(AppCommand::AudioPause { paused: true });
+        self.commands.push(AppCommand::AudioPause {
+            domain: TimeDomain::Story,
+            paused: true,
+        });
+    }
+    fn cancel_slot_restore(&mut self) {
+        if !std::mem::take(&mut self.slot_restore) {
+            return;
+        }
+        let owns_error = self.diagnostic.as_ref().is_some_and(|d| {
+            d.location == "load"
+                || d.details.as_ref().is_some_and(|details| {
+                    details.operation == "load"
+                        || details.request.is_some_and(|request| {
+                            self.prepare.as_ref().is_some_and(|p| {
+                                p.request == request && matches!(p.purpose, Purpose::Restore)
+                            }) || self.content.get(&request).is_some_and(|p| {
+                                matches!(
+                                    p.purpose,
+                                    ContentPurpose::Restore(_, false)
+                                        | ContentPurpose::RestoreValidation
+                                        | ContentPurpose::RestoreBodies(false)
+                                        | ContentPurpose::Media {
+                                            purpose: Purpose::Restore,
+                                            ..
+                                        }
+                                )
+                            })
+                        })
+                        || (details.operation == "prepare"
+                            && details.stage == "admission"
+                            && self
+                                .failed_admission
+                                .as_ref()
+                                .is_some_and(|(purpose, _, _)| matches!(purpose, Purpose::Restore)))
+                })
+        });
+        if owns_error {
+            self.error = None;
+            self.diagnostic = None;
+            self.status.clear();
+        }
+        // Invalid envelopes have not acquired a candidate lane: leave any
+        // pre-existing Story or menu preparation intact in that case.
+        if self.content.values().any(|p| {
+            matches!(
+                p.purpose,
+                ContentPurpose::Restore(_, false)
+                    | ContentPurpose::RestoreValidation
+                    | ContentPurpose::RestoreBodies(false)
+                    | ContentPurpose::Media {
+                        purpose: Purpose::Restore,
+                        ..
+                    }
+            )
+        }) {
+            self.cancel_content(false);
+        }
+        let owns_prepare = self
+            .prepare
+            .as_ref()
+            .is_some_and(|p| matches!(p.purpose, Purpose::Restore))
+            || self
+                .failed_admission
+                .as_ref()
+                .is_some_and(|(p, _, _)| matches!(p, Purpose::Restore));
+        let owns_deferred = self
+            .deferred_prepare
+            .as_ref()
+            .is_some_and(|(_, p, _, _)| matches!(p, Purpose::Restore));
+        if owns_prepare {
+            self.cancel_preparation();
+        }
+        if owns_deferred {
+            self.deferred_prepare = None;
+        }
+        if owns_prepare || owns_deferred {
+            self.pauses.remove("prepare");
+        }
+        self.candidate = None;
+        self.restore_work = None;
+        if matches!(self.device_resume, Some(Purpose::Restore)) {
+            self.device_resume = None;
+        }
+    }
+    fn accept_slot_load(&mut self, job: u32) -> Option<u32> {
+        let (expected, slot, session, instance) = self.slot_load?;
+        if expected != job {
+            return None;
+        }
+        self.slot_load = None;
+        if session != self.generation.session || instance != self.menu_session.instance {
+            self.observe("stale_slot_load_discarded", Some(job));
+            return None;
+        }
+        Some(slot)
     }
     fn restore(&mut self, s: Snapshot) -> Result<()> {
         self.restore_with_purpose(s, false)
@@ -2022,38 +2464,160 @@ impl Player {
         sequence: u32,
         budget: &mut u32,
     ) -> Result<()> {
+        self.sync_menu_state()?;
+        let a = match a {
+            UiAction::ConfirmSave { token } => {
+                let Some(c) = self.save_confirmation.as_ref().filter(|c| c.token == token) else {
+                    return Ok(());
+                };
+                if self.is_loading() || self.slot_load.is_some() {
+                    return Ok(());
+                }
+                let slot = c.slot;
+                self.save_confirmation = None;
+                UiAction::Save { slot }
+            }
+            UiAction::CancelSave { token } => {
+                if self
+                    .save_confirmation
+                    .as_ref()
+                    .is_some_and(|c| c.token == token)
+                {
+                    self.save_confirmation = None;
+                }
+                return Ok(());
+            }
+            UiAction::Close if self.save_confirmation.is_some() => {
+                self.save_confirmation = None;
+                return Ok(());
+            }
+            UiAction::Title | UiAction::Load { .. } if self.save_confirmation.is_some() => {
+                self.save_confirmation = None;
+                a
+            }
+            _ if self.save_confirmation.is_some() => return Ok(()),
+            _ => a,
+        };
+        let a = if let UiAction::MenuValue {
+            instance,
+            revision,
+            control,
+            value,
+        } = a
+        {
+            let Some(action) = self.resolve_menu_value(instance, revision, &control, value)? else {
+                return Ok(());
+            };
+            action
+        } else {
+            a
+        };
+        let resolved_menu = matches!(&a, UiAction::MenuControl { .. });
+        let a = if let UiAction::MenuControl {
+            instance,
+            revision,
+            control,
+        } = a
+        {
+            let Some(action) = self.resolve_menu_control(instance, revision, &control)? else {
+                return Ok(());
+            };
+            action
+        } else {
+            a
+        };
+        if self.menu_peek && matches!(a, UiAction::Close) {
+            self.set_interface_hidden(false);
+            return Ok(());
+        }
+        let cancelled_slot_restore = self.slot_restore;
+        if matches!(
+            &a,
+            UiAction::Close
+                | UiAction::Title
+                | UiAction::NewGame
+                | UiAction::ImageMenuEntry { .. }
+                | UiAction::ImageMenu { .. }
+                | UiAction::Menu
+                | UiAction::Settings
+                | UiAction::Saves
+                | UiAction::History
+                | UiAction::Load { .. }
+                | UiAction::Import
+                | UiAction::Rollback
+        ) {
+            self.cancel_slot_restore();
+            self.slot_load = None;
+        }
+        if self.interface_hidden
+            && matches!(
+                a,
+                UiAction::Advance
+                    | UiAction::Continue
+                    | UiAction::Menu
+                    | UiAction::ToggleAuto
+                    | UiAction::ToggleSkip
+                    | UiAction::HoldSkip { pressed: true }
+                    | UiAction::ToggleInterface
+                    | UiAction::RestoreInterface
+            )
+        {
+            self.set_interface_hidden(false);
+            return Ok(());
+        }
         match a {
+            UiAction::MenuValue { .. }
+            | UiAction::MenuControl { .. }
+            | UiAction::ConfirmSave { .. }
+            | UiAction::CancelSave { .. } => unreachable!("resolved above"),
+            UiAction::ToggleInterface => {
+                if self.screen == Screen::Story
+                    && !self.paused()
+                    && !self.is_loading()
+                    && self.core.state().choice.is_none()
+                    && self.core.dialogue().is_some()
+                {
+                    self.set_interface_hidden(true);
+                }
+            }
+            UiAction::RestoreInterface => {
+                self.set_interface_hidden(false);
+            }
             UiAction::ImageMenu { menu } => {
-                let allowed = self.core.program().theme.image_menus.get(&self.image_menu).is_some_and(|current|
-                    current.buttons.iter().any(|button| matches!(&button.action, nir_format::ImageMenuAction::Menu { menu: target } if target == &menu)
-                        && button.requires.as_ref().is_none_or(|key| self.profile.contains(key))));
-                if self.screen == Screen::Title
+                let allowed = self.active_menu_id().and_then(|id|self.core.program().theme.image_menus.get(id)).is_some_and(|current|
+                    current.controls().any(|(id,action,requires)| (resolved_menu || (self.screen==Screen::Title && !current.uses_state() && !current.uses_services() && current.buttons.iter().any(|b|b.id==id))) && matches!(action, nir_format::ImageMenuAction::Menu { menu: target } if target == &menu)
+                        && requires.is_none_or(|key| self.profile.contains(key))));
+                if matches!(self.screen, Screen::Title | Screen::Menu)
                     && allowed
                     && self.core.program().theme.image_menus.contains_key(&menu)
                 {
-                    self.image_menu = menu;
+                    if self.core.program().theme.image_menus[&menu].uses_storage() {
+                        self.commands.push(AppCommand::ListSaves);
+                    }
+                    if self.screen == Screen::Title {
+                        self.image_menu = menu;
+                    } else {
+                        self.cancel_menu_preparation();
+                        self.overlay_menu = Some(menu);
+                    }
+                    self.menu_session.menu.clear();
                     self.hovered_image = None;
                 }
             }
             UiAction::HoverImage { id } => {
                 self.hovered_image = id.filter(|id| {
-                    self.screen == Screen::Title
-                        && self
-                            .core
-                            .program()
-                            .theme
-                            .image_menus
-                            .get(&self.image_menu)
-                            .is_some_and(|menu| menu.buttons.iter().any(|button| &button.id == id))
+                    self.active_menu_id()
+                        .and_then(|menu| self.core.program().theme.image_menus.get(menu))
+                        .is_some_and(|menu| menu.controls().any(|(control, _, _)| control == id))
                 });
             }
             UiAction::NewGame | UiAction::ImageMenuEntry { .. } => {
                 let function = match &a {
                     UiAction::ImageMenuEntry { function } => {
                         let allowed = self.screen == Screen::Title && self.core.program().theme.image_menus
-                            .get(&self.image_menu).is_some_and(|menu| menu.buttons.iter().any(|button|
-                                matches!(&button.action, nir_format::ImageMenuAction::Entry { function: target } if target == function)
-                                && button.requires.as_ref().is_none_or(|key| self.profile.contains(key))));
+                            .get(&self.image_menu).is_some_and(|menu| menu.controls().any(|(id,action,requires)|
+                                (resolved_menu || (!menu.uses_state() && !menu.uses_services() && menu.buttons.iter().any(|b|b.id==id))) && matches!(action, nir_format::ImageMenuAction::Entry { function: target } if target == function)
+                                && requires.is_none_or(|key| self.profile.contains(key))));
                         if !allowed {
                             return Ok(());
                         }
@@ -2073,8 +2637,10 @@ impl Player {
                 self.candidate = None;
                 self.prefetch_attempted = None;
                 self.generation.session += 1;
+                self.set_interface_hidden(false);
+                self.held_skip = false;
                 self.failed_admission = None;
-                self.commands.push(AppCommand::AudioReset);
+                self.reset_audio();
                 self.core = Core::new_at(
                     self.validated.clone(),
                     self.release.clone(),
@@ -2084,6 +2650,7 @@ impl Player {
                 self.screen = Screen::Story;
                 self.return_screen = Screen::Story;
                 self.pauses.retain(|r| r == "hidden");
+                self.ui_pauses.retain(|r| r == "hidden");
                 self.checkpoints.clear();
                 self.error = None;
                 self.diagnostic = None;
@@ -2097,6 +2664,11 @@ impl Player {
                     self.step(CoreInput::None, budget)?;
                 }
             }
+            UiAction::MenuHistoryScroll { .. } => {}
+            UiAction::Scroll {
+                region: ScrollRegion::Settings,
+                ..
+            } => {}
             UiAction::Scroll { .. } => {
                 if interaction != self.current_interaction() {
                     return Ok(());
@@ -2104,11 +2676,14 @@ impl Player {
                 // Browsing revealed text takes control back from automatic reading.
                 self.auto = false;
                 self.skip = false;
+                self.held_skip = false;
                 self.auto_elapsed = 0;
+                self.auto_wait_delay = None;
             }
             UiAction::Advance => {
                 if self.screen == Screen::Story && !self.paused() {
                     self.auto_elapsed = 0;
+                    self.auto_wait_delay = None;
                     self.step(
                         CoreInput::Advance {
                             interaction,
@@ -2121,6 +2696,7 @@ impl Player {
             UiAction::Choose { option } => {
                 if self.screen == Screen::Story && !self.paused() {
                     self.skip = false;
+                    self.held_skip = false;
                     self.step(
                         CoreInput::Choose {
                             interaction,
@@ -2145,9 +2721,18 @@ impl Player {
                 self.screen = Screen::Story;
             }
             UiAction::Menu | UiAction::Settings | UiAction::History | UiAction::Saves => {
+                if matches!(a, UiAction::Menu) && self.screen != Screen::Menu {
+                    self.overlay_menu = None;
+                    // Force a fresh overlay when reopening from the story.
+                    if self.screen != Screen::Title {
+                        self.menu_session.menu.clear();
+                    }
+                }
                 if matches!(self.screen, Screen::Title | Screen::Story | Screen::Ended) {
                     self.return_screen = self.screen;
                 }
+                self.held_skip = false;
+                self.set_interface_hidden(false);
                 self.screen = match a {
                     UiAction::Settings => Screen::Settings,
                     UiAction::History => Screen::History,
@@ -2155,30 +2740,52 @@ impl Player {
                     _ => Screen::Menu,
                 };
                 self.pauses.insert("menu".into());
-                if self.screen == Screen::Saves {
+                if self.screen == Screen::Saves
+                    || self
+                        .active_menu_id()
+                        .and_then(|id| self.core.program().theme.image_menus.get(id))
+                        .is_some_and(ImageMenu::uses_storage)
+                {
                     self.commands.push(AppCommand::ListSaves);
                 }
             }
             UiAction::Close => {
+                if self.pop_menu()? {
+                    return Ok(());
+                }
+                self.cancel_menu_preparation();
                 self.screen = self.return_screen;
                 self.pauses.remove("menu");
                 self.status.clear();
+                if cancelled_slot_restore && self.screen == Screen::Story && self.prepare.is_none()
+                {
+                    if let Some(pending) = &self.core.state().pending {
+                        self.begin_prepare(
+                            Purpose::Activation,
+                            pending.id,
+                            self.validated.cue_assets(&pending.cue),
+                        )?;
+                    }
+                }
             }
             UiAction::Title => {
                 self.image_menu = "title".into();
                 self.hovered_image = None;
                 let restart_locale = self.locale_pending();
                 self.cancel_content(false);
-                self.commands.push(AppCommand::AudioReset);
+                self.reset_audio();
                 self.cancel_preparation();
                 self.candidate = None;
                 self.restore_work = None;
                 self.prefetch_attempted = None;
                 self.device_resume = None;
                 self.pauses.retain(|r| r == "hidden");
+                self.ui_pauses.retain(|r| r == "hidden");
                 self.screen = Screen::Title;
                 self.return_screen = Screen::Title;
                 self.generation.session += 1;
+                self.set_interface_hidden(false);
+                self.held_skip = false;
                 self.error = None;
                 self.diagnostic = None;
                 self.status.clear();
@@ -2190,9 +2797,30 @@ impl Player {
             UiAction::ToggleAuto => {
                 self.auto = !self.auto;
                 self.skip = false;
+                self.held_skip = false;
                 self.auto_elapsed = 0;
+                self.auto_wait_delay = None;
+                if self.auto
+                    && self.core.dialogue().is_some_and(|(_, d)| {
+                        d.reading
+                            .as_ref()
+                            .is_some_and(|r| r.wait == VoiceWaitPolicy::SampledRemaining)
+                    })
+                {
+                    self.read_policy(0, budget)?;
+                }
+            }
+            UiAction::HoldSkip { pressed } => {
+                self.held_skip = pressed
+                    && self.screen == Screen::Story
+                    && !self.paused()
+                    && self.core.state().choice.is_none();
+                if self.held_skip {
+                    self.auto = false;
+                }
             }
             UiAction::ToggleSkip => {
+                self.held_skip = false;
                 self.skip = !self.skip;
                 self.auto = false;
             }
@@ -2235,6 +2863,16 @@ impl Player {
                     self.start_locale_switch()?;
                 }
             }
+            UiAction::TextSpeed { delta } => {
+                self.preferences.text_speed =
+                    finite_clamp(self.preferences.text_speed + delta, 0.25, 4., 1.);
+                self.persist_preferences();
+            }
+            UiAction::AutoWait { delta } => {
+                self.preferences.auto_wait_scale =
+                    finite_clamp(self.preferences.auto_wait_scale + delta, 0.25, 4., 1.);
+                self.persist_preferences();
+            }
             UiAction::Volume { bus, delta } => {
                 let v = match bus {
                     AudioBus::Bgm => &mut self.preferences.bgm_volume,
@@ -2268,13 +2906,18 @@ impl Player {
                     ));
                 }
                 let revision = self.slot_revisions.get(&slot).copied().unwrap_or(0);
-                self.request += 1;
+                let next_revision = revision.checked_add(1).ok_or_else(|| {
+                    Diagnostic::new("E_SAVE_LIMIT", "save", "slot revision exhausted")
+                })?;
+                self.request = self.request.checked_add(1).ok_or_else(|| {
+                    Diagnostic::new("E_REQUEST_LIMIT", "save", "request identity exhausted")
+                })?;
                 let job = self.request;
                 self.save_jobs.insert(job, (slot, self.generation.session));
                 let envelope = SaveEnvelope {
                     format: 1,
                     slot,
-                    revision: revision + 1,
+                    revision: next_revision,
                     digest: nir_content::digest(&bytes),
                     snapshot: s,
                 };
@@ -2291,7 +2934,22 @@ impl Player {
                 }
                 .into();
             }
-            UiAction::Load { slot } => self.commands.push(AppCommand::Load { slot }),
+            UiAction::Load { slot } => {
+                if slot > 2 {
+                    return Ok(());
+                }
+                self.request = self.request.checked_add(1).ok_or_else(|| {
+                    Diagnostic::new("E_REQUEST_LIMIT", "load", "request identity exhausted")
+                })?;
+                let job = self.request;
+                self.slot_load = Some((
+                    job,
+                    slot,
+                    self.generation.session,
+                    self.menu_session.instance,
+                ));
+                self.commands.push(AppCommand::Load { slot, job });
+            }
             UiAction::Export => {
                 let snapshot = self.core.snapshot();
                 let envelope = SaveEnvelope {
@@ -2343,6 +3001,7 @@ impl Player {
                 }
             }
         }
+        self.sync_menu_state()?;
         Ok(())
     }
     fn persist_preferences(&mut self) {
@@ -2361,21 +3020,41 @@ impl Player {
         }
         Ok(())
     }
+    fn advance_story_time(&mut self, delta_us: u64, budget: &mut u32) -> Result<()> {
+        if self.needs_story_clock() {
+            let before = self.core.state().tick_us.0;
+            self.step(CoreInput::Time { delta_us }, budget)?;
+            self.read_policy(self.core.state().tick_us.0 - before, budget)?;
+        }
+        Ok(())
+    }
     fn read_policy(&mut self, delta: u64, budget: &mut u32) -> Result<()> {
-        if self.paused() || self.core.state().choice.is_some() {
+        if self.interface_hidden || self.paused() || self.core.state().choice.is_some() {
             self.skip = false;
+            self.held_skip = false;
             return Ok(());
         }
         let Some((_, d)) = self.core.dialogue() else {
             return Ok(());
         };
+        let anchor = (
+            self.generation.session,
+            d.interaction,
+            d.reading.as_ref().map_or(0, |r| r.revision),
+        );
+        if self.auto_anchor != Some(anchor) {
+            self.auto_elapsed = 0;
+            self.auto_wait_delay = None;
+            self.auto_anchor = Some(anchor);
+        }
         let read = self
             .profile
             .contains(&format!("read:{}:{}", d.text_id, d.meaning_revision));
-        if self.skip && !read {
+        if (self.skip || self.held_skip) && !read {
             self.skip = false;
+            self.held_skip = false;
         }
-        if self.skip && read && !d.at_gate {
+        if (self.skip || self.held_skip) && read && !d.at_gate {
             let token = d.interaction;
             let sequence = self.core.state().last_input.saturating_add(1);
             self.step(
@@ -2386,22 +3065,81 @@ impl Player {
                 budget,
             )?;
         } else if self.auto && d.awaiting_advance {
-            self.auto_elapsed = self.auto_elapsed.saturating_add(delta);
-            let voice = self.core.state().tasks.values().any(|t| {
-                t.state == TaskState::Running
-                    && matches!(
-                        t.effect,
-                        Effect::Audio {
-                            bus: AudioBus::Voice,
-                            ..
-                        }
-                    )
-            });
-            let delay = self.core.program().player.auto_delay_us.0
-                + (d.full_text().chars().count() as u64 * 20_000);
-            if !voice && self.auto_elapsed >= delay {
+            let voice = if let Some(reading) = &d.reading {
+                reading.voice.is_some_and(|id| {
+                    self.core
+                        .state()
+                        .tasks
+                        .get(&id)
+                        .is_some_and(|t| t.state == TaskState::Running)
+                })
+            } else {
+                self.core.state().tasks.values().any(|t| {
+                    t.state == TaskState::Running
+                        && matches!(
+                            t.effect,
+                            Effect::Audio {
+                                bus: AudioBus::Voice,
+                                ..
+                            }
+                        )
+                })
+            };
+            let sampled = d
+                .reading
+                .as_ref()
+                .is_some_and(|r| r.wait == VoiceWaitPolicy::SampledRemaining);
+            if voice
+                && d.reading
+                    .as_ref()
+                    .is_some_and(|r| r.wait == VoiceWaitPolicy::AfterVoice)
+            {
+                self.auto_elapsed = 0;
+                self.auto_wait_delay = None;
+            } else {
+                let starting = self.auto_wait_delay.is_none();
+                self.auto_wait_delay.get_or_insert_with(|| {
+                    let base = self.core.program().player.auto_delay(
+                        d.full_text().chars().count(),
+                        self.preferences.auto_wait_scale,
+                    );
+                    let remaining = if sampled && self.preferences.voice_volume > 0. {
+                        d.reading
+                            .as_ref()
+                            .and_then(|r| r.voice)
+                            .and_then(|id| self.core.state().tasks.get(&id))
+                            .filter(|t| t.state == TaskState::Running)
+                            .and_then(|t| {
+                                if let Effect::Audio { asset, .. } = &t.effect {
+                                    self.core.program().asset(asset).map(|a| {
+                                        a.duration_us.0.saturating_sub(
+                                            t.audio_position_us.unwrap_or(t.elapsed_us).0,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    base.saturating_add(remaining)
+                });
+                // The sample is taken at the current boundary, so do not
+                // charge time from before that boundary to a new sampled timer.
+                if !sampled || !starting {
+                    self.auto_elapsed = self.auto_elapsed.saturating_add(delta);
+                }
+            }
+            if (!voice || sampled)
+                && self
+                    .auto_wait_delay
+                    .is_some_and(|delay| self.auto_elapsed >= delay)
+            {
                 let token = d.interaction;
                 self.auto_elapsed = 0;
+                self.auto_wait_delay = None;
                 self.step(
                     CoreInput::Advance {
                         interaction: token,
@@ -2412,8 +3150,12 @@ impl Player {
             }
         } else {
             self.auto_elapsed = 0;
+            self.auto_wait_delay = None;
         }
         Ok(())
+    }
+    pub fn menu_depth(&self) -> usize {
+        self.menu_session.depth()
     }
     pub fn model(&self) -> UiModel {
         self.model_for(&self.core, self.screen)
@@ -2422,6 +3164,11 @@ impl Player {
         self.model_for_locale(c, screen, &self.effective_ui_locale)
     }
     fn model_for_locale(&self, c: &Core, screen: Screen, ui_locale: &str) -> UiModel {
+        let screen = if self.menu_peek && screen == Screen::Menu {
+            Screen::Story
+        } else {
+            screen
+        };
         let ui_plan = &c.program().locale_config.ui[ui_locale];
         let text_plan = &c.program().locale_config.text[&self.effective_text_locale];
         // Menus opened from the title use its retained background, even when
@@ -2433,7 +3180,14 @@ impl Player {
                     Screen::Menu | Screen::Settings | Screen::Saves | Screen::History
                 ));
         UiModel {
-            image_menu: self.image_menu.clone(),
+            transition_style: c.transition_style(),
+            image_menu: self.active_menu_id().unwrap_or(&self.image_menu).to_owned(),
+            authored_menu: self.active_menu_id().is_some()
+                && !(screen == Screen::Menu && self.error.is_some()),
+            menu_instance: self.menu_session.instance,
+            menu_revision: self.menu_session.revision,
+            menu_depth: self.menu_session.depth(),
+            menu_locals: self.menu_session.locals.clone(),
             hovered_image: self.hovered_image.clone(),
             profile: self.profile.clone(),
             title: self.title.clone(),
@@ -2452,6 +3206,8 @@ impl Player {
                 c.program().stage.width as f32,
                 c.program().stage.height as f32,
             ],
+            dialogue_appearance: c.sample_dialogue_appearance(),
+            interface_hidden: self.interface_hidden && screen == Screen::Story,
             hidden_dialogue: c.state().dialogue_hidden && c.dialogue().is_some(),
             dialogue: c
                 .dialogue()
@@ -2518,19 +3274,25 @@ impl Player {
             locale_error: self.locale_error.clone(),
             preflight_texts: vec![],
             theme: (*c.program().theme).clone(),
-            history: c
-                .state()
-                .history
-                .iter()
-                .map(|h| nir_presentation::HistoryView {
-                    speaker: h.speaker.clone(),
-                    text: h.text.clone(),
-                    locale: h.locale.clone(),
-                    font_plan_digest: h.font_plan_digest.clone(),
-                    font_assets: c.program().locale_config.text[&h.locale].fonts.clone(),
-                })
-                .collect(),
+            history: if screen == Screen::History {
+                Self::history_rows(c, self.history_offset, 3)
+                    .into_iter()
+                    .map(|row| row.entry)
+                    .collect()
+            } else {
+                vec![]
+            },
+            history_total: c.state().history.len(),
+            menu_history: self.menu_history_model(c, screen),
+            menu_history_flow: self.menu_history_flow_model(screen),
             slots: self.slots.clone(),
+            save_confirmation: self.save_confirmation.as_ref().map(|c| (c.token, c.slot)),
+            busy_slots: self.save_jobs.values().map(|(slot, _)| *slot).collect(),
+            can_save: self.screen != Screen::Title
+                && self.return_screen != Screen::Title
+                && self.slot_load.is_none(),
+            menu_reading_modes: self.menu_reading_modes(),
+            menu_story: self.menu_story_values(),
             paused: self.paused(),
             loading: self.is_loading(),
             status: self.status.clone(),
@@ -2542,12 +3304,19 @@ impl Player {
                 .map(|d| d.recovery.clone())
                 .unwrap_or_default(),
             auto: self.auto,
-            skip: self.skip,
+            skip: self.skip || self.held_skip,
             outcome: c.state().outcome.clone(),
             history_offset: self.history_offset,
         }
     }
     pub fn preview(&self) -> UiModel {
+        let mut model = self.preview_inner();
+        // Prepare the visible state too: restoring a transient mask must not
+        // expose text that was skipped by resource/glyph preparation.
+        model.interface_hidden = false;
+        model
+    }
+    fn preview_inner(&self) -> UiModel {
         if let Some(p) = &self.prepare {
             match p.purpose {
                 Purpose::Activation => {
@@ -2647,6 +3416,10 @@ mod media_tests {
         program.theme.image_menus.insert(
             "title".into(),
             nir_format::ImageMenu {
+                builtin_navigation: true,
+                story_exports: BTreeMap::new(),
+                locals: BTreeMap::new(),
+                elements: vec![],
                 background: "bg.station".into(),
                 buttons: vec![button],
             },
@@ -2712,6 +3485,10 @@ mod media_tests {
         program.theme.image_menus.insert(
             "title".into(),
             nir_format::ImageMenu {
+                builtin_navigation: true,
+                story_exports: BTreeMap::new(),
+                locals: BTreeMap::new(),
+                elements: vec![],
                 background: "bg.river".into(),
                 buttons: vec![],
             },
@@ -2797,6 +3574,10 @@ mod media_tests {
         program.theme.image_menus.insert(
             "title".into(),
             nir_format::ImageMenu {
+                builtin_navigation: true,
+                story_exports: BTreeMap::new(),
+                locals: BTreeMap::new(),
+                elements: vec![],
                 background: "missing".into(),
                 buttons: vec![],
             },

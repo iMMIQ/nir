@@ -690,3 +690,405 @@ fn theme_edit_changes_release_without_changing_locked_sdk() {
             .release
     );
 }
+
+#[test]
+fn fixed_auto_delay_configuration_emits_only_its_used_capability() {
+    let d = project();
+    let legacy = load_project(d.path()).unwrap();
+    assert!(!legacy
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "player.auto-delay-policy.v1"));
+    fs::write(
+        d.path().join("config/player.toml"),
+        "format = 1\n[defaults]\nauto_delay_policy = \"fixed\"\nauto_delay_us = \"0\"\n",
+    )
+    .unwrap();
+    let fixed = load_project(d.path()).unwrap();
+    assert_eq!(fixed.program.player.auto_delay_us.0, 0);
+    assert!(fixed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "player.auto-delay-policy.v1"));
+}
+
+#[test]
+fn reading_menu_actions_emit_only_their_used_capability() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-reading.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"auto\"\nrect = [0,0,300,80]\ncontent = { type = \"hit_region\", label = \"Auto\", action = {type = \"reading\", mode = \"auto\"} }\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-reading.v1"));
+    compile(&loaded.program).unwrap();
+}
+
+#[test]
+fn stack_and_reading_conditions_keep_required_capabilities_without_actions() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-stack.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"list\"\nrect = [0,0,300,80]\nvisible_when = [{type = \"reading_available\", mode = \"auto\", available = false}]\ncontent = {type = \"stack\", gap = 10}\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    for cap in [
+        "ui.menu-stack.v1",
+        "ui.menu-reading.v1",
+        "ui.menu-services.v1",
+        "ui.menu-state.v1",
+    ] {
+        assert!(loaded.program.requires.iter().any(|c| c == cap), "{cap}");
+    }
+    compile(&loaded.program).unwrap();
+}
+
+#[test]
+fn text_button_project_round_trips_and_keeps_its_used_capability() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-text-button.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"caption\"\nrect = [0,0,300,80]\ncontent = {type = \"text_button\", label = \"Action\", size = 26, color = [1,1,1,1], hover_color = [0,1,0,1], disabled_color = [0,0,0,1], action = {type = \"settings\"}}\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-text-button.v1"));
+    compile(&loaded.program).unwrap();
+}
+
+#[test]
+fn readonly_story_aliases_compile_and_require_only_used_capability() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-story.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\nstory_exports = { count = \"affection\" }\n[[image_menus.title.elements]]\nid = \"entry\"\nrect = [0,0,300,80]\nvisible_when = [{type = \"story\", name = \"count\", equals = 0}]\ncontent = {type = \"hit_region\", label = \"Entry\", action = {type = \"settings\"}}\n");
+    fs::write(&path, &text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-story.v1"));
+    compile(&loaded.program).unwrap();
+    fs::write(
+        &path,
+        text.replace("count = \"affection\"", "count = \"undeclared\""),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .and_then(|p| compile(&p.program))
+        .is_err());
+}
+
+#[test]
+fn continuous_history_capability_is_pruned_and_runtime_rechecks_contract() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-flow.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"history\"\nrect = [40,40,600,360]\ncontent = {type = \"history_flow\", size = 24, line_height = 36, gap = 12, wheel_step = 72, page_step = 180, max_visible = 32, color = [1,1,1,1]}\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-flow.v1"));
+    assert!(!loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history.v1"));
+    compile(&loaded.program).unwrap();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/history-flow");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    nir_core::ValidatedProgram::from_runtime(executable.program.clone()).unwrap();
+    let mut root = executable.program.clone();
+    root.requires.retain(|c| c != "ui.menu-history-flow.v1");
+    assert_eq!(
+        nir_core::ValidatedProgram::from_runtime(root)
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    let mut root = executable.program;
+    if let nir_format::MenuContent::HistoryFlow { max_visible, .. } =
+        &mut root.theme.image_menus.get_mut("title").unwrap().elements[0].content
+    {
+        *max_visible = 0;
+    }
+    assert!(nir_core::ValidatedProgram::from_runtime(root).is_err());
+}
+
+#[test]
+fn history_scrollbar_states_enter_asset_closure_and_runtime_rechecks_capability() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-scrollbar.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str(r#"
+[image_menus.title]
+background = "bg.station"
+buttons = []
+[[image_menus.title.elements]]
+id = "history"
+rect = [40,40,600,360]
+content = {type = "history_flow", size = 24, line_height = 36, gap = 12, wheel_step = 72, page_step = 180, max_visible = 32, color = [1,1,1,1]}
+[[image_menus.title.elements]]
+id = "scroll"
+rect = [660,40,32,360]
+content = {type = "history_scrollbar", window = "history", label = "History scroll", thumb_height = 24, arrow_height = 16, line_step = 36, track = {asset = "bg.station"}, thumb = {asset = "bg.station", hover_asset = "bg.river", pressed_asset = "actor.aki", disabled_asset = "bg.river"}, decrease = {asset = "bg.station"}, increase = {asset = "bg.station"}}
+"#);
+    fs::write(&path, &text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-scrollbar.v1"));
+    let assets = loaded.program.theme.image_menus["title"].image_assets();
+    for id in ["bg.station", "bg.river", "actor.aki"] {
+        assert!(assets.contains(id));
+    }
+    compile(&loaded.program).unwrap();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/history-scrollbar");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    nir_core::ValidatedProgram::from_runtime(executable.program.clone()).unwrap();
+    let mut root = executable.program.clone();
+    root.requires
+        .retain(|c| c != "ui.menu-history-scrollbar.v1");
+    assert_eq!(
+        nir_core::ValidatedProgram::from_runtime(root)
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    let mut root = executable.program;
+    if let nir_format::MenuContent::HistoryScrollbar { window, .. } =
+        &mut root.theme.image_menus.get_mut("title").unwrap().elements[1].content
+    {
+        *window = "missing".into();
+    }
+    assert!(nir_core::ValidatedProgram::from_runtime(root).is_err());
+    fs::write(
+        &path,
+        text.replace("hover_asset = \"bg.river\"", "hover_asset = \"audio.bgm\""),
+    )
+    .unwrap();
+    assert!(load_project(d.path())
+        .and_then(|p| compile(&p.program))
+        .is_err());
+}
+
+#[test]
+fn menu_navigation_prunes_unused_capability_and_runtime_rechecks_links() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-navigation.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str(
+        r#"
+[image_menus.title]
+background = "bg.station"
+buttons = []
+[[image_menus.title.elements]]
+id = "child"
+rect = [40,40,200,60]
+content = {type = "hit_region", label = "Child", action = {type = "push_menu", menu = "child"}}
+[image_menus.child]
+background = "bg.river"
+buttons = []
+[[image_menus.child.elements]]
+id = "back"
+rect = [40,40,200,60]
+content = {type = "hit_region", label = "Back", action = {type = "back"}}
+"#,
+    );
+    fs::write(&path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-navigation.v1"));
+    assert!(loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-services.v1"));
+    compile(&loaded.program).unwrap();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/navigation");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    nir_core::ValidatedProgram::from_runtime(executable.program.clone()).unwrap();
+    let mut root = executable.program.clone();
+    root.requires.retain(|c| c != "ui.menu-navigation.v1");
+    assert_eq!(
+        nir_core::ValidatedProgram::from_runtime(root)
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    let mut root = executable.program;
+    if let nir_format::MenuContent::HitRegion { action, .. } =
+        &mut root.theme.image_menus.get_mut("title").unwrap().elements[0].content
+    {
+        *action = nir_format::ImageMenuAction::PushMenu {
+            menu: "missing".into(),
+        };
+    }
+    assert!(nir_core::ValidatedProgram::from_runtime(root).is_err());
+}
+
+#[test]
+fn history_availability_has_independent_source_and_runtime_capability() {
+    let d = project();
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-availability.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str(
+        r#"
+[image_menus.title]
+background = "bg.station"
+builtin_navigation = false
+buttons = []
+[[image_menus.title.elements]]
+id = "resume"
+rect = [40,40,200,60]
+enabled_when = [{type = "history_available", available = true}]
+content = {type = "hit_region", label = "Resume", action = {type = "new_game"}}
+"#,
+    );
+    fs::write(&path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    for capability in [
+        "ui.menu-state.v1",
+        "ui.menu-services.v1",
+        "ui.menu-history-availability.v1",
+        "ui.menu-chrome.v1",
+    ] {
+        assert!(loaded.program.requires.iter().any(|c| c == capability));
+    }
+    assert!(!loaded
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-history-flow.v1"));
+    compile(&loaded.program).unwrap();
+    for cap in ["ui.menu-history-availability.v1", "ui.menu-chrome.v1"] {
+        let mut missing = loaded.program.clone();
+        missing.requires.retain(|c| c != cap);
+        assert!(compile(&missing).is_err());
+    }
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/history-availability");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    nir_core::ValidatedProgram::from_runtime(executable.program.clone()).unwrap();
+    for cap in ["ui.menu-history-availability.v1", "ui.menu-chrome.v1"] {
+        let mut root = executable.program.clone();
+        root.requires.retain(|c| c != cap);
+        assert_eq!(
+            nir_core::ValidatedProgram::from_runtime(root)
+                .unwrap_err()
+                .code,
+            "E_CAPABILITY"
+        );
+    }
+    assert!(!load_project(&source())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-chrome.v1"));
+}

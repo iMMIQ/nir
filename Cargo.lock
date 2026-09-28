@@ -1883,6 +1883,7 @@ dependencies = [
  "nir-player",
  "nir-presentation",
  "nir-render-wgpu",
+ "serde",
  "serde_json",
  "web-sys",
 ]

@@ -331,6 +331,7 @@ fn ui_and_text_locales_commit_independently_and_freeze_open_text() {
         }) {
             let commands = p.pump(
                 vec![AppEvent::AudioEnded {
+                    domain: TimeDomain::Story,
                     task: task.id,
                     session: p.generation.session,
                 }],
@@ -623,6 +624,7 @@ fn choice_at_deadline(budget: u32) {
                     && matches!(t.effect, Effect::Audio { looped: false, .. })
             })
             .map(|t| AppEvent::AudioEnded {
+                domain: TimeDomain::Story,
                 task: t.id,
                 session: p.generation.session,
             })
@@ -664,19 +666,25 @@ fn same_reason_tokens_release_only_their_own_pause() {
     let mut p = playing();
     let one = p.acquire_pause("plugin");
     let two = p.acquire_pause("plugin");
-    assert!(p
-        .pump(vec![], 10)
-        .iter()
-        .any(|c| matches!(c, AppCommand::AudioPause { paused: true })));
+    assert!(p.pump(vec![], 10).iter().any(|c| matches!(
+        c,
+        AppCommand::AudioPause {
+            domain: TimeDomain::Story,
+            paused: true
+        }
+    )));
     drop(one);
     action(&mut p, UiAction::Menu);
     action(&mut p, UiAction::Close);
     assert!(p.paused());
     drop(two);
-    assert!(p
-        .pump(vec![], 10)
-        .iter()
-        .any(|c| matches!(c, AppCommand::AudioPause { paused: false })));
+    assert!(p.pump(vec![], 10).iter().any(|c| matches!(
+        c,
+        AppCommand::AudioPause {
+            domain: TimeDomain::Story,
+            paused: false
+        }
+    )));
     assert!(!p.paused());
 }
 
@@ -953,6 +961,8 @@ fn work_defaults_yield_to_player_preferences_and_survive_new_sessions() {
     assert!(p.preferences.reduced_motion);
     let saved = Preferences {
         font_scale: 1.4,
+        text_speed: 2.,
+        auto_wait_scale: 0.5,
         bgm_volume: 0.7,
         reduced_motion: false,
         ..Default::default()
@@ -961,6 +971,19 @@ fn work_defaults_yield_to_player_preferences_and_survive_new_sessions() {
     ready(&mut p, commands);
     let commands = action(&mut p, UiAction::NewGame);
     ready(&mut p, commands);
+    assert_eq!(p.preferences.text_speed, 2.);
+    assert_eq!(p.preferences.auto_wait_scale, 0.5);
+    if let Some((id, dialogue)) = p.core().dialogue() {
+        let Effect::Dialogue { reveal_us, .. } = p.core().state().tasks[&id].effect else {
+            panic!()
+        };
+        assert_eq!(
+            dialogue.reveal_interval_us,
+            Some(Micros((reveal_us.0 as f64 / 2.).round() as u64))
+        );
+    } else {
+        panic!("new session must have a dialogue");
+    }
     assert_eq!(p.preferences.font_scale, 1.4);
     assert_eq!(p.preferences.bgm_volume, 0.7);
     assert!(!p.preferences.reduced_motion);
@@ -1070,6 +1093,53 @@ fn author_auto_delay_controls_reading_after_reveal_and_pauses() {
         ready(&mut p, c);
     }
     assert_ne!(p.current_interaction(), interaction);
+}
+
+#[test]
+fn fixed_auto_delay_ignores_length_freezes_scale_and_pauses_with_story() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.player.auto_delay_policy = AutoDelayPolicy::Fixed;
+    program.player.auto_delay_us = Micros(250_000);
+    assert_eq!(program.player.auto_delay(1, 1.), 250_000);
+    assert_eq!(program.player.auto_delay(10_000, 1.), 250_000);
+    assert_eq!(program.player.auto_delay(1, 2.), 500_000);
+    assert!(Player::new(program.clone(), "r".into(), "t".into()).is_err());
+    program.requires.push("player.auto-delay-policy.v1".into());
+    let mut p = Player::new(program, "r".into(), "t".into()).unwrap();
+    let c = p.pump(vec![], 1000);
+    ready(&mut p, c);
+    let c = action(&mut p, UiAction::NewGame);
+    ready(&mut p, c);
+    action(&mut p, UiAction::Advance);
+    let interaction = p.current_interaction();
+    action(&mut p, UiAction::ToggleAuto);
+    p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+    assert_eq!(p.current_interaction(), interaction);
+    action(&mut p, UiAction::AutoWait { delta: 3. });
+    action(&mut p, UiAction::Menu);
+    p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 1_000_000,
+        }],
+        1000,
+    );
+    action(&mut p, UiAction::Close);
+    p.pump(vec![AppEvent::Tick { delta_us: 149_999 }], 1000);
+    assert_eq!(p.current_interaction(), interaction);
+    let c = p.pump(vec![AppEvent::Tick { delta_us: 1 }], 1000);
+    ready(&mut p, c);
+    assert_ne!(p.current_interaction(), interaction);
+}
+#[test]
+fn zero_auto_delay_is_explicit_and_legacy_default_still_includes_text_length() {
+    let mut player = PlayerDefaults::default();
+    assert_eq!(player.auto_delay(10, 1.), 1_400_000);
+    player.auto_delay_us = Micros(0);
+    assert!(validate_ui_config(&Theme::default(), &player).is_err());
+    player.auto_delay_policy = AutoDelayPolicy::Fixed;
+    assert!(validate_ui_config(&Theme::default(), &player).is_ok());
+    assert_eq!(player.auto_delay(10_000, 4.), 0);
 }
 
 fn reading_text() -> nir_presentation::TextEngine {
@@ -1236,6 +1306,9 @@ fn history_allows_browsing_inside_a_long_entry() {
     let next = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
     assert!(next.scrolls[0].offset > 0.);
     m.history_offset = 3;
+    // The Player now supplies the visible window, not the entire history.
+    // Moving to an empty window must still discard the previous text scroll.
+    m.history.clear();
     let older = reading.project(&m, (1, 2), 390., 844., &messages, &mut text);
     assert!(older.scrolls.is_empty());
 }
@@ -1266,4 +1339,1151 @@ fn mixed_line_endings_and_styled_paragraphs_keep_original_reveal_offsets() {
         let packet = ReadingState::default().project(&m, (1, 2), 390., 844., &messages, &mut text);
         assert!(packet.scrolls[0].max > 1000.);
     }
+}
+
+#[test]
+fn dialogue_opacity_multiplies_author_colors_without_fading_scene() {
+    use nir_presentation::{project, Messages};
+    let p = playing();
+    let mut model = p.model();
+    model.loading = false;
+    model.paused = false;
+    let messages = Messages::default();
+    for background in [None, Some("test-box".into())] {
+        model.theme.dialogue.background = background;
+        model.dialogue_appearance = DialogueAppearance::default();
+        let before = project(&model, 1280., 800., &messages);
+        model.dialogue_appearance = DialogueAppearance {
+            opacity: 0.5,
+            background_opacity: 0.4,
+            text_opacity: 0.6,
+        };
+        let after = project(&model, 1280., 800., &messages);
+        assert_eq!(before.quads.len(), after.quads.len());
+        assert_eq!(before.texts.len(), after.texts.len());
+        let dialogue = model.dialogue.as_ref().unwrap();
+        let old_text = before
+            .texts
+            .iter()
+            .find(|t| t.text == dialogue.full_text)
+            .unwrap();
+        let new_text = after
+            .texts
+            .iter()
+            .find(|t| t.text == dialogue.full_text)
+            .unwrap();
+        assert!((new_text.color[3] - old_text.color[3] * 0.3).abs() < 0.00001);
+        let changed: Vec<_> = before
+            .quads
+            .iter()
+            .zip(&after.quads)
+            .filter(|(a, b)| a.color != b.color)
+            .collect();
+        assert!(!changed.is_empty());
+        for (a, b) in changed {
+            assert!((b.color[3] - a.color[3] * 0.2).abs() < 0.00001);
+        }
+        for (a, b) in before.quads.iter().zip(&after.quads) {
+            if a.asset.is_some() && model.nodes.iter().any(|n| n.asset == a.asset) {
+                assert_eq!(a.color, b.color);
+            }
+        }
+        assert_eq!(before.semantics.len(), after.semantics.len());
+    }
+}
+
+#[test]
+fn foreground_and_story_pause_owners_and_clocks_are_independent() {
+    let mut p = playing();
+    let story_before = p.core().state().tick_us;
+    let ui_before = p.foreground_clock();
+    let commands = action(&mut p, UiAction::Menu);
+    assert!(commands.iter().any(|c| matches!(
+        c,
+        AppCommand::AudioPause {
+            domain: TimeDomain::Story,
+            paused: true
+        }
+    )));
+    assert!(!p.domain_paused(TimeDomain::ForegroundUi));
+    assert!(!p.needs_clock());
+    let clock = p.acquire_foreground_clock().unwrap();
+    assert!(p.needs_clock());
+    p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+    assert_eq!(p.core().state().tick_us, story_before);
+    assert_eq!(p.foreground_clock().0, ui_before.0 + 100_000);
+    let ui_token = p.acquire_domain_pause(TimeDomain::ForegroundUi, "overlay");
+    let second = p.acquire_domain_pause(TimeDomain::ForegroundUi, "overlay");
+    p.pump(vec![AppEvent::Hidden(true)], 1000);
+    action(&mut p, UiAction::Close);
+    assert!(p.domain_paused(TimeDomain::Story));
+    p.pump(vec![AppEvent::Hidden(false)], 1000);
+    assert!(!p.domain_paused(TimeDomain::Story));
+    assert!(p.domain_paused(TimeDomain::ForegroundUi));
+    drop(ui_token);
+    assert!(p.domain_paused(TimeDomain::ForegroundUi));
+    let before = p.foreground_clock();
+    p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+    assert_eq!(p.foreground_clock(), before);
+    assert!(p.core().state().tick_us > story_before);
+    drop(second);
+    p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+    assert_eq!(p.foreground_clock().0, before.0 + 100_000);
+    action(&mut p, UiAction::Menu);
+    assert!(p.needs_clock());
+    drop(clock);
+    assert!(!p.needs_clock());
+}
+
+#[test]
+fn foreground_completion_with_a_story_task_number_cannot_end_or_fail_story_audio() {
+    let mut p = playing();
+    let task = p
+        .core()
+        .state()
+        .tasks
+        .values()
+        .find(|t| matches!(t.effect, Effect::Audio { .. }))
+        .unwrap()
+        .id;
+    let before = p.core().state().tasks[&task].state;
+    p.pump(
+        vec![
+            AppEvent::AudioEnded {
+                domain: TimeDomain::ForegroundUi,
+                task,
+                session: p.generation.session,
+            },
+            AppEvent::AudioFailed {
+                domain: TimeDomain::ForegroundUi,
+                task,
+                session: p.generation.session,
+                message: "retired UI voice".into(),
+            },
+        ],
+        1000,
+    );
+    assert_eq!(p.core().state().tasks[&task].state, before);
+    assert!(p.error.is_none());
+}
+
+#[test]
+fn foreground_clock_demand_is_bounded_and_released_by_owner() {
+    let p = player();
+    let mut leases: Vec<_> = (0..MAX_TASKS)
+        .map(|_| p.acquire_foreground_clock().unwrap())
+        .collect();
+    assert!(p.acquire_foreground_clock().is_none());
+    leases.pop();
+    assert!(p.acquire_foreground_clock().is_some());
+}
+
+fn voice_bound_player(binding: Option<(Option<&str>, VoiceWaitPolicy)>) -> Player {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.functions.get_mut("main").unwrap().entry = "intro".into();
+    program.player.auto_delay_us = Micros(100_000);
+    let asset = program
+        .assets
+        .iter()
+        .find(|(_, a)| a.kind == AssetKind::Audio)
+        .unwrap()
+        .0
+        .clone();
+    for id in ["spoken", "unrelated"] {
+        program
+            .cues
+            .get_mut("intro")
+            .unwrap()
+            .effects
+            .push(EffectDef {
+                id: id.into(),
+                scope: Scope::Session,
+                effect: Effect::Audio {
+                    asset: asset.clone(),
+                    bus: AudioBus::Voice,
+                    looped: false,
+                    gain: 1.,
+                },
+            });
+    }
+    if let Some((voice, wait)) = binding {
+        if wait == VoiceWaitPolicy::SampledRemaining {
+            program.requires.extend([
+                "text.voice-timer.v1".into(),
+                "player.auto-delay-policy.v1".into(),
+            ]);
+            program.player.auto_delay_policy = AutoDelayPolicy::Fixed;
+            program.assets.get_mut(&asset).unwrap().duration_us = Micros(2_000_000);
+        }
+        program.requires.push("text.voice-binding.v1".into());
+        program
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("wait_intro")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: "bind-page-voice".into(),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: voice.map(str::to_owned),
+                    wait,
+                },
+            });
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    assert!(p.core().dialogue().unwrap().1.awaiting_advance);
+    p
+}
+
+#[test]
+fn sampled_voice_timer_freezes_remaining_position_and_mute_state() {
+    for (muted, ended_early) in [(false, false), (false, true), (true, false)] {
+        let mut p = voice_bound_player(Some((Some("spoken"), VoiceWaitPolicy::SampledRemaining)));
+        let task = p.core().state().handles["spoken"];
+        p.observe_audio_positions(
+            TimeDomain::Story,
+            p.generation.session,
+            &[AudioPosition {
+                task,
+                position_us: Micros(1_250_000),
+                envelope: None,
+            }],
+        )
+        .unwrap();
+        if muted {
+            action(
+                &mut p,
+                UiAction::Volume {
+                    bus: AudioBus::Voice,
+                    delta: -1.,
+                },
+            );
+        }
+        let interaction = p.current_interaction();
+        action(&mut p, UiAction::ToggleAuto);
+        if ended_early {
+            p.pump(
+                vec![AppEvent::AudioEnded {
+                    domain: TimeDomain::Story,
+                    task,
+                    session: p.generation.session,
+                }],
+                1000,
+            );
+        }
+        // Changes after sampling must neither shorten nor extend the timer.
+        action(
+            &mut p,
+            UiAction::Volume {
+                bus: AudioBus::Voice,
+                delta: if muted { 1. } else { -1. },
+            },
+        );
+        let delay = if muted { 100_000 } else { 850_000 };
+        for delta in [delay / 2, delay - delay / 2 - 1] {
+            p.pump(vec![AppEvent::Tick { delta_us: delta }], 1000);
+        }
+        assert_eq!(
+            p.current_interaction(),
+            interaction,
+            "muted={muted}, ended={ended_early}"
+        );
+        let c = p.pump(vec![AppEvent::Tick { delta_us: 1 }], 1000);
+        ready(&mut p, c);
+        assert_ne!(
+            p.current_interaction(),
+            interaction,
+            "muted={muted}, ended={ended_early}"
+        );
+    }
+}
+#[test]
+fn auto_uses_the_bound_voice_and_distinguishes_serial_and_parallel_delay() {
+    for wait in [VoiceWaitPolicy::AfterVoice, VoiceWaitPolicy::Parallel] {
+        let mut p = voice_bound_player(Some((Some("spoken"), wait)));
+        let token = p.current_interaction();
+        action(&mut p, UiAction::ToggleAuto);
+        for _ in 0..20 {
+            p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+        }
+        assert_eq!(p.current_interaction(), token);
+        let spoken = p.core().state().handles["spoken"];
+        let unrelated = p.core().state().handles["unrelated"];
+        p.pump(
+            vec![AppEvent::AudioEnded {
+                domain: TimeDomain::Story,
+                task: spoken,
+                session: p.generation.session,
+            }],
+            1000,
+        );
+        p.pump(vec![AppEvent::Tick { delta_us: 1 }], 1000);
+        if wait == VoiceWaitPolicy::AfterVoice {
+            assert_eq!(
+                p.current_interaction(),
+                token,
+                "post-voice delay must not have elapsed concurrently"
+            );
+            for _ in 0..20 {
+                p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+                if p.current_interaction() != token {
+                    break;
+                }
+            }
+        }
+        assert_ne!(p.current_interaction(), token);
+        assert_eq!(
+            p.core().state().tasks[&unrelated].state,
+            nir_core::TaskState::Running
+        );
+    }
+}
+#[test]
+fn explicit_no_voice_does_not_wait_for_ambient_voice_but_legacy_still_does() {
+    for binding in [None, Some((None, VoiceWaitPolicy::Parallel))] {
+        let mut p = voice_bound_player(binding);
+        let token = p.current_interaction();
+        action(&mut p, UiAction::ToggleAuto);
+        for _ in 0..20 {
+            p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+            if p.current_interaction() != token {
+                break;
+            }
+        }
+        assert_eq!(p.current_interaction() == token, binding.is_none());
+    }
+}
+#[test]
+fn fully_revealed_dialogue_keeps_audio_offsets_advancing_and_menu_freezes_them() {
+    let mut p = voice_bound_player(None);
+    let id = p.core().state().handles["spoken"];
+    assert!(p.needs_clock());
+    let before = p.core().state().tasks[&id].elapsed_us.0;
+    for _ in 0..4 {
+        p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+    }
+    assert_eq!(p.core().state().tasks[&id].elapsed_us.0, before + 1_000_000);
+    action(&mut p, UiAction::Menu);
+    p.pump(vec![AppEvent::Tick { delta_us: 250_000 }], 1000);
+    assert_eq!(p.core().state().tasks[&id].elapsed_us.0, before + 1_000_000);
+    let commands = action(&mut p, UiAction::Save { slot: 1 });
+    let snapshot = commands
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::Save { envelope, .. } => Some(&envelope.snapshot),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(snapshot.tasks[&id].elapsed_us.0, before + 1_000_000);
+}
+
+#[test]
+fn automatic_wait_freezes_preferences_until_the_next_cycle() {
+    let mut p = voice_bound_player(Some((None, VoiceWaitPolicy::Parallel)));
+    let token = p.current_interaction();
+    let base = p.core().program().player.auto_delay_us.0
+        + p.core().dialogue().unwrap().1.full_text().chars().count() as u64 * 20_000;
+    p.preferences.auto_wait_scale = 4.;
+    action(&mut p, UiAction::ToggleAuto);
+    p.pump(vec![AppEvent::Tick { delta_us: 1 }], 1000);
+    action(&mut p, UiAction::AutoWait { delta: -3.75 });
+    for _ in 0..(base / 100_000 + 2) {
+        p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+    }
+    assert_eq!(
+        p.current_interaction(),
+        token,
+        "active timer keeps the original 4x duration"
+    );
+    action(&mut p, UiAction::ToggleAuto);
+    action(&mut p, UiAction::ToggleAuto);
+    for _ in 0..(base / 100_000 + 2) {
+        p.pump(vec![AppEvent::Tick { delta_us: 100_000 }], 1000);
+        if p.current_interaction() != token {
+            break;
+        }
+    }
+    assert_ne!(
+        p.current_interaction(),
+        token,
+        "new cycle uses the updated duration"
+    );
+}
+
+#[test]
+fn settings_scrolling_keeps_new_preferences_and_close_reachable() {
+    use nir_presentation::{Messages, ReadingState, Screen};
+    let p = playing();
+    for (width, height) in [(390., 844.), (844., 390.), (1280., 720.)] {
+        let mut m = p.model();
+        m.screen = Screen::Settings;
+        m.loading = false;
+        let mut state = ReadingState::default();
+        let mut text = reading_text();
+        let messages = Messages::default();
+        let mut found_speed = false;
+        let mut found_wait = false;
+        for _ in 0..30 {
+            let packet = state.project(&m, (1, 1), width, height, &messages, &mut text);
+            assert!(packet.semantics.iter().any(|n| n.action == UiAction::Close));
+            for n in &packet.semantics {
+                assert!(n.rect[1] >= 0. && n.rect[1] + n.rect[3] <= height);
+                found_speed |= matches!(n.action, UiAction::TextSpeed { .. });
+                found_wait |= matches!(n.action, UiAction::AutoWait { .. });
+            }
+            if !state.scroll(ScrollRegion::Settings, 1, &packet) {
+                break;
+            }
+        }
+        assert!(found_speed && found_wait, "{width}x{height}");
+    }
+}
+
+#[test]
+fn held_skip_release_is_independent_of_toggle_and_cleared_by_menu_and_focus_loss() {
+    let mut p = voice_bound_player(Some((None, VoiceWaitPolicy::Parallel)));
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    assert!(p.model().skip);
+    action(&mut p, UiAction::HoldSkip { pressed: false });
+    assert!(!p.model().skip);
+    action(&mut p, UiAction::ToggleSkip);
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    action(&mut p, UiAction::HoldSkip { pressed: false });
+    assert!(p.model().skip, "release must not disable latched skip");
+    action(&mut p, UiAction::ToggleSkip);
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    action(&mut p, UiAction::Menu);
+    assert!(!p.model().skip);
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    assert!(!p.model().skip, "menu cannot start held skip");
+    action(&mut p, UiAction::Close);
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    p.pump(vec![AppEvent::Hidden(true)], 1000);
+    p.pump(vec![AppEvent::Hidden(false)], 1000);
+    assert!(!p.model().skip);
+}
+
+#[test]
+fn held_skip_cannot_advance_unread_dialogue() {
+    let mut p = voice_bound_player(Some((None, VoiceWaitPolicy::Parallel)));
+    let token = p.current_interaction();
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    p.pump(vec![AppEvent::Tick { delta_us: 1000 }], 1000);
+    assert_eq!(p.current_interaction(), token);
+    assert!(!p.model().skip);
+}
+
+#[test]
+fn held_skip_advances_a_read_dialogue() {
+    let mut p = voice_bound_player(Some((None, VoiceWaitPolicy::Parallel)));
+    let token = p.current_interaction();
+    let d = p.core().dialogue().unwrap().1;
+    let key = format!("read:{}:{}", d.text_id, d.meaning_revision);
+    p.pump(vec![AppEvent::Profile([key].into_iter().collect())], 1000);
+    action(&mut p, UiAction::HoldSkip { pressed: true });
+    p.pump(vec![AppEvent::Tick { delta_us: 1000 }], 1000);
+    assert_ne!(p.current_interaction(), token);
+}
+
+#[test]
+fn long_tick_preserves_elapsed_audio_time_and_counts_ui_time_once_across_budget_yields() {
+    for budget in [1, 1000] {
+        let mut p = voice_bound_player(None);
+        let audio = p.core().state().handles["spoken"];
+        let before = p.core().state().tasks[&audio].elapsed_us.0;
+        let ui = p.foreground_clock().0;
+        p.pump(vec![AppEvent::Tick { delta_us: 900_000 }], budget);
+        for _ in 0..10 {
+            p.pump(vec![], 1000);
+        }
+        assert_eq!(
+            p.core().state().tasks[&audio].elapsed_us.0 - before,
+            900_000
+        );
+        assert_eq!(p.foreground_clock().0 - ui, 900_000);
+    }
+}
+
+#[test]
+fn new_session_discards_old_clock_continuation_without_charging_ui_again() {
+    let mut p = voice_bound_player(None);
+    let ui = p.foreground_clock().0;
+    p.pump(vec![AppEvent::Tick { delta_us: 900_000 }], 1);
+    let session = p.generation.session;
+    action(&mut p, UiAction::NewGame);
+    p.pump(vec![], 1000);
+    assert_ne!(p.generation.session, session);
+    assert_eq!(p.core().state().tick_us.0, 0);
+    assert_eq!(p.foreground_clock().0 - ui, 900_000);
+}
+
+#[test]
+fn shared_pointer_router_blocks_disabled_controls_and_only_advances_story_background() {
+    use nir_presentation::{pointer_action, DrawPacket, Screen, SemanticNode};
+    let p = playing();
+    let mut m = p.model();
+    m.loading = false;
+    m.paused = false;
+    m.screen = Screen::Story;
+    let mut packet = DrawPacket::default();
+    packet.width = 800.;
+    packet.height = 600.;
+    assert_eq!(
+        pointer_action(&packet, &m, 20., 20., 0),
+        Some(UiAction::Advance)
+    );
+    assert_eq!(
+        pointer_action(&packet, &m, 20., 20., 2),
+        Some(UiAction::Menu)
+    );
+    assert_eq!(pointer_action(&packet, &m, 20., 20., 1), None);
+    assert_eq!(pointer_action(&packet, &m, -1., 20., 0), None);
+    assert_eq!(pointer_action(&packet, &m, f32::NAN, 20., 0), None);
+    for enabled in [true, false] {
+        packet.semantics.push(SemanticNode {
+            value: None,
+            id: packet.semantics.len() as u32,
+            label: "control".into(),
+            action: UiAction::Menu,
+            enabled,
+            rect: [0., 0., 100., 100.],
+            locale: "en".into(),
+        });
+    }
+    assert_eq!(
+        packet.hit(20., 20.),
+        None,
+        "disabled top control blocks the enabled one underneath"
+    );
+    assert_eq!(pointer_action(&packet, &m, 20., 20., 0), None);
+    m.paused = true;
+    assert_eq!(pointer_action(&packet, &m, 200., 20., 0), None);
+    m.paused = false;
+    m.dialogue = None;
+    assert_eq!(pointer_action(&packet, &m, 200., 20., 0), None);
+    for screen in [
+        Screen::Menu,
+        Screen::Settings,
+        Screen::Saves,
+        Screen::History,
+    ] {
+        m.screen = screen;
+        assert_eq!(pointer_action(&packet, &m, 200., 20., 0), None);
+        assert_eq!(
+            pointer_action(&packet, &m, 200., 20., 2),
+            Some(UiAction::Close)
+        );
+    }
+    m.screen = Screen::Title;
+    assert_eq!(pointer_action(&packet, &m, 200., 20., 2), None);
+    m.loading = true;
+    packet.semantics[1].enabled = true;
+    packet.semantics[1].action = UiAction::LocaleCancel;
+    assert_eq!(
+        pointer_action(&packet, &m, 20., 20., 0),
+        Some(UiAction::LocaleCancel),
+        "loading must not trap visible cancellation controls"
+    );
+}
+
+#[test]
+fn shared_primary_router_obeys_available_title_actions_and_choice_focus() {
+    use nir_presentation::{
+        pointer_action, primary_action, ChoiceView, DrawPacket, Screen, SemanticNode,
+    };
+    let p = playing();
+    let mut m = p.model();
+    m.loading = false;
+    m.paused = false;
+    m.screen = Screen::Title;
+    let mut packet = DrawPacket::default();
+    packet.width = 800.;
+    packet.height = 600.;
+    assert_eq!(primary_action(&packet, &m), None);
+    packet.semantics.push(SemanticNode {
+        value: None,
+        id: 0,
+        label: "new".into(),
+        action: UiAction::NewGame,
+        enabled: false,
+        rect: [0., 0., 10., 10.],
+        locale: "en".into(),
+    });
+    assert_eq!(primary_action(&packet, &m), None);
+    packet.semantics[0].enabled = true;
+    assert_eq!(primary_action(&packet, &m), Some(UiAction::NewGame));
+    packet.semantics.clear();
+    m.screen = Screen::Story;
+    assert_eq!(primary_action(&packet, &m), Some(UiAction::Advance));
+    m.choices.push(ChoiceView {
+        id: "one".into(),
+        label: "one".into(),
+        enabled: true,
+        locale: "en".into(),
+        font_plan_digest: String::new(),
+        font_assets: vec![],
+    });
+    assert_eq!(primary_action(&packet, &m), None);
+    assert_eq!(pointer_action(&packet, &m, 100., 100., 0), None);
+    m.choices.clear();
+    m.dialogue = None;
+    m.hidden_dialogue = true;
+    assert_eq!(
+        primary_action(&packet, &m),
+        Some(UiAction::Advance),
+        "script-hidden dialogue keeps its existing continuation route"
+    );
+    m.paused = true;
+    assert_eq!(primary_action(&packet, &m), None);
+    packet.semantics.push(SemanticNode {
+        value: None,
+        id: 1,
+        label: "continue".into(),
+        action: UiAction::Continue,
+        enabled: true,
+        rect: [0., 0., 10., 10.],
+        locale: "en".into(),
+    });
+    assert_eq!(primary_action(&packet, &m), Some(UiAction::Continue));
+    m.screen = Screen::Menu;
+    assert_eq!(primary_action(&packet, &m), None);
+    m.loading = true;
+    assert_eq!(primary_action(&packet, &m), None);
+}
+
+fn interface_player(policy: HidePolicy, script_hidden: bool) -> Player {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.functions.get_mut("main").unwrap().entry = "intro".into();
+    program.player.hide_policy = policy;
+    if policy == HidePolicy::PauseStory {
+        program.requires.push("player.hide-policy.v1".into());
+    }
+    if script_hidden {
+        program.requires.push("text.visibility.v1".into());
+        program
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("wait_intro")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: "script-hidden".into(),
+                operation: Operation::DialogueVisibility { visible: false },
+            });
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    p
+}
+
+#[test]
+fn temporary_hide_masks_ui_without_advancing_on_restore_or_overwriting_script_visibility() {
+    use nir_presentation::{project, Messages};
+    for script_hidden in [false, true] {
+        let mut p = interface_player(HidePolicy::ContinueStory, script_hidden);
+        let token = p.current_interaction();
+        action(&mut p, UiAction::ToggleAuto);
+        let snapshot = serde_json::to_value(p.core().snapshot()).unwrap();
+        action(&mut p, UiAction::ToggleInterface);
+        assert!(p.interface_hidden());
+        assert!(
+            !p.preview().interface_hidden,
+            "preparation must include the restored presentation"
+        );
+        assert!(!p.paused());
+        assert!(!p.auto && !p.model().skip);
+        assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), snapshot);
+        let packet = project(&p.model(), 1280., 720., &Messages::default());
+        assert!(packet.texts.is_empty());
+        assert_eq!(packet.semantics.len(), 1);
+        assert_eq!(packet.semantics[0].action, UiAction::RestoreInterface);
+        p.pump(vec![AppEvent::Tick { delta_us: 300_000 }], 1000);
+        assert_eq!(p.current_interaction(), token);
+        assert!(p.interface_hidden());
+        action(&mut p, UiAction::Advance);
+        assert!(!p.interface_hidden());
+        assert_eq!(p.current_interaction(), token);
+        assert_eq!(p.core().state().dialogue_hidden, script_hidden);
+    }
+}
+
+#[test]
+fn explicit_hide_pause_releases_only_its_own_owner() {
+    let mut p = interface_player(HidePolicy::PauseStory, false);
+    action(&mut p, UiAction::ToggleInterface);
+    assert!(p.paused());
+    let tick = p.core().state().tick_us;
+    p.pump(vec![AppEvent::Tick { delta_us: 300_000 }], 1000);
+    assert_eq!(p.core().state().tick_us, tick);
+    p.pump(vec![AppEvent::Hidden(true)], 1000);
+    action(&mut p, UiAction::RestoreInterface);
+    assert!(!p.interface_hidden());
+    assert!(
+        p.paused(),
+        "restoring interface must not release background pause"
+    );
+    p.pump(vec![AppEvent::Hidden(false)], 1000);
+    assert!(!p.paused());
+}
+
+#[test]
+fn hide_policy_requires_capability_and_mask_does_not_survive_new_session() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.player.hide_policy = HidePolicy::PauseStory;
+    assert_eq!(
+        nir_core::ValidatedProgram::new(program).unwrap_err().code,
+        "E_CAPABILITY"
+    );
+    let mut p = interface_player(HidePolicy::ContinueStory, false);
+    action(&mut p, UiAction::ToggleInterface);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    assert!(!p.interface_hidden());
+    action(&mut p, UiAction::ToggleInterface);
+    assert!(p.interface_hidden());
+    p.pump(vec![AppEvent::Tick { delta_us: 0 }; 200], 0);
+    assert!(
+        !p.interface_hidden(),
+        "blocking recovery UI must not remain masked"
+    );
+}
+
+#[test]
+fn custom_dialogue_rect_has_a_static_hint_without_changing_text_bounds() {
+    use nir_presentation::{project, Messages};
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.theme.dialogue.rect = Some([10., 500., 1200., 180.]);
+    let messages = Messages::default();
+    for (width, height) in [(1280., 720.), (390., 844.), (844., 390.)] {
+        let packet = project(&model, width, height, &messages);
+        let hint = packet
+            .texts
+            .iter()
+            .find(|t| t.text == messages.text(&model.ui_locale, "advance-hint"))
+            .unwrap();
+        assert!(hint.x >= 0. && hint.y >= 0. && hint.y + hint.line_height <= height);
+        let text = packet
+            .texts
+            .iter()
+            .find(|t| t.region == Some(ScrollRegion::Dialogue))
+            .unwrap();
+        assert!(hint.y >= text.y + text.height || hint.y + hint.line_height <= text.y);
+    }
+    model.theme.dialogue.rect = Some([0., 0., 1280., 720.]);
+    let packet = project(&model, 1280., 720., &messages);
+    let hint = packet
+        .texts
+        .iter()
+        .find(|t| t.text == messages.text(&model.ui_locale, "advance-hint"))
+        .unwrap();
+    let text = packet
+        .texts
+        .iter()
+        .find(|t| t.region == Some(ScrollRegion::Dialogue))
+        .unwrap();
+    assert!(
+        hint.y >= text.y + text.height,
+        "full-screen default padding can hold the hint without covering text"
+    );
+}
+
+#[test]
+fn default_interface_hide_keeps_audio_clock_running() {
+    let mut p = voice_bound_player(None);
+    let audio = p.core().state().handles["spoken"];
+    let before = p.core().state().tasks[&audio].elapsed_us.0;
+    let commands = action(&mut p, UiAction::ToggleInterface);
+    assert!(!commands.iter().any(|c| matches!(
+        c,
+        AppCommand::AudioPause {
+            domain: TimeDomain::Story,
+            paused: true
+        }
+    )));
+    p.pump(vec![AppEvent::Tick { delta_us: 300_000 }], 1000);
+    assert_eq!(
+        p.core().state().tasks[&audio].elapsed_us.0,
+        before + 300_000
+    );
+}
+
+#[test]
+fn audio_observations_are_session_scoped_and_restore_the_device_playhead() {
+    for observed in [false, true] {
+        let mut p = voice_bound_player(None);
+        let id = p.core().state().handles["spoken"];
+        let epoch = p.generation.session;
+        let before = p.core().snapshot();
+        let positions = [AudioPosition {
+            envelope: None,
+            task: id,
+            position_us: Micros(800_000),
+        }];
+        p.observe_audio_positions(TimeDomain::ForegroundUi, epoch, &positions)
+            .unwrap();
+        p.observe_audio_positions(TimeDomain::Story, epoch + 1, &positions)
+            .unwrap();
+        assert_eq!(p.core().state().tasks[&id].audio_position_us, None);
+        if observed {
+            p.observe_audio_positions(TimeDomain::Story, epoch, &positions)
+                .unwrap();
+        }
+        assert_eq!(p.core().state().tick_us, before.tick_us);
+        assert_eq!(
+            p.core().state().tasks[&id].elapsed_us,
+            before.tasks[&id].elapsed_us
+        );
+        action(&mut p, UiAction::Menu);
+        let commands = action(&mut p, UiAction::Save { slot: 1 });
+        let envelope = commands
+            .into_iter()
+            .find_map(|c| match c {
+                AppCommand::Save { envelope, .. } => Some(envelope),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            envelope.snapshot.tasks[&id].audio_position_us,
+            observed.then_some(Micros(800_000))
+        );
+        let commands = p.pump(vec![AppEvent::Loaded { envelope }], 1000);
+        let commands = ready(&mut p, commands);
+        let expected = if observed {
+            Micros(800_000)
+        } else {
+            before.tasks[&id].elapsed_us
+        };
+        assert!(commands.iter().any(|c| matches!(c, AppCommand::AudioStart { task, position_us, .. } if *task == id && *position_us == expected)));
+        assert!(p.paused());
+    }
+}
+
+#[test]
+fn domain_dispatch_does_not_charge_menu_return_time_to_story() {
+    let mut p = voice_bound_player(None);
+    let before = p.core().state().tick_us;
+    let ui = p.foreground_clock();
+    action(&mut p, UiAction::Menu);
+    p.pump(
+        vec![AppEvent::TickDomains {
+            story_us: 0,
+            foreground_us: 800_000,
+        }],
+        1000,
+    );
+    action(&mut p, UiAction::Close);
+    p.pump(
+        vec![AppEvent::TickDomains {
+            story_us: 0,
+            foreground_us: 800_000,
+        }],
+        1000,
+    );
+    assert_eq!(p.core().state().tick_us, before);
+    assert_eq!(p.foreground_clock().0, ui.0 + 1_600_000);
+    p.pump(
+        vec![AppEvent::TickDomains {
+            story_us: 50_000,
+            foreground_us: 50_000,
+        }],
+        1000,
+    );
+    assert_eq!(p.core().state().tick_us.0, before.0 + 50_000);
+    assert_eq!(p.foreground_clock().0, ui.0 + 1_650_000);
+}
+
+#[test]
+fn transition_masks_leave_the_active_asset_set_and_reenter_on_restore() {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    let image = program
+        .assets
+        .values()
+        .find(|a| a.kind == AssetKind::Image)
+        .unwrap()
+        .clone();
+    program.assets.insert("mask.pattern".into(), image);
+    program.requires.push("stage.mask.v1".into());
+    program.functions.get_mut("main").unwrap().entry = "intro".into();
+    let scene = program.scenes.keys().next().unwrap().clone();
+    program
+        .cues
+        .get_mut("intro")
+        .unwrap()
+        .effects
+        .push(EffectDef {
+            id: "mask".into(),
+            scope: Scope::Session,
+            effect: Effect::StagePresent {
+                scene,
+                duration_us: Micros(1000),
+                transition: StageTransition::Mask {
+                    asset: "mask.pattern".into(),
+                    channel: MaskChannel::Alpha,
+                    invert: false,
+                    softness: 0.2,
+                },
+            },
+        });
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    assert!(p.retained_assets().contains("mask.pattern"));
+    let snapshot = p.core().snapshot();
+    p.pump(vec![AppEvent::Tick { delta_us: 1000 }], 1000);
+    assert!(!p.retained_assets().contains("mask.pattern"));
+    let digest = nir_content::digest(&serde_json::to_vec(&snapshot).unwrap());
+    let commands = p.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(SaveEnvelope {
+                format: 1,
+                slot: 0,
+                revision: 1,
+                snapshot,
+                digest,
+            }),
+        }],
+        1000,
+    );
+    ready(&mut p, commands);
+    assert!(p.retained_assets().contains("mask.pattern"));
+    assert!(p.paused());
+}
+
+fn slot_load_job(p: &mut Player, slot: u32) -> u32 {
+    action(p, UiAction::Load { slot })
+        .into_iter()
+        .find_map(|c| {
+            if let AppCommand::Load { job, .. } = c {
+                Some(job)
+            } else {
+                None
+            }
+        })
+        .unwrap()
+}
+fn slot_envelope(p: &Player, slot: u32) -> Box<SaveEnvelope> {
+    let snapshot = p.core().snapshot();
+    Box::new(SaveEnvelope {
+        format: 1,
+        slot,
+        revision: 1,
+        digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+        snapshot,
+    })
+}
+#[test]
+fn slot_load_rejects_replaced_requests_and_back_then_reopen() {
+    let mut p = playing();
+    action(&mut p, UiAction::Saves);
+    let envelope = slot_envelope(&p, 0);
+    let first = slot_load_job(&mut p, 0);
+    let second = slot_load_job(&mut p, 0);
+    let before = p.generation.session;
+    let commands = p.pump(
+        vec![AppEvent::SlotLoaded {
+            job: first,
+            envelope: envelope.clone(),
+        }],
+        1000,
+    );
+    assert!(!commands.iter().any(|c| matches!(
+        c,
+        AppCommand::GetAssets { .. } | AppCommand::PreparePresentation { .. }
+    )));
+    assert_eq!(p.generation.session, before);
+    action(&mut p, UiAction::Close);
+    action(&mut p, UiAction::Saves);
+    let commands = p.pump(
+        vec![AppEvent::SlotLoaded {
+            job: second,
+            envelope: envelope.clone(),
+        }],
+        1000,
+    );
+    ready(&mut p, commands);
+    assert_eq!(p.generation.session, before);
+    let third = slot_load_job(&mut p, 0);
+    p.pump(
+        vec![AppEvent::SlotLoadFailed {
+            job: second,
+            message: "late failure".into(),
+        }],
+        1000,
+    );
+    assert!(p.error.is_none());
+    let commands = p.pump(
+        vec![AppEvent::SlotLoaded {
+            job: third,
+            envelope,
+        }],
+        1000,
+    );
+    ready(&mut p, commands);
+    assert_eq!(p.generation.session, before + 1);
+}
+#[test]
+fn slot_load_rejects_wrong_slot_and_consumes_the_request() {
+    let mut p = playing();
+    action(&mut p, UiAction::Saves);
+    let job = slot_load_job(&mut p, 0);
+    let envelope = slot_envelope(&p, 1);
+    p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    assert_eq!(p.diagnostic.as_ref().unwrap().code, "E_SAVE_SLOT");
+    let before = p.generation.session;
+    let envelope = slot_envelope(&p, 0);
+    let commands = p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    ready(&mut p, commands);
+    assert_eq!(p.generation.session, before);
+    assert!(!action(&mut p, UiAction::Load { slot: 3 })
+        .iter()
+        .any(|c| matches!(c, AppCommand::Load { .. })));
+}
+
+#[test]
+fn closing_during_slot_candidate_preparation_keeps_story_and_rejects_ready() {
+    let mut p = playing();
+    action(&mut p, UiAction::Saves);
+    let envelope = slot_envelope(&p, 0);
+    let job = slot_load_job(&mut p, 0);
+    let before = p.generation.session;
+    let commands = p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    assert!(p.is_loading());
+    let cancelled = action(&mut p, UiAction::Close);
+    assert!(cancelled
+        .iter()
+        .any(|c| matches!(c, AppCommand::CancelAssets { .. })));
+    ready(&mut p, commands);
+    assert_eq!(p.generation.session, before);
+    assert_eq!(p.screen, nir_presentation::Screen::Story);
+    assert!(!p.is_loading());
+    assert!(!p.paused());
+}
+
+#[test]
+fn closing_a_failed_slot_restore_clears_only_its_diagnostic() {
+    for corrupt in [false, true] {
+        let mut p = playing();
+        action(&mut p, UiAction::Saves);
+        let job = slot_load_job(&mut p, 0);
+        let mut envelope = slot_envelope(&p, 0);
+        if corrupt {
+            envelope.digest = "invalid".into();
+        }
+        let commands = p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+        if !corrupt {
+            let request = commands
+                .iter()
+                .find_map(|c| {
+                    if let AppCommand::GetAssets { request, .. } = c {
+                        Some(*request)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            p.pump(
+                vec![AppEvent::AssetFailed {
+                    request,
+                    message: "restore image unavailable".into(),
+                }],
+                1000,
+            );
+        }
+        assert!(p.error.is_some());
+        action(&mut p, UiAction::Close);
+        assert!(p.error.is_none());
+        assert!(p.diagnostic.is_none());
+        assert!(!p.paused());
+        assert!(!p.is_loading());
+    }
+    let mut p = playing();
+    action(&mut p, UiAction::Saves);
+    let job = slot_load_job(&mut p, 0);
+    let envelope = slot_envelope(&p, 0);
+    p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    p.pump(
+        vec![AppEvent::HostFailed("unrelated host error".into())],
+        1000,
+    );
+    action(&mut p, UiAction::Close);
+    assert_eq!(p.diagnostic.as_ref().unwrap().code, "E_HOST");
+}
+
+#[test]
+fn restore_media_failure_does_not_fail_original_pending_activation() {
+    let saved = playing();
+    let envelope = slot_envelope(&saved, 0);
+    let mut p = player();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    action(&mut p, UiAction::NewGame);
+    assert!(p.core().state().pending.is_some());
+    action(&mut p, UiAction::Saves);
+    let original = serde_json::to_value(p.core().snapshot()).unwrap();
+    let job = slot_load_job(&mut p, 0);
+    let commands = p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    let request = commands
+        .iter()
+        .find_map(|c| {
+            if let AppCommand::GetAssets { request, .. } = c {
+                Some(*request)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    p.pump(
+        vec![AppEvent::AssetFailed {
+            request,
+            message: "candidate failure".into(),
+        }],
+        1000,
+    );
+    assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), original);
+    let commands = action(&mut p, UiAction::Close);
+    ready(&mut p, commands);
+    assert!(p.core().dialogue().is_some());
+    assert!(!p.is_loading());
+}
+
+#[test]
+fn invalid_slot_envelope_does_not_cancel_existing_story_preparation() {
+    let saved = playing();
+    let mut envelope = slot_envelope(&saved, 0);
+    envelope.digest = "invalid".into();
+    let mut p = player();
+    let boot = p.pump(vec![], 1000);
+    ready(&mut p, boot);
+    let original = action(&mut p, UiAction::NewGame);
+    action(&mut p, UiAction::Saves);
+    let job = slot_load_job(&mut p, 0);
+    p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
+    let close = action(&mut p, UiAction::Close);
+    assert!(!close
+        .iter()
+        .any(|c| matches!(c, AppCommand::CancelAssets { .. })));
+    ready(&mut p, original);
+    assert!(p.core().dialogue().is_some());
+    assert!(p.error.is_none());
 }

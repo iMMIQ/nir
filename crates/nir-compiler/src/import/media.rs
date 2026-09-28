@@ -74,6 +74,41 @@ pub(super) fn gal_size(data: &[u8]) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+/// Source profiles supply the documented state count and order. Dimensions
+/// alone never decide whether a raster contains states or animation frames.
+pub(super) fn horizontal_states(image: &RgbaImage, count: u32) -> Result<Vec<RgbaImage>> {
+    ensure!(
+        (1..=16).contains(&count)
+            && image.width() > 0
+            && image.height() > 0
+            && image.width().is_multiple_of(count),
+        "E_IMPORT_UI_SKIN: invalid horizontal state strip"
+    );
+    let width = image.width() / count;
+    ensure!(width > 0, "E_IMPORT_UI_SKIN: empty state");
+    Ok((0..count)
+        .map(|n| image::imageops::crop_imm(image, n * width, 0, width, image.height()).to_image())
+        .collect())
+}
+
+/// Bake a finite, static source TileNew into one PNG without adding runtime
+/// tiling semantics or changing the source tile's alpha and edge pixels.
+pub(super) fn tile(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaImage> {
+    ensure!(
+        image.width() > 0
+            && image.height() > 0
+            && width > 0
+            && height > 0
+            && width <= 8192
+            && height <= 8192
+            && width as usize * height as usize <= MAX_PIXELS,
+        "E_IMPORT_UI_TILE: invalid tiled dimensions"
+    );
+    Ok(RgbaImage::from_fn(width, height, |x, y| {
+        *image.get_pixel(x % image.width(), y % image.height())
+    }))
+}
+
 /// Single-frame GAL 105/106. Multiple visible layers are composited with their
 /// origin, opacity and color key. Unresolved forward block references fail.
 pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {

@@ -1,3 +1,78 @@
+// Sample the scheduled envelope on its own (pause-aware) device clock.
+export function envelopePosition(plan, now) {
+    if(!plan || plan.owner==null)return undefined;
+    const elapsed=Math.min(plan.duration,Math.max(0,Math.round((now-plan.at)*1e6)));
+    return {owner:plan.owner,elapsed_us:String(plan.base+elapsed)};
+}
+// Revision changes refresh actions, while focus stays on the same live control.
+export function focusIdentity(action) {
+    if(!action)return null;
+    const value=JSON.parse(action);
+    if(value.type==='menu_history_scroll'&&value.control) return JSON.stringify([value.type,value.instance,value.window,value.control,value.input.type,value.input.type==='line'?value.input.delta:null]);
+    return ['menu_control','menu_value'].includes(value.type)?JSON.stringify([value.type,value.instance,value.control]):action;
+}
+export function samePointerTarget(a,b) {
+    if(!a||!b)return false;
+    if(a.type==='menu_value'&&b.type==='menu_value')
+        return a.instance===b.instance&&a.revision===b.revision&&a.control===b.control;
+    return JSON.stringify(a)===JSON.stringify(b);
+}
+// Both domains retain elapsed time across bounded dispatch. Story boundaries
+// discard only Story time; opening a menu must not freeze foreground effects.
+export class DomainElapsed {
+    story=0;foreground=0;
+    add(elapsed,{hidden,before,after}) {
+        const foreground=!hidden&&before.session===after.session;
+        const story=foreground&&!before.paused&&!after.paused&&before.screen==='Story';
+        this.story=story?this.story+elapsed:0;
+        this.foreground=foreground?this.foreground+elapsed:0;
+    }
+    take() {
+        const story=Math.min(0xffffffff,this.story),foreground=Math.min(0xffffffff,this.foreground);
+        this.story-=story;this.foreground-=foreground;
+        return [story,foreground];
+    }
+}
+// Separate device clocks: suspending Story must not freeze foreground UI media.
+export class AudioDomains {
+    constructor(Context, warn=console.warn) {
+        this.routes=new Map(['story','foreground_ui'].map(domain=>[domain,{context:new Context(),paused:true,unlocked:null}]));
+        this.warn=warn;this.closed=false;
+        for(const r of this.routes.values())r.context.suspend().catch(warn);
+    }
+    route(domain) {
+        const route=this.routes.get(domain);
+        if(!route)throw new Error(`E_AUDIO_DOMAIN: ${domain}`);
+        return route;
+    }
+    context(domain){return this.route(domain).context;}
+    paused(domain){return this.route(domain).paused;}
+    unlocked(domain){return this.route(domain).unlocked;}
+    unlock() {
+        if(this.closed)return;
+        for(const route of this.routes.values()) {
+            if(route.paused&&route.unlocked)continue;
+            const pending=route.context.resume();route.unlocked=pending;
+            pending.then(()=>{
+                if(!this.closed&&route.paused)route.context.suspend().catch(this.warn);
+            },error=>{if(route.unlocked===pending)route.unlocked=null;this.warn(error);});
+        }
+    }
+    setPaused(domain, paused) {
+        const route=this.route(domain);route.paused=paused;
+        if(this.closed)return;
+        if(paused)route.context.suspend().catch(this.warn);
+        else if(route.unlocked)route.context.resume().catch(this.warn);
+    }
+    snapshot(){return Object.fromEntries([...this.routes].map(([domain,r])=>[domain,{state:r.context.state,paused:r.paused}]));}
+    close(){this.closed=true;for(const r of this.routes.values())r.context.close().catch(this.warn);}
+}
+export function audioVoiceKey(command) {
+    if(command.domain!=='story'&&command.domain!=='foreground_ui')throw new Error('E_AUDIO_DOMAIN');
+    if(![command.session,command.task].every(n=>Number.isInteger(n)&&n>=0&&n<=0xffffffff))throw new Error('E_AUDIO_ID');
+    return `${command.domain}:${command.session}:${command.task}`;
+}
+
 // Diagnostic-only ring: explicit fields, bounded storage, no narrative payloads.
 export class TraceRecorder {
     constructor({capacity=4096,enabled=false,now=()=>performance.now()}={}) {
@@ -394,15 +469,17 @@ export function initialRuntimePreferences(program,saved,languages,reducedMotion)
         ui_locale:program.locale_config.default_ui||program.default_locale,
         text_locale:program.locale_config.default_text||program.default_locale,
         font_scale:program.player.font_scale,
+        text_speed:1,
+        auto_wait_scale:1,
         bgm_volume:program.player.bgm_volume,
         voice_volume:program.player.voice_volume,
         sfx_volume:program.player.sfx_volume,
         reduced_motion:program.player.reduced_motion,
     };
     const selected=initialPreferences(defaults,saved,program.locale_config,languages,reducedMotion);
-    const preferences=Object.fromEntries(['ui_locale','text_locale','font_scale','bgm_volume','voice_volume','sfx_volume','reduced_motion']
+    const preferences=Object.fromEntries(['ui_locale','text_locale','text_speed','auto_wait_scale','font_scale','bgm_volume','voice_volume','sfx_volume','reduced_motion']
         .map(key=>[key,selected[key]]));
-    for(const key of ['font_scale','bgm_volume','voice_volume','sfx_volume'])
+    for(const key of ['text_speed','auto_wait_scale','font_scale','bgm_volume','voice_volume','sfx_volume'])
         if(typeof preferences[key]!=='number'||!Number.isFinite(preferences[key]))preferences[key]=defaults[key];
     if(typeof preferences.reduced_motion!=='boolean')preferences.reduced_motion=defaults.reduced_motion;
     return preferences;
@@ -518,21 +595,6 @@ export async function initializeBackend({requested='auto',probe,create,replaceCa
     }
 }
 
-// Only primary pointers activate hit targets. Secondary clicks use the system
-// menu, and an unfocused Enter must not invent an action for a submenu.
-export function pointerAction(button,screen,hit) {
-    if(button===0)return hit;
-    if(button!==2)return null;
-    if(screen==='Story')return {type:'menu'};
-    if(['Menu','Settings','Saves','History'].includes(screen))return {type:'close'};
-    return null;
-}
-export function primaryKeyAction(screen,paused,nodes) {
-    if(screen==='Title')return nodes.find(n=>n.enabled&&n.action.type==='new_game')?.action??null;
-    if(screen==='Story')return {type:paused?'continue':'advance'};
-    return null;
-}
-
 export async function start({wasm,release,releaseDigest,releaseRoot,executable,fetchObject,fail,startupTrace=[],sha256}) {
     const params=new URL(location.href).searchParams;
     const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
@@ -615,12 +677,12 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         }catch(error){if(generation===historyGeneration)historyMessage.textContent=`Unable to read save history: ${error}`;}
     }
     const AudioContext=window.AudioContext||window.webkitAudioContext;
-    const audio=new AudioContext();let unlocked=null,audioPaused=true;
+    const audioDomains=new AudioDomains(AudioContext),audio=audioDomains.context('story');
     const buffers=new Map(),voices=new Map(),bytesCache=new Map(),assetDescriptors=new Map(),requests=new SharedRequests((id,signal)=>fetchObject(id,signal,observe)),preparations=new Map(),contentPreparations=new Map(),contentStaging=new ContentStagingBudget(CONTENT_STAGING_LIMIT,syncContentStagingMetrics);
-    let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false;
+    let raf=0,lastTime=null,sequence=0,disposed=false,recovering=false,pendingFocusId=null;
     const inbox=new OwnerInbox(256,128,8,observe,()=>traceContext),resourcePool=new WorkPool(4),decodePool=new WorkPool(2),uploadPool=new WorkPool(1);
     const decodeRequests=new SharedRequests((id,signal,source)=>decodePool.run(()=>audio.decodeAudioData(source.bytes.slice(0)),signal,{priority:source.priority,group:source.group,deadline:source.deadline,phase:'audio_decode'}));
-    let ownerTimer=null,pendingElapsed=0,wakeRequestedAt=null,pendingWakeWaitStartUs=null,pendingWakeWaitEndUs=null,cachedHostState=null;
+    let ownerTimer=null,pendingElapsed=new DomainElapsed(),wakeRequestedAt=null,pendingWakeWaitStartUs=null,pendingWakeWaitEndUs=null,cachedHostState=null;
     function invalidateHostState(){cachedHostState=null;}
     function mutateEngine(run) {try{return run();}finally{invalidateHostState();}}
     function hostEvent(kind,value) {mutateEngine(()=>engine.host_event(kind,typeof value==='string'?value:JSON.stringify(value)));}
@@ -662,33 +724,47 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         }).then(value=>post(slot,()=>success(value)),error=>post(slot,()=>failure(error)));
         return slot;
     }
-    function unlock() {if(audio.state!=='running'){unlocked=audio.resume();unlocked.catch(e=>console.warn('Audio unlock failed',e));}else{unlocked=Promise.resolve();}}
+    function unlock() { audioDomains.unlock(); }
     function stopVoice(id) {
         const v=voices.get(id);if(!v)return;v.stopped=true;v.slot.cancel();
-        try{v.source?.stop();}catch{}v.source?.disconnect();v.gain?.disconnect();voices.delete(id);
+        try{v.source?.stop();}catch{}v.source?.disconnect();v.gain?.disconnect();v.envelope?.disconnect();voices.delete(id);
     }
     function playVoice(c) {
-        stopVoice(c.task);
-        const failed=e=>mutateEngine(()=>engine.audio_failed(c.task,c.session,String(e)));
-        const slot=inbox.reserve('completion',`audio:${c.session}:${c.task}`,{session:c.session,task:c.task});
+        const key=audioVoiceKey(c),context=audioDomains.context(c.domain);
+        stopVoice(key);
+        const failed=e=>mutateEngine(()=>engine.audio_failed_in(c.domain,c.task,c.session,String(e)));
+        const slot=inbox.reserve('completion',`audio:${key}`,{session:c.session,task:c.task});
         if(!slot){failed('E_REQUEST_CAPACITY');return;}
         const buffer=buffers.get(c.asset);
         if(!buffer){post(slot,()=>failed('E_AUDIO_BUFFER'));return;}
         let v;
         try {
-            const source=audio.createBufferSource(),gain=audio.createGain();source.buffer=buffer;source.loop=c.looped;
-            gain.gain.value=preferences[`${c.bus}_volume`]??.5;source.connect(gain).connect(audio.destination);
-            v={source,gain,slot,bus:c.bus,asset:c.asset,stopped:false};voices.set(c.task,v);
+            const source=context.createBufferSource(),gain=context.createGain(),envelope=context.createGain();source.buffer=buffer;source.loop=c.looped;envelope.gain.value=c.envelope??1;
+            gain.gain.value=(c.gain??1)*(preferences[`${c.bus}_volume`]??.5);source.connect(envelope).connect(gain).connect(context.destination);
+            v={domain:c.domain,session:c.session,task:c.task,position:Number(c.position_us)/1e6,context,source,gain,envelope,slot,eventGain:c.gain??1,bus:c.bus,asset:c.asset,stopped:false};voices.set(key,v);
             let offset=Number(c.position_us)/1e6;if(c.looped)offset%=buffer.duration;else offset=Math.min(offset,Math.max(0,buffer.duration-.001));
             source.onended=()=>{if(!v.stopped&&!c.looped)post(slot,()=>{
-                if(voices.get(c.task)===v){voices.delete(c.task);source.disconnect();gain.disconnect();}
-                mutateEngine(()=>engine.audio_ended(c.task,c.session));
+                if(voices.get(key)!==v||v.stopped)return;
+                voices.delete(key);source.disconnect();gain.disconnect();envelope.disconnect();
+                mutateEngine(()=>engine.audio_ended_in(c.domain,c.task,c.session));
             });};
-            source.start(0,offset);metrics.audioStarts++;
+            source.start(0,offset);v.started=context.currentTime;metrics.audioStarts++;
         } catch(e){
-            if(v){v.stopped=true;v.source.disconnect();v.gain.disconnect();voices.delete(c.task);}
+            if(v){v.stopped=true;v.source.disconnect();v.gain.disconnect();v.envelope.disconnect();voices.delete(key);}
             post(slot,()=>failed(e));
         }
+    }
+    function sampleAudioPositions() {
+        const groups=new Map();
+        for(const v of voices.values()) {
+            if(v.domain!=='story'||v.stopped||v.started===undefined)continue;
+            let position=v.position+Math.max(0,v.context.currentTime-v.started);
+            if(!v.source.loop)position=Math.min(position,v.source.buffer.duration);
+            const positions=groups.get(v.session)||[];
+            positions.push({task:v.task,position_us:String(Math.round(position*1e6)),envelope:envelopePosition(v.envelopePlan,v.context.currentTime)});
+            groups.set(v.session,positions);
+        }
+        for(const [session,positions] of groups)mutateEngine(()=>engine.audio_positions_in('story',session,JSON.stringify(positions)));
     }
     async function asset(id,a,signal,context) {
         if(!a)throw new Error(`E_ASSET_DESCRIPTOR: ${id}`);
@@ -777,9 +853,9 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
                     // Decoding is valid while the context is suspended. Only
                     // required playback needs an unlocked context, and a
                     // cancelled request must not wait for resume to settle.
-                    if(job.priority==='required'&&unlocked&&!audioPaused)await awaitAbortable(unlocked,signal);
+                    if(job.priority==='required'&&audioDomains.unlocked('story')&&!audioDomains.paused('story'))await awaitAbortable(audioDomains.unlocked('story'),signal);
                     signal.throwIfAborted();
-                    if(job.priority==='required'&&audio.state!=='running'&&!audioPaused)throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
+                    if(job.priority==='required'&&audio.state!=='running'&&!audioDomains.paused('story'))throw new Error('E_AUDIO_LOCKED: activate sound with a user gesture');
                 }
                 node.stage=stage='decode_upload';
                 let complete=false;
@@ -918,11 +994,11 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         return request(()=>commitSaveRecord(db,slotKey(c.slot),c.envelope,metadata,c.expected_revision),()=>{observe('storage_committed',context);hostEvent('saved',{job:c.job,slot:c.slot,revision:c.envelope.revision});if(historyPanel&&!historyPanel.hidden)void refreshHistory();},
             e=>{const code=e?.name==='QuotaExceededError'?'E_STORAGE_QUOTA':String(e).includes('E_SAVE_CONFLICT')?'E_SAVE_CONFLICT':'E_STORAGE';observe('diagnostic',{...context,domain:'storage',code});hostEvent('save_failed',{job:c.job,code,message:String(e)});},{group:`save:${c.job}`});
     }
-    function load(slot) {
+    function load(command) {
         const session=state().session;
-        return request(async()=>{const s=await readSaveRecord(db,slotKey(slot));if(!s)throw new Error('E_SAVE_MISSING');return s.envelope;},
-            value=>{if(state().session===session)hostEvent('loaded',value);},
-            e=>{if(state().session===session)hostEvent('load_failed',String(e));},{group:'load',replace:true});
+        return request(async()=>{const s=await readSaveRecord(db,slotKey(command.slot));if(!s)throw new Error('E_SAVE_MISSING');return s.envelope;},
+            value=>{if(state().session===session)hostEvent('slot_loaded',{job:command.job,envelope:value});},
+            e=>{if(state().session===session)hostEvent('slot_load_failed',{job:command.job,message:String(e)});},{group:'load',replace:true});
     }
     function importSave(){
         inbox.cancelGroup('load');const slot=inbox.reserve('completion','load'),session=state().session;
@@ -954,12 +1030,22 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             case 'promote_assets':promotePreparation(c.request,c.session);break;
             case 'cancel_assets':cancelPreparation(c.request);break;
             case 'audio_start':playVoice(c);break;
-            case 'audio_stop':stopVoice(c.task);break;
-            case 'audio_reset':for(const id of [...voices.keys()])stopVoice(id);break;
-            case 'audio_pause':audioPaused=c.paused;if(c.paused){audio.suspend().catch(()=>{});}else if(unlocked){audio.resume().catch(e=>console.warn(e));}break;
-            case 'save':save(c);break;case 'load':load(c.slot);break;case 'list_saves':listSaves();break;
-            case 'apply_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`];break;
-            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=preferences[`${v.bus}_volume`]??.5;{const value=preferences;request(()=>write('preferences',sharedKey,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
+            case 'audio_envelope':{
+                const v=voices.get(audioVoiceKey(c));if(!v)break;
+                const now=v.context.currentTime,param=v.envelope.gain;
+                param.cancelScheduledValues(now);param.setValueAtTime(c.from,now);
+                const duration=Number(c.duration_us)/1e6;
+                v.envelopePlan={owner:c.owner,base:Number(c.elapsed_us),at:now,duration:Number(c.duration_us)};
+                if(duration>0)param.linearRampToValueAtTime(c.to,now+duration);
+                else param.setValueAtTime(c.to,now);
+                break;
+            }
+            case 'audio_stop':stopVoice(audioVoiceKey(c));break;
+            case 'audio_reset':audioDomains.route(c.domain);for(const [id,v] of [...voices])if(v.domain===c.domain)stopVoice(id);break;
+            case 'audio_pause':audioDomains.setPaused(c.domain,c.paused);break;
+            case 'save':save(c);break;case 'load':load(c);break;case 'list_saves':listSaves();break;
+            case 'apply_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=v.eventGain*(preferences[`${v.bus}_volume`]??.5);break;
+            case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=v.eventGain*(preferences[`${v.bus}_volume`]??.5);{const value=preferences;request(()=>write('preferences',sharedKey,value),()=>{},e=>hostEvent('load_failed',`E_PREFERENCES: ${e}`));}break;
             case 'persist_profile':request(()=>mergeProfile(c.keys),()=>{},e=>hostEvent('load_failed',`E_PROFILE: ${e}`));break;
             case 'export':{const url=URL.createObjectURL(new Blob([c.json],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`${release.game_id}.nir-save.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);break;}
             case 'import':importSave();break;
@@ -983,14 +1069,14 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         observe('input_received',{sequence:sequence+1,session:context.session});
         unlock();if(a.type==='new_game'&&metrics.startInputMs===null)metrics.startInputMs=performance.now();
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
-        return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');mutateEngine(()=>engine.action(JSON.stringify(a),context.interaction,seq,context.session));},'input');
+        return deliver(()=>{sampleAudioPositions();if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');mutateEngine(()=>engine.action(JSON.stringify(a),context.interaction,seq,context.session));},'input');
     }
-    let semanticSignature='',announcement='',announcementLocale='',semanticNodes=[];
+    let semanticSignature='',announcement='',announcementLocale='';
     function semantics(view) {
-        semanticNodes=view.nodes;
-        historyButton.hidden=state().screen!=='Menu';
+        historyButton.hidden=state().screen!=='Menu'||state().menu_depth>0;
         document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
-        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{deliver(()=>mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2)),'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
+        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=focusIdentity(document.activeElement?.dataset?.action);nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.setAttribute('aria-label',n.label);b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;if(['range','scrollbar'].includes(n.value?.type)){b.setAttribute('role','slider');b.setAttribute('aria-valuemin',n.value.min??0);b.setAttribute('aria-valuemax',n.value.max);b.setAttribute('aria-valuenow',n.value.value);if(n.value.type==='scrollbar')b.setAttribute('aria-orientation','vertical');}else if(n.value?.type==='toggle'){b.setAttribute('role','switch');b.setAttribute('aria-checked',String(n.value.checked));}b.dataset.action=JSON.stringify(n.action);b.dataset.control=String(n.id);b.dataset.rect=JSON.stringify(n.rect);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{deliver(()=>{mutateEngine(()=>engine.focus_control(n.id));mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2));},'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>{document.querySelector('#focus-ring').style.display='none';deliver(()=>mutateEngine(()=>engine.focus_control(undefined)),'input');};nav.append(b);if(focusIdentity(b.dataset.action)===focused)b.focus({preventScroll:true});}}
+        if(pendingFocusId!==null){const target=pendingFocusId;pendingFocusId=null;if(target.session===s.session&&target.interaction===s.interaction&&target.screen===s.screen)document.querySelector(`#actions button[data-control="${target.id}"]`)?.focus({preventScroll:true});}
         const spokenLocale=view.announcement_locale||view.locale||'zh-Hans';if(view.announcement&&(view.announcement!==announcement||spokenLocale!==announcementLocale)){announcement=view.announcement;announcementLocale=spokenLocale;const live=document.querySelector('#announcement');live.lang=spokenLocale;live.textContent=announcement;}
     }
     function frame(now) {
@@ -1002,14 +1088,12 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             mutateEngine(()=>engine.begin_turn());
             checkDevice();if(disposed){finishPerformanceTurn(perfTurn);return;}
             const before=state();traceContext={session:before.session,device:before.device};
-            const elapsed=lastTime===null?0:Math.min(250000,Math.max(0,Math.round((now-lastTime)*1000)));lastTime=now;
+            const elapsed=lastTime===null?0:Math.max(0,Math.round((now-lastTime)*1000));lastTime=now;
             inbox.drain({canRun:kind=>!disposed&&(!recovering||kind==='control')&&(kind==='control'||engine.pending_events()<112)});if(disposed){finishPerformanceTurn(perfTurn);return;}flush();
             if(recovering){if(inbox.hasControl)wake();if(perfTurn)performanceStats.record('event_handling',eventStartUs,Math.round(performance.now()*1000),perfTurn);finishPerformanceTurn(perfTurn);return;}
             const after=state();
-            if(!document.hidden&&!before.paused&&before.screen==='Story'&&!after.paused&&before.session===after.session){
-                pendingElapsed=Math.min(250000,pendingElapsed+elapsed);
-                if(!inbox.hasInput){mutateEngine(()=>engine.tick(pendingElapsed));pendingElapsed=0;}
-            }else{pendingElapsed=0;}
+            pendingElapsed.add(elapsed,{hidden:document.hidden,before,after});
+            if(!inbox.hasInput){const [story,foreground]=pendingElapsed.take();sampleAudioPositions();mutateEngine(()=>engine.tick_domains(story,foreground));}
             mutateEngine(()=>engine.continue_turn());flush();
             if(perfTurn)performanceStats.record('event_handling',eventStartUs,Math.round(performance.now()*1000),perfTurn);
             const current=size();if(current.width!==width||current.height!==height||current.dpr!==dpr){({width,height,dpr}=current);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);}
@@ -1033,46 +1117,89 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         }
     }
     function schedule() {if(disposed||recovering)return;if(!raf)raf=requestAnimationFrame(()=>{raf=0;wake();});}
-    let down=null;
+    let down=null,barPointer=null;
+    // The host retains capture until release even if a page change cancels the
+    // shared gesture, so that release cannot become a click in the new page.
+    const barGesture=(phase,x,y)=>{const consumed=mutateEngine(()=>engine.pointer_gesture(phase,x,y,0));schedule();return consumed;};
+    const cancelPointer=()=>{
+        down=null;
+        if(barPointer!==null){const id=barPointer;barPointer=null;barGesture(3,0,0);if(canvas.hasPointerCapture(id))canvas.releasePointerCapture(id);}
+    };
+    const scrollAction=(view,delta,page=false)=>view.menu
+        ? {type:'menu_history_scroll',...view.menu,input:{type:page?'page':'step',delta}}
+        : {type:'scroll',region:view.region,delta};
     const scrollAt=(x,y)=>state().scrolls.find(v=>x>=v.rect[0]&&x<=v.rect[0]+v.rect[2]&&y>=v.rect[1]&&y<=v.rect[1]+v.rect[3]);
-    const onDown=(e)=>{if(e.button!==0&&e.button!==2)return;unlock();const context=state();down={button:e.button,action:pointerAction(e.button,context.screen,JSON.parse(engine.hit(e.clientX,e.clientY))),context,x:e.clientX,y:e.clientY,scroll:e.button===0?scrollAt(e.clientX,e.clientY):null};};
+    const onDown=(e)=>{if(e.button!==0&&e.button!==2)return;pendingFocusId=null;if(document.activeElement?.closest('#actions'))document.activeElement.blur();mutateEngine(()=>engine.focus_control(undefined));unlock();if(e.button===0&&barPointer===null&&barGesture(0,e.clientX,e.clientY)){barPointer=e.pointerId;canvas.setPointerCapture(e.pointerId);down=null;return;}const context=state();down={button:e.button,action:JSON.parse(engine.pointer_action(e.clientX,e.clientY,e.button)),context,x:e.clientX,y:e.clientY,scroll:e.button===0?scrollAt(e.clientX,e.clientY):null};};
     const onUp=(e)=>{
+        if(barPointer===e.pointerId&&e.button===0){barGesture(2,e.clientX,e.clientY);const id=barPointer;barPointer=null;if(canvas.hasPointerCapture(id))canvas.releasePointerCapture(id);return;}
         if(!down||e.button!==down.button)return;
+        const current=state();
+        if(current.session!==down.context.session||current.interaction!==down.context.interaction){down=null;return;}
         const dy=e.clientY-down.y;
-        if(down.scroll&&Math.abs(dy)>30&&Math.abs(e.clientX-down.x)<80){action({type:'scroll',region:down.scroll.region,delta:dy<0?1:-1},down.context);}
-        else if(Math.hypot(e.clientX-down.x,dy)<20){const hit=pointerAction(e.button,state().screen,JSON.parse(engine.hit(e.clientX,e.clientY)));if(down.action&&JSON.stringify(down.action)===JSON.stringify(hit))action(down.action,down.context);}
+        if(down.scroll&&Math.abs(dy)>30&&Math.abs(e.clientX-down.x)<80){action(scrollAction(down.scroll,dy<0?1:-1),down.context);}
+        else if((down.action?.type==='menu_value'&&typeof down.action.value==='number')||Math.hypot(e.clientX-down.x,dy)<20){const hit=JSON.parse(engine.pointer_action(e.clientX,e.clientY,e.button));if(samePointerTarget(down.action,hit))action(hit,down.context);}
         down=null;
     };
     let hoverTarget;
-    const onMove=(e)=>{if(state().screen!=='Title')return;const target=engine.hit(e.clientX,e.clientY);if(target===hoverTarget)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
-    const onLeave=()=>{hoverTarget=undefined;if(state().screen==='Title')deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');};
-    const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action({type:'scroll',region:view.region,delta:e.deltaY>0?1:-1});}};
+    const onMove=(e)=>{if(barPointer===e.pointerId){barGesture(1,e.clientX,e.clientY);return;}if(!['Title','Menu'].includes(state().screen)){hoverTarget=undefined;return;}const target=engine.hit(e.clientX,e.clientY);if(target===hoverTarget&&!state().history_scrollbar)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
+    const onLeave=()=>{if(barPointer!==null)return;down=null;hoverTarget=undefined;if(['Title','Menu'].includes(state().screen))deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');};
+    const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action(scrollAction(view,e.deltaY>0?1:-1));}};
+    const heldControls=new Set();
+    const releaseHeld=()=>{if(!heldControls.size)return;heldControls.clear();action({type:'hold_skip',pressed:false});};
+    const onEditingFocus=e=>{if(e.target?.isContentEditable||e.target?.matches?.('input,textarea,select'))releaseHeld();};
+    const onKeyUp=e=>{if(e.key==='Control'){if(!heldControls.delete(e.code))return;if(!heldControls.size)action({type:'hold_skip',pressed:false});}};
     const onKey=(e)=>{
         if(!historyPanel.hidden){if(e.key==='Escape'){e.preventDefault();historyClose.click();}return;}
+        if(e.isComposing||document.activeElement?.isContentEditable||document.activeElement?.matches('input,textarea,select'))return;
+        if(e.key==='Control'&&!e.repeat&&!e.isComposing&&!e.metaKey&&!e.altKey){
+            if(document.activeElement?.isContentEditable||document.activeElement?.matches('input,textarea,select'))return;
+            heldControls.add(e.code);action({type:'hold_skip',pressed:true});return;
+        }
         if(e.isComposing||e.repeat||e.ctrlKey||e.metaKey||e.altKey)return;
         if(e.key==='PageUp'||e.key==='PageDown'){
             const s=state(),view=s.scrolls.find(v=>v.region==='choices')||s.scrolls[0];
-            if(view){e.preventDefault();action({type:'scroll',region:view.region,delta:e.key==='PageDown'?1:-1},s);}return;
+            if(view){e.preventDefault();action(scrollAction(view,e.key==='PageDown'?1:-1,true),s);}return;
         }
-        if(e.key==='Escape'){e.preventDefault();const s=state();action({type:['Menu','Settings','Saves','History'].includes(s.screen)?'close':'menu'});return;}
+        if(e.key==='Escape'){e.preventDefault();const s=state();action({type:s.menu_depth>0||['Menu','Settings','Saves','History'].includes(s.screen)?'close':'menu'});return;}
+        // Let browser chrome and host-owned controls remain reachable at the
+        // boundary; only movement within the player uses its semantic order.
+        if(e.key==='Tab'&&document.activeElement?.closest('#actions')) {
+            const buttons=[...document.querySelectorAll('#actions button:not(:disabled)')];
+            const rect=JSON.parse(document.activeElement.dataset.rect),x=rect[0]+rect[2]/2,y=rect[1]+rect[3]/2;
+            const canFollow=state().scrolls.some(v=>x>=v.rect[0]&&x<=v.rect[0]+v.rect[2]&&y>=v.rect[1]&&y<=v.rect[1]+v.rect[3]&&(e.shiftKey?v.offset>0:v.offset<v.max));
+            if(!canFollow&&document.activeElement===(e.shiftKey?buttons[0]:buttons.at(-1)))return;
+        }
+        const valueDirection={ArrowLeft:0,ArrowDown:5,ArrowRight:1,ArrowUp:4,Home:2,End:3}[e.key];
+        if(valueDirection!==undefined&&document.activeElement?.closest('#actions')){
+            const focused=document.activeElement;
+            const a=JSON.parse(engine.control_value_action(Number(focused.dataset.control),focused.dataset.action,valueDirection));
+            if(a){e.preventDefault();action(a,state());return;}
+        }
+        const direction={Tab:e.shiftKey?0:1,ArrowLeft:2,ArrowRight:3,ArrowUp:4,ArrowDown:5}[e.key];
+        if(direction!==undefined && (!document.activeElement?.matches('button')||document.activeElement.closest('#actions'))) {
+            const id=mutateEngine(()=>engine.navigate_focus(direction));
+            if(id!==undefined){e.preventDefault();const s=state();pendingFocusId={id,session:s.session,interaction:s.interaction,screen:s.screen};schedule();}return;
+        }
         if(document.activeElement?.tagName==='BUTTON')return;
-        if(e.key===' '||e.key==='Enter'){e.preventDefault();const s=state(),a=primaryKeyAction(s.screen,s.paused,semanticNodes);if(a)action(a,s);}
-        else if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();document.querySelector('#actions button:not([disabled])')?.focus();}
+        if(e.key.toLowerCase()==='h'){e.preventDefault();action({type:'toggle_interface'});return;}
+        if(e.key===' '||e.key==='Enter'){e.preventDefault();const s=state(),a=JSON.parse(engine.primary_action());if(a)action(a,s);}
+
     };
-    const onVisibility=()=>{const hidden=document.hidden;deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
+    const onVisibility=()=>{const hidden=document.hidden;if(hidden){releaseHeld();cancelPointer();}deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
     const onResize=()=>schedule();
     let glContextLost=false;
-    const onCancel=()=>down=null;
-    const onGlLost=e=>{e.preventDefault();glContextLost=true;deliver(checkDevice,'control');};
+    const onCancel=()=>cancelPointer();
+    const onBlur=()=>{releaseHeld();cancelPointer();};
+    const onGlLost=e=>{e.preventDefault();glContextLost=true;cancelPointer();deliver(checkDevice,'control');};
     const onContextMenu=e=>e.preventDefault();
-    function bindCanvas(){canvas.addEventListener('contextmenu',onContextMenu);canvas.addEventListener('pointermove',onMove);canvas.addEventListener('pointerleave',onLeave);canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
-    function unbindCanvas(){canvas.removeEventListener('contextmenu',onContextMenu);canvas.removeEventListener('pointermove',onMove);canvas.removeEventListener('pointerleave',onLeave);canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
-    bindCanvas();window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
+    function bindCanvas(){canvas.addEventListener('contextmenu',onContextMenu);canvas.addEventListener('pointermove',onMove);canvas.addEventListener('pointerleave',onLeave);canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('lostpointercapture',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
+    function unbindCanvas(){canvas.removeEventListener('contextmenu',onContextMenu);canvas.removeEventListener('pointermove',onMove);canvas.removeEventListener('pointerleave',onLeave);canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('lostpointercapture',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
+    bindCanvas();window.addEventListener('keydown',onKey);window.addEventListener('keyup',onKeyUp);window.addEventListener('blur',onBlur);document.addEventListener('focusin',onEditingFocus);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;
         const validation=engine.gpu_error();if(validation&&!glContextLost){observe('diagnostic',{domain:'render',code:'E_GPU_VALIDATION',operation:'render'});fail(`E_GPU_VALIDATION: ${validation}`);dispose();return;}
         if(!glContextLost&&!engine.device_lost())return;
-        recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;mutateEngine(()=>engine.begin_recovery());
+        cancelPointer();recovering=true;observe('device_loss_detected');metrics.deviceRecoveries++;mutateEngine(()=>engine.begin_recovery());
         const recovery=inbox.reserve('control','device');
         if(!recovery){fail('E_REQUEST_CAPACITY: device recovery');dispose();return;}
         const backend=activeBackend;
@@ -1088,13 +1215,13 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     const diagnostics=()=>{
         const performance=performanceStats?performanceStats.snapshot():{...disabledPerformance};
         if(performanceStats&&!disposed)performance.text_cache=JSON.parse(engine.text_cache_stats());
-        return {format:1,release:releaseDigest,engine:release.engine.wasm,backend:activeBackend,fallback_reason:fallbackReason,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,decode_pool_active:decodePool.active,decode_pool_waiting:decodePool.waiting.length,upload_pool_active:uploadPool.active,upload_pool_waiting:uploadPool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioPaused,pending_media:[...preparations].slice(0,128).map(([request,job])=>({request,session:job.session,priority:job.priority,aborted:job.signal.aborted,stages:[...job.nodes.values()].slice(0,128).map(node=>({asset:node.asset,stage:node.stage}))})),pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
+        return {format:1,release:releaseDigest,engine:release.engine.wasm,backend:activeBackend,fallback_reason:fallbackReason,...trace.snapshot(),performance,content_staging:{encoded_bytes:contentStaging.used,peak_encoded_bytes:contentStaging.peak,budget_encoded_bytes:contentStaging.limit,reservations:contentStaging.reservations.size,waiting_demands:contentStaging.waiting.length},host_work:{resource_pool_active:resourcePool.active,resource_pool_waiting:resourcePool.waiting.length,decode_pool_active:decodePool.active,decode_pool_waiting:decodePool.waiting.length,upload_pool_active:uploadPool.active,upload_pool_waiting:uploadPool.waiting.length,shared_fetches:requests.jobs.size,content_jobs:contentPreparations.size,media_jobs:preparations.size,request_slots:inbox.slots.size,pending_owner_callbacks:inbox.length,audio_state:audio.state,audio_paused:audioDomains.paused('story'),audio_domains:audioDomains.snapshot(),pending_media:[...preparations].slice(0,128).map(([request,job])=>({request,session:job.session,priority:job.priority,aborted:job.signal.aborted,stages:[...job.nodes.values()].slice(0,128).map(node=>({asset:node.asset,stage:node.stage}))})),pending_content:[...contentPreparations.values()].slice(0,128).map(job=>({request:job.request,session:job.session,priority:job.priority,state:job.state,staged:job.staged,aborted:job.signal.aborted}))},measurement:{clock:'performance.now; navigation origin',stage_timing:'inclusive, non-additive intervals',gpu_time:'unmeasured',physical_memory:'unmeasured'}};
     };
     if(trace.enabled)window.nirDiagnostics={snapshot:diagnostics,download(){const url=URL.createObjectURL(new Blob([JSON.stringify(diagnostics(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='nir-diagnostics.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}};
     if(testMode)window.__nir={state:debugState,action,metrics,traces,diagnostics,needsClock:()=>engine.needs_clock(),rawAction:(a,token,seq,epoch)=>deliver(()=>mutateEngine(()=>engine.action(JSON.stringify(a),token,seq,epoch)),'input'),loseDevice:()=>engine.simulate_device_loss(),hidden:(v)=>deliver(()=>mutateEngine(()=>engine.hidden(v)))};
     request(()=>read('profile',sharedKey),profile=>{if(profile)hostEvent('profile',profile);},e=>hostEvent('load_failed',`E_STORAGE_BOOT: ${e}`),{group:'boot'});
-    function dispose(){if(disposed)return;disposed=true;historyGeneration++;historyPanel.remove();historyButton.remove();historyStyle.remove();devBanner?.remove();clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audio.close();db.close();unbindCanvas();window.removeEventListener('keydown',onKey);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
-    window.addEventListener('pagehide',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(true)));}else{dispose();}});
+    function dispose(){if(disposed)return;cancelPointer();disposed=true;historyGeneration++;historyPanel.remove();historyButton.remove();historyStyle.remove();devBanner?.remove();clearTimeout(ownerTimer);inbox.clear();for(const request of [...contentPreparations.keys()])cancelContent(request);for(const request of [...preparations.keys()])cancelPreparation(request);cancelAnimationFrame(raf);clearInterval(poll);for(const id of [...voices.keys()])stopVoice(id);audioDomains.close();db.close();unbindCanvas();window.removeEventListener('keydown',onKey);window.removeEventListener('keyup',onKeyUp);window.removeEventListener('blur',onBlur);document.removeEventListener('focusin',onEditingFocus);window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);engine.free();}
+    window.addEventListener('pagehide',e=>{if(e.persisted){cancelPointer();deliver(()=>mutateEngine(()=>engine.hidden(true)));}else{dispose();}});
     window.addEventListener('pageshow',e=>{if(e.persisted){deliver(()=>mutateEngine(()=>engine.hidden(false)));}});
 }
 

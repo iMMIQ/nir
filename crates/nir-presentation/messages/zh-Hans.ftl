@@ -2,6 +2,7 @@ new-game = 开始阅读
 continue = 继续阅读
 menu = 菜单
 close = 返回故事
+back = 返回
 settings = 设置
 history = 回看
 saves = 存档 / 读档
@@ -56,3 +57,16 @@ title-hint = SPACE  →  READ     ·     ESC  →  MENU
 advance-hint = SPACE / ↗
 gate-hint = …
 reveal-hint = · · ·
+
+text-speed = 字速
+auto-wait = 自动等待
+reading-preferences-hint = 字速从下一段对白生效；自动等待从下一次计时生效。
+
+hide-interface = 隐藏
+show-interface = 恢复界面
+
+overwrite-slot = 覆盖存档槽
+confirm-overwrite = 确认覆盖
+cancel-overwrite = 取消
+
+history-unavailable = 回看准备失败。返回后重试。

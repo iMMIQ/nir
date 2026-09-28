@@ -585,7 +585,7 @@ fn revision_identity_is_frozen_during_preparation_and_validated_on_restore() {
     );
     c.set_locale("en").unwrap();
     let snapshot = c.snapshot();
-    assert_eq!(snapshot.format, 1);
+    assert_eq!(snapshot.format, SNAPSHOT_VERSION);
     let mut legacy = serde_json::to_value(&snapshot).unwrap();
     let dialogue = legacy["pending"]["dialogues"]["line"]
         .as_object_mut()
@@ -617,4 +617,52 @@ fn revision_identity_is_frozen_during_preparation_and_validated_on_restore() {
     corrupt.history[0].contract_digest = "bad".into();
     assert!(Core::restore(validated.clone(), corrupt, "test-release").is_err());
     assert!(Core::restore(validated, snapshot, "another-release").is_err());
+}
+
+#[test]
+fn typed_scene_tracks_preserve_legacy_clip_route_traces() {
+    for route in ["walk", "stay"] {
+        let mut p = program();
+        p.requires.push("tween.target.v1".into());
+        for definition in p.cues.values_mut().flat_map(|cue| &mut cue.effects) {
+            if let Effect::Clip {
+                node,
+                property,
+                to,
+                duration_us,
+                replace,
+                easing,
+                finish,
+                cancel,
+            } = &definition.effect
+            {
+                definition.effect = Effect::Tween {
+                    target: TweenTarget::SceneNode {
+                        node: node.clone(),
+                        property: *property,
+                    },
+                    to: *to,
+                    duration_us: *duration_us,
+                    replace: *replace,
+                    easing: *easing,
+                    finish: *finish,
+                    cancel: *cancel,
+                };
+            }
+        }
+        let mut legacy = core();
+        let mut typed = Core::new(
+            ValidatedProgram::new(p).unwrap(),
+            "test-release".into(),
+            "zh-Hans".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            drive(&mut legacy, Some(route)),
+            drive(&mut typed, Some(route))
+        );
+        assert_eq!(legacy.sample_scene(), typed.sample_scene());
+        assert_eq!(legacy.state().outcome, typed.state().outcome);
+        assert_eq!(legacy.state().variables, typed.state().variables);
+    }
 }

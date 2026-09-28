@@ -225,11 +225,60 @@ impl Engine {
     pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), JsValue> {
         self.inner.hover(x, y).map_err(js)
     }
+    pub fn pointer_gesture(
+        &mut self,
+        phase: u8,
+        x: f32,
+        y: f32,
+        button: u8,
+    ) -> std::result::Result<bool, JsValue> {
+        self.inner.pointer_gesture(phase, x, y, button).map_err(js)
+    }
+    pub fn pointer_action(&self, x: f32, y: f32, button: u8) -> String {
+        serde_json::to_string(&self.inner.pointer_action(x, y, button)).unwrap()
+    }
+    pub fn navigate_focus(&mut self, direction: u8) -> Option<u32> {
+        self.inner.navigate_focus(direction)
+    }
+    pub fn focus_value_action(&self, direction: u8) -> String {
+        serde_json::to_string(&self.inner.focus_value_action(direction)).unwrap()
+    }
+    pub fn control_value_action(&self, id: u32, expected: &str, direction: u8) -> String {
+        let action = serde_json::from_str(expected)
+            .ok()
+            .and_then(|expected| self.inner.control_value_action(id, &expected, direction));
+        serde_json::to_string(&action).unwrap()
+    }
+    pub fn focus_control(&mut self, id: Option<u32>) {
+        self.inner.focus_control(id)
+    }
+    pub fn primary_action(&self) -> String {
+        serde_json::to_string(&self.inner.primary_action()).unwrap()
+    }
     pub fn hit(&self, x: f32, y: f32) -> String {
         self.inner.hit(x, y)
     }
     pub fn tick(&mut self, delta_us: u32) -> std::result::Result<(), JsValue> {
         self.inner.tick(delta_us).map_err(js)
+    }
+    pub fn tick_domains(&mut self, story_us: u32, foreground_us: u32) -> Result<(), JsValue> {
+        self.inner.tick_domains(story_us, foreground_us).map_err(js)
+    }
+    pub fn audio_positions_in(
+        &mut self,
+        domain: String,
+        session: u32,
+        positions: String,
+    ) -> std::result::Result<(), JsValue> {
+        let domain = nir_content::parse(
+            serde_json::to_string(&domain).unwrap().as_bytes(),
+            "audio-domain",
+        )
+        .map_err(js)?;
+        let positions = nir_content::parse(positions.as_bytes(), "audio-positions").map_err(js)?;
+        self.inner
+            .audio_positions_in(domain, session, positions)
+            .map_err(js)
     }
     pub fn hidden(&mut self, value: bool) -> std::result::Result<(), JsValue> {
         self.inner.hidden(value).map_err(js)
@@ -244,6 +293,29 @@ impl Engine {
         message: String,
     ) -> std::result::Result<(), JsValue> {
         self.inner.audio_failed(task, session, message).map_err(js)
+    }
+    pub fn audio_ended_in(
+        &mut self,
+        domain: &str,
+        task: u32,
+        session: u32,
+    ) -> std::result::Result<(), JsValue> {
+        let domain =
+            serde_json::from_value(serde_json::Value::String(domain.into())).map_err(js)?;
+        self.inner.audio_ended_in(domain, task, session).map_err(js)
+    }
+    pub fn audio_failed_in(
+        &mut self,
+        domain: &str,
+        task: u32,
+        session: u32,
+        message: String,
+    ) -> std::result::Result<(), JsValue> {
+        let domain =
+            serde_json::from_value(serde_json::Value::String(domain.into())).map_err(js)?;
+        self.inner
+            .audio_failed_in(domain, task, session, message)
+            .map_err(js)
     }
     pub fn host_event(&mut self, kind: String, json: String) -> std::result::Result<(), JsValue> {
         self.inner.host_event(kind, json).map_err(js)

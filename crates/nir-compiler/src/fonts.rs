@@ -87,6 +87,31 @@ pub(crate) fn characters_by_plan(p: &Program, title: &str) -> Result<CharacterSe
     common_program.locale_config = LocaleConfig::default();
     let mut common: BTreeSet<char> = (' '..='~').collect();
     collect_strings(&serde_json::to_value(common_program)?, &mut common);
+    for menu in p.theme.image_menus.values() {
+        for button in &menu.buttons {
+            common.extend(button.label.chars());
+        }
+        for element in &menu.elements {
+            if let nir_format::MenuContent::Button { label, .. }
+            | nir_format::MenuContent::TextButton { label, .. }
+            | nir_format::MenuContent::HitRegion { label, .. }
+            | nir_format::MenuContent::Toggle { label, .. }
+            | nir_format::MenuContent::Range { label, .. }
+            | nir_format::MenuContent::HistoryScrollbar { label, .. } = &element.content
+            {
+                common.extend(label.chars());
+            }
+            if let Some(nir_format::MenuLocal::Enum { values, .. }) = element
+                .text_local
+                .as_ref()
+                .and_then(|name| menu.locals.get(name))
+            {
+                for value in values {
+                    common.extend(value.chars());
+                }
+            }
+        }
+    }
     common.retain(|c| !c.is_control());
     let mut ui = BTreeMap::new();
     let mut text = BTreeMap::new();
@@ -317,4 +342,46 @@ pub(crate) fn prepare(
         license_digest: String::new(),
     };
     Ok((output, report))
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    #[test]
+    fn bound_enum_alternatives_and_control_labels_enter_every_author_text_plan() {
+        let mut p: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        p.theme.image_menus.insert("title".into(),serde_json::from_value(serde_json::json!({
+            "background":"bg.station","buttons":[],
+            "locals":{"tab":{"type":"enum","initial":"甲","values":["甲","乙"]}},
+            "elements":[
+                {"id":"label","rect":[0,0,100,30],"text_local":"tab","content":{"type":"text","text":"甲","size":20,"color":[1,1,1,1]}},
+                {"id":"button","rect":[0,40,100,30],"content":{"type":"hit_region","label":"丙","action":{"type":"new_game"}}}
+            ]
+        })).unwrap());
+        let sets = characters_by_plan(&p, "Test").unwrap();
+        for chars in sets.text.values() {
+            for c in ['甲', '乙', '丙'] {
+                assert!(chars.contains(&c), "missing {c}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod menu_text_tests {
+    use super::*;
+    #[test]
+    fn text_button_label_enters_all_author_font_plans() {
+        let mut p: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        p.theme.image_menus.insert("title".into(),serde_json::from_value(serde_json::json!({
+            "background":"bg.station","buttons":[],"elements":[{"id":"caption","rect":[0,0,100,40],"content":{"type":"text_button","label":"Ω雪","size":26,"color":[1,1,1,1],"hover_color":[0,1,0,1],"disabled_color":[0,0,0,1],"action":{"type":"settings"}}}]
+        })).unwrap());
+        let sets = characters_by_plan(&p, "Test").unwrap();
+        assert!(!sets.ui.is_empty() && !sets.text.is_empty());
+        for chars in sets.ui.values().chain(sets.text.values()) {
+            assert!(chars.contains(&'Ω') && chars.contains(&'雪'));
+        }
+    }
 }

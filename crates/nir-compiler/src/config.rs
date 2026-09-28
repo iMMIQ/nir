@@ -67,6 +67,8 @@ impl LocaleManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeManifest {
+    #[serde(default)]
+    pub menu_overlay: Option<String>,
     pub format: u32,
     pub id: String,
     pub base: String,
@@ -206,6 +208,7 @@ pub(crate) fn resolve_config(
             "dialogue",
             "choice",
             "image_menus",
+            "menu_overlay",
             "return_to_title",
         ] {
             record(
@@ -222,6 +225,7 @@ pub(crate) fn resolve_config(
         theme.dialogue = m.dialogue;
         theme.choice = m.choice;
         theme.image_menus = m.image_menus;
+        theme.menu_overlay = m.menu_overlay;
         theme.return_to_title = m.return_to_title;
     }
     let tokens: ThemeTokens = json(&tokens_path)?;

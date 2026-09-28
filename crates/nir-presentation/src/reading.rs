@@ -1,12 +1,47 @@
 use super::*;
+#[path = "reading_flow.rs"]
+mod flow;
+pub(super) use flow::HistoryFlowView;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScrollView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub menu: Option<MenuScrollIdentity>,
     pub region: ScrollRegion,
     pub rect: [f32; 4],
     pub offset: f32,
     pub max: f32,
     pub step: f32,
+}
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MenuScrollIdentity {
+    pub instance: u32,
+    pub revision: u32,
+    pub window: String,
+    pub layout: u32,
+}
+impl ScrollView {
+    pub fn action(&self, delta: i32, page: bool) -> UiAction {
+        if let Some(menu) = &self.menu {
+            UiAction::MenuHistoryScroll {
+                control: None,
+                instance: menu.instance,
+                revision: menu.revision,
+                window: menu.window.clone(),
+                layout: menu.layout,
+                input: if page {
+                    HistoryScrollInput::Page { delta }
+                } else {
+                    HistoryScrollInput::Step { delta }
+                },
+            }
+        } else {
+            UiAction::Scroll {
+                region: self.region,
+                delta,
+            }
+        }
+    }
 }
 #[derive(Debug, Default)]
 struct TextView {
@@ -17,11 +52,17 @@ struct TextView {
 }
 #[derive(Debug, Default)]
 pub struct ReadingState {
+    pub(crate) bar_pointer: Option<[f32; 2]>,
+    pub(crate) bar_pressed: Option<(MenuScrollIdentity, String, HistoryBarPart)>,
+    pub(crate) bar_gesture: Option<crate::scrollbar::BarGesture>,
+    flow: Option<flow::State>,
+    flow_pending: bool,
     identity: Option<(u32, u32)>,
     history_identity: Option<(u32, usize, usize)>,
     dialogue: TextView,
     history: TextView,
     choice_offset: f32,
+    settings_offset: f32,
 }
 impl ReadingState {
     pub fn matches(&self, identity: (u32, u32)) -> bool {
@@ -31,7 +72,11 @@ impl ReadingState {
         self.dialogue.follow = false;
     }
     pub fn scroll(&mut self, region: ScrollRegion, delta: i32, packet: &DrawPacket) -> bool {
-        let Some(view) = packet.scrolls.iter().find(|v| v.region == region) else {
+        let Some(view) = packet
+            .scrolls
+            .iter()
+            .find(|v| v.region == region && v.menu.is_none())
+        else {
             return false;
         };
         let offset = (view.offset + delta.clamp(-1, 1) as f32 * view.step).clamp(0., view.max);
@@ -42,6 +87,7 @@ impl ReadingState {
             }
             ScrollRegion::Choices => self.choice_offset = offset,
             ScrollRegion::History => self.history.offset = offset,
+            ScrollRegion::Settings => self.settings_offset = offset,
         }
         true
     }
@@ -102,7 +148,19 @@ impl ReadingState {
                     + 12.
             })
             .collect();
-        let mut p = project_measured(m, width, height, messages, &heights, self.choice_offset);
+        let mut p = project_measured(
+            m,
+            width,
+            height,
+            messages,
+            &heights,
+            self.choice_offset,
+            self.settings_offset,
+        );
+        let paints = p.menu_paint.len();
+        self.project_history_flow(&mut p, m, identity.0, messages, text);
+        let added = p.menu_paint.len() - paints;
+        self.project_history_bar(&mut p, m, added);
         text.layout(&p);
         let mut views = vec![];
         for r in &mut p.texts {
@@ -112,7 +170,7 @@ impl ReadingState {
             let view = match region {
                 ScrollRegion::Dialogue => &mut self.dialogue,
                 ScrollRegion::History => &mut self.history,
-                ScrollRegion::Choices => continue,
+                ScrollRegion::Choices | ScrollRegion::Settings => continue,
             };
             let shape = TextEngine::key(r);
             let buffer = &text.buffers[&shape];
@@ -153,6 +211,7 @@ impl ReadingState {
             r.scroll = view.offset;
             if max > 0. {
                 views.push(ScrollView {
+                    menu: None,
                     region,
                     rect: [r.x, r.y, r.width, r.height],
                     offset: view.offset,
@@ -165,6 +224,9 @@ impl ReadingState {
             if let Some(index) = p.dialogue_hint.take() {
                 p.texts.remove(index);
             }
+            if let Some(index) = p.dialogue_hint_quad.take() {
+                p.quads.remove(index);
+            }
         }
         self.choice_offset = p
             .scrolls
@@ -172,6 +234,11 @@ impl ReadingState {
             .find(|v| v.region == ScrollRegion::Choices)
             .map(|v| v.offset)
             .unwrap_or(0.);
+        self.settings_offset = p
+            .scrolls
+            .iter()
+            .find(|v| v.region == ScrollRegion::Settings)
+            .map_or(0., |v| v.offset);
         for v in views {
             controls(&mut p, v, m, messages);
         }
@@ -180,6 +247,8 @@ impl ReadingState {
 }
 
 pub(super) fn controls(p: &mut DrawPacket, view: ScrollView, m: &UiModel, messages: &Messages) {
+    let first_quad = p.quads.len();
+    let first_text = p.texts.len();
     let [x, y, w, h] = view.rect;
     let button_width = ((w - 6.) / 2.).min(144.);
     // Always reachable outside the clipped content, including while a Gate is latched.
@@ -201,6 +270,15 @@ pub(super) fn controls(p: &mut DrawPacket, view: ScrollView, m: &UiModel, messag
         p.semantics.last_mut().unwrap().enabled = enabled;
         if !enabled {
             p.texts.last_mut().unwrap().color = m.theme.muted;
+        }
+    }
+    if view.region == ScrollRegion::Dialogue {
+        let appearance = m.dialogue_appearance;
+        for quad in &mut p.quads[first_quad..] {
+            quad.color[3] *= appearance.opacity * appearance.background_opacity;
+        }
+        for text in &mut p.texts[first_text..] {
+            text.color[3] *= appearance.opacity * appearance.text_opacity;
         }
     }
     p.scrolls.push(view);

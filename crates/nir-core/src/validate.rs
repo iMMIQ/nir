@@ -194,7 +194,10 @@ impl RuntimeProgramView {
         if let Some(definition) = self.cues.get(cue) {
             for effect in &definition.effects {
                 match &effect.effect {
-                    Effect::StagePresent { scene, .. } => {
+                    Effect::StagePresent {
+                        scene, transition, ..
+                    } => {
+                        set.extend(transition.asset().map(str::to_owned));
                         if let Some(nodes) = self.scenes.get(scene) {
                             set.extend(nodes.iter().filter_map(|node| node.asset.clone()));
                         }
@@ -332,7 +335,10 @@ impl RuntimeProgramView {
             if let Some(definition) = p.cues.get(cue) {
                 for effect in &definition.effects {
                     match &effect.effect {
-                        Effect::StagePresent { scene, .. } => {
+                        Effect::StagePresent {
+                            scene, transition, ..
+                        } => {
+                            assets.extend(transition.asset().map(str::to_owned));
                             if let Some(nodes) = p.scenes.get(scene) {
                                 assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
                             }
@@ -1817,8 +1823,8 @@ fn validate_image_menus(
         }
     }
     for menu in theme.image_menus.values() {
-        for button in &menu.buttons {
-            if let ImageMenuAction::Entry { function: id } = &button.action {
+        for (_, action, _) in menu.controls() {
+            if let ImageMenuAction::Entry { function: id } = action {
                 if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
                     return Err(err(
                         "E_THEME_ENTRY",
@@ -1833,6 +1839,205 @@ fn validate_image_menus(
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
+    if (root.theme.menu_overlay.is_some()
+        || root
+            .theme
+            .image_menus
+            .values()
+            .any(ImageMenu::uses_services))
+        && !root.requires.iter().any(|c| c == "ui.menu-services.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-services.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| !m.builtin_navigation)
+        && !root.requires.iter().any(|c| c == "ui.menu-chrome.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-chrome.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_text_buttons)
+        && !root.requires.iter().any(|c| c == "ui.menu-text-button.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-text-button.v1",
+        ));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_stack)
+        && !root.requires.iter().any(|c| c == "ui.menu-stack.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-stack.v1"));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_story)
+        && !root.requires.iter().any(|c| c == "ui.menu-story.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-story.v1"));
+    }
+    for menu in root.theme.image_menus.values() {
+        menu.validate_story_exports(&root.variables)?;
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_reading)
+        && !root.requires.iter().any(|c| c == "ui.menu-reading.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-reading.v1",
+        ));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_storage)
+        && !root.requires.iter().any(|c| c == "ui.menu-storage.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-storage.v1",
+        ));
+    }
+
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_navigation)
+        && !root.requires.iter().any(|c| c == "ui.menu-navigation.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-navigation.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_scrollbar)
+        && !root
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-scrollbar.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-scrollbar.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_flow)
+        && !root.requires.iter().any(|c| c == "ui.menu-history-flow.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-flow.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_availability)
+        && !root
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-availability.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-availability.v1",
+        ));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_history)
+        && !root.requires.iter().any(|c| c == "ui.menu-history.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-history.v1",
+        ));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_values)
+        && !root.requires.iter().any(|c| c == "ui.menu-values.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-values.v1",
+        ));
+    }
+    if root.theme.image_menus.values().any(ImageMenu::uses_state)
+        && !root.requires.iter().any(|c| c == "ui.menu-state.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-state.v1"));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| !m.elements.is_empty())
+        && !root.requires.iter().any(|c| c == "ui.menu-elements.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-elements.v1",
+        ));
+    }
+    if root.theme.dialogue.shadow.is_some()
+        && !root.requires.iter().any(|cap| cap == "text.shadow.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.dialogue.shadow",
+            "text.shadow.v1",
+        ));
+    }
+    if root.player.auto_delay_policy != AutoDelayPolicy::LengthScaled
+        && !root
+            .requires
+            .iter()
+            .any(|cap| cap == "player.auto-delay-policy.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "player.auto_delay_policy",
+            "player.auto-delay-policy.v1",
+        ));
+    }
+    if root.player.hide_policy != HidePolicy::ContinueStory
+        && !root
+            .requires
+            .iter()
+            .any(|cap| cap == "player.hide-policy.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "player.hide_policy",
+            "player.hide-policy.v1",
+        ));
+    }
     validate_image_menus(
         &root.theme,
         |id| root.assets.get(id).map(|a| a.kind),
@@ -2329,8 +2534,36 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
             if !names.insert(&def.id) {
                 return Err(err("E_DUPLICATE", id, &def.id));
             }
+            if matches!(def.effect, Effect::Tween { .. })
+                && !root.requires.iter().any(|c| c == "tween.target.v1")
+            {
+                return Err(err("E_CAPABILITY", id, "tween.target.v1"));
+            }
+            if let Some((address, track, _)) = def.effect.scalar_track(0., 0.) {
+                if !address.accepts(track.to) {
+                    return Err(err("E_VISUAL", id, "invalid target value"));
+                }
+                if !writers.insert(address) {
+                    return Err(err("E_OWNERSHIP", id, "multiple property writers"));
+                }
+            }
             match &def.effect {
-                Effect::StagePresent { scene, .. } => {
+                Effect::StagePresent {
+                    scene, transition, ..
+                } => {
+                    if !transition.valid() {
+                        return Err(err("E_TRANSITION", id, "invalid wipe softness"));
+                    }
+                    if let Some(cap) = transition.capability() {
+                        if !root.requires.iter().any(|c| c == cap) {
+                            return Err(err("E_CAPABILITY", id, cap));
+                        }
+                    }
+                    if let Some(asset) = transition.asset() {
+                        if view.asset_kind(asset) != Some(AssetKind::Image) {
+                            return Err(err("E_ASSET", id, "mask must reference an image"));
+                        }
+                    }
                     stages += 1;
                     if root.scene_owners.get(scene) != Some(&package.module)
                         || view.scenes.get(scene).is_none()
@@ -2349,20 +2582,44 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                         return Err(err("E_TEXT", id, text));
                     }
                 }
+                Effect::AudioStop {
+                    target,
+                    duration_us,
+                } => {
+                    if !view.requires.iter().any(|cap| cap == "audio.stop.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.stop.v1"));
+                    }
+                    if root.task_owners.get(target) != Some(&package.module)
+                        || duration_us.0 > 60_000_000
+                        || target == &def.id
+                        || !view.task_definitions.get(target).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err(
+                            "E_AUDIO_STOP",
+                            id,
+                            "stop requires an audio target and duration within 0..60s",
+                        ));
+                    }
+                }
+                Effect::Audio { gain, .. }
+                    if *gain != 1.0 && !view.requires.iter().any(|c| c == "audio.gain.v1") =>
+                {
+                    return Err(err("E_CAPABILITY", id, "audio.gain.v1"));
+                }
+                Effect::Audio { gain, .. } if !valid_audio_gain(*gain) => {
+                    return Err(err(
+                        "E_AUDIO_GAIN",
+                        id,
+                        "event gain must be finite and within 0..4",
+                    ));
+                }
                 Effect::Audio { asset, .. } if view.asset_kind(asset) != Some(AssetKind::Audio) => {
                     return Err(err("E_ASSET_TYPE", id, asset));
-                }
-                Effect::Clip {
-                    node, property, to, ..
-                } if !to.is_finite()
-                    || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
-                    || (*property == Property::Scale && *to < 0.)
-                    || !writers.insert((node, property)) =>
-                {
-                    return Err(err("E_VISUAL", id, node));
-                }
-                Effect::Clip { node, property, .. } => {
-                    writers.insert((node, property));
                 }
                 _ => {}
             }
@@ -2394,7 +2651,16 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                     ));
                 }
             }
-            if let Effect::StagePresent { scene, .. } = &effect.effect {
+            if let Effect::StagePresent {
+                scene, transition, ..
+            } = &effect.effect
+            {
+                if let Some(asset) = transition.asset() {
+                    expected.insert(asset.to_owned());
+                    if !recipe.contains(asset) {
+                        return Err(err("E_RECIPE", id, "mask missing from activation recipe"));
+                    }
+                }
                 let nodes = view.scenes.get(scene).map(Vec::as_slice).or_else(|| {
                     (view.title_scene.as_deref() == Some(scene))
                         .then_some(view.title_nodes.as_slice())
@@ -2517,6 +2783,56 @@ fn validate_runtime_function(
         for op in &block.ops {
             if !op_ids.insert(&op.id) {
                 return Err(err("E_DUPLICATE", &at, &op.id));
+            }
+            if let Operation::DialogueVoice { task, voice, wait } = &op.operation {
+                if !view.requires.iter().any(|c| c == "text.voice-binding.v1") {
+                    return Err(err("E_CAPABILITY", &op.id, "text.voice-binding.v1"));
+                }
+                let root = view.runtime_root().unwrap();
+                if *wait == VoiceWaitPolicy::SampledRemaining {
+                    if !view.requires.iter().any(|c| c == "text.voice-timer.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "text.voice-timer.v1"));
+                    }
+                    // Code may precede its asset catalog. Catalog admission independently
+                    // rejects audio without a positive duration before playback.
+                    if voice.as_ref().is_some_and(|name|view.task_definitions.get(name).is_some_and(|defs|defs.iter().any(|effect|
+                        matches!(effect.as_ref(),Effect::Audio{asset,..} if view.asset(asset).is_some_and(|a|a.duration_us.0==0))
+                    ))) { return Err(err("E_VOICE_DURATION",&op.id,"sampled voice timer requires known asset duration")); }
+                }
+                let local = |name: &str| {
+                    root.task_owners.get(name).map(String::as_str) == view.function_module(fid)
+                };
+                let dialogue = view.task_definitions.get(task);
+                if !local(task)
+                    || !dialogue.is_some_and(|defs| {
+                        !defs.is_empty()
+                            && defs
+                                .iter()
+                                .all(|e| matches!(e.as_ref(), Effect::Dialogue { .. }))
+                    })
+                    || voice.as_ref().is_some_and(|name| {
+                        !local(name)
+                            || !view.task_definitions.get(name).is_some_and(|defs| {
+                                defs.iter().all(|e| {
+                                    matches!(
+                                        e.as_ref(),
+                                        Effect::Audio {
+                                            bus: AudioBus::Voice,
+                                            ..
+                                        }
+                                    )
+                                }) && defs.iter().any(|e| {
+                                    matches!(e.as_ref(), Effect::Audio { looped: false, .. })
+                                })
+                            })
+                    })
+                {
+                    return Err(err(
+                        "E_VOICE_BINDING",
+                        &op.id,
+                        "expected local dialogue and non-looping Voice task",
+                    ));
+                }
             }
             match &op.operation {
                 Operation::Assign { target, value }
@@ -2823,6 +3139,180 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         return validate_runtime_root(root);
     }
     validate_ui_config(&p.theme, &p.player)?;
+    if (p.theme.menu_overlay.is_some()
+        || p.theme.image_menus.values().any(ImageMenu::uses_services))
+        && !p.requires.iter().any(|c| c == "ui.menu-services.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-services.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(|m| !m.builtin_navigation)
+        && !p.requires.iter().any(|c| c == "ui.menu-chrome.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-chrome.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_text_buttons)
+        && !p.requires.iter().any(|c| c == "ui.menu-text-button.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-text-button.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_stack)
+        && !p.requires.iter().any(|c| c == "ui.menu-stack.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-stack.v1"));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_story)
+        && !p.requires.iter().any(|c| c == "ui.menu-story.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-story.v1"));
+    }
+    for menu in p.theme.image_menus.values() {
+        menu.validate_story_exports(&p.variables)?;
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_reading)
+        && !p.requires.iter().any(|c| c == "ui.menu-reading.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-reading.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_storage)
+        && !p.requires.iter().any(|c| c == "ui.menu-storage.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-storage.v1",
+        ));
+    }
+
+    if p.theme.image_menus.values().any(ImageMenu::uses_navigation)
+        && !p.requires.iter().any(|c| c == "ui.menu-navigation.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-navigation.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_scrollbar)
+        && !p
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-scrollbar.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-scrollbar.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_flow)
+        && !p.requires.iter().any(|c| c == "ui.menu-history-flow.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-flow.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_availability)
+        && !p
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-availability.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-availability.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_history)
+        && !p.requires.iter().any(|c| c == "ui.menu-history.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-history.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_values)
+        && !p.requires.iter().any(|c| c == "ui.menu-values.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            "requires",
+            "ui.menu-values.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_state)
+        && !p.requires.iter().any(|c| c == "ui.menu-state.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-state.v1"));
+    }
+    if p.theme.image_menus.values().any(|m| !m.elements.is_empty())
+        && !p.requires.iter().any(|c| c == "ui.menu-elements.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-elements.v1",
+        ));
+    }
+    if p.theme.dialogue.shadow.is_some() && !p.requires.iter().any(|cap| cap == "text.shadow.v1") {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.dialogue.shadow",
+            "text.shadow.v1",
+        ));
+    }
+    if p.player.auto_delay_policy != AutoDelayPolicy::LengthScaled
+        && !p
+            .requires
+            .iter()
+            .any(|cap| cap == "player.auto-delay-policy.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "player.auto_delay_policy",
+            "player.auto-delay-policy.v1",
+        ));
+    }
+    if p.player.hide_policy != HidePolicy::ContinueStory
+        && !p.requires.iter().any(|cap| cap == "player.hide-policy.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "player.hide_policy",
+            "player.hide-policy.v1",
+        ));
+    }
     validate_image_menus(
         &p.theme,
         |id| p.asset_kind(id),
@@ -3060,8 +3550,36 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 return Err(err("E_DUPLICATE", id, &def.id));
             }
             task_defs.entry(&def.id).or_default().push(&def.effect);
+            if matches!(def.effect, Effect::Tween { .. })
+                && !p.requires.iter().any(|c| c == "tween.target.v1")
+            {
+                return Err(err("E_CAPABILITY", id, "tween.target.v1"));
+            }
+            if let Some((address, track, _)) = def.effect.scalar_track(0., 0.) {
+                if !address.accepts(track.to) {
+                    return Err(err("E_VISUAL", id, "invalid target value"));
+                }
+                if !writers.insert(address) {
+                    return Err(err("E_OWNERSHIP", id, "multiple property writers"));
+                }
+            }
             match &def.effect {
-                Effect::StagePresent { scene, .. } => {
+                Effect::StagePresent {
+                    scene, transition, ..
+                } => {
+                    if !transition.valid() {
+                        return Err(err("E_TRANSITION", id, "invalid wipe softness"));
+                    }
+                    if let Some(cap) = transition.capability() {
+                        if !p.requires.iter().any(|c| c == cap) {
+                            return Err(err("E_CAPABILITY", id, cap));
+                        }
+                    }
+                    if let Some(asset) = transition.asset() {
+                        if p.asset_kind(asset) != Some(AssetKind::Image) {
+                            return Err(err("E_ASSET", id, "mask must reference an image"));
+                        }
+                    }
                     stage_count += 1;
                     if !p.scenes.contains_key(scene) {
                         return Err(err("E_SCENE", id, scene));
@@ -3075,24 +3593,45 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         return Err(err("E_TEXT", id, text));
                     }
                 }
+                Effect::AudioStop {
+                    target,
+                    duration_us,
+                } => {
+                    if !p.requires.iter().any(|cap| cap == "audio.stop.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.stop.v1"));
+                    }
+                    if duration_us.0 > 60_000_000
+                        || target == &def.id
+                        || !p.task_definitions.get(target).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err(
+                            "E_AUDIO_STOP",
+                            id,
+                            "stop requires an audio target and duration within 0..60s",
+                        ));
+                    }
+                }
+                Effect::Audio { gain, .. }
+                    if *gain != 1.0 && !p.requires.iter().any(|c| c == "audio.gain.v1") =>
+                {
+                    return Err(err("E_CAPABILITY", id, "audio.gain.v1"));
+                }
+                Effect::Audio { gain, .. } if !valid_audio_gain(*gain) => {
+                    return Err(err(
+                        "E_AUDIO_GAIN",
+                        id,
+                        "event gain must be finite and within 0..4",
+                    ));
+                }
                 Effect::Audio { asset, .. }
                     if p.assets.get(asset).map(|a| a.kind) != Some(AssetKind::Audio) =>
                 {
                     return Err(err("E_ASSET_TYPE", id, asset));
-                }
-                Effect::Clip {
-                    node, property, to, ..
-                } if !to.is_finite()
-                    || (*property == Property::Opacity && !(0.0..=1.0).contains(to))
-                    || (*property == Property::Scale && *to < 0.) =>
-                {
-                    return Err(err("E_VISUAL", id, node));
-                }
-                Effect::Clip { node, property, .. } if !writers.insert((node, property)) => {
-                    return Err(err("E_OWNERSHIP", id, node));
-                }
-                Effect::Clip { node, property, .. } => {
-                    writers.insert((node, property));
                 }
                 _ => {}
             }
@@ -3154,6 +3693,43 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             for op in &b.ops {
                 if !op_ids.insert(&op.id) {
                     return Err(err("E_DUPLICATE", &at, &op.id));
+                }
+                if let Operation::DialogueVoice { task, voice, wait } = &op.operation {
+                    if !p.requires.iter().any(|c| c == "text.voice-binding.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "text.voice-binding.v1"));
+                    }
+                    if *wait == VoiceWaitPolicy::SampledRemaining {
+                        if !p.requires.iter().any(|c| c == "text.voice-timer.v1") {
+                            return Err(err("E_CAPABILITY", &op.id, "text.voice-timer.v1"));
+                        }
+                        if voice.as_ref().is_some_and(|name|task_defs.get(name.as_str()).is_some_and(|defs|defs.iter().any(|effect|
+                            matches!(effect,Effect::Audio{asset,..} if p.assets.get(asset).is_none_or(|a|a.duration_us.0==0))
+                        ))) { return Err(err("E_VOICE_DURATION",&op.id,"sampled voice timer requires known asset duration")); }
+                    }
+                    if !task_defs.get(task.as_str()).is_some_and(|defs| {
+                        !defs.is_empty()
+                            && defs.iter().all(|e| matches!(e, Effect::Dialogue { .. }))
+                    }) || voice.as_ref().is_some_and(|name| {
+                        !task_defs.get(name.as_str()).is_some_and(|defs| {
+                            defs.iter().all(|e| {
+                                matches!(
+                                    e,
+                                    Effect::Audio {
+                                        bus: AudioBus::Voice,
+                                        ..
+                                    }
+                                )
+                            }) && defs
+                                .iter()
+                                .any(|e| matches!(e, Effect::Audio { looped: false, .. }))
+                        })
+                    }) {
+                        return Err(err(
+                            "E_VOICE_BINDING",
+                            &op.id,
+                            "expected dialogue and non-looping Voice task",
+                        ));
+                    }
                 }
                 match &op.operation {
                     Operation::Assign { target, value }
@@ -4068,6 +4644,62 @@ mod runtime_tests {
     }
 
     #[test]
+    fn runtime_code_rejects_undeclared_voice_binding_capability() {
+        let mut function = simple_function();
+        function
+            .blocks
+            .get_mut(&function.entry.clone())
+            .unwrap()
+            .ops
+            .push(Op {
+                id: "bind".into(),
+                operation: Operation::DialogueVoice {
+                    task: "m.line".into(),
+                    voice: None,
+                    wait: VoiceWaitPolicy::Parallel,
+                },
+            });
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), function)]),
+            empty_static(),
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_CAPABILITY");
+    }
+
+    #[test]
+    fn runtime_static_rejects_undeclared_typed_target_capability() {
+        let mut package = empty_static();
+        package.cues.insert(
+            "m.cue".into(),
+            Cue {
+                effects: vec![EffectDef {
+                    id: "m.fade".into(),
+                    scope: Scope::Session,
+                    effect: Effect::Tween {
+                        target: TweenTarget::DialogueRoot {
+                            property: DialogueProperty::Opacity,
+                        },
+                        to: 0.,
+                        duration_us: Micros(1000),
+                        replace: false,
+                        easing: Easing::Linear,
+                        finish: FinishPolicy::CommitEnd,
+                        cancel: CancelPolicy::CommitCurrent,
+                    },
+                }],
+            },
+        );
+        package
+            .activation_recipes
+            .insert("m.cue".into(), BTreeSet::new());
+        let (view, batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            package,
+        );
+        assert_eq!(view.install_batch(batch).unwrap_err().code, "E_CAPABILITY");
+    }
+
+    #[test]
     fn runtime_static_rejects_invalid_clip_values_and_incomplete_recipes() {
         let clip = EffectDef {
             id: "m.clip".into(),
@@ -4125,6 +4757,7 @@ mod runtime_tests {
                     scope: Scope::Scene,
                     effect: Effect::StagePresent {
                         scene: "m.scene".into(),
+                        transition: StageTransition::default(),
                         duration_us: Micros(0),
                     },
                 }],

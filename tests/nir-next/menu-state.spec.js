@@ -1,0 +1,26 @@
+import {test,expect} from '@playwright/test';
+test('finite tabs, conditional controls, stale revisions and keyboard focus share one menu state',async({page})=>{
+  await page.setViewportSize({width:1280,height:720});
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto('http://127.0.0.1:4205/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'}).catch(e=>{if(!e.message.includes('interrupted'))throw e;});
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+  const tab=name=>page.getByRole('button',{name:`${name} tab`,exact:true});
+  const slot=page.getByRole('button',{name:'Select slot 2',exact:true});
+  const stale=JSON.parse(await tab('History').getAttribute('data-action'));
+  expect(await slot.count()).toBe(0);
+  await tab('Saves').focus();await page.keyboard.press('Enter');
+  await expect(slot).toBeEnabled();
+  await expect(tab('Saves')).toBeFocused();
+  const current=JSON.parse(await tab('History').getAttribute('data-action'));
+  expect(current.revision).toBeGreaterThan(stale.revision);
+  await page.evaluate(a=>window.__nir.action(a),stale);
+  await expect(slot).toBeEnabled();
+  await page.mouse.click(150,460);await expect(slot).toBeDisabled();
+  await tab('History').focus();await page.keyboard.press('Enter');
+  await expect(slot).toHaveCount(0);
+  await tab('Saves').focus();await page.keyboard.press('Enter');
+  await expect(slot).toBeDisabled();
+  await expect(tab('Saves')).toBeFocused();
+  expect(await page.evaluate(()=>window.__nir.state().screen)).toBe('Title');
+  expect(errors).toEqual([]);
+});

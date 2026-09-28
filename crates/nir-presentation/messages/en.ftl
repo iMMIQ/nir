@@ -2,6 +2,7 @@ new-game = Begin reading
 continue = Continue
 menu = Menu
 close = Back to story
+back = Back
 settings = Settings
 history = History
 saves = Save / Load
@@ -56,3 +57,16 @@ title-hint = SPACE  →  READ     ·     ESC  →  MENU
 advance-hint = SPACE / ↗
 gate-hint = …
 reveal-hint = · · ·
+
+text-speed = Text speed
+auto-wait = Auto wait
+reading-preferences-hint = Text speed applies to the next dialogue; auto wait applies to the next timer.
+
+hide-interface = Hide
+show-interface = Show interface
+
+overwrite-slot = Overwrite save slot
+confirm-overwrite = Confirm overwrite
+cancel-overwrite = Cancel
+
+history-unavailable = History is unavailable. Close this page and try again.

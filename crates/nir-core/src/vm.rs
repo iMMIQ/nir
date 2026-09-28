@@ -27,6 +27,31 @@ pub enum TaskState {
     Cancelled,
     Failed,
 }
+/// Why a task became terminal; never replaces its Await-compatible state.
+/// Snapshot v2 requires a reason for every terminal task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEndReason {
+    Completed,
+    NaturalEnd,
+    FinishedByControl,
+    CancelledByControl,
+    Replaced,
+    ScopeExited,
+    Failed,
+}
+fn unit_envelope() -> f32 {
+    1.0
+}
+impl TaskEndReason {
+    fn state(self) -> TaskState {
+        match self {
+            Self::Completed | Self::NaturalEnd | Self::FinishedByControl => TaskState::Finished,
+            Self::CancelledByControl | Self::Replaced | Self::ScopeExited => TaskState::Cancelled,
+            Self::Failed => TaskState::Failed,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenSpan {
@@ -34,6 +59,13 @@ pub struct FrozenSpan {
     pub text: String,
     pub emphasis: bool,
     pub gate: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueReading {
+    pub voice: Option<u32>,
+    pub wait: VoiceWaitPolicy,
+    pub revision: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +84,10 @@ pub struct Dialogue {
     pub awaiting_advance: bool,
     pub last_reveal_us: Micros,
     pub interaction: u32,
+    #[serde(default)]
+    pub reading: Option<DialogueReading>,
+    #[serde(default)]
+    pub reveal_interval_us: Option<Micros>,
 }
 impl Dialogue {
     pub fn full_text(&self) -> String {
@@ -80,6 +116,16 @@ pub struct Task {
     pub scope: Scope,
     pub effect: Effect,
     pub state: TaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<TaskEndReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_task: Option<u32>,
+    #[serde(default = "unit_envelope")]
+    pub audio_envelope: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_position_us: Option<Micros>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_device_elapsed_us: Option<Micros>,
     pub started_us: Micros,
     pub elapsed_us: Micros,
     pub milestones: BTreeSet<Milestone>,
@@ -158,6 +204,8 @@ pub struct Snapshot {
     pub choice: Option<OfferedChoice>,
     #[serde(default)]
     pub dialogue_hidden: bool,
+    #[serde(default)]
+    pub dialogue_appearance: DialogueAppearance,
     pub history: Vec<HistoryEntry>,
     pub locale: String,
     pub next_id: u32,
@@ -214,6 +262,15 @@ pub enum CoreIntent {
         bus: AudioBus,
         looped: bool,
         position_us: Micros,
+        gain: f32,
+    },
+    AudioEnvelope {
+        owner: Option<u32>,
+        elapsed_us: Micros,
+        task: u32,
+        from: f32,
+        to: f32,
+        duration_us: Micros,
     },
     AudioStop {
         task: u32,
@@ -245,6 +302,7 @@ pub struct Core {
     intents: Vec<CoreIntent>,
     work_remaining: u32,
     remaining_time_us: u64,
+    text_speed: f32,
 }
 impl Core {
     pub fn new(program: ValidatedProgram, release: String, locale: String) -> Result<Self> {
@@ -299,6 +357,7 @@ impl Core {
             waiting: None,
             choice: None,
             dialogue_hidden: false,
+            dialogue_appearance: DialogueAppearance::default(),
             history: vec![],
             locale,
             next_id: 2,
@@ -314,7 +373,16 @@ impl Core {
             intents: vec![],
             work_remaining: 0,
             remaining_time_us: 0,
+            text_speed: 1.,
         })
+    }
+    /// Player preference captured by the next dialogue; never scales Story time.
+    pub fn set_text_speed(&mut self, speed: f32) -> Result<()> {
+        if !speed.is_finite() || !(0.25..=4.).contains(&speed) {
+            return Err(self.error("E_PREFERENCE", "text speed outside 0.25..4"));
+        }
+        self.text_speed = speed;
+        Ok(())
     }
     pub fn state(&self) -> &Snapshot {
         &self.state
@@ -773,7 +841,7 @@ impl Core {
                     matches!(t.effect, Effect::Audio { looped: false, .. })
                         && t.state == TaskState::Running
                 }) {
-                    self.finish_task(task, TaskState::Finished)?;
+                    self.end_task(task, TaskEndReason::NaturalEnd)?;
                 }
             }
             CoreInput::TaskFailed { task, message } => {
@@ -964,13 +1032,64 @@ impl Core {
                     .handles
                     .get(task)
                     .ok_or_else(|| self.error("E_TASK", task))?;
-                self.finish_task(
+                self.end_task(
                     id,
                     match action {
-                        TaskAction::Cancel => TaskState::Cancelled,
-                        TaskAction::Finish => TaskState::Finished,
+                        TaskAction::Cancel => TaskEndReason::CancelledByControl,
+                        TaskAction::Finish => TaskEndReason::FinishedByControl,
                     },
                 )?;
+            }
+            Operation::DialogueVoice { task, voice, wait } => {
+                let id = *self
+                    .state
+                    .handles
+                    .get(task)
+                    .ok_or_else(|| self.error("E_TASK", task))?;
+                let voice_id = voice
+                    .as_ref()
+                    .map(|name| {
+                        let id = *self
+                            .state
+                            .handles
+                            .get(name)
+                            .ok_or_else(|| self.error("E_TASK", name))?;
+                        if !matches!(
+                            self.state.tasks[&id].effect,
+                            Effect::Audio {
+                                bus: AudioBus::Voice,
+                                looped: false,
+                                ..
+                            }
+                        ) {
+                            return Err(self.error(
+                                "E_TASK_TYPE",
+                                "reading voice must be non-looping Voice audio",
+                            ));
+                        }
+                        Ok(id)
+                    })
+                    .transpose()?;
+                let at = self.location();
+                let t = self.state.tasks.get_mut(&id).unwrap();
+                if t.state != TaskState::Running {
+                    return Err(Diagnostic::new("E_TASK", at, "dialogue has ended"));
+                }
+                let d = t
+                    .dialogue
+                    .as_mut()
+                    .ok_or_else(|| Diagnostic::new("E_TASK_TYPE", &at, task))?;
+                let revision = d
+                    .reading
+                    .as_ref()
+                    .map_or(0, |r| r.revision)
+                    .checked_add(1)
+                    .ok_or_else(|| Diagnostic::new("E_LIMIT", at, "reading binding revisions"))?;
+                d.reading = Some(DialogueReading {
+                    voice: voice_id,
+                    wait: *wait,
+                    revision,
+                });
             }
             Operation::DialogueContinue { task } => {
                 let id = *self
@@ -1064,7 +1183,7 @@ impl Core {
                     .map(|t| t.id)
                     .collect();
                 for id in ids {
-                    self.finish_task(id, TaskState::Cancelled)?;
+                    self.end_task(id, TaskEndReason::ScopeExited)?;
                 }
                 let f = self.frame().clone();
                 if let Some(next) = f.return_to {
@@ -1082,7 +1201,12 @@ impl Core {
                 let id = self.id()?;
                 let mut dialogues = BTreeMap::new();
                 for def in &effects {
-                    if let Effect::Dialogue { text, speaker, .. } = &def.effect {
+                    if let Effect::Dialogue {
+                        text,
+                        speaker,
+                        reveal_us,
+                    } = &def.effect
+                    {
                         let d = Dialogue {
                             text_id: text.clone(),
                             meaning_revision: self.program().texts[text].meaning_revision,
@@ -1104,6 +1228,10 @@ impl Core {
                             awaiting_advance: false,
                             last_reveal_us: self.state.tick_us,
                             interaction: self.id()?,
+                            reading: None,
+                            reveal_interval_us: Some(Micros(
+                                (reveal_us.0 as f64 / self.text_speed as f64).round() as u64,
+                            )),
                         };
                         dialogues.insert(def.id.clone(), d);
                     }
@@ -1202,7 +1330,7 @@ impl Core {
             Terminator::End { outcome } => {
                 let ids: Vec<_> = self.state.tasks.keys().copied().collect();
                 for id in ids {
-                    self.finish_task(id, TaskState::Cancelled)?;
+                    self.end_task(id, TaskEndReason::ScopeExited)?;
                 }
                 self.trace(format!("end:{outcome}"));
                 self.state.outcome = Some(outcome);
@@ -1239,7 +1367,28 @@ impl Core {
             let mut target = vec![];
             let mut captured = 0.;
             let mut base = 0.;
+            let mut target_task = None;
             match &def.effect {
+                Effect::AudioStop { target, .. } => {
+                    let target_id = *self
+                        .state
+                        .handles
+                        .get(target)
+                        .ok_or_else(|| self.error("E_TASK", target))?;
+                    let audio = &self.state.tasks[&target_id];
+                    if !matches!(audio.effect, Effect::Audio { .. }) {
+                        return Err(
+                            self.error("E_TASK_TYPE", "audio stop requires an audio instance")
+                        );
+                    }
+                    if self.state.tasks.values().any(|task| {
+                        task.state == TaskState::Running && task.target_task == Some(target_id)
+                    }) {
+                        return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
+                    }
+                    target_task = Some(target_id);
+                    captured = audio.audio_envelope;
+                }
                 Effect::StagePresent { scene, .. } => {
                     if self.state.tasks.values().any(|t| {
                         t.state == TaskState::Running
@@ -1261,7 +1410,7 @@ impl Core {
                         .map(|t| t.id)
                         .collect();
                     for id in ids {
-                        self.finish_task(id, TaskState::Cancelled)?;
+                        self.end_task(id, TaskEndReason::ScopeExited)?;
                     }
                     self.state.scene = target.clone();
                     self.state.scene_generation = self
@@ -1269,34 +1418,6 @@ impl Core {
                         .scene_generation
                         .checked_add(1)
                         .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
-                }
-                Effect::Clip {
-                    node,
-                    property,
-                    replace,
-                    ..
-                } => {
-                    if self.state.tasks.values().any(|t|t.state==TaskState::Running&&matches!(t.effect,Effect::StagePresent{duration_us,..} if duration_us.0>0)){return Err(self.error("E_OWNERSHIP","transition owns root"));}
-                    captured = self
-                        .sample_scene()
-                        .iter()
-                        .find(|n| &n.id == node)
-                        .ok_or_else(|| self.error("E_NODE", node))?
-                        .get(*property);
-                    base = self
-                        .state
-                        .scene
-                        .iter()
-                        .find(|n| &n.id == node)
-                        .ok_or_else(|| self.error("E_NODE", node))?
-                        .get(*property);
-                    let old:Vec<_>=self.state.tasks.values().filter(|t|t.state==TaskState::Running&&t.scene_generation==self.state.scene_generation&&matches!(&t.effect,Effect::Clip{node:n,property:p,..} if n==node&&p==property)).map(|t|t.id).collect();
-                    if !old.is_empty() && !*replace {
-                        return Err(self.error("E_OWNERSHIP", node));
-                    }
-                    for id in old {
-                        self.finish_task(id, TaskState::Cancelled)?;
-                    }
                 }
                 Effect::Dialogue { .. } => {
                     let old: Vec<_> = self
@@ -1310,12 +1431,70 @@ impl Core {
                         .map(|t| t.id)
                         .collect();
                     for id in old {
-                        self.finish_task(id, TaskState::Cancelled)?;
+                        self.end_task(id, TaskEndReason::Replaced)?;
                     }
                 }
                 _ => {}
             }
+            if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
+                match &address {
+                    TweenTarget::SceneNode { node, property } => {
+                        if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
+                            return Err(self.error("E_OWNERSHIP", "transition owns root"));
+                        }
+                        captured = self
+                            .sample_scene()
+                            .iter()
+                            .find(|n| &n.id == node)
+                            .ok_or_else(|| self.error("E_NODE", node))?
+                            .get(*property);
+                        base = self
+                            .state
+                            .scene
+                            .iter()
+                            .find(|n| &n.id == node)
+                            .ok_or_else(|| self.error("E_NODE", node))?
+                            .get(*property);
+                    }
+                    TweenTarget::DialogueRoot { property } => {
+                        captured = self.sample_dialogue_appearance().get(*property);
+                        base = self.state.dialogue_appearance.get(*property);
+                    }
+                }
+                let old: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.state == TaskState::Running
+                            && self.track_is_current(t, &address)
+                            && t.effect
+                                .scalar_track(0., 0.)
+                                .is_some_and(|(a, _, _)| a == address)
+                    })
+                    .map(|t| t.id)
+                    .collect();
+                if !old.is_empty() && !replace {
+                    return Err(self.error("E_OWNERSHIP", format!("{address:?}")));
+                }
+                for id in old {
+                    self.end_task(id, TaskEndReason::Replaced)?;
+                }
+            }
             let id = self.id()?;
+            if let Effect::AudioStop { duration_us, .. } = &def.effect {
+                let target = target_task.expect("resolved audio stop target");
+                if self.state.tasks[&target].state == TaskState::Running {
+                    self.intents.push(CoreIntent::AudioEnvelope {
+                        owner: Some(id),
+                        elapsed_us: Micros(0),
+                        task: target,
+                        from: captured,
+                        to: 0.,
+                        duration_us: *duration_us,
+                    });
+                }
+            }
             let dialogue = p.dialogues.get(&def.id).cloned();
             if let Some(d) = &dialogue {
                 self.state.history.push(HistoryEntry {
@@ -1340,12 +1519,19 @@ impl Core {
                     self.state.history.remove(0);
                 }
             }
-            if let Effect::Audio { asset, bus, looped } = &def.effect {
+            if let Effect::Audio {
+                asset,
+                bus,
+                looped,
+                gain,
+            } = &def.effect
+            {
                 self.intents.push(CoreIntent::AudioStart {
                     task: id,
                     asset: asset.clone(),
                     bus: *bus,
                     looped: *looped,
+                    gain: *gain,
                     position_us: Micros(0),
                 });
             }
@@ -1357,6 +1543,11 @@ impl Core {
                 scope: def.scope,
                 effect: def.effect,
                 state: TaskState::Running,
+                end_reason: None,
+                target_task,
+                audio_envelope: 1.,
+                audio_position_us: None,
+                audio_device_elapsed_us: None,
                 started_us: self.state.tick_us,
                 elapsed_us: Micros(0),
                 milestones: BTreeSet::from([Milestone::Started]),
@@ -1372,8 +1563,23 @@ impl Core {
         self.jump(p.next);
         self.trace(format!("activate:{}", p.cue));
         self.intents.push(CoreIntent::Checkpoint);
-        let ids:Vec<_>=self.state.tasks.values().filter(|t|t.state==TaskState::Running&&matches!(t.effect,Effect::StagePresent{duration_us,..}|Effect::Clip{duration_us,..}|Effect::Delay{duration_us} if duration_us.0==0)).map(|t|t.id).collect();
+        let ids:Vec<_>=self.state.tasks.values().filter(|t|t.state==TaskState::Running&&matches!(t.effect,Effect::StagePresent{duration_us,..}|Effect::Clip{duration_us,..}|Effect::Tween{duration_us,..}|Effect::Delay{duration_us}|Effect::AudioStop{duration_us,..} if duration_us.0==0)).map(|t|t.id).collect();
         for id in ids {
+            self.finish_task(id, TaskState::Finished)?;
+        }
+        let ended_stops: Vec<_> = self
+            .state
+            .tasks
+            .values()
+            .filter(|task| {
+                task.state == TaskState::Running
+                    && task
+                        .target_task
+                        .is_some_and(|id| self.state.tasks[&id].state != TaskState::Running)
+            })
+            .map(|task| task.id)
+            .collect();
+        for id in ended_stops {
             self.finish_task(id, TaskState::Finished)?;
         }
         let keep: BTreeSet<_> = self
@@ -1381,6 +1587,18 @@ impl Core {
             .handles
             .values()
             .copied()
+            .chain(
+                self.state
+                    .tasks
+                    .values()
+                    .filter_map(|task| task.target_task),
+            )
+            .chain(
+                self.state
+                    .tasks
+                    .values()
+                    .filter_map(|t| t.dialogue.as_ref()?.reading.as_ref()?.voice),
+            )
             .chain(
                 self.state
                     .waiting
@@ -1426,43 +1644,34 @@ impl Core {
         }
     }
     fn finish_task(&mut self, id: u32, status: TaskState) -> Result<()> {
+        let reason = match status {
+            TaskState::Finished => TaskEndReason::Completed,
+            TaskState::Cancelled => TaskEndReason::CancelledByControl,
+            TaskState::Failed => TaskEndReason::Failed,
+            TaskState::Running => return Err(self.error("E_TASK", "invalid terminal state")),
+        };
+        self.end_task(id, reason)
+    }
+    fn end_task(&mut self, id: u32, reason: TaskEndReason) -> Result<()> {
+        let status = reason.state();
         let Some(t) = self.state.tasks.get(&id).cloned() else {
             return Err(self.error("E_TASK", id.to_string()));
         };
         if t.state != TaskState::Running {
             return Ok(());
         }
-        if let Effect::Clip {
-            node,
-            property,
-            to,
-            duration_us,
-            easing,
-            finish,
-            cancel,
-            ..
-        } = &t.effect
-        {
-            let progress = if duration_us.0 == 0 {
-                1.
-            } else {
-                (t.elapsed_us.0 as f64 / duration_us.0 as f64).min(1.) as f32
-            };
-            let progress = ease(progress, *easing);
-            let v = match status {
-                TaskState::Finished => match finish {
-                    FinishPolicy::CommitEnd => *to,
-                    FinishPolicy::RemoveEffect => t.base,
-                },
-                _ => match cancel {
-                    CancelPolicy::CommitCurrent => t.captured + (*to - t.captured) * progress,
-                    CancelPolicy::SettleEnd => *to,
-                    CancelPolicy::RestoreBase => t.base,
-                },
-            };
-            if t.scene_generation == self.state.scene_generation {
-                if let Some(n) = self.state.scene.iter_mut().find(|n| &n.id == node) {
-                    n.set(*property, v);
+        if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
+            let value = track.settle(t.elapsed_us, status == TaskState::Finished);
+            if self.track_is_current(&t, &address) {
+                match address {
+                    TweenTarget::SceneNode { node, property } => {
+                        if let Some(n) = self.state.scene.iter_mut().find(|n| n.id == node) {
+                            n.set(property, value);
+                        }
+                    }
+                    TweenTarget::DialogueRoot { property } => {
+                        self.state.dialogue_appearance.set(property, value)
+                    }
                 }
             }
         }
@@ -1478,11 +1687,103 @@ impl Core {
         }
         let task = self.state.tasks.get_mut(&id).unwrap();
         task.state = status;
+        task.end_reason = Some(reason);
         if status == TaskState::Finished {
             task.milestones.insert(Milestone::Finished);
         }
+        if let Effect::AudioStop { duration_us, .. } = t.effect {
+            let target = t
+                .target_task
+                .ok_or_else(|| self.error("E_TASK", "missing audio target"))?;
+            if self.state.tasks[&target].state == TaskState::Running {
+                if status == TaskState::Finished {
+                    self.end_task(target, TaskEndReason::CancelledByControl)?;
+                } else {
+                    let progress = if duration_us.0 == 0 {
+                        1.
+                    } else {
+                        (t.audio_device_elapsed_us.unwrap_or(t.elapsed_us).0 as f64
+                            / duration_us.0 as f64)
+                            .min(1.) as f32
+                    };
+                    let value = interpolate(t.captured, 0., progress, Easing::Linear);
+                    self.state.tasks.get_mut(&target).unwrap().audio_envelope = value;
+                    self.intents.push(CoreIntent::AudioEnvelope {
+                        owner: None,
+                        elapsed_us: Micros(0),
+                        task: target,
+                        from: value,
+                        to: value,
+                        duration_us: Micros(0),
+                    });
+                }
+            }
+        }
+        if matches!(t.effect, Effect::Audio { .. }) {
+            let dependents: Vec<_> = self
+                .state
+                .tasks
+                .values()
+                .filter(|task| task.state == TaskState::Running && task.target_task == Some(id))
+                .map(|task| task.id)
+                .collect();
+            for dependent in dependents {
+                self.end_task(
+                    dependent,
+                    if reason == TaskEndReason::NaturalEnd {
+                        TaskEndReason::Completed
+                    } else {
+                        reason
+                    },
+                )?;
+            }
+        }
         self.trace(format!("task:{id}:{status:?}"));
         Ok(())
+    }
+    /// Current envelope and remaining linear segment, independent of event gain.
+    pub fn audio_envelope(&self, id: u32) -> (f32, f32, Micros) {
+        for task in self.state.tasks.values() {
+            if task.state == TaskState::Running && task.target_task == Some(id) {
+                if let Effect::AudioStop { duration_us, .. } = task.effect {
+                    let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
+                    let remaining = duration_us.0.saturating_sub(elapsed.0);
+                    let value = ScalarTween {
+                        from: task.captured,
+                        base: task.captured,
+                        to: 0.,
+                        duration_us,
+                        easing: Easing::Linear,
+                        finish: FinishPolicy::CommitEnd,
+                        cancel: CancelPolicy::CommitCurrent,
+                    }
+                    .sample(elapsed);
+                    return (value, 0., Micros(remaining));
+                }
+            }
+        }
+        let value = self
+            .state
+            .tasks
+            .get(&id)
+            .map_or(1., |task| task.audio_envelope);
+        (value, value, Micros(0))
+    }
+    pub fn audio_envelope_checkpoint(&self, id: u32) -> (Option<u32>, Micros) {
+        self.state
+            .tasks
+            .values()
+            .find(|task| {
+                task.state == TaskState::Running
+                    && task.target_task == Some(id)
+                    && matches!(task.effect, Effect::AudioStop { .. })
+            })
+            .map_or((None, Micros(0)), |task| {
+                (
+                    Some(task.id),
+                    task.audio_device_elapsed_us.unwrap_or(task.elapsed_us),
+                )
+            })
     }
     fn reveal(&mut self, id: u32, until_gate: bool) -> Result<()> {
         let now = self.state.tick_us;
@@ -1548,7 +1849,9 @@ impl Core {
             {
                 let due = match &t.effect {
                     Effect::Clip { duration_us, .. }
+                    | Effect::Tween { duration_us, .. }
                     | Effect::Delay { duration_us }
+                    | Effect::AudioStop { duration_us, .. }
                     | Effect::StagePresent { duration_us, .. } => {
                         Some(t.started_us.0.saturating_add(duration_us.0))
                     }
@@ -1556,7 +1859,11 @@ impl Core {
                         .dialogue
                         .as_ref()
                         .filter(|d| !d.at_gate && !d.awaiting_advance)
-                        .map(|d| d.last_reveal_us.0.saturating_add(reveal_us.0.max(1))),
+                        .map(|d| {
+                            d.last_reveal_us
+                                .0
+                                .saturating_add(d.reveal_interval_us.unwrap_or(*reveal_us).0.max(1))
+                        }),
                     _ => None,
                 };
                 if let Some(due) = due {
@@ -1586,7 +1893,9 @@ impl Core {
                 let t = &self.state.tasks[&id];
                 match t.effect {
                     Effect::Clip { duration_us, .. }
+                    | Effect::Tween { duration_us, .. }
                     | Effect::Delay { duration_us }
+                    | Effect::AudioStop { duration_us, .. }
                     | Effect::StagePresent { duration_us, .. }
                         if t.elapsed_us.0 >= duration_us.0 =>
                     {
@@ -1596,7 +1905,8 @@ impl Core {
                         if t.dialogue.as_ref().is_some_and(|d| {
                             !d.at_gate
                                 && !d.awaiting_advance
-                                && next - d.last_reveal_us.0 >= reveal_us.0.max(1)
+                                && next - d.last_reveal_us.0
+                                    >= d.reveal_interval_us.unwrap_or(reveal_us).0.max(1)
                         }) =>
                     {
                         self.reveal(id, false)?
@@ -1617,34 +1927,45 @@ impl Core {
         }
         Ok(())
     }
+    fn track_is_current(&self, task: &Task, target: &TweenTarget) -> bool {
+        !matches!(target, TweenTarget::SceneNode { .. })
+            || task.scene_generation == self.state.scene_generation
+    }
     pub fn sample_scene(&self) -> Vec<Node> {
         let mut nodes = self.state.scene.clone();
-        for t in self.state.tasks.values().filter(|t| {
-            t.state == TaskState::Running && t.scene_generation == self.state.scene_generation
-        }) {
-            if let Effect::Clip {
-                node,
-                property,
-                to,
-                duration_us,
-                easing,
-                ..
-            } = &t.effect
-            {
-                let p = if duration_us.0 == 0 {
-                    1.
-                } else {
-                    (t.elapsed_us.0 as f64 / duration_us.0 as f64).min(1.) as f32
-                };
-                if let Some(n) = nodes.iter_mut().find(|n| &n.id == node) {
-                    n.set(
-                        *property,
-                        t.captured + (*to - t.captured) * ease(p, *easing),
-                    );
+        for task in self
+            .state
+            .tasks
+            .values()
+            .filter(|t| t.state == TaskState::Running)
+        {
+            if let Some((address, track, _)) = task.effect.scalar_track(task.captured, task.base) {
+                if self.track_is_current(task, &address) {
+                    if let TweenTarget::SceneNode { node, property } = address {
+                        if let Some(n) = nodes.iter_mut().find(|n| n.id == node) {
+                            n.set(property, track.sample(task.elapsed_us));
+                        }
+                    }
                 }
             }
         }
         nodes
+    }
+    pub fn sample_dialogue_appearance(&self) -> DialogueAppearance {
+        let mut appearance = self.state.dialogue_appearance;
+        for task in self
+            .state
+            .tasks
+            .values()
+            .filter(|t| t.state == TaskState::Running)
+        {
+            if let Some((TweenTarget::DialogueRoot { property }, track, _)) =
+                task.effect.scalar_track(task.captured, task.base)
+            {
+                appearance.set(property, track.sample(task.elapsed_us));
+            }
+        }
+        appearance
     }
     pub fn dialogue(&self) -> Option<(u32, &Dialogue)> {
         self.state.tasks.values().rev().find_map(|t| {
@@ -1654,6 +1975,20 @@ impl Core {
                 None
             }
         })
+    }
+    pub fn transition_style(&self) -> StageTransition {
+        self.state
+            .tasks
+            .values()
+            .find_map(|t| {
+                if t.state == TaskState::Running {
+                    if let Effect::StagePresent { transition, .. } = &t.effect {
+                        return Some(transition.clone());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default()
     }
     pub fn transition(&self) -> Option<(&[Node], f32)> {
         self.state.tasks.values().find_map(|t| {
@@ -1671,6 +2006,65 @@ impl Core {
                 None
             }
         })
+    }
+    /// Observations never execute story code or change task time/milestones.
+    pub fn observe_audio_positions(&mut self, positions: &[AudioPosition]) -> Result<()> {
+        if positions.len() > MAX_TASKS
+            || positions
+                .iter()
+                .map(|p| p.task)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != positions.len()
+        {
+            return Err(self.error(
+                "E_AUDIO_POSITION",
+                "duplicate or excessive device positions",
+            ));
+        }
+        // Validate the complete batch before mutating any checkpoint.
+        for position in positions {
+            if let Some(envelope) = &position.envelope {
+                if let Some(task) = self.state.tasks.get(&envelope.owner).filter(|t| {
+                    t.state == TaskState::Running && t.target_task == Some(position.task)
+                }) {
+                    if !matches!(task.effect,Effect::AudioStop {duration_us,..} if envelope.elapsed_us.0<=duration_us.0)
+                    {
+                        return Err(
+                            self.error("E_AUDIO_POSITION", "invalid device envelope progress")
+                        );
+                    }
+                }
+            }
+        }
+        for position in positions {
+            let active = self.state.tasks.get(&position.task).is_some_and(|t| {
+                t.state == TaskState::Running && matches!(t.effect, Effect::Audio { .. })
+            });
+            if active {
+                if let Some(envelope) = &position.envelope {
+                    if let Some(task) = self.state.tasks.get_mut(&envelope.owner).filter(|t| {
+                        t.state == TaskState::Running
+                            && t.target_task == Some(position.task)
+                            && matches!(t.effect, Effect::AudioStop { .. })
+                    }) {
+                        // Within one device incarnation progress is monotonic.
+                        task.audio_device_elapsed_us = Some(Micros(
+                            task.audio_device_elapsed_us
+                                .map_or(envelope.elapsed_us.0, |old| {
+                                    old.0.max(envelope.elapsed_us.0)
+                                }),
+                        ));
+                    }
+                }
+            }
+            if let Some(task) = self.state.tasks.get_mut(&position.task).filter(|t| {
+                t.state == TaskState::Running && matches!(t.effect, Effect::Audio { .. })
+            }) {
+                task.audio_position_us = Some(position.position_us);
+            }
+        }
+        Ok(())
     }
     pub fn needs_clock(&self) -> bool {
         if self.state.fault.is_some() || self.state.outcome.is_some() {
@@ -1695,7 +2089,9 @@ impl Core {
                             .dialogue
                             .as_ref()
                             .is_some_and(|d| !d.at_gate && !d.awaiting_advance),
-                        Effect::Audio { .. } => false,
+                        // Audio advances on the device even when text is fully
+                        // revealed. Keep the Story clock alive for save offsets.
+                        Effect::Audio { .. } => true,
                         _ => true,
                     }
             })
@@ -1793,10 +2189,18 @@ impl Core {
                 || t.id >= s.next_id
                 || !instances.insert(t.id)
                 || t.started_us.0 > s.tick_us.0
+                || t.scene_generation > s.scene_generation
                 || !t.captured.is_finite()
                 || !t.base.is_finite()
             {
                 return Err(fail("task state"));
+            }
+            if let (Effect::Dialogue { reveal_us, .. }, Some(d)) = (&t.effect, &t.dialogue) {
+                if d.reveal_interval_us
+                    .is_some_and(|v| !valid_reveal_interval(*reveal_us, v))
+                {
+                    return Err(fail("invalid frozen reveal interval"));
+                }
             }
             if let Some(d) = &t.dialogue {
                 if !p.locales.contains_key(&d.locale)
@@ -1859,6 +2263,12 @@ impl Core {
                 return Err(fail("pending continuation mismatch"));
             }
             for (name, d) in &pending.dialogues {
+                if d.reading.is_some() {
+                    return Err(fail("pending dialogue cannot have a voice binding"));
+                }
+                if d.reveal_interval_us.is_some_and(|v| !pending.effects.iter().any(|e| {
+                    &e.id == name && matches!(e.effect, Effect::Dialogue { reveal_us, .. } if valid_reveal_interval(reveal_us, v))
+                })) { return Err(fail("invalid pending reveal interval")); }
                 if !pending.effects.iter().any(|e| {
                     &e.id == name
                         && matches!(&e.effect,Effect::Dialogue{text,..} if text==&d.text_id)
@@ -1933,7 +2343,97 @@ impl Core {
                 }
             }
         }
+        if !s.dialogue_appearance.valid() {
+            return Err(fail("invalid dialogue appearance"));
+        }
+        let mut property_owners = BTreeSet::new();
+        let mut envelope_owners = BTreeSet::new();
         for t in s.tasks.values() {
+            if let Some(reading) = t.dialogue.as_ref().and_then(|d| d.reading.as_ref()) {
+                if !p.requires.iter().any(|c| c == "text.voice-binding.v1")
+                    || (reading.wait == VoiceWaitPolicy::SampledRemaining
+                        && (!p.requires.iter().any(|c|c=="text.voice-timer.v1")
+                            || reading.voice.is_some_and(|id|s.tasks.get(&id).is_some_and(|t|
+                                matches!(&t.effect,Effect::Audio{asset,..} if p.asset(asset).is_none_or(|a|a.duration_us.0==0))
+                            ))))
+                    || reading.revision == 0
+                    || reading.voice.is_some_and(|id| {
+                        !s.tasks.get(&id).is_some_and(|v| {
+                            matches!(
+                                v.effect,
+                                Effect::Audio {
+                                    bus: AudioBus::Voice,
+                                    looped: false,
+                                    ..
+                                }
+                            )
+                        })
+                    })
+                {
+                    return Err(fail("invalid dialogue voice binding"));
+                }
+            }
+
+            if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
+                if !address.accepts(t.captured) || !address.accepts(t.base) {
+                    return Err(fail("invalid captured property"));
+                }
+                if t.state == TaskState::Running {
+                    if t.elapsed_us.0 >= track.duration_us.0 {
+                        return Err(fail("expired property track"));
+                    }
+                    let current = !matches!(address, TweenTarget::SceneNode { .. })
+                        || t.scene_generation == s.scene_generation;
+                    if current {
+                        if let TweenTarget::SceneNode { node, .. } = &address {
+                            if !s.scene.iter().any(|n| &n.id == node) {
+                                return Err(fail("missing property target"));
+                            }
+                        }
+                        if !property_owners.insert(address) {
+                            return Err(fail("multiple property writers"));
+                        }
+                    }
+                }
+            }
+            if !t.audio_envelope.is_finite() || !(0.0..=1.0).contains(&t.audio_envelope) {
+                return Err(fail("invalid audio envelope"));
+            }
+            match &t.effect {
+                Effect::AudioStop {
+                    target,
+                    duration_us,
+                } => {
+                    let target_id = t.target_task.ok_or_else(|| fail("missing stop target"))?;
+                    let audio = s
+                        .tasks
+                        .get(&target_id)
+                        .ok_or_else(|| fail("missing audio instance"))?;
+                    if target_id >= t.id
+                        || audio.name != *target
+                        || !matches!(audio.effect, Effect::Audio { .. })
+                        || !t.captured.is_finite()
+                        || !(0.0..=1.0).contains(&t.captured)
+                        || (t.state == TaskState::Running
+                            && (audio.state != TaskState::Running
+                                || t.elapsed_us.0 >= duration_us.0
+                                || !envelope_owners.insert(target_id)))
+                    {
+                        return Err(fail("invalid stop ownership or progress"));
+                    }
+                }
+                _ if t.target_task.is_some() => return Err(fail("unexpected target task")),
+                _ => {}
+            }
+            if (t.state == TaskState::Running) != t.end_reason.is_none()
+                || t.end_reason.is_some_and(|reason| {
+                    reason.state() != t.state
+                        || (reason == TaskEndReason::NaturalEnd
+                            && !matches!(t.effect, Effect::Audio { looped: false, .. }))
+                })
+            {
+                return Err(fail("task terminal reason mismatch"));
+            }
             if !canonical_verified {
                 validate_task_definition(t, p)?;
             }
@@ -1942,6 +2442,15 @@ impl Core {
                 && !s.frames.iter().any(|f| f.id == t.frame)
             {
                 return Err(fail("orphan frame task"));
+            }
+            if let Some(elapsed) = t.audio_device_elapsed_us {
+                if !matches!(t.effect,Effect::AudioStop {duration_us,..} if elapsed.0<=duration_us.0)
+                {
+                    return Err(fail("invalid device envelope checkpoint"));
+                }
+            }
+            if t.audio_position_us.is_some() && !matches!(t.effect, Effect::Audio { .. }) {
+                return Err(fail("device position on non-audio task"));
             }
             if t.state == TaskState::Running && t.elapsed_us.0 != s.tick_us.0 - t.started_us.0 {
                 return Err(fail("task progress mismatch"));
@@ -2007,6 +2516,7 @@ impl Core {
             intents: vec![],
             work_remaining: 0,
             remaining_time_us: 0,
+            text_speed: 1.,
         };
         core.state.last_input = 0;
         // Restored interactions receive fresh identities, in addition to the host epoch change.
@@ -2035,11 +2545,11 @@ impl Core {
         Ok(core)
     }
 }
-fn ease(p: f32, e: Easing) -> f32 {
-    match e {
-        Easing::Linear => p,
-        Easing::Smooth => p * p * (3. - 2. * p),
-    }
+
+fn valid_reveal_interval(authored: Micros, frozen: Micros) -> bool {
+    let min = (authored.0 as f64 / 4.).round() as u64;
+    let max = (authored.0 as f64 / 0.25).round() as u64;
+    (min..=max).contains(&frozen.0)
 }
 
 pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView) -> Result<()> {

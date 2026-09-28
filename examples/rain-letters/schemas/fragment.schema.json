@@ -192,6 +192,14 @@
         "effects"
       ]
     },
+    "DialogueProperty": {
+      "type": "string",
+      "enum": [
+        "opacity",
+        "background_opacity",
+        "text_opacity"
+      ]
+    },
     "Easing": {
       "type": "string",
       "enum": [
@@ -210,6 +218,9 @@
             },
             "scene": {
               "type": "string"
+            },
+            "transition": {
+              "$ref": "#/$defs/StageTransition"
             },
             "type": {
               "type": "string",
@@ -271,6 +282,48 @@
         {
           "type": "object",
           "properties": {
+            "cancel": {
+              "$ref": "#/$defs/CancelPolicy",
+              "default": "commit_current"
+            },
+            "duration_us": {
+              "$ref": "#/$defs/Micros"
+            },
+            "easing": {
+              "$ref": "#/$defs/Easing",
+              "default": "linear"
+            },
+            "finish": {
+              "$ref": "#/$defs/FinishPolicy",
+              "default": "commit_end"
+            },
+            "replace": {
+              "type": "boolean",
+              "default": false
+            },
+            "target": {
+              "$ref": "#/$defs/TweenTarget"
+            },
+            "to": {
+              "type": "number",
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "const": "tween"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "target",
+            "to",
+            "duration_us"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "reveal_us": {
               "$ref": "#/$defs/Micros"
             },
@@ -302,6 +355,10 @@
             "bus": {
               "$ref": "#/$defs/AudioBus"
             },
+            "gain": {
+              "type": "number",
+              "format": "float"
+            },
             "looped": {
               "type": "boolean",
               "default": false
@@ -316,6 +373,28 @@
             "type",
             "asset",
             "bus"
+          ]
+        },
+        {
+          "description": "A finite stop operation; completion is separate from natural playback end.",
+          "type": "object",
+          "properties": {
+            "duration_us": {
+              "$ref": "#/$defs/Micros"
+            },
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "audio_stop"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "target",
+            "duration_us"
           ]
         },
         {
@@ -488,6 +567,12 @@
         "blocks"
       ]
     },
+    "MaskChannel": {
+      "type": "string",
+      "enum": [
+        "alpha"
+      ]
+    },
     "Micros": {
       "type": "string"
     },
@@ -648,6 +733,23 @@
         {
           "type": "object",
           "properties": {
+            "type": {
+              "type": "string",
+              "const": "dialogue_visibility"
+            },
+            "visible": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "visible"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "target": {
               "type": "string"
             },
@@ -760,6 +862,33 @@
         {
           "type": "object",
           "properties": {
+            "task": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "dialogue_voice"
+            },
+            "voice": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wait": {
+              "$ref": "#/$defs/VoiceWaitPolicy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "task",
+            "wait"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "key": {
               "type": "string"
             },
@@ -792,6 +921,75 @@
         "frame",
         "scene",
         "interaction"
+      ]
+    },
+    "StageTransition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "dissolve"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "asset": {
+              "type": "string"
+            },
+            "channel": {
+              "$ref": "#/$defs/MaskChannel"
+            },
+            "invert": {
+              "type": "boolean",
+              "default": false
+            },
+            "softness": {
+              "type": "number",
+              "format": "float",
+              "default": 0.0
+            },
+            "type": {
+              "type": "string",
+              "const": "mask"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "asset",
+            "channel"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "direction": {
+              "$ref": "#/$defs/WipeDirection"
+            },
+            "softness": {
+              "type": "number",
+              "format": "float",
+              "default": 0.0
+            },
+            "type": {
+              "type": "string",
+              "const": "wipe"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "direction"
+          ]
+        }
       ]
     },
     "TaskAction": {
@@ -1053,6 +1251,49 @@
         }
       ]
     },
+    "TweenTarget": {
+      "description": "Typed property addresses. UI-owned objects are deliberately not addressable by Story.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string"
+            },
+            "property": {
+              "$ref": "#/$defs/Property"
+            },
+            "type": {
+              "type": "string",
+              "const": "scene_node"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "node",
+            "property"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "property": {
+              "$ref": "#/$defs/DialogueProperty"
+            },
+            "type": {
+              "type": "string",
+              "const": "dialogue_root"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "property"
+          ]
+        }
+      ]
+    },
     "Value": {
       "oneOf": [
         {
@@ -1117,6 +1358,25 @@
         "string"
       ]
     },
+    "VoiceWaitPolicy": {
+      "oneOf": [
+        {
+          "description": "Freeze remaining audible voice duration at the beginning of the Auto cycle.",
+          "type": "string",
+          "const": "sampled_remaining"
+        },
+        {
+          "description": "Reading delay starts once the bound voice is no longer running.",
+          "type": "string",
+          "const": "after_voice"
+        },
+        {
+          "description": "Reading delay and bound voice run concurrently; both must complete.",
+          "type": "string",
+          "const": "parallel"
+        }
+      ]
+    },
     "WaitCondition": {
       "type": "object",
       "properties": {
@@ -1131,6 +1391,15 @@
       "required": [
         "task",
         "milestone"
+      ]
+    },
+    "WipeDirection": {
+      "type": "string",
+      "enum": [
+        "left_to_right",
+        "right_to_left",
+        "top_to_bottom",
+        "bottom_to_top"
       ]
     }
   }

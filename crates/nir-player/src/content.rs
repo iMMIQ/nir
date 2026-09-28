@@ -962,15 +962,15 @@ impl Player {
             self.locale_error = Some(message);
             self.pauses.remove("locale");
         } else {
-            self.report(
-                Diagnostic::new("E_MODULE_PREPARE", "content", message).classified(
+            let mut diagnostic = Diagnostic::new("E_MODULE_PREPARE", "content", message)
+                .classified(
                     ErrorDomain::Prepare,
                     "load-module",
                     "content",
                     vec![Recovery::Retry, Recovery::Exit],
-                ),
-                true,
-            );
+                );
+            diagnostic.details.as_mut().unwrap().request = Some(request);
+            self.report(diagnostic, true);
         }
     }
     fn complete_restore_validation(
@@ -1370,6 +1370,9 @@ impl Player {
                 .filter_map(|node| node.asset.clone())
                 .collect();
             for task in s.tasks.values() {
+                if let Effect::StagePresent { transition, .. } = &task.effect {
+                    assets.extend(transition.asset().map(str::to_owned));
+                }
                 if let Effect::Audio { asset, .. } = &task.effect {
                     assets.insert(asset.clone());
                 }

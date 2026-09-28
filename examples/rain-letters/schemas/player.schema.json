@@ -27,12 +27,29 @@
     "format"
   ],
   "$defs": {
+    "AutoDelayPolicy": {
+      "type": "string",
+      "enum": [
+        "length_scaled",
+        "fixed"
+      ]
+    },
+    "HidePolicy": {
+      "type": "string",
+      "enum": [
+        "continue_story",
+        "pause_story"
+      ]
+    },
     "Micros": {
       "type": "string"
     },
     "PlayerDefaults": {
       "type": "object",
       "properties": {
+        "auto_delay_policy": {
+          "$ref": "#/$defs/AutoDelayPolicy"
+        },
         "auto_delay_us": {
           "$ref": "#/$defs/Micros",
           "default": "1200000"
@@ -46,6 +63,9 @@
           "type": "number",
           "format": "float",
           "default": 1.0
+        },
+        "hide_policy": {
+          "$ref": "#/$defs/HidePolicy"
         },
         "prefetch_content": {
           "type": "boolean",

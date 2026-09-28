@@ -1029,3 +1029,75 @@ fn new_game_waits_for_in_flight_text_locale_before_freezing_first_dialogue() {
     assert_eq!(player.effective_text_locale, "en");
     assert_eq!(player.core().dialogue().unwrap().1.locale, "en");
 }
+
+#[test]
+fn failed_slot_restore_content_can_return_to_the_unchanged_story() {
+    let (root, objects) = bundled();
+    let mut p = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let commands = p.pump(vec![], 1000);
+    drain(&mut p, commands, &objects);
+    let commands = action(&mut p, UiAction::NewGame);
+    drain(&mut p, commands, &objects);
+    let snapshot = p.core().snapshot();
+    let before = serde_json::to_value(&snapshot).unwrap();
+    let envelope = SaveEnvelope {
+        format: 1,
+        slot: 0,
+        revision: 1,
+        digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+        snapshot,
+    };
+    action(&mut p, UiAction::Saves);
+    let job = action(&mut p, UiAction::Load { slot: 0 })
+        .iter()
+        .find_map(|c| {
+            if let AppCommand::Load { job, .. } = c {
+                Some(*job)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let commands = p.pump(
+        vec![AppEvent::SlotLoaded {
+            job,
+            envelope: Box::new(envelope),
+        }],
+        1000,
+    );
+    let request = commands
+        .iter()
+        .find_map(|c| {
+            if let AppCommand::GetContent { request, .. } = c {
+                Some(*request)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    p.pump(
+        vec![AppEvent::ContentFailed {
+            request,
+            message: "candidate content unavailable".into(),
+        }],
+        1000,
+    );
+    assert!(p.error.is_some());
+    assert_eq!(
+        p.diagnostic
+            .as_ref()
+            .unwrap()
+            .details
+            .as_ref()
+            .unwrap()
+            .request,
+        Some(request)
+    );
+    let commands = action(&mut p, UiAction::Close);
+    drain(&mut p, commands, &objects);
+    assert!(p.error.is_none());
+    assert!(p.diagnostic.is_none());
+    assert!(!p.paused());
+    assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), before);
+    assert!(!p.accepts_content(request));
+}

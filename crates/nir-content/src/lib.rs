@@ -427,7 +427,10 @@ pub fn cue_assets(p: &Program, cue: &str) -> BTreeSet<String> {
     if let Some(c) = p.cues.get(cue) {
         for def in &c.effects {
             match &def.effect {
-                Effect::StagePresent { scene, .. } => {
+                Effect::StagePresent {
+                    scene, transition, ..
+                } => {
+                    set.extend(transition.asset().map(str::to_owned));
                     if let Some(nodes) = p.scenes.get(scene) {
                         set.extend(nodes.iter().filter_map(|n| n.asset.clone()));
                     }

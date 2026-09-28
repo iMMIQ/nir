@@ -89,7 +89,7 @@ enum ImportCommand {
         /// Source label LineNo, not an index into the command array.
         #[arg(long, default_value_t = 0)]
         line: u32,
-        /// Write an incomplete migration with explicit faults at unsupported commands.
+        /// Write an incomplete migration (fault blocks or a source-derived UI preview).
         #[arg(long)]
         draft: bool,
         #[arg(long, default_value = "org.nir.imported.livemaker")]

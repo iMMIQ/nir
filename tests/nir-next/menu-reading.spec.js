@@ -1,0 +1,61 @@
+import {test,expect} from '@playwright/test';
+
+test('reading menu actions return to Story and stale controls cannot change the resumed mode',async({page})=>{
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto('http://127.0.0.1:4211/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().dialogue&&!window.__nir.state().loading);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&!window.__nir.state().loading);
+  await expect(page.getByRole('button',{name:'Skip read',exact:true})).toBeDisabled();
+  const auto=page.getByRole('button',{name:'Resume Auto',exact:true});
+  const hide=page.getByRole('button',{name:'Hide text',exact:true});
+  const staleAuto=JSON.parse(await auto.getAttribute('data-action'));
+  const before=await page.evaluate(()=>window.__nir.state().interaction);
+  const tick=await page.evaluate(()=>window.__nir.state().tick_us);
+  await hide.focus();await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Story'&&window.__nir.state().interface_hidden);
+  await page.waitForTimeout(250);
+  expect(await page.evaluate(()=>window.__nir.state().tick_us)).toBe(tick);
+  expect(await page.evaluate(()=>window.__nir.state().paused)).toBe(true);
+  await page.evaluate(a=>window.__nir.action(a),staleAuto);
+  expect(await page.evaluate(()=>window.__nir.state().interface_hidden)).toBe(true);
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(before);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>!window.__nir.state().interface_hidden&&window.__nir.state().screen==='Menu');
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(before);
+  await page.evaluate(()=>window.__nir.action({type:'close'}));
+  await page.waitForFunction(()=>window.__nir.state().screen==='Story');
+  await page.evaluate(()=>window.__nir.action({type:'advance'}));
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&!window.__nir.state().loading);
+  const staleHide=JSON.parse(await hide.getAttribute('data-action'));
+  const interaction=await page.evaluate(()=>window.__nir.state().interaction);
+  await page.mouse.click(400,140);
+  await page.waitForFunction(()=>window.__nir.state().screen==='Story'&&!window.__nir.state().paused);
+  await page.evaluate(a=>window.__nir.action(a),staleHide);
+  expect(await page.evaluate(()=>window.__nir.state().interface_hidden)).toBe(false);
+  await page.waitForFunction(i=>window.__nir.state().interaction!==i,interaction);
+  expect(errors).toEqual([]);
+});
+
+
+test('menu peek preserves a pending choice and returns to its menu',async({page})=>{
+  await page.goto('http://127.0.0.1:4212/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().choice&&!window.__nir.state().loading);
+  const before=await page.evaluate(()=>({interaction:window.__nir.state().interaction,choice:window.__nir.state().choice}));
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&!window.__nir.state().loading);
+  await expect(page.getByRole('button',{name:'Resume Auto',exact:true})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Skip read',exact:true})).toBeDisabled();
+  await page.getByRole('button',{name:'Hide text',exact:true}).focus();
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().interface_hidden&&window.__nir.state().screen==='Story');
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(()=>!window.__nir.state().interface_hidden&&window.__nir.state().screen==='Menu');
+  expect(await page.evaluate(()=>window.__nir.state().interaction)).toBe(before.interaction);
+  expect(await page.evaluate(()=>window.__nir.state().choice)).toEqual(before.choice);
+});

@@ -1,0 +1,798 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModuleCode",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "functions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Function"
+      }
+    },
+    "module": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "module",
+    "functions"
+  ],
+  "$defs": {
+    "BinaryOp": {
+      "type": "string",
+      "enum": [
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "rem",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "and",
+        "or",
+        "concat"
+      ]
+    },
+    "Block": {
+      "type": "object",
+      "properties": {
+        "ops": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Op"
+          }
+        },
+        "terminator": {
+          "$ref": "#/$defs/Terminator"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "terminator"
+      ]
+    },
+    "Expr": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "const"
+            },
+            "value": {
+              "$ref": "#/$defs/Value"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "var"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "left": {
+              "$ref": "#/$defs/Expr"
+            },
+            "op": {
+              "$ref": "#/$defs/BinaryOp"
+            },
+            "right": {
+              "$ref": "#/$defs/Expr"
+            },
+            "type": {
+              "type": "string",
+              "const": "binary"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "op",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "not"
+            },
+            "value": {
+              "$ref": "#/$defs/Expr"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        }
+      ]
+    },
+    "Function": {
+      "type": "object",
+      "properties": {
+        "blocks": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Block"
+          }
+        },
+        "entry": {
+          "type": "string"
+        },
+        "locals": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ValueType"
+          },
+          "default": {}
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ValueType"
+          },
+          "default": {}
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValueType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "entry",
+        "blocks"
+      ]
+    },
+    "Milestone": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "started"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "finished"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "marker"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id"
+          ]
+        }
+      ]
+    },
+    "Op": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "operation"
+      ]
+    },
+    "Operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "dialogue_visibility"
+            },
+            "visible": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "visible"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "assign"
+            },
+            "value": {
+              "$ref": "#/$defs/Expr"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "target",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "max": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "min": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "random"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "target",
+            "min",
+            "max"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string"
+            },
+            "property": {
+              "$ref": "#/$defs/Property"
+            },
+            "type": {
+              "type": "string",
+              "const": "draft_patch"
+            },
+            "value": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "node",
+            "property",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TaskAction"
+            },
+            "task": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "task_control"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "task",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "dialogue_continue"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "task"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "dialogue_voice"
+            },
+            "voice": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wait": {
+              "$ref": "#/$defs/VoiceWaitPolicy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "task",
+            "wait"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "profile_merge"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "key"
+          ]
+        }
+      ]
+    },
+    "Property": {
+      "type": "string",
+      "enum": [
+        "x",
+        "y",
+        "scale",
+        "opacity"
+      ]
+    },
+    "TaskAction": {
+      "type": "string",
+      "enum": [
+        "cancel",
+        "finish"
+      ]
+    },
+    "Terminator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "goto"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/Expr"
+            },
+            "no": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "branch"
+            },
+            "yes": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "condition",
+            "yes",
+            "no"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cases": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "default": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "switch"
+            },
+            "value": {
+              "$ref": "#/$defs/Expr"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value",
+            "cases",
+            "default"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/Expr"
+              },
+              "default": {}
+            },
+            "function": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "result": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "const": "call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "function",
+            "next"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "return"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Expr"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cue": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "activate"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "cue",
+            "next"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conditions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/WaitCondition"
+              }
+            },
+            "next": {
+              "type": "string"
+            },
+            "on_cancelled": {
+              "type": "string"
+            },
+            "on_failed": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "await"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conditions",
+            "next",
+            "on_cancelled",
+            "on_failed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "branches": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "choice": {
+              "type": "string"
+            },
+            "on_empty": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "interact"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "choice",
+            "branches",
+            "on_empty"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "end"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "outcome"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "fault"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "code",
+            "message"
+          ]
+        }
+      ]
+    },
+    "Value": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "bool"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "i32"
+            },
+            "value": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ValueType": {
+      "type": "string",
+      "enum": [
+        "bool",
+        "i32",
+        "string"
+      ]
+    },
+    "VoiceWaitPolicy": {
+      "oneOf": [
+        {
+          "description": "Freeze remaining audible voice duration at the beginning of the Auto cycle.",
+          "type": "string",
+          "const": "sampled_remaining"
+        },
+        {
+          "description": "Reading delay starts once the bound voice is no longer running.",
+          "type": "string",
+          "const": "after_voice"
+        },
+        {
+          "description": "Reading delay and bound voice run concurrently; both must complete.",
+          "type": "string",
+          "const": "parallel"
+        }
+      ]
+    },
+    "WaitCondition": {
+      "type": "object",
+      "properties": {
+        "milestone": {
+          "$ref": "#/$defs/Milestone"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task",
+        "milestone"
+      ]
+    }
+  }
+}

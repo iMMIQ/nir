@@ -1,7 +1,16 @@
 //! Versioned, platform-independent wire contracts. Unknown semantic fields fail closed.
 #![forbid(unsafe_code)]
+mod menu;
+mod transition;
+mod tween;
+pub use menu::{
+    MenuCondition, MenuContent, MenuElement, MenuImageStates, MenuLocal, MenuPreference,
+    MenuRangeBinding, MenuSlot, MenuToggleBinding, MenuValue, MenuValueInput, MAX_MENU_PARENTS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+pub use transition::{MaskChannel, StageTransition, WipeDirection};
+pub use tween::{interpolate, DialogueAppearance, ScalarTween};
 
 pub const FORMAT_VERSION: u32 = 1;
 /// Wire version for the indexed, lazily loaded runtime root. Source `Program`
@@ -9,25 +18,77 @@ pub const FORMAT_VERSION: u32 = 1;
 /// independently from the runtime package layout.
 pub const RUNTIME_FORMAT_VERSION: u32 = 2;
 pub const CONTENT_PACKAGE_VERSION: u32 = 2;
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 pub const CAPABILITIES: &[&str] = &[
     "module.lazy.v1",
     "control.v1",
     "stage.sprite.v1",
     "stage.dissolve.v1",
     "clip.scalar.v1",
+    "tween.target.v1",
     "text.structured.v1",
     "text.revisions.v1",
     "text.gate.v1",
     "choice.v1",
     "audio.buffer.v1",
+    "audio.gain.v1",
+    "audio.stop.v1",
     "ui.image-menu.v1",
     "text.visibility.v1",
+    "text.voice-binding.v1",
+    "text.voice-timer.v1",
+    "player.hide-policy.v1",
+    "player.auto-delay-policy.v1",
+    "text.shadow.v1",
+    "stage.wipe.v1",
+    "stage.mask.v1",
+    "ui.menu-elements.v1",
+    "ui.menu-state.v1",
+    "ui.menu-services.v1",
+    "ui.menu-navigation.v1",
+    "ui.menu-chrome.v1",
+    "ui.menu-history-availability.v1",
+    "ui.menu-reading.v1",
+    "ui.menu-story.v1",
+    "ui.menu-stack.v1",
+    "ui.menu-text-button.v1",
+    "ui.menu-storage.v1",
+    "ui.menu-history.v1",
+    "ui.menu-history-flow.v1",
+    "ui.menu-history-scrollbar.v1",
+    "ui.menu-values.v1",
 ];
+/// Device observation, separate from the deterministic Story task clock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioPosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<AudioEnvelopePosition>,
+    pub task: u32,
+    pub position_us: Micros,
+}
+
+/// Device envelope progress belongs to a concrete AudioStop task, not a bus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AudioEnvelopePosition {
+    pub owner: u32,
+    pub elapsed_us: Micros,
+}
+
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TASKS: usize = 256;
 pub const MAX_FRAMES: usize = 64;
 pub const MAX_NODES: usize = 1024;
+
+/// Host clocks and pause routes; not an additional story execution context.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeDomain {
+    Story,
+    ForegroundUi,
+}
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -668,9 +729,25 @@ pub enum Operation {
     DialogueContinue {
         task: String,
     },
+    DialogueVoice {
+        task: String,
+        voice: Option<String>,
+        wait: VoiceWaitPolicy,
+    },
     ProfileMerge {
         key: String,
     },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceWaitPolicy {
+    /// Freeze remaining audible voice duration at the beginning of the Auto cycle.
+    SampledRemaining,
+    /// Reading delay starts once the bound voice is no longer running.
+    AfterVoice,
+    /// Reading delay and bound voice run concurrently; both must complete.
+    Parallel,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -780,12 +857,27 @@ pub enum Scope {
 pub enum Effect {
     StagePresent {
         scene: String,
+        #[serde(default, skip_serializing_if = "StageTransition::is_default")]
+        transition: StageTransition,
         #[serde(default)]
         duration_us: Micros,
     },
     Clip {
         node: String,
         property: Property,
+        to: f32,
+        duration_us: Micros,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        easing: Easing,
+        #[serde(default)]
+        finish: FinishPolicy,
+        #[serde(default)]
+        cancel: CancelPolicy,
+    },
+    Tween {
+        target: TweenTarget,
         to: f32,
         duration_us: Micros,
         #[serde(default)]
@@ -806,12 +898,120 @@ pub enum Effect {
     Audio {
         asset: String,
         bus: AudioBus,
+        #[serde(default = "unit_gain", skip_serializing_if = "is_unit_gain")]
+        gain: f32,
         #[serde(default)]
         looped: bool,
+    },
+    /// A finite stop operation; completion is separate from natural playback end.
+    AudioStop {
+        target: String,
+        duration_us: Micros,
     },
     Delay {
         duration_us: Micros,
     },
+}
+/// Typed property addresses. UI-owned objects are deliberately not addressable by Story.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TweenTarget {
+    SceneNode { node: String, property: Property },
+    DialogueRoot { property: DialogueProperty },
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogueProperty {
+    Opacity,
+    BackgroundOpacity,
+    TextOpacity,
+}
+impl TweenTarget {
+    pub fn accepts(&self, value: f32) -> bool {
+        value.is_finite()
+            && match self {
+                Self::SceneNode {
+                    property: Property::X | Property::Y,
+                    ..
+                } => true,
+                Self::SceneNode {
+                    property: Property::Scale,
+                    ..
+                } => value >= 0.,
+                _ => (0.0..=1.0).contains(&value),
+            }
+    }
+}
+impl Effect {
+    /// Legacy Clip and typed Tween use one evaluator and one writer identity.
+    pub fn scalar_track(&self, from: f32, base: f32) -> Option<(TweenTarget, ScalarTween, bool)> {
+        let (target, to, duration_us, replace, easing, finish, cancel) = match self {
+            Self::Clip {
+                node,
+                property,
+                to,
+                duration_us,
+                replace,
+                easing,
+                finish,
+                cancel,
+            } => (
+                TweenTarget::SceneNode {
+                    node: node.clone(),
+                    property: *property,
+                },
+                to,
+                duration_us,
+                replace,
+                easing,
+                finish,
+                cancel,
+            ),
+            Self::Tween {
+                target,
+                to,
+                duration_us,
+                replace,
+                easing,
+                finish,
+                cancel,
+            } => (
+                target.clone(),
+                to,
+                duration_us,
+                replace,
+                easing,
+                finish,
+                cancel,
+            ),
+            _ => return None,
+        };
+        Some((
+            target,
+            ScalarTween {
+                from,
+                base,
+                to: *to,
+                duration_us: *duration_us,
+                easing: *easing,
+                finish: *finish,
+                cancel: *cancel,
+            },
+            *replace,
+        ))
+    }
+}
+fn unit_gain() -> f32 {
+    1.0
+}
+fn is_unit_gain(value: &f32) -> bool {
+    *value == 1.0
+}
+/// Event gain is separate from the player's mixer preferences.
+pub fn valid_audio_gain(value: f32) -> bool {
+    value.is_finite() && (0.0..=4.0).contains(&value)
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -995,6 +1195,8 @@ pub enum AssetKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Theme {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_overlay: Option<String>,
     pub background: [f32; 4],
     pub panel: [f32; 4],
     pub accent: [f32; 4],
@@ -1022,6 +1224,7 @@ impl Default for Theme {
             slots: ThemeSlots::default(),
             dialogue: DialogueProps::default(),
             choice: ChoiceProps::default(),
+            menu_overlay: None,
             image_menus: BTreeMap::new(),
             return_to_title: false,
         }
@@ -1031,8 +1234,28 @@ impl Default for Theme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageMenu {
+    /// Authors can reserve the complete page for source controls. Shared
+    /// Escape/right-click and preparation-failure exits remain available.
+    #[serde(
+        default = "builtin_navigation_default",
+        skip_serializing_if = "is_builtin_navigation_default"
+    )]
+    pub builtin_navigation: bool,
+    /// Explicit read-only aliases of bounded story scalars. Never UI write targets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub story_exports: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locals: BTreeMap<String, MenuLocal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<MenuElement>,
     pub background: String,
     pub buttons: Vec<ImageButton>,
+}
+fn builtin_navigation_default() -> bool {
+    true
+}
+fn is_builtin_navigation_default(value: &bool) -> bool {
+    *value
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1054,6 +1277,16 @@ pub struct ImageButton {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageMenuAction {
+    PushMenu { menu: String },
+    Back,
+    Reading { mode: MenuReadingMode },
+    HistoryPage { window: String, delta: i32 },
+    SaveSlot { slot: MenuSlot },
+    LoadSlot { slot: MenuSlot },
+    Close,
+    AdjustPreference { field: MenuPreference, delta: f32 },
+    ToggleReducedMotion,
+    SetLocal { local: String, value: MenuValue },
     NewGame,
     Saves,
     Settings,
@@ -1062,8 +1295,18 @@ pub enum ImageMenuAction {
     Entry { function: String },
 }
 impl ImageMenuAction {
-    pub fn ui_action(&self) -> UiAction {
-        match self {
+    pub fn ui_action(&self) -> Option<UiAction> {
+        Some(match self {
+            Self::PushMenu { .. }
+            | Self::Back
+            | Self::SetLocal { .. }
+            | Self::Reading { .. }
+            | Self::SaveSlot { .. }
+            | Self::LoadSlot { .. }
+            | Self::HistoryPage { .. } => return None,
+            Self::Close => UiAction::Close,
+            Self::AdjustPreference { field, delta } => field.adjust(*delta),
+            Self::ToggleReducedMotion => UiAction::ReducedMotion,
             Self::NewGame => UiAction::NewGame,
             Self::Saves => UiAction::Saves,
             Self::Settings => UiAction::Settings,
@@ -1072,8 +1315,16 @@ impl ImageMenuAction {
             Self::Entry { function } => UiAction::ImageMenuEntry {
                 function: function.clone(),
             },
-        }
+        })
     }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuReadingMode {
+    Auto,
+    SkipRead,
+    PeekStory,
 }
 impl Theme {
     pub fn image_assets(&self) -> BTreeSet<String> {
@@ -1082,6 +1333,11 @@ impl Theme {
             assets.insert(asset.clone());
         }
         for menu in self.image_menus.values() {
+            assets.extend(
+                menu.elements
+                    .iter()
+                    .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
+            );
             assets.insert(menu.background.clone());
             for button in &menu.buttons {
                 assets.insert(button.asset.clone());
@@ -1122,9 +1378,18 @@ pub enum ChoiceComponent {
     Compact,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextShadow {
+    pub offset: [f32; 2],
+    pub color: [f32; 4],
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DialogueProps {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<TextShadow>,
     pub height: f32,
     pub padding: f32,
     pub font_size: f32,
@@ -1136,6 +1401,7 @@ pub struct DialogueProps {
 impl Default for DialogueProps {
     fn default() -> Self {
         Self {
+            shadow: None,
             height: 220.,
             padding: 24.,
             font_size: 23.,
@@ -1162,9 +1428,35 @@ impl Default for ChoiceProps {
     }
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HidePolicy {
+    #[default]
+    ContinueStory,
+    PauseStory,
+}
+fn default_hide_policy(value: &HidePolicy) -> bool {
+    *value == HidePolicy::ContinueStory
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDelayPolicy {
+    #[default]
+    LengthScaled,
+    Fixed,
+}
+fn default_auto_delay_policy(value: &AutoDelayPolicy) -> bool {
+    *value == AutoDelayPolicy::LengthScaled
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlayerDefaults {
+    #[serde(skip_serializing_if = "default_auto_delay_policy")]
+    pub auto_delay_policy: AutoDelayPolicy,
+    #[serde(skip_serializing_if = "default_hide_policy")]
+    pub hide_policy: HidePolicy,
     pub font_scale: f32,
     pub bgm_volume: f32,
     pub voice_volume: f32,
@@ -1177,6 +1469,8 @@ pub struct PlayerDefaults {
 impl Default for PlayerDefaults {
     fn default() -> Self {
         Self {
+            auto_delay_policy: AutoDelayPolicy::LengthScaled,
+            hide_policy: HidePolicy::ContinueStory,
             font_scale: 1.,
             bgm_volume: 0.3,
             voice_volume: 0.8,
@@ -1189,11 +1483,22 @@ impl Default for PlayerDefaults {
     }
 }
 impl PlayerDefaults {
+    pub fn auto_delay(&self, character_count: usize, scale: f32) -> u64 {
+        let extra = if self.auto_delay_policy == AutoDelayPolicy::LengthScaled {
+            (character_count as u64).saturating_mul(20_000)
+        } else {
+            0
+        };
+        let base = self.auto_delay_us.0.saturating_add(extra);
+        (base as f64 * scale as f64).round() as u64
+    }
     pub fn preferences(&self, ui_locale: String, text_locale: String) -> Preferences {
         Preferences {
             ui_locale,
             text_locale,
             font_scale: self.font_scale,
+            text_speed: 1.,
+            auto_wait_scale: 1.,
             bgm_volume: self.bgm_volume,
             voice_volume: self.voice_volume,
             sfx_volume: self.sfx_volume,
@@ -1224,7 +1529,9 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
     };
     if theme.dialogue.rect.as_ref().is_some_and(|r| !rect_ok(r))
         || theme.image_menus.len() > 64
-        || (!theme.image_menus.is_empty() && !theme.image_menus.contains_key("title"))
+        || (!theme.image_menus.is_empty()
+            && !theme.image_menus.contains_key("title")
+            && theme.menu_overlay.is_none())
     {
         return Err(Diagnostic::new(
             "E_THEME_PROPS",
@@ -1232,9 +1539,26 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
             "invalid image menu or dialogue rectangle",
         ));
     }
+    if theme
+        .menu_overlay
+        .as_ref()
+        .is_some_and(|id| !theme.image_menus.contains_key(id))
+    {
+        return Err(Diagnostic::new(
+            "E_VIEW",
+            "theme.menu_overlay",
+            "unknown overlay menu",
+        ));
+    }
     for (id, menu) in &theme.image_menus {
+        menu.validate_elements()?;
+        if menu.controls().any(|(_,action,_)|matches!(action,ImageMenuAction::Menu {menu} | ImageMenuAction::PushMenu {menu} if !theme.image_menus.contains_key(menu))) {return Err(Diagnostic::new("E_VIEW","theme.image_menus","unknown menu target"));}
         let mut ids = BTreeSet::new();
-        if id.is_empty() || menu.background.is_empty() || menu.buttons.len() > 256 {
+        if id.is_empty()
+            || (menu.uses_navigation() && id.len() > 128)
+            || menu.background.is_empty()
+            || menu.buttons.len() > 256
+        {
             return Err(Diagnostic::new(
                 "E_THEME_PROPS",
                 "theme.image_menus",
@@ -1247,13 +1571,36 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
                 || button.label.is_empty()
                 || button.asset.is_empty()
                 || !rect_ok(&button.rect)
-                || matches!(&button.action, ImageMenuAction::Menu { menu } if !theme.image_menus.contains_key(menu))
+                || matches!(&button.action, ImageMenuAction::Menu { menu } | ImageMenuAction::PushMenu {menu} if !theme.image_menus.contains_key(menu))
             {
                 return Err(Diagnostic::new(
                     "E_THEME_PROPS",
                     "theme.image_menus",
                     "invalid button or menu target",
                 ));
+            }
+        }
+    }
+    // System overlays cannot launch an unisolated title-only replay entry.
+    if let Some(root) = &theme.menu_overlay {
+        let mut pending = vec![root.as_str()];
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            for (_, action, _) in theme.image_menus[id].controls() {
+                match action {
+                    ImageMenuAction::Entry { .. } => return Err(Diagnostic::new(
+                        "E_VIEW_SERVICE",
+                        "theme.menu_overlay",
+                        "entry requires the title context; isolated replay is not available here",
+                    )),
+                    ImageMenuAction::Menu { menu } | ImageMenuAction::PushMenu { menu } => {
+                        pending.push(menu.as_str())
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1329,6 +1676,17 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
             ));
         }
     }
+    if let Some(shadow) = theme.dialogue.shadow {
+        if shadow.offset.iter().any(|v| !range(*v, -16., 16.))
+            || shadow.color.iter().any(|v| !range(*v, 0., 1.))
+        {
+            return Err(Diagnostic::new(
+                "E_THEME_PROPS",
+                "theme.dialogue.shadow",
+                "expected finite offset -16..16 and RGBA 0..1",
+            ));
+        }
+    }
     for (name, value, lo, hi) in [
         ("font_scale", player.font_scale, 0.8, 1.5),
         ("bgm_volume", player.bgm_volume, 0., 1.),
@@ -1343,11 +1701,16 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
             ));
         }
     }
-    if !(100_000..=30_000_000).contains(&player.auto_delay_us.0) {
+    let minimum = if player.auto_delay_policy == AutoDelayPolicy::Fixed {
+        0
+    } else {
+        100_000
+    };
+    if !(minimum..=30_000_000).contains(&player.auto_delay_us.0) {
         return Err(Diagnostic::new(
             "E_PLAYER_CONFIG",
             "player.auto_delay_us",
-            "expected 100000..30000000 microseconds",
+            format!("expected {minimum}..30000000 microseconds"),
         ));
     }
     Ok(())
@@ -1443,12 +1806,16 @@ pub struct Object {
     pub media_type: String,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     pub ui_locale: String,
     pub text_locale: String,
     pub font_scale: f32,
+    #[serde(default = "one", skip_serializing_if = "is_unit_gain")]
+    pub text_speed: f32,
+    #[serde(default = "one", skip_serializing_if = "is_unit_gain")]
+    pub auto_wait_scale: f32,
     pub bgm_volume: f32,
     pub voice_volume: f32,
     pub sfx_volume: f32,
@@ -1460,6 +1827,8 @@ impl Default for Preferences {
             ui_locale: "zh-Hans".into(),
             text_locale: "zh-Hans".into(),
             font_scale: 1.,
+            text_speed: 1.,
+            auto_wait_scale: 1.,
             bgm_volume: 0.3,
             voice_volume: 0.8,
             sfx_volume: 0.5,
@@ -1472,36 +1841,193 @@ impl Default for Preferences {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiAction {
+    MenuHistoryScroll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<String>,
+        instance: u32,
+        revision: u32,
+        window: String,
+        layout: u32,
+        input: HistoryScrollInput,
+    },
+    MenuValue {
+        instance: u32,
+        revision: u32,
+        control: String,
+        value: MenuValueInput,
+    },
+    ConfirmSave {
+        token: u32,
+    },
+    CancelSave {
+        token: u32,
+    },
+    MenuControl {
+        instance: u32,
+        revision: u32,
+        control: String,
+    },
     NewGame,
-    ImageMenu { menu: String },
-    ImageMenuEntry { function: String },
-    HoverImage { id: Option<String> },
+    ImageMenu {
+        menu: String,
+    },
+    ImageMenuEntry {
+        function: String,
+    },
+    HoverImage {
+        id: Option<String>,
+    },
     Continue,
     Advance,
-    Choose { option: String },
+    Choose {
+        option: String,
+    },
     Menu,
     Close,
     Settings,
     History,
     Saves,
-    Save { slot: u32 },
-    Load { slot: u32 },
+    Save {
+        slot: u32,
+    },
+    Load {
+        slot: u32,
+    },
     Rollback,
     Title,
     ToggleAuto,
     ToggleSkip,
-    UiLocale { locale: String },
-    TextLocale { locale: String },
+    ToggleInterface,
+    RestoreInterface,
+    HoldSkip {
+        pressed: bool,
+    },
+    UiLocale {
+        locale: String,
+    },
+    TextLocale {
+        locale: String,
+    },
     LocaleRetry,
     LocaleCancel,
-    FontSize { delta: f32 },
-    Volume { bus: AudioBus, delta: f32 },
+    FontSize {
+        delta: f32,
+    },
+    TextSpeed {
+        delta: f32,
+    },
+    AutoWait {
+        delta: f32,
+    },
+    Volume {
+        bus: AudioBus,
+        delta: f32,
+    },
     ReducedMotion,
-    HistoryPage { delta: i32 },
-    Scroll { region: ScrollRegion, delta: i32 },
+    HistoryPage {
+        delta: i32,
+    },
+    Scroll {
+        region: ScrollRegion,
+        delta: i32,
+    },
     Export,
     Import,
     Retry,
+}
+
+impl UiAction {
+    /// Only focus retention may ignore a menu model revision. Dispatch must not.
+    pub fn same_pointer_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::MenuValue {
+                    instance: a,
+                    revision: b,
+                    control: c,
+                    ..
+                },
+                Self::MenuValue {
+                    instance: d,
+                    revision: e,
+                    control: f,
+                    ..
+                },
+            ) => a == d && b == e && c == f,
+            _ => self == other,
+        }
+    }
+    pub fn same_focus_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::MenuHistoryScroll {
+                    instance: a,
+                    window: wa,
+                    control: Some(b),
+                    input: c,
+                    ..
+                },
+                Self::MenuHistoryScroll {
+                    instance: d,
+                    window: wd,
+                    control: Some(e),
+                    input: f,
+                    ..
+                },
+            ) => {
+                a == d
+                    && wa == wd
+                    && b == e
+                    && match (c, f) {
+                        (
+                            HistoryScrollInput::Position { .. },
+                            HistoryScrollInput::Position { .. },
+                        ) => true,
+                        (
+                            HistoryScrollInput::Line { delta: x },
+                            HistoryScrollInput::Line { delta: y },
+                        ) => x == y,
+                        _ => false,
+                    }
+            }
+            (
+                Self::MenuValue {
+                    instance: a,
+                    control: b,
+                    ..
+                },
+                Self::MenuValue {
+                    instance: c,
+                    control: d,
+                    ..
+                },
+            ) => a == c && b == d,
+            (
+                Self::MenuControl {
+                    instance: a,
+                    control: b,
+                    ..
+                },
+                Self::MenuControl {
+                    instance: c,
+                    control: d,
+                    ..
+                },
+            ) => a == c && b == d,
+            _ => self == other,
+        }
+    }
+}
+
+/// View-local history navigation; never a story or saved-state mutation.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryScrollInput {
+    Line { delta: i32 },
+    Step { delta: i32 },
+    Page { delta: i32 },
+    Position { ratio: f32 },
 }
 
 /// Viewport navigation, never a VM instruction or a snapshot cursor.
@@ -1509,6 +2035,7 @@ pub enum UiAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrollRegion {
+    Settings,
     Dialogue,
     Choices,
     History,
