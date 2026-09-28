@@ -299,6 +299,7 @@ pub struct Player {
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
     prepare: Option<Preparation>,
+    failed_admission: Option<(Purpose, u32, BTreeSet<String>)>,
     media_lookahead: Option<MediaLookahead>,
     media_retired: BTreeMap<u32, PrepareJob>,
     deferred_prepare: Option<(Generation, Purpose, u32, BTreeSet<String>)>,
@@ -411,6 +412,7 @@ impl Player {
             inbox: VecDeque::new(),
             work_used: 0,
             prepare: None,
+            failed_admission: None,
             media_lookahead: None,
             media_retired: BTreeMap::new(),
             deferred_prepare: None,
@@ -756,7 +758,9 @@ impl Player {
         if let Some(pending) = &s.pending {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
-        a.extend(self.core.program().theme.image_assets());
+        // Menus are only displayed on the title screen. Keeping their images
+        // during Story can crowd out a new voice or transition under the budget.
+        a.extend(core.program().theme.dialogue.background.iter().cloned());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         let config = &core.program().locale_config;
         for locale in s
@@ -890,6 +894,28 @@ impl Player {
         &mut self,
         purpose: Purpose,
         activation: u32,
+        assets: BTreeSet<String>,
+    ) -> Result<()> {
+        self.failed_admission = None;
+        match self.admit_prepare(purpose, activation, assets.clone()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.cancel_preparation();
+                self.failed_admission = Some((purpose, activation, assets));
+                self.pauses.insert("prepare".into());
+                Err(error.classified(
+                    ErrorDomain::Prepare,
+                    "prepare",
+                    "admission",
+                    vec![Recovery::Retry, Recovery::KeepCurrent, Recovery::Exit],
+                ))
+            }
+        }
+    }
+    fn admit_prepare(
+        &mut self,
+        purpose: Purpose,
+        activation: u32,
         mut assets: BTreeSet<String>,
     ) -> Result<()> {
         if self.deferred_prepare.take().is_some() {
@@ -917,6 +943,12 @@ impl Player {
             .checked_add(1)
             .ok_or_else(|| Diagnostic::new("E_LIMIT", "request", "counter"))?;
         let costs = self.costs(&assets)?;
+        // Stop/cancel intents precede this preparation in the owner's command
+        // queue. Only current scene/tasks and the candidate need to stay pinned;
+        // a cancelled voice/BGM must not occupy the previous active lease.
+        if let Some(active) = &mut self.active {
+            active.retain(&assets);
+        }
         let job = match PrepareJob::new(activation, self.generation, costs.clone(), &self.ledger) {
             Ok(job) => job,
             Err(_) if self.media_lookahead.is_some() || !self.media_retired.is_empty() => {
@@ -992,6 +1024,7 @@ impl Player {
         Ok(())
     }
     fn cancel_preparation(&mut self) {
+        self.failed_admission = None;
         if let Some(p) = self.prepare.take() {
             if !p.failed {
                 self.observe("prepare_cancelled", Some(p.request));
@@ -1886,6 +1919,7 @@ impl Player {
                     .ok_or_else(|| Diagnostic::new("E_RESTORE", "commit", "no candidate"))?;
                 candidate.set_locale(&self.effective_text_locale)?;
                 self.generation.session += 1;
+                self.failed_admission = None;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = candidate;
                 self.restore_work = None;
@@ -2039,6 +2073,7 @@ impl Player {
                 self.candidate = None;
                 self.prefetch_attempted = None;
                 self.generation.session += 1;
+                self.failed_admission = None;
                 self.commands.push(AppCommand::AudioReset);
                 self.core = Core::new_at(
                     self.validated.clone(),
@@ -2316,6 +2351,9 @@ impl Player {
         });
     }
     fn restart_preparation(&mut self) -> Result<()> {
+        if let Some((purpose, activation, assets)) = self.failed_admission.clone() {
+            return self.begin_prepare(purpose, activation, assets);
+        }
         if let Some(prep) = self.prepare.as_ref() {
             let (purpose, activation) = (prep.purpose, prep.job.activation);
             let assets = self.retained_assets();
@@ -2665,6 +2703,91 @@ mod media_tests {
         player.action(entry, 0, 4, &mut 100).unwrap();
         assert_eq!(player.screen, Screen::Story);
         assert_eq!(player.core.state().frames[0].function, "replay");
+    }
+
+    #[test]
+    fn story_releases_menu_images_but_keeps_dialogue_background() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.theme.image_menus.insert(
+            "title".into(),
+            nir_format::ImageMenu {
+                background: "bg.river".into(),
+                buttons: vec![],
+            },
+        );
+        program.theme.dialogue.background = Some("bg.station".into());
+        let player = at_intro_wait(program);
+        let retained = player.retained_assets();
+        assert!(retained.contains("bg.station"));
+        assert!(!retained.contains("bg.river"));
+        assert!(player.title_assets().contains("bg.river"));
+    }
+
+    #[test]
+    fn next_activation_releases_obsolete_active_reservations() {
+        let mut player = player();
+        player.cancel_preparation();
+        player.pauses.retain(|_| false);
+        player.screen = Screen::Story;
+        player.return_screen = Screen::Story;
+        player.active = Some(
+            player
+                .ledger
+                .reserve(&BTreeMap::from([(
+                    "retired-audio".into(),
+                    LIMIT - player.ledger.used() - 1,
+                )]))
+                .unwrap(),
+        );
+        player
+            .begin_prepare(Purpose::Activation, 7, BTreeSet::from(["bg.river".into()]))
+            .unwrap();
+        assert!(player.prepare.is_some());
+        assert!(player.memory_used() < LIMIT / 2);
+    }
+
+    #[test]
+    fn admission_failure_pauses_and_retries_same_activation() {
+        let mut player = player();
+        player.cancel_preparation();
+        player.pauses.retain(|_| false);
+        player.commands.clear();
+        player.screen = Screen::Story;
+        player.return_screen = Screen::Story;
+        let occupied = player
+            .ledger
+            .reserve(&BTreeMap::from([(
+                "test-pressure".into(),
+                LIMIT - player.ledger.used() - 1,
+            )]))
+            .unwrap();
+        let error = player
+            .action(UiAction::NewGame, 0, 0, &mut 100)
+            .unwrap_err();
+        let activation = player.core.state().pending.as_ref().unwrap().id;
+        assert_eq!(error.code, "E_BUDGET");
+        assert!(error
+            .details
+            .as_ref()
+            .unwrap()
+            .recovery
+            .contains(&Recovery::Retry));
+        player.report(error, true);
+        assert!(player.paused());
+        assert!(!player.needs_clock());
+        assert!(player.failed_admission.is_some());
+        assert!(player.prepare.is_none());
+        drop(occupied);
+        player.action(UiAction::Retry, 0, 0, &mut 100).unwrap();
+        assert!(player.failed_admission.is_none());
+        assert_eq!(player.prepare.as_ref().unwrap().job.activation, activation);
+        assert!(player
+            .commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::GetAssets { .. })));
+        player.action(UiAction::Title, 0, 0, &mut 100).unwrap();
+        assert!(player.failed_admission.is_none());
     }
 
     #[test]

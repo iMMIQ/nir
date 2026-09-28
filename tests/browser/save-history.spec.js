@@ -55,6 +55,7 @@ test('history keeps unavailable saves exportable and only opens validated releas
       {gameId,profile,releaseDigest,slot,version:'0.9'},0);
     db.close();
   },module);
+  await page.evaluate(()=>window.__nir.action({type:'menu'}));
   await page.locator('#nir-history-button').click();
   const row=page.locator('#nir-history-panel tr').filter({hasText:'0.9'});
   await expect(row).toContainText('Release resources unavailable');

@@ -70,6 +70,7 @@ test('staged A and B preserve same-slot saves across promotion and rollback',asy
     await action(page,{type:'load',slot:0});
     await page.waitForFunction(()=>window.__nir.state().screen==='Story'&&!window.__nir.state().loading);
 
+    await action(page,{type:'menu'});
     await page.locator('#nir-history-button').click();
     const panel=page.locator('#nir-history-panel');
     await expect(panel.locator('tbody tr')).toHaveCount(2);

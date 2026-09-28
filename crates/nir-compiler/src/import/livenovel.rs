@@ -19,10 +19,12 @@ pub(super) fn recognizes(source: &Source, entry: &str) -> bool {
         && source.path("シーン回想.lsb").is_ok()
 }
 type Episode = (usize, String, Vec<Node>, BTreeMap<String, Value>);
+#[derive(Clone)]
 struct Asset {
     source: String,
     gain: Option<f32>,
     size: [u32; 2],
+    blackened: bool,
 }
 struct Adapter {
     source: Source,
@@ -136,10 +138,18 @@ impl Adapter {
                     source: name,
                     gain: None,
                     size: [w, h],
+                    blackened: false,
                 },
             );
         }
         Ok((id.clone(), self.assets[&id].size))
+    }
+    fn locked_image(&mut self, image: &str) -> String {
+        let id = format!("{image}.locked");
+        let mut asset = self.assets[image].clone();
+        asset.blackened = true;
+        self.assets.insert(id.clone(), asset);
+        id
     }
     fn visual(&mut self, path: &str) -> Result<(Option<String>, [u32; 2], [f32; 4])> {
         if let Some(hex) = path.strip_prefix('$') {
@@ -178,6 +188,7 @@ impl Adapter {
             source: name,
             gain: Some(gain),
             size: [0, 0],
+            blackened: false,
         });
         Ok(id)
     }
@@ -447,6 +458,15 @@ impl Adapter {
             self.op(blocks, json!({"type":"dialogue_continue","task":"line"}));
         }
         self.wait(blocks, "line", json!({"type":"finished"}));
+        // LiveNovel stops non-repeating voice when the page is dismissed,
+        // even if the following page has no PLAYSND event of its own.
+        if self
+            .audio
+            .get("voice")
+            .is_some_and(|effect| effect["looped"] == false)
+        {
+            self.stop(blocks, "voice");
+        }
         Ok(())
     }
     fn finish_function(&mut self, name: &str, mut blocks: Vec<Value>, end: Value) {
@@ -738,12 +758,13 @@ impl Adapter {
                     .get(&unlock)
                     .context("E_IMPORT_LIVENOVEL: missing replay thumbnail")?,
             )?;
+            let locked_asset = Some(self.locked_image(&asset));
             buttons.push(ImageButton {
                 id: format!("replay{index}"),
                 label: format!("回想 {}", index + 1),
                 asset,
                 hover_asset: None,
-                locked_asset: None,
+                locked_asset,
                 rect: [
                     50. + (index % 3) as f32 * 250.,
                     20. + (index / 3) as f32 * 200.,
@@ -797,7 +818,7 @@ impl Adapter {
                 buttons,
             },
         );
-        self.warnings.insert("Replay thumbnails retain original grid coordinates. Locked thumbnails are dimmed; a NIR return button and system-menu access remain available for touch/keyboard navigation.".into());
+        self.warnings.insert("Replay thumbnails retain original grid coordinates. Locked thumbnails preserve alpha with black RGB; a NIR return button and system-menu access remain available for touch/keyboard navigation.".into());
         self.scenes.insert("title".into(), vec![]);
         Ok(
             json!({"fragment_format":1,"functions":self.functions,"cues":self.cues,"scenes":self.scenes}),
@@ -823,13 +844,14 @@ impl Adapter {
                         .with_context(|| format!("audio {}", asset.source))?,
                 )
             } else {
-                (
-                    "image",
-                    "png",
-                    media::png(
-                        &media::gal(&bytes).with_context(|| format!("image {}", asset.source))?,
-                    )?,
-                )
+                ("image", "png", {
+                    let mut image =
+                        media::gal(&bytes).with_context(|| format!("image {}", asset.source))?;
+                    if asset.blackened {
+                        media::blacken(&mut image);
+                    }
+                    media::png(&image)?
+                })
             };
             total += bytes.len();
             ensure!(
@@ -837,7 +859,7 @@ impl Adapter {
                 "E_IMPORT_LIMIT: converted media exceeds 1 GiB"
             );
             let source = format!("imported/{id}.{extension}");
-            media_map.insert(id.clone(),json!({"source":asset.source,"source_sha256":source_hash,"kind":kind,"output":source,"gain":asset.gain}));
+            media_map.insert(id.clone(),json!({"source":asset.source,"source_sha256":source_hash,"kind":kind,"output":source,"gain":asset.gain,"transform":if asset.blackened {Some("black_rgb_preserve_alpha")} else {None}}));
             fs::write(root.join("assets").join(&source), bytes)?;
             entries.push(json!({"id":id,"kind":kind,"source":source,"rights":"Imported source game asset; original rights retained."}));
         }
@@ -1005,6 +1027,61 @@ mod tests {
             .page(&[Glyph::Event(vec!["UNKNOWN".into()])], &mut blocks)
             .is_err());
     }
+    #[test]
+    fn page_completion_cancels_non_looping_voice_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+        adapter
+            .audio
+            .insert("bgm".into(), json!({"type":"audio","looped":true}));
+        adapter
+            .audio
+            .insert("voice".into(), json!({"type":"audio","looped":false}));
+        let mut blocks = vec![];
+        adapter
+            .page(&[Glyph::Char("Test".into())], &mut blocks)
+            .unwrap();
+        assert_eq!(blocks[1]["terminator"]["type"], "await");
+        assert_eq!(
+            blocks[2]["ops"][0]["operation"],
+            json!({"type":"task_control","task":"voice","action":"cancel"})
+        );
+        assert!(!adapter.audio.contains_key("voice"));
+        assert!(adapter.audio.contains_key("bgm"));
+        adapter
+            .audio
+            .insert("voice".into(), json!({"type":"audio","looped":true}));
+        blocks.clear();
+        adapter
+            .page(&[Glyph::Char("Next".into())], &mut blocks)
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(adapter.audio.contains_key("voice"));
+    }
+
+    #[test]
+    fn locked_thumbnail_is_a_distinct_black_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+        adapter.assets.insert(
+            "thumbnail".into(),
+            Asset {
+                source: "fixture.gal".into(),
+                gain: None,
+                size: [2, 1],
+                blackened: false,
+            },
+        );
+        let locked = adapter.locked_image("thumbnail");
+        assert_ne!(locked, "thumbnail");
+        assert!(adapter.assets[&locked].blackened);
+        assert!(!adapter.assets["thumbnail"].blackened);
+        let mut image =
+            image::RgbaImage::from_raw(2, 1, vec![90, 120, 255, 255, 50, 60, 70, 34]).unwrap();
+        media::blacken(&mut image);
+        assert_eq!(image.as_raw(), &[0, 0, 0, 255, 0, 0, 0, 34]);
+    }
+
     #[test]
     fn menu106_reads_coordinates_hover_and_rejects_truncation() {
         use super::super::lsb::tests::{string, u32b};

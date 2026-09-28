@@ -81,6 +81,25 @@ pub struct Reservation {
     ledger: BudgetLedger,
     ids: BTreeSet<String>,
 }
+impl Reservation {
+    /// Release this lease's pins on resources no longer used by the owner.
+    /// Other active/preparation leases retain their independent pins.
+    pub fn retain(&mut self, assets: &BTreeSet<String>) {
+        let removed: Vec<_> = self.ids.difference(assets).cloned().collect();
+        let mut ledger = self.ledger.0.borrow_mut();
+        for id in removed {
+            self.ids.remove(&id);
+            if let Some(entry) = ledger.items.get_mut(&id) {
+                entry.pins -= 1;
+                if entry.pins == 0 {
+                    let bytes = entry.bytes;
+                    ledger.items.remove(&id);
+                    ledger.used -= bytes;
+                }
+            }
+        }
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut l = self.ledger.0.borrow_mut();
@@ -153,6 +172,25 @@ impl PrepareJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trimming_one_lease_preserves_other_owners() {
+        let ledger = BudgetLedger::new(100);
+        let mut active = ledger
+            .reserve(&BTreeMap::from([("old".into(), 60), ("shared".into(), 20)]))
+            .unwrap();
+        let other = ledger
+            .reserve(&BTreeMap::from([("shared".into(), 20)]))
+            .unwrap();
+        active.retain(&BTreeSet::from(["shared".into()]));
+        assert_eq!(ledger.used(), 20);
+        assert_eq!(ledger.pins(), 2);
+        active.retain(&BTreeSet::new());
+        assert_eq!(ledger.used(), 20);
+        drop(active);
+        drop(other);
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn joint_admission_and_drop() {
         let l = BudgetLedger::new(100);

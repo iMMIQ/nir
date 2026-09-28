@@ -518,6 +518,21 @@ export async function initializeBackend({requested='auto',probe,create,replaceCa
     }
 }
 
+// Only primary pointers activate hit targets. Secondary clicks use the system
+// menu, and an unfocused Enter must not invent an action for a submenu.
+export function pointerAction(button,screen,hit) {
+    if(button===0)return hit;
+    if(button!==2)return null;
+    if(screen==='Story')return {type:'menu'};
+    if(['Menu','Settings','Saves','History'].includes(screen))return {type:'close'};
+    return null;
+}
+export function primaryKeyAction(screen,paused,nodes) {
+    if(screen==='Title')return nodes.find(n=>n.enabled&&n.action.type==='new_game')?.action??null;
+    if(screen==='Story')return {type:paused?'continue':'advance'};
+    return null;
+}
+
 export async function start({wasm,release,releaseDigest,releaseRoot,executable,fetchObject,fail,startupTrace=[],sha256}) {
     const params=new URL(location.href).searchParams;
     const trace=new TraceRecorder({enabled:params.get('trace')!=='0'&&(params.has('diagnostics')||params.has('test'))});
@@ -560,9 +575,9 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     observe('engine_created',{start_us:createStart,end_us:String(Math.round(performance.now()*1000))});
     document.title=release.title;
     const historyStyle=document.createElement('style');
-    historyStyle.textContent=`#nir-history-button,#nir-dev-banner{position:fixed;z-index:4;font:14px system-ui,sans-serif}#nir-history-button{top:12px;right:12px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:4px;cursor:pointer}#nir-dev-banner{top:12px;left:12px;padding:7px 10px;background:#9d6823;color:#fff;border-radius:4px;pointer-events:none}#nir-history-panel{position:fixed;z-index:6;inset:0;background:#071b20ed;color:#f2f2e9;overflow:auto;padding:clamp(18px,4vw,48px);font:15px system-ui,sans-serif}#nir-history-panel[hidden]{display:none}#nir-history-panel .nir-history-inner{max-width:900px;margin:auto}#nir-history-panel h2{font-size:24px;font-weight:500}#nir-history-panel button{margin:3px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:3px;cursor:pointer}#nir-history-panel button:disabled{opacity:.45;cursor:default}#nir-history-panel table{width:100%;border-collapse:collapse}#nir-history-panel th,#nir-history-panel td{text-align:left;border-bottom:1px solid #5d7474;padding:10px 6px;vertical-align:top}#nir-history-panel code{overflow-wrap:anywhere}#nir-history-panel .nir-history-status{min-width:115px}`;
+    historyStyle.textContent=`#nir-history-button,#nir-dev-banner{position:fixed;z-index:4;font:14px system-ui,sans-serif}#nir-history-button{top:12px;right:12px;max-width:45vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:4px;cursor:pointer}#nir-dev-banner{top:12px;left:12px;padding:7px 10px;background:#9d6823;color:#fff;border-radius:4px;pointer-events:none}#nir-history-panel{position:fixed;z-index:6;inset:0;background:#071b20ed;color:#f2f2e9;overflow:auto;padding:clamp(18px,4vw,48px);font:15px system-ui,sans-serif}#nir-history-panel[hidden]{display:none}#nir-history-panel .nir-history-inner{max-width:900px;margin:auto}#nir-history-panel h2{font-size:24px;font-weight:500}#nir-history-panel button{margin:3px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:3px;cursor:pointer}#nir-history-panel button:disabled{opacity:.45;cursor:default}#nir-history-panel table{width:100%;border-collapse:collapse}#nir-history-panel th,#nir-history-panel td{text-align:left;border-bottom:1px solid #5d7474;padding:10px 6px;vertical-align:top}#nir-history-panel code{overflow-wrap:anywhere}#nir-history-panel .nir-history-status{min-width:115px}`;
     document.head.append(historyStyle);
-    const historyButton=document.createElement('button');historyButton.id='nir-history-button';historyButton.type='button';historyButton.textContent='发行存档 / Save history';historyButton.onclick=()=>{if(state().screen==='Story')void action({type:'menu'});historyPanel.hidden=false;document.querySelector('#actions').inert=true;historyClose.focus();void refreshHistory();};document.body.append(historyButton);
+    const historyButton=document.createElement('button');historyButton.id='nir-history-button';historyButton.type='button';historyButton.hidden=true;historyButton.textContent='发行存档 / Save history';historyButton.onclick=()=>{if(state().screen==='Story')void action({type:'menu'});historyPanel.hidden=false;document.querySelector('#actions').inert=true;historyClose.focus();void refreshHistory();};document.body.append(historyButton);
     let devBanner=null;
     if(release.profile==='dev'){devBanner=document.createElement('div');devBanner.id='nir-dev-banner';devBanner.textContent='Development build · saves are isolated';document.body.append(devBanner);}
     const historyPanel=document.createElement('section');historyPanel.id='nir-history-panel';historyPanel.hidden=true;historyPanel.setAttribute('role','dialog');historyPanel.setAttribute('aria-modal','true');historyPanel.setAttribute('aria-label','Save history');
@@ -970,8 +985,10 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         sequence=Math.max(sequence+1,state().sequence+1);const seq=sequence;
         return deliver(()=>{if(a.type==='title'||a.type==='new_game')inbox.cancelGroup('load');mutateEngine(()=>engine.action(JSON.stringify(a),context.interaction,seq,context.session));},'input');
     }
-    let semanticSignature='',announcement='',announcementLocale='';
+    let semanticSignature='',announcement='',announcementLocale='',semanticNodes=[];
     function semantics(view) {
+        semanticNodes=view.nodes;
+        historyButton.hidden=state().screen!=='Menu';
         document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
         if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=document.activeElement?.dataset?.action;nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;b.dataset.action=JSON.stringify(n.action);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,context);b.onfocus=()=>{deliver(()=>mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2)),'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>document.querySelector('#focus-ring').style.display='none';nav.append(b);if(b.dataset.action===focused)b.focus({preventScroll:true});}}
         const spokenLocale=view.announcement_locale||view.locale||'zh-Hans';if(view.announcement&&(view.announcement!==announcement||spokenLocale!==announcementLocale)){announcement=view.announcement;announcementLocale=spokenLocale;const live=document.querySelector('#announcement');live.lang=spokenLocale;live.textContent=announcement;}
@@ -1018,12 +1035,12 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     function schedule() {if(disposed||recovering)return;if(!raf)raf=requestAnimationFrame(()=>{raf=0;wake();});}
     let down=null;
     const scrollAt=(x,y)=>state().scrolls.find(v=>x>=v.rect[0]&&x<=v.rect[0]+v.rect[2]&&y>=v.rect[1]&&y<=v.rect[1]+v.rect[3]);
-    const onDown=(e)=>{unlock();down={action:JSON.parse(engine.hit(e.clientX,e.clientY)),context:state(),x:e.clientX,y:e.clientY,scroll:scrollAt(e.clientX,e.clientY)};};
+    const onDown=(e)=>{if(e.button!==0&&e.button!==2)return;unlock();const context=state();down={button:e.button,action:pointerAction(e.button,context.screen,JSON.parse(engine.hit(e.clientX,e.clientY))),context,x:e.clientX,y:e.clientY,scroll:e.button===0?scrollAt(e.clientX,e.clientY):null};};
     const onUp=(e)=>{
-        if(!down)return;
+        if(!down||e.button!==down.button)return;
         const dy=e.clientY-down.y;
         if(down.scroll&&Math.abs(dy)>30&&Math.abs(e.clientX-down.x)<80){action({type:'scroll',region:down.scroll.region,delta:dy<0?1:-1},down.context);}
-        else if(Math.hypot(e.clientX-down.x,dy)<20){const hit=JSON.parse(engine.hit(e.clientX,e.clientY));if(down.action&&JSON.stringify(down.action)===JSON.stringify(hit))action(down.action,down.context);}
+        else if(Math.hypot(e.clientX-down.x,dy)<20){const hit=pointerAction(e.button,state().screen,JSON.parse(engine.hit(e.clientX,e.clientY)));if(down.action&&JSON.stringify(down.action)===JSON.stringify(hit))action(down.action,down.context);}
         down=null;
     };
     let hoverTarget;
@@ -1039,7 +1056,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         }
         if(e.key==='Escape'){e.preventDefault();const s=state();action({type:['Menu','Settings','Saves','History'].includes(s.screen)?'close':'menu'});return;}
         if(document.activeElement?.tagName==='BUTTON')return;
-        if(e.key===' '||e.key==='Enter'){e.preventDefault();const s=state();action({type:s.screen==='Title'?'new_game':s.paused?'continue':'advance'});}
+        if(e.key===' '||e.key==='Enter'){e.preventDefault();const s=state(),a=primaryKeyAction(s.screen,s.paused,semanticNodes);if(a)action(a,s);}
         else if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();document.querySelector('#actions button:not([disabled])')?.focus();}
     };
     const onVisibility=()=>{const hidden=document.hidden;deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
@@ -1047,8 +1064,9 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     let glContextLost=false;
     const onCancel=()=>down=null;
     const onGlLost=e=>{e.preventDefault();glContextLost=true;deliver(checkDevice,'control');};
-    function bindCanvas(){canvas.addEventListener('pointermove',onMove);canvas.addEventListener('pointerleave',onLeave);canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
-    function unbindCanvas(){canvas.removeEventListener('pointermove',onMove);canvas.removeEventListener('pointerleave',onLeave);canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
+    const onContextMenu=e=>e.preventDefault();
+    function bindCanvas(){canvas.addEventListener('contextmenu',onContextMenu);canvas.addEventListener('pointermove',onMove);canvas.addEventListener('pointerleave',onLeave);canvas.addEventListener('wheel',onWheel,{passive:false});canvas.addEventListener('pointerdown',onDown);canvas.addEventListener('pointerup',onUp);canvas.addEventListener('pointercancel',onCancel);canvas.addEventListener('webglcontextlost',onGlLost);}
+    function unbindCanvas(){canvas.removeEventListener('contextmenu',onContextMenu);canvas.removeEventListener('pointermove',onMove);canvas.removeEventListener('pointerleave',onLeave);canvas.removeEventListener('wheel',onWheel);canvas.removeEventListener('pointerdown',onDown);canvas.removeEventListener('pointerup',onUp);canvas.removeEventListener('pointercancel',onCancel);canvas.removeEventListener('webglcontextlost',onGlLost);}
     bindCanvas();window.addEventListener('keydown',onKey);document.addEventListener('visibilitychange',onVisibility);window.addEventListener('resize',onResize);
     function checkDevice(){
         if(disposed||recovering)return;

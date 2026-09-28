@@ -293,6 +293,12 @@ fn blocks(
     );
     Ok(out)
 }
+pub(super) fn blacken(image: &mut RgbaImage) {
+    for pixel in image.pixels_mut() {
+        pixel.0[..3].fill(0);
+    }
+}
+
 pub(super) fn png(image: &RgbaImage) -> Result<Vec<u8>> {
     let mut bytes = vec![];
     image::codecs::png::PngEncoder::new(&mut bytes).write_image(
