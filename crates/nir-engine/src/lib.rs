@@ -40,7 +40,7 @@ const MAX_PENDING_HOST_PROFILES: usize = 128;
 fn profile_clock_us() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
-        return (web_sys::window().unwrap().performance().unwrap().now() * 1000.) as u64;
+        (web_sys::window().unwrap().performance().unwrap().now() * 1000.) as u64
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
