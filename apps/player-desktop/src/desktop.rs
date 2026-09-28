@@ -1,11 +1,11 @@
+use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
+use crate::{atomic_write, Bundle, Storage};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nir_engine::Engine;
 use nir_format::*;
 use nir_player::{AppCommand, AppEvent};
 use nir_presentation::SlotView;
 use nir_render_wgpu::{Renderer, RendererBackend};
-use player_windows::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
-use player_windows::{atomic_write, Bundle, Storage};
 use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -115,6 +115,9 @@ fn worker(bundle: Arc<Bundle>) -> (mpsc::SyncSender<Job>, mpsc::Receiver<Loaded>
     });
     (send, receive)
 }
+/// A pointer press waiting for release on the same target: button, action,
+/// press position and the input identity observed at press time.
+type PendingPointer = (MouseButton, UiAction, (f32, f32), (u32, u32));
 struct Voice {
     sink: Sink,
     position_base: u64,
@@ -142,7 +145,7 @@ struct Runtime {
     hidden: bool,
     held_controls: [bool; 2],
     modifiers: ModifiersState,
-    pointer_down: Option<(MouseButton, UiAction, (f32, f32), (u32, u32))>,
+    pointer_down: Option<PendingPointer>,
     bar_pointer: bool,
     focused: bool,
     occluded: bool,
@@ -644,8 +647,12 @@ impl Runtime {
 }
 fn create_renderer(window: Arc<Window>) -> Result<Renderer> {
     let size = window.inner_size();
+    #[cfg(windows)]
+    let (backends, backend) = (wgpu::Backends::DX12, RendererBackend::Dx12);
+    #[cfg(target_os = "linux")]
+    let (backends, backend) = (wgpu::Backends::VULKAN, RendererBackend::Vulkan);
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::DX12,
+        backends,
         ..Default::default()
     });
     let surface = instance.create_surface(window)?;
@@ -654,7 +661,7 @@ fn create_renderer(window: Arc<Window>) -> Result<Renderer> {
         surface,
         size.width.max(1),
         size.height.max(1),
-        RendererBackend::Dx12,
+        backend,
     ))?)
 }
 struct App {
@@ -668,6 +675,9 @@ struct App {
     smoke_advance: Instant,
     advances: u32,
     hidden: bool,
+    /// Set when a return-to-title ending restarted the story: the save cycle
+    /// must run at the first dialogue because saves from Title are refused.
+    save_at_dialogue: bool,
 }
 impl App {
     fn update(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -694,10 +704,31 @@ impl App {
                 1 if !state["dialogue"].is_null()
                     && self.smoke_advance.elapsed() > Duration::from_millis(120) =>
                 {
-                    if self.advances < 30 {
+                    if self.save_at_dialogue || self.advances >= 30 {
+                        runtime.input(UiAction::Saves)?;
+                        self.smoke_step = 2;
+                    } else {
                         runtime.input(UiAction::Advance)?;
                         self.advances += 1;
                         self.smoke_advance = Instant::now();
+                    }
+                }
+                // A pending choice is a mid-story checkpoint: run the save
+                // cycle here so the load restores an interactive state.
+                // (Advance cannot settle a choice, and saving after the
+                // ending would restore a dead end.)
+                1 if !state["choice"].is_null() => {
+                    runtime.input(UiAction::Saves)?;
+                    self.smoke_step = 2;
+                }
+                // A finished story parks on Ended (or returns to Title); a
+                // choice-free story never offers the mid-story checkpoint.
+                // Ended still accepts saves; Title refuses them, so restart
+                // and save at the first dialogue instead.
+                1 if matches!(state["screen"].as_str(), Some("Ended") | Some("Title")) => {
+                    if state["screen"] == "Title" {
+                        runtime.input(UiAction::NewGame)?;
+                        self.save_at_dialogue = true;
                     } else {
                         runtime.input(UiAction::Saves)?;
                         self.smoke_step = 2;
@@ -713,7 +744,12 @@ impl App {
                     runtime.input(UiAction::Load { slot: 0 })?;
                     self.smoke_step = 4;
                 }
-                4 if !state["dialogue"].is_null() && state["loading"] == false => {
+                4 if state["loading"] == false
+                    && state["screen"] == "Story"
+                    && (!state["dialogue"].is_null()
+                        || !state["choice"].is_null()
+                        || !state["outcome"].is_null()) =>
+                {
                     atomic_write(
                         path,
                         &serde_json::to_vec_pretty(
@@ -1024,13 +1060,34 @@ impl ApplicationHandler for App {
         }
     }
 }
+/// Save/preferences root. Windows follows %LOCALAPPDATA%; Linux follows the XDG
+/// data dir ($XDG_DATA_HOME when absolute, else ~/.local/share). `--data-dir`
+/// overrides this in `run`.
+#[cfg(windows)]
+fn default_data_root() -> Result<PathBuf> {
+    Ok(std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .context("E_STORAGE_ROOT: LOCALAPPDATA missing")?
+        .join("NIR/games"))
+}
+#[cfg(target_os = "linux")]
+fn default_data_root() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Ok(dir.join("NIR/games"));
+        }
+    }
+    Ok(std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("E_STORAGE_ROOT: HOME missing to locate ~/.local/share")?
+        .join(".local/share/NIR/games"))
+}
+
 pub fn run() -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut root = exe.parent().context("E_PACKAGE_ROOT")?.join("data");
-    let mut data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("E_STORAGE_ROOT: LOCALAPPDATA missing")?
-        .join("NIR/games");
+    let mut data = default_data_root()?;
     let mut smoke = None;
     let mut hidden = false;
     let mut verify = false;
@@ -1066,6 +1123,7 @@ pub fn run() -> Result<()> {
         started: Instant::now(),
         smoke_advance: Instant::now(),
         advances: 0,
+        save_at_dialogue: false,
         hidden,
     };
     event_loop.run_app(&mut app)?;

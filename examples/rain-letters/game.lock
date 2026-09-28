@@ -1,17 +1,18 @@
 format = 1
 engine_api = "nir-player/0.1"
 capability_profile = "web-v1"
-sdk_digest = "99b1aee75230e152cda1ba3b7a55ea1bc1afdd04b2991c64e181c4c218f2c30a"
+sdk_digest = "d2053d75317140f2f885246476792001a000f1e2c9808931f3f5a4fd74e47a65"
 
 [sdk]
 format = 1
-compiler_version = "0.1.0"
+compiler_version = "0.1.1"
 
 [sdk.files]
-"THIRD-PARTY.txt" = "9f1b19ab2681851747e2858caecdcc756595d4897cbf688c8678a91e22f19dca"
-"bootstrap.js" = "9424cf9457bf1b93727d3799a4f16f69ab5cb2aefd57b24efcb0900ae54cccca"
-"compiler.sha256" = "f2564ddb59cdc223a5c84bbc6272fb2bca14ff0236559c69a87005d2ee4d0e4a"
-"host.js" = "17220b8301535c751dbbba3ace683daf4adbbc02f84252628e69b2ba620ac493"
+"THIRD-PARTY.txt" = "6e6446b17e034738c2ba5c7d098468d34981fa9e695b01d7f3ab6222a92d2176"
+"bootstrap.js" = "0389a4eb7010cd66511ce3bbfa35ae34fccff1e4e0bfc21ff8d3c9739909beac"
+"compiler.sha256" = "4af4e98862463ff168068f18a077fd96d8be49eea92444494ced26b173f6492f"
+"host.js" = "fe25cfd03d63505f921757156e2ab5d2fa44c0868a7ab8c1320bc82c7a33bb92"
 "index.html" = "61d4c8349194f8a3c47ce1480f8d4d84c5fc089a0aac95102910479ec1b50c7b"
-"player_web.js" = "d6742612b8cd7e3e9a93eb07f3b5389423c5fe7d69caa1a45b4d695706173341"
-"player_web_bg.wasm" = "0d566794aba27b9bb87e3dea0df4467c20c69f3aeac95bee221b5412ed059ff7"
+"linux/player-linux" = "1bd26eba77af08ebd426f6650fe95e584d165999de30318f59c05274e568d152"
+"player_web.js" = "20915d3a1070cb87beeb36738d4051bc393382edffb042b77b80e790b31daa9a"
+"player_web_bg.wasm" = "8628a92777cc6b583e001e0e7bbf18aae669d0b9a742b22e590ce3df90c177f7"

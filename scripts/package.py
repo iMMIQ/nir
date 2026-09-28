@@ -55,6 +55,8 @@ for name in selected:
 
 init 默认创建带母版字体的独立最小作品；CLI 自动编译运行字体。使用 init --template web-basic 可创建功能回归工程。novelc 和 sdk 必须配套保留。最终作品默认输出到 my-story/dist/full/web，可完整上传至 HTTPS 静态站点，保留 NOTICE.txt。
 
+SDK 内含 Linux 原生播放器 sdk/linux/player-linux。运行 `./novelc -p my-story build --target linux --locked` 输出原生 Linux 版本 dist/full/linux（Vulkan 渲染，无需浏览器）；要求 x86_64、glibc 2.39+ 与 Vulkan 驱动，详见 docs/LINUX.md。
+
 运行附带的测试工程：
 
 ```

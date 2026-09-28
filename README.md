@@ -40,6 +40,10 @@ SDK 的 `novelc` 内置 Rust 导入工具，无需 Python。当前实验性支�
 
 在 Windows x64 构建 `cargo xtask sdk` 后，运行 `novelc -p my-story resolve` 和 `novelc -p my-story build --target windows --locked`。分发完整 `dist/full/windows/` 目录，玩家双击 `Game.exe`，无需浏览器或本地服务器。使用 DirectX 12 原生渲染，详见 [Windows 发布与验证](docs/WINDOWS.md)。
 
+## Linux 原生发布
+
+在 Linux x86_64 构建 `cargo xtask sdk` 后，运行 `novelc -p my-story resolve` 和 `novelc -p my-story build --target linux --locked`。分发完整 `dist/full/linux/` 目录（打包为 tar.gz），玩家运行 `./Game`，无需浏览器或本地服务器。使用 Vulkan 原生渲染，详见 [Linux 发布与验证](docs/LINUX.md)。
+
 ## 作品结构
 
 ```text

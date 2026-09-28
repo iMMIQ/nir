@@ -20,6 +20,15 @@
               bun
               nodejs_24
               pkg-config
+              # Native desktop player (rodio/cpal links ALSA at build time).
+              alsa-lib
+              # Runtime bits for local player-linux runs: Vulkan loader with
+              # lavapipe for headless software rendering, plus X/Wayland clients.
+              vulkan-loader
+              mesa
+              libxkbcommon
+              wayland
+              xvfb-run
             ];
 
             nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];

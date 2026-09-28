@@ -15,10 +15,11 @@ use std::{
 };
 pub use wgpu;
 
-/// Browser rendering backend selected before a canvas context is bound.
+/// Rendering backend selected before a surface context is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendererBackend {
     Dx12,
+    Vulkan,
     WebGpu,
     WebGl2,
 }
@@ -27,6 +28,7 @@ impl RendererBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Dx12 => "dx12",
+            Self::Vulkan => "vulkan",
             Self::WebGpu => "webgpu",
             Self::WebGl2 => "webgl2",
         }
@@ -151,7 +153,7 @@ fn select_surface_format(
     Vec<wgpu::TextureFormat>,
 )> {
     match backend {
-        RendererBackend::WebGpu | RendererBackend::Dx12 => {
+        RendererBackend::WebGpu | RendererBackend::Dx12 | RendererBackend::Vulkan => {
             let surface_format = *formats.first().ok_or_else(|| error("no surface format"))?;
             let format = surface_format.add_srgb_suffix();
             let views = if format == surface_format {
@@ -236,7 +238,7 @@ impl Renderer {
                 label: Some("NIR renderer"),
                 required_features: wgpu::Features::empty(),
                 required_limits: match backend {
-                    RendererBackend::WebGpu | RendererBackend::Dx12 => {
+                    RendererBackend::WebGpu | RendererBackend::Dx12 | RendererBackend::Vulkan => {
                         wgpu::Limits::downlevel_defaults()
                     }
                     RendererBackend::WebGl2 => wgpu::Limits::downlevel_webgl2_defaults(),

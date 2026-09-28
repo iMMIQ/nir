@@ -105,7 +105,7 @@ impl<I: Iterator<Item = f32>> Iterator for EnvelopeSamples<I> {
         self.input.size_hint()
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl<I: rodio::Source> rodio::Source for EnvelopeSamples<I> {
     fn current_span_len(&self) -> Option<usize> {
         self.input.current_span_len()

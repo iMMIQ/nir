@@ -55,6 +55,6 @@ Web Audio 使用独立包络 GainNode；玩家音量与事件 gain 使用另一 
 
 LiveNovel 适配将 BGM `STOPSND ... PASS` 转为不阻塞主流的停止任务；非循环语音在源页完成处以 50 ms 淡出停止。循环语音不执行该翻页清理。导入器复用每通道的停止句柄，避免长篇阅读积累无限任务名。
 
-原生语义回归：`cargo test -p nir-core --test audio_contract`。采样包络及存储回归：`cargo test -p player-windows --lib`；Linux 执行该命令不代表 Windows 音频设备实测。
+原生语义回归：`cargo test -p nir-core --test audio_contract`。采样包络及存储回归：`cargo test -p player-desktop --lib`；Linux 执行该命令不代表 Windows 音频设备实测。
 
 构建配套 SDK 后，`npx playwright test --config playwright.nir-next.config.js` 会生成中性工程并检查 WebGL2 的事件增益、连续淡出、暂停、存读档剩余包络及会话清理。该入口不使用私有游戏或外部媒体工具。Windows 真机和硬件 WebGPU 仍需独立验收。

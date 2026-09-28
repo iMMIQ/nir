@@ -28,7 +28,7 @@ jobs:
           # Includes native/WASM targets and ~/.cargo/bin (wasm-bindgen).
           save-if: false
       - name: Install native subsetter build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb libxkbcommon-x11-0
       - name: Install JS dependencies and test host scheduling
         run: |
           bun install --frozen-lockfile
@@ -87,17 +87,27 @@ jobs:
           CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           export CHROMIUM
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
+      - name: Native Linux player acceptance
+        env:
+          # lavapipe keeps the native Vulkan smoke functional on GPU-less runners.
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          ./dist/novelc -p examples/rain-letters build --target linux --locked --out dist/rain-letters-linux
+          mkdir -p target/tmp
+          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' python3 scripts/verify_linux.py dist/rain-letters-linux
       - name: Package and verify release assets
         run: |
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$VERSION"; fi
           test "$(dist/novelc --version)" = "novelc $VERSION"
+          test -x dist/sdk/linux/player-linux
           python3 scripts/package.py
           python3 scripts/verify_release.py dist/bundle/rain-letters-web
           dist/bundle/novelc release verify --directory dist/bundle/rain-letters-web
           python3 scripts/audit_publication.py "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz"
           (cd dist && sha256sum --check SHA256SUMS)
           readelf -l dist/bundle/novelc | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
+          readelf -l dist/bundle/sdk/linux/player-linux | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

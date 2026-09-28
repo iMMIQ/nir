@@ -18,10 +18,10 @@ jobs:
       - name: Native checks
         run: |
           cargo fmt --all --check
-          cargo test --locked -p player-windows --lib
+          cargo test --locked -p player-desktop --lib
           cargo test --locked -p nir-player
           cargo check --locked -p player-web --target wasm32-unknown-unknown
-          cargo clippy --locked -p player-windows --all-targets -- -D warnings
+          cargo clippy --locked -p player-desktop -p player-windows --all-targets -- -D warnings
       - name: Build SDK
         shell: pwsh
         run: |

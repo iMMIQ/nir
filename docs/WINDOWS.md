@@ -35,7 +35,7 @@ Windows SDK 增加 `sdk/windows/player-windows.exe`，真实字节纳入 `game.l
 ## 验证
 
 ```powershell
-cargo test -p player-windows --lib
+cargo test -p player-desktop --lib
 cargo check -p player-web --target wasm32-unknown-unknown
 python scripts/check_architecture.py
 python scripts/verify_windows.py target/convert/yuuko2/dist/full/windows

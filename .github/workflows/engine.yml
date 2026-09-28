@@ -29,7 +29,7 @@ jobs:
           # Includes native/WASM targets and ~/.cargo/bin (wasm-bindgen).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native subsetter build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev
       - name: Install JS dependencies and test host scheduling
         run: |
           bun install --frozen-lockfile

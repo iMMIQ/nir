@@ -13,9 +13,9 @@
 | nir-render-wgpu | WebGPU/WebGL2 表面、线性预乘合成、转场与 glyphon |
 | nir-platform-web | 浏览器画布接口及输入、Web Audio、IndexedDB 宿主 |
 | nir-compiler | 工程解析、验证、执行模块、场景测试、构建与锁 |
-| nir-engine | Web/Windows 共用的 Player 与渲染器组装、阅读导航、资源交付和设备恢复 |
+| nir-engine | Web 与桌面共用的 Player 与渲染器组装、阅读导航、资源交付和设备恢复 |
 
-四个入口分别为 `apps/player-web`（浏览器绑定）、`apps/player-windows`（Windows 原生窗口、音频与本地存储）、`tools/novelc`（作者工具）、`xtask`（SDK 构建）。依赖检查基于 Cargo 实际解析图，同时检查传递依赖：核心无浏览器/GPU，播放器不链接编译器。
+入口分别为 `apps/player-web`（浏览器绑定）、`apps/player-desktop`（Windows/Linux 共用的原生窗口、音频与本地存储外壳）、`apps/player-windows` 与 `apps/player-linux`（平台二进制入口）、`tools/novelc`（作者工具）、`xtask`（SDK 构建）。依赖检查基于 Cargo 实际解析图，同时检查传递依赖：核心无浏览器/GPU，播放器不链接编译器。
 
 ## ADR-001：一个同步剧情流
 

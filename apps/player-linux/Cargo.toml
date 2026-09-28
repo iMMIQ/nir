@@ -1,5 +1,5 @@
 [package]
-name = "player-windows"
+name = "player-linux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,6 +7,3 @@ license.workspace = true
 [dependencies]
 player-desktop = { path = "../player-desktop" }
 serde_json.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-rfd = { version = "0.15", default-features = false }

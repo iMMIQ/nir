@@ -26,7 +26,7 @@
 | 版本/能力 | source=1、runtime=2、snapshot=1；已有 requires/CAPABILITIES；编译器写入全部能力 | 复用声明和校验，改为实际使用闭包；不预先整体升版 |
 | 恢复 | 快照检查已强依赖 Task 时长/状态/里程碑等不变量 | 新 owner、组合游标和局部状态必须同时改 restore 验证，不能只扩 DTO |
 
-代码锚点：`nir-format/src/lib.rs`，`nir-core/src/{vm,validate,restore}.rs`，`nir-player/src/lib.rs`，`nir-presentation/src/{lib,reading}.rs`，`nir-engine/src/lib.rs`，`nir-compiler/src/{project,import/livenovel}.rs`，`nir-platform-web/host.js`，`apps/player-windows/src/desktop.rs`（均相对仓库相应 crates/apps 目录）。
+代码锚点：`nir-format/src/lib.rs`，`nir-core/src/{vm,validate,restore}.rs`，`nir-player/src/lib.rs`，`nir-presentation/src/{lib,reading}.rs`，`nir-engine/src/lib.rs`，`nir-compiler/src/{project,import/livenovel}.rs`，`nir-platform-web/host.js`，`apps/player-desktop/src/desktop.rs`（均相对仓库相应 crates/apps 目录）。
 
 ## 3. 阶段与依赖
 

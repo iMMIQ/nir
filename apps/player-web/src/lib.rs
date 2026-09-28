@@ -60,7 +60,7 @@ async fn renderer(
         backends: match backend {
             RendererBackend::WebGpu => wgpu::Backends::BROWSER_WEBGPU,
             RendererBackend::WebGl2 => wgpu::Backends::GL,
-            RendererBackend::Dx12 => unreachable!(),
+            RendererBackend::Dx12 | RendererBackend::Vulkan => unreachable!(),
         },
         ..Default::default()
     });

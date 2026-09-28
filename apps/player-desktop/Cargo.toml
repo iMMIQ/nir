@@ -1,0 +1,31 @@
+[package]
+name = "player-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-engine.workspace = true
+anyhow.workspace = true
+nir-content.workspace = true
+nir-format.workspace = true
+serde_json.workspace = true
+nir-player.workspace = true
+nir-presentation.workspace = true
+nir-render-wgpu.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+winit = "0.30"
+pollster = "0.4"
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
+wgpu = { workspace = true, features = ["dx12"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+wgpu = { workspace = true, features = ["vulkan"] }
+
+[dev-dependencies]
+tempfile = "3"

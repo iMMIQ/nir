@@ -1,7 +1,15 @@
 [workspace]
 resolver = "2"
 exclude = ["vendor/wgpu", "vendor/tiny_http", "vendor/hb-subset"]
-members = ["crates/*", "apps/player-web", "apps/player-windows", "tools/novelc", "xtask"]
+members = [
+    "crates/*",
+    "apps/player-web",
+    "apps/player-desktop",
+    "apps/player-windows",
+    "apps/player-linux",
+    "tools/novelc",
+    "xtask",
+]
 default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
 
 [workspace.package]

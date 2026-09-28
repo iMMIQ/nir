@@ -121,6 +121,17 @@ fn main() -> Result<()> {
                     "dist/sdk/windows/player-windows.exe",
                 )?;
             }
+            if cfg!(target_os = "linux") {
+                run(Command::new("cargo").args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "player-linux",
+                    "--release",
+                ]))?;
+                fs::create_dir_all("dist/sdk/linux")?;
+                fs::copy("target/release/player-linux", "dist/sdk/linux/player-linux")?;
+            }
             run(Command::new("python3")
                 .args(["scripts/third_party.py", "dist/sdk/THIRD-PARTY.txt"]))?;
             copy_dir(
@@ -211,6 +222,7 @@ fn main() -> Result<()> {
                 "nir-assets",
                 "nir-player",
                 "nir-presentation",
+                "player-desktop",
             ] {
                 command.args(["-p", package]);
             }

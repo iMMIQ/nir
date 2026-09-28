@@ -46,6 +46,13 @@ pub fn sdk_manifest(sdk: &Path) -> Result<SdkManifest> {
             nir_content::digest(&fs::read(native)?),
         );
     }
+    let native = sdk.join("linux/player-linux");
+    if native.try_exists()? {
+        files.insert(
+            "linux/player-linux".into(),
+            nir_content::digest(&fs::read(native)?),
+        );
+    }
     Ok(SdkManifest {
         format: 1,
         compiler_version: env!("CARGO_PKG_VERSION").into(),
@@ -1318,6 +1325,24 @@ pub fn build_profile(
     }
     Ok(report)
 }
+/// Platform parameters shared by the Windows and Linux native build paths.
+struct NativeTarget {
+    /// SDK-relative player path, e.g. `windows/player-windows.exe`.
+    player: &'static str,
+    /// Error code prefix, host name and executable format label.
+    code: &'static str,
+    host: &'static str,
+    format: &'static str,
+    /// Executable magic checked before packaging (PE `MZ`, ELF `\x7fELF`).
+    magic: &'static [u8],
+    /// Intermediate web build directory under the project's `.nir/`.
+    intermediate: &'static str,
+    /// Packaged binary name (`Game.exe` on Windows, `Game` on Linux).
+    binary: &'static str,
+    readme: String,
+    /// Report file name under the project's `reports/`.
+    report: &'static str,
+}
 /// Reuse content lowering, then publish a native-only graph (no HTML, JS or WASM).
 pub fn build_windows(
     root: &Path,
@@ -1326,13 +1351,73 @@ pub fn build_windows(
     profile: &str,
     locked: bool,
 ) -> Result<BuildReport> {
-    let player = fs::read(sdk.join("windows/player-windows.exe"))
-        .context("E_SDK_WINDOWS: Windows player missing; build the SDK on Windows")?;
+    build_native(
+        root,
+        sdk,
+        out,
+        profile,
+        locked,
+        &NativeTarget {
+            player: "windows/player-windows.exe",
+            code: "E_SDK_WINDOWS",
+            host: "Windows",
+            format: "PE",
+            magic: b"MZ",
+            intermediate: "windows-content",
+            binary: "Game.exe",
+            readme: "NIR Windows native player\r\nDouble-click Game.exe. Keep the data folder and NOTICE.txt beside it.\r\nWindows 10/11 x64 with a DirectX 12 capable driver is required.\r\nNo browser, WebView2, web server or network connection is required.\r\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\r\nSaves: %LOCALAPPDATA%\\NIR\\games\\<game-id-hash>\\<profile>\\releases\\<release>\\\r\nSaves are isolated by exact release; retain older game folders to continue older saves.\r\n".into(),
+            report: "windows-build.json",
+        },
+    )
+}
+/// Reuse content lowering, then publish a native-only graph (no HTML, JS or WASM).
+pub fn build_linux(
+    root: &Path,
+    sdk: &Path,
+    out: &Path,
+    profile: &str,
+    locked: bool,
+) -> Result<BuildReport> {
+    build_native(
+        root,
+        sdk,
+        out,
+        profile,
+        locked,
+        &NativeTarget {
+            player: "linux/player-linux",
+            code: "E_SDK_LINUX",
+            host: "Linux",
+            format: "ELF",
+            magic: b"\x7fELF",
+            intermediate: "linux-content",
+            binary: "Game",
+            readme: "NIR Linux native player\nRun ./Game from the bundle directory. Keep the data folder and NOTICE.txt beside it.\nx86_64 Linux with glibc 2.39+ and a Vulkan capable driver is required; audio uses ALSA or PulseAudio.\nNo browser, JavaScript, web server or network connection is required.\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\nSaves: $XDG_DATA_HOME/NIR/games/<game-id-hash>/<profile>/releases/<release>/ (default ~/.local/share)\nSaves are isolated by exact release; retain older game folders to continue older saves.\n".into(),
+            report: "linux-build.json",
+        },
+    )
+}
+fn build_native(
+    root: &Path,
+    sdk: &Path,
+    out: &Path,
+    profile: &str,
+    locked: bool,
+    target: &NativeTarget,
+) -> Result<BuildReport> {
+    let player = fs::read(sdk.join(target.player)).with_context(|| {
+        format!(
+            "{}: {} player missing; build the SDK on {}",
+            target.code, target.host, target.host
+        )
+    })?;
     anyhow::ensure!(
-        player.starts_with(b"MZ"),
-        "E_SDK_WINDOWS: invalid PE executable"
+        player.starts_with(target.magic),
+        "{}: invalid {} executable",
+        target.code,
+        target.format
     );
-    let intermediate = root.join(".nir/windows-content");
+    let intermediate = root.join(".nir").join(target.intermediate);
     let mut report = build_profile(root, sdk, &intermediate, profile, locked, true)?;
     let web: ReleaseManifest = nir_content::parse(
         &fs::read(intermediate.join(format!("releases/{}.json", report.release)))?,
@@ -1376,12 +1461,23 @@ pub fn build_windows(
         data.join(format!("releases/{}.json", report.release)),
         bytes,
     )?;
-    fs::write(out.join("Game.exe.next"), &player)?;
-    fs::rename(out.join("Game.exe.next"), out.join("Game.exe"))?;
+    fs::write(out.join(format!("{}.next", target.binary)), &player)?;
+    fs::rename(
+        out.join(format!("{}.next", target.binary)),
+        out.join(target.binary),
+    )?;
+    // Executables packaged on a Unix host must keep the execute bit through
+    // archive extraction; Windows hosts have no mode bit to preserve.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(out.join(target.binary), fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("{}: mark {} executable", target.code, target.binary))?;
+    }
     fs::copy(intermediate.join("NOTICE.txt"), out.join("NOTICE.txt"))?;
-    fs::write(out.join("README.txt"), "NIR Windows native player\r\nDouble-click Game.exe. Keep the data folder and NOTICE.txt beside it.\r\nWindows 10/11 x64 with a DirectX 12 capable driver is required.\r\nNo browser, WebView2, web server or network connection is required.\r\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\r\nSaves: %LOCALAPPDATA%\\NIR\\games\\<game-id-hash>\\<profile>\\releases\\<release>\\\r\nSaves are isolated by exact release; retain older game folders to continue older saves.\r\n")?;
+    fs::write(out.join("README.txt"), target.readme.clone())?;
     fs::write(
-        root.join("reports/windows-build.json"),
+        root.join("reports").join(target.report),
         serde_json::to_vec_pretty(&report)?,
     )?;
     fs::write(
