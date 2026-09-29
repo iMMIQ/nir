@@ -571,3 +571,15 @@ SDK 已重建，Schema 已更新；独立发行验证与浏览器整套 33 项�
 - SDK 重构后浏览器验收通过（batch-48-browser-menu-effects.log）：标题进入恰一次（1 音效 + 1 循环音乐），200ms 稳定后不再重播；Start 后会话重置终止 UI 域声音、Story 域 BGM 起；覆盖页就绪后进入（累计 4 起）且稳定；过期 data-action 不增点击音效、真实提交恰 +1；Escape 关闭立即响铃、渐隐中保持 Menu 与音乐停止数不变、完成后才切 Story 并停音乐，透明度全程 0→1 可观测。无页面错误。
 
 P4.1 完成；Replay 事务（P4.2）开始。证据：reports/nir-next/batch-48-xtask-test.log、batch-48-xtask-sdk.log、batch-48-browser-menu-effects.log。契约见 MENU-EFFECTS-SEMANTICS.md、CAPABILITIES.md 与 TIME-DOMAINS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 49：Replay 事务（P4.2）
+
+- 新增 `ui.replay.v1`：图片菜单 `replay` 控件动作（具名函数 + 可选 `requires` 解锁键）与活动相限定的 `exit_replay`。三相事务 entering/active/returning（engine `state().replay` 暴露），启动时冻结原会话描述——Core 快照、检查点、屏幕/返回屏、菜单面、菜单页与局部值/父链/挂起标题页（FrozenMenu 含 instance/revision）、auto/skip；候选 Core 以 `Core::new_at` 创建，入口块只在候选内以独立预算推进到第一个激活/内容屏障，声音、痕迹与 Profile 意图在切换前不存在。
+- 切换与返回：候选媒体（`Purpose::Replay`，激活号取候选待定 Cue id，`CoreInput::Prepared` 与之一致）准备完成后切换——会话自增、音频重置、检查点重记、菜单面关闭；回想函数 outcome 结束或手动 `exit_replay` 进入 returning，冻结会话作为 Restore 候选重新验证/准备，提交后在新会话与菜单实例/版本下接回（unfreeze 同时提升 instance 和 revision，冻结前菜单输入全部过期，页面效果按新实例重放）。回标题/NewGame 显式放弃整个事务。
+- 隔离不变量：单一活动 Core；活动回想（active/returning）内 `profile_merge` 不落玩家 Profile 也不发出 `PersistProfile`；Save/Export 活动期拒绝，Load/Import 存在任何回想事务即拒绝，Rollback 仅无事务或 active 后允许（returning 中回退会覆盖返回候选）；嵌套 replay 与存储控件动作在 `resolve_menu_control` 和动作派发双重复查即死亡，`exit_replay` 非活动相幂等；已有准备/恢复候选/槽位读取进行中时新 replay 静默忽略。菜单投影按 `replay_active` 门控保存/读取/回想/退出控件。
+- 失败与恢复：entering 中资源失败保留冻结页与原会话，Retry 重启候选自身媒体；准入失败整事务即刻作废（候选与冻结态同弃，诊断剥除 Retry——重试已无可提交候选），释放后重新点击从头开始；设备丢失经 DeviceReady 按候选自身资源恢复；取消准备不再丢弃 entering 中的回想（重试/设备恢复路径复用同一候选），真正的放弃只在标题/NewGame 分支显式清除。设计自查修复四项：Replay 准备激活号 0 与候选 pending 不符、cancel_preparation 误毁 entering 事务、Returning 中 Rollback 覆盖返回候选、槽位读取与回想并发竞态。
+- 资源：候选媒体与冻结会话联合准入（`active.retain` 释放不再交集的冻结资产，重叠回想在 LIMIT-1 仍可进入；含未保留资产的回想在零余量下明确 E_BUDGET）；入口块内容屏障按 `ContentPurpose::ReplayEntry` 获取；`E_THEME_ENTRY` 覆盖 replay 动作；源/Runtime 双重校验 `ui.replay.v1`（uses_replay 时编译器保留）。
+- Rust 契约 12 项（nir-player replay_tests）：锁定未解锁拒绝、双击仅一次进入、outcome 返回（Profile 隔离 + 返回中 ExitReplay 幂等 + 冻结位置/检查点/新菜单实例 + 冻结前权威过期）、手动退出返回、无活动回想时退出拒绝、活动相内嵌套入口/存储派发复查死亡、资源失败保留冻结页并可 Retry、准入失败整事务作废无 Retry 且后续新点击可用、标题/NewGame 放弃、入口期设备丢失恢复候选、旧 entry 不回归。最终 `cargo xtask test` 33 套件全部通过（batch-49-xtask-test.log）、SDK 重建通过（batch-49-xtask-sdk.log）。
+- 浏览器验收（端口 4221，`replay.spec.js` 2 项 + 整套 36 项全过，batch-49-browser-replay.log / batch-49-browser-full.log）：锁定控件禁用且伪造当前授权动作同样死亡；IndexedDB 播种 "seen" 解锁；同一 data-action 双投递仅一次进入，entering 期间冻结页保持屏幕；active 后回想正文与冻结正文不同、覆盖层仅提供退出；outcome 后返回原页原正文、控制件恢复可用而冻结前点击不再起效；手动 `Exit replay` 经覆盖控件完整返回。无页面错误。
+
+P4.2 完成；P5（Sequence/ParallelAll 组合）待实施。证据：reports/nir-next/batch-49-xtask-test.log、batch-49-xtask-sdk.log、batch-49-browser-replay.log、batch-49-browser-full.log。契约见 REPLAY-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。

@@ -1831,7 +1831,9 @@ fn validate_image_menus(
     }
     for menu in theme.image_menus.values() {
         for (_, action, _) in menu.controls() {
-            if let ImageMenuAction::Entry { function: id } = action {
+            if let ImageMenuAction::Entry { function: id } | ImageMenuAction::Replay { function: id } =
+                action
+            {
                 if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
                     return Err(err(
                         "E_THEME_ENTRY",
@@ -1872,6 +1874,15 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "theme.image_menus",
             "ui.menu-services.v1",
         ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_replay)
+        && !root.requires.iter().any(|c| c == "ui.replay.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.replay.v1"));
     }
     if root
         .theme
@@ -3211,6 +3222,11 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             "theme.image_menus",
             "ui.menu-effects.v1",
         ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_replay)
+        && !p.requires.iter().any(|c| c == "ui.replay.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.replay.v1"));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_reading)
         && !p.requires.iter().any(|c| c == "ui.menu-reading.v1")

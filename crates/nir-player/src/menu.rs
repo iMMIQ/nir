@@ -15,10 +15,26 @@ struct MenuFrame {
     menu: String,
     locals: BTreeMap<String, MenuValue>,
 }
+#[derive(Clone)]
 struct SuspendedTitle {
     page: MenuFrame,
     session: u32,
     parents: Vec<MenuFrame>,
+}
+/// Navigation-semantic menu state captured when a replay freezes the
+/// session: the page, its locals, the parent chain and any suspended title
+/// page. Storage, profile and reading mirrors are recomputed by sync and
+/// never frozen.
+#[derive(Clone)]
+pub(super) struct FrozenMenu {
+    menu: String,
+    screen: Screen,
+    locals: BTreeMap<String, MenuValue>,
+    parents: Vec<MenuFrame>,
+    suspended_title: Option<SuspendedTitle>,
+    restore: Option<MenuFrame>,
+    instance: u32,
+    revision: u32,
 }
 
 pub(super) struct MenuSession {
@@ -73,6 +89,33 @@ impl MenuSession {
     fn next(n: u32) -> Result<u32> {
         n.checked_add(1)
             .ok_or_else(|| Diagnostic::new("E_VIEW_LIMIT", "menu", "view identity exhausted"))
+    }
+    pub(super) fn freeze(&self) -> FrozenMenu {
+        FrozenMenu {
+            menu: self.menu.clone(),
+            screen: self.screen,
+            locals: self.locals.clone(),
+            parents: self.parents.clone(),
+            suspended_title: self.suspended_title.clone(),
+            restore: self.restore.clone(),
+            instance: self.instance,
+            revision: self.revision,
+        }
+    }
+    /// Restore the frozen page under a new session with fresh authority:
+    /// pre-freeze menu inputs stay rejected, and the bumped instance makes
+    /// the page re-enter, replaying its page effects and music.
+    pub(super) fn unfreeze(&mut self, frozen: FrozenMenu, session: u32) -> Result<()> {
+        self.menu = frozen.menu;
+        self.screen = frozen.screen;
+        self.locals = frozen.locals;
+        self.parents = frozen.parents;
+        self.suspended_title = frozen.suspended_title;
+        self.restore = frozen.restore;
+        self.session = session;
+        self.instance = Self::next(frozen.instance)?;
+        self.revision = Self::next(frozen.revision)?;
+        Ok(())
     }
     pub fn depth(&self) -> usize {
         self.parents.len()
@@ -636,6 +679,20 @@ impl Player {
             return Ok(None);
         };
         if guard.is_some_and(|key| !self.profile.contains(key)) {
+            return Ok(None);
+        }
+        // Replay invariants re-check at dispatch, not just in projection:
+        // nested entries and storage traffic die here for any entering or
+        // live replay, and an exit exists only while one is actually live.
+        if self.replay_work.is_some()
+            && matches!(
+                action,
+                ImageMenuAction::Replay { .. }
+                    | ImageMenuAction::SaveSlot { .. }
+                    | ImageMenuAction::LoadSlot { .. }
+            )
+            || (matches!(action, ImageMenuAction::ExitReplay) && !self.replay_live())
+        {
             return Ok(None);
         }
         if menu.elements.iter().any(|e| e.id == control)

@@ -110,6 +110,9 @@ pub struct UiModel {
     pub save_confirmation: Option<(u32, u32)>,
     pub busy_slots: std::collections::BTreeSet<u32>,
     pub can_save: bool,
+    /// A live replay owns the session: replay entries close, the exit opens,
+    /// and storage services hide until the frozen session returns.
+    pub replay_active: bool,
     pub menu_story: std::collections::BTreeMap<String, MenuValue>,
     pub menu_reading_modes: std::collections::BTreeSet<MenuReadingMode>,
     pub paused: bool,
@@ -571,14 +574,21 @@ fn menu_service_enabled(action: &ImageMenuAction, m: &UiModel) -> bool {
         }
         ImageMenuAction::SaveSlot { slot } => {
             m.can_save
+                && !m.replay_active
                 && slot
                     .resolve(&m.menu_locals)
                     .is_some_and(|slot| !m.busy_slots.contains(&slot))
         }
-        ImageMenuAction::LoadSlot { slot } => slot.resolve(&m.menu_locals).is_some_and(|slot| {
-            m.slots.iter().any(|row| row.slot == slot && row.exists)
-                && !m.busy_slots.contains(&slot)
-        }),
+        ImageMenuAction::LoadSlot { slot } => {
+            !m.replay_active
+                && slot.resolve(&m.menu_locals).is_some_and(|slot| {
+                    m.slots.iter().any(|row| row.slot == slot && row.exists)
+                        && !m.busy_slots.contains(&slot)
+                })
+        }
+        // Nested replays never nest: the frozen session is the only one.
+        ImageMenuAction::Replay { .. } => !m.replay_active,
+        ImageMenuAction::ExitReplay => m.replay_active,
         _ => true,
     }
 }

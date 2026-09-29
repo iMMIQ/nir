@@ -345,6 +345,9 @@ pub(super) enum ContentPurpose {
     RestoreBodies(bool),
     Locale,
     Prefetch,
+    /// Text objects a replay candidate's entry block crossed before its
+    /// first media barrier; completed only while the entry is preparing.
+    ReplayEntry,
 }
 #[derive(Clone)]
 pub(super) struct ContentPreparation {
@@ -1294,6 +1297,10 @@ impl Player {
                 self.restore_with_purpose(*snapshot, rollback)
             }
             ContentPurpose::Locale => self.start_locale_switch(),
+            ContentPurpose::ReplayEntry => {
+                self.continue_replay_entry()?;
+                Ok(())
+            }
             ContentPurpose::RestoreValidation => unreachable!(),
             ContentPurpose::RestoreBodies(_) => unreachable!(),
             ContentPurpose::Prefetch => unreachable!(),

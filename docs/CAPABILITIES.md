@@ -93,6 +93,8 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 `ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画、效果等待或来源系统菜单的自动效果映射。
 
+`ui.replay.v1` 提供显式声明的回想事务：`replay` 控件动作冻结原会话（快照、检查点、菜单页与局部值、auto/skip），候选 Core 在屏障外独自准备后切换为唯一活动会话，结束（outcome 或手动 `exit_replay`）时冻结会话作为恢复候选重新验证并原样接回。活动期间 Profile 写入、保存/导出、读取/导入隔离，嵌套入口与存储动作在派发点复查即拒绝；入口媒体与冻结会话联合准入，重叠资产不重复计费；准入失败整事务作废且不提供 Retry。旧 `entry` 动作行为不变。见 [Replay 事务](REPLAY-SEMANTICS.md)。不含共享变量写回、sleep/awake 语义或来源系统的自动回想映射。
+
 `ui.menu-chrome.v1` 允许页面关闭自动添加的导航按钮，保留作者控件、Escape／右键和失败出口。默认开启，旧页面行为不变；转换器可在原页面只使用键盘返回时自动生成该声明，见 [菜单服务](MENU-SERVICES-SEMANTICS.md)。
 
 `ui.menu-navigation.v1` 提供最多八层父页的 push_menu／back，保存有界局部值、逐层 Close 和返回后的新输入实例；旧 menu 替换行为保持兼容。资源、服务与布局状态的边界见 [菜单子页导航](MENU-NAVIGATION-SEMANTICS.md)。

@@ -12,6 +12,8 @@ use menu::{MenuSession, SaveConfirmation};
 mod content;
 mod effects;
 use effects::{DeferredExitKind, MenuEffectsState};
+mod replay;
+use replay::{ReplayPhase, ReplayWork};
 mod pause;
 use clock::ForegroundClockDemand;
 pub use clock::ForegroundClockToken;
@@ -283,7 +285,7 @@ pub enum AppEvent {
     DeviceLost,
     DeviceReady,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Purpose {
     Boot,
     Menu,
@@ -291,6 +293,9 @@ enum Purpose {
     Restore,
     Rollback,
     Device,
+    /// Isolated replay entry: the frozen session stays live until this
+    /// candidate prepares.
+    Replay,
 }
 struct Preparation {
     request: u32,
@@ -374,6 +379,7 @@ pub struct Player {
     prefetch_attempted: Option<PrefetchAttempt>,
     candidate: Option<Core>,
     device_resume: Option<Purpose>,
+    replay_work: Option<ReplayWork>,
     ledger: BudgetLedger,
     _surface_budget: Reservation,
     active: Option<Reservation>,
@@ -506,6 +512,7 @@ impl Player {
             media_attempted: None,
             candidate: None,
             device_resume: None,
+            replay_work: None,
             ledger,
             _surface_budget,
             active: None,
@@ -1210,6 +1217,9 @@ impl Player {
     }
     fn cancel_preparation(&mut self) {
         self.failed_admission = None;
+        // An entering replay survives a cancelled preparation: its retry and
+        // device-resume paths re-prepare the same candidate. Real abandonment
+        // (Title, NewGame) clears the whole transaction explicitly.
         if let Some(p) = self.prepare.take() {
             if !p.failed {
                 self.observe("prepare_cancelled", Some(p.request));
@@ -1427,7 +1437,9 @@ impl Player {
                     task,
                 }),
                 CoreIntent::ProfileMerge { key } => {
-                    if self.profile.insert(key) {
+                    // Replay cores run isolated: their profile writes die with
+                    // the replay and never mark the owner's progress.
+                    if !self.replay_live() && self.profile.insert(key) {
                         self.commands.push(AppCommand::PersistProfile {
                             keys: self.profile.clone(),
                         });
@@ -1464,7 +1476,11 @@ impl Player {
             self.set_interface_hidden(false);
         }
         if self.core.state().outcome.is_some() {
-            if self.core.program().theme.return_to_title {
+            if self.replay_live() {
+                // A finished replay returns to its frozen session instead of
+                // the title: the launching page is the replay's home.
+                self.begin_replay_return()?;
+            } else if self.core.program().theme.return_to_title {
                 let root = self
                     .core
                     .state()
@@ -2152,9 +2168,18 @@ impl Player {
                 let purpose = match self.device_resume.take() {
                     Some(Purpose::Restore) => Purpose::Restore,
                     Some(Purpose::Rollback) => Purpose::Rollback,
+                    // The entering replay re-prepares its candidate after the
+                    // device came back; its frozen session still owns the page.
+                    Some(Purpose::Replay) => Purpose::Replay,
                     _ => Purpose::Device,
                 };
-                self.begin_prepare(purpose, 0, self.retained_assets())?;
+                if purpose == Purpose::Replay {
+                    // The replay candidate's activation is its own pending
+                    // cue, which the generic resume path cannot know.
+                    self.begin_replay_media()?;
+                } else {
+                    self.begin_prepare(purpose, 0, self.retained_assets())?;
+                }
                 if self.locale_error.is_none()
                     && (self.preferences.ui_locale != self.effective_ui_locale
                         || self.preferences.text_locale != self.effective_text_locale)
@@ -2272,36 +2297,45 @@ impl Player {
                 budget,
             )?,
             Purpose::Restore | Purpose::Rollback => {
-                let mut candidate = self
+                let candidate = self
                     .candidate
                     .take()
                     .ok_or_else(|| Diagnostic::new("E_RESTORE", "commit", "no candidate"))?;
-                candidate.set_locale(&self.effective_text_locale)?;
-                self.generation.session += 1;
-                self.set_interface_hidden(false);
-                self.held_skip = false;
-                self.failed_admission = None;
-                self.reset_audio();
-                self.slot_restore = false;
-                self.core = candidate;
-                self.restore_work = None;
-                self.touch_snapshot_content(self.core.state())?;
-                self.screen = Screen::Story;
-                self.return_screen = Screen::Story;
-                self.pauses.remove("menu");
-                self.pauses.remove("fault");
-                self.pauses.insert("restored".into());
-                if matches!(purpose, Purpose::Rollback) {
-                    self.checkpoints.pop();
+                if purpose == Purpose::Restore && self.replay_work.as_ref().is_some_and(|w| w.phase == ReplayPhase::Returning)
+                {
+                    // The frozen session returns whole: its checkpoints, menu
+                    // page and navigation locals never noticed the replay.
+                    self.commit_replay_return(candidate)?;
                 } else {
-                    self.checkpoints.clear();
-                    self.checkpoints.push(self.core.snapshot());
+                    let mut candidate = candidate;
+                    candidate.set_locale(&self.effective_text_locale)?;
+                    self.generation.session += 1;
+                    self.set_interface_hidden(false);
+                    self.held_skip = false;
+                    self.failed_admission = None;
+                    self.reset_audio();
+                    self.slot_restore = false;
+                    self.core = candidate;
+                    self.restore_work = None;
+                    self.touch_snapshot_content(self.core.state())?;
+                    self.screen = Screen::Story;
+                    self.return_screen = Screen::Story;
+                    self.pauses.remove("menu");
+                    self.pauses.remove("fault");
+                    self.pauses.insert("restored".into());
+                    if matches!(purpose, Purpose::Rollback) {
+                        self.checkpoints.pop();
+                    } else {
+                        self.checkpoints.clear();
+                        self.checkpoints.push(self.core.snapshot());
+                    }
+                    self.auto = false;
+                    self.skip = false;
+                    self.held_skip = false;
+                    self.restart_audio();
                 }
-                self.auto = false;
-                self.skip = false;
-                self.held_skip = false;
-                self.restart_audio();
             }
+            Purpose::Replay => self.commit_replay_enter(lease.activation, budget)?,
             Purpose::Device => {
                 self.pauses.remove("device");
                 self.ui_pauses.remove("device");
@@ -2581,6 +2615,7 @@ impl Player {
                 | UiAction::Title
                 | UiAction::NewGame
                 | UiAction::ImageMenuEntry { .. }
+                | UiAction::ImageMenuReplay { .. }
                 | UiAction::ImageMenu { .. }
                 | UiAction::Menu
                 | UiAction::Settings
@@ -2679,6 +2714,9 @@ impl Player {
                 self.cancel_content(false);
                 self.restore_work = None;
                 self.candidate = None;
+                // Starting a fresh story abandons any replay transaction:
+                // its frozen state and half-entered candidate with it.
+                self.replay_work = None;
                 self.prefetch_attempted = None;
                 self.generation.session += 1;
                 self.set_interface_hidden(false);
@@ -2706,6 +2744,38 @@ impl Player {
                 // transaction commits its effective context for this session.
                 if !self.locale_pending() {
                     self.step(CoreInput::None, budget)?;
+                }
+            }
+            UiAction::ImageMenuReplay { function } => {
+                let allowed = matches!(self.screen, Screen::Title | Screen::Menu)
+                    && self
+                        .active_menu_id()
+                        .and_then(|id| self.core.program().theme.image_menus.get(id))
+                        .is_some_and(|menu| {
+                            menu.controls().any(
+                                |(id, action, requires)| {
+                                    (resolved_menu
+                                        || (!menu.uses_state()
+                                            && !menu.uses_services()
+                                            && menu.buttons.iter().any(|b| b.id == id)))
+                                        && matches!(
+                                            action,
+                                            nir_format::ImageMenuAction::Replay {
+                                                function: target
+                                            } if target == &function
+                                        )
+                                        && requires.is_none_or(|key| self.profile.contains(key))
+                                },
+                            )
+                        });
+                if !allowed {
+                    return Ok(());
+                }
+                self.begin_replay(&function, budget)?;
+            }
+            UiAction::ExitReplay => {
+                if self.replay_live() {
+                    self.begin_replay_return()?;
                 }
             }
             UiAction::MenuHistoryScroll { .. } => {}
@@ -2817,6 +2887,9 @@ impl Player {
                 self.cancel_preparation();
                 self.candidate = None;
                 self.restore_work = None;
+                // Returning to the title abandons any replay transaction —
+                // entering, live or returning — together with its frozen state.
+                self.replay_work = None;
                 self.prefetch_attempted = None;
                 self.device_resume = None;
                 self.pauses.retain(|r| r == "hidden");
@@ -2927,7 +3000,10 @@ impl Player {
                 self.persist_preferences();
             }
             UiAction::Save { slot } => {
-                if self.return_screen == Screen::Title
+                // Replay sessions never touch storage: saves belong to the
+                // frozen session, which returns with its own history intact.
+                if self.replay_live()
+                    || self.return_screen == Screen::Title
                     || slot > 2
                     || self
                         .save_jobs
@@ -2975,7 +3051,9 @@ impl Player {
                 .into();
             }
             UiAction::Load { slot } => {
-                if slot > 2 {
+                // A load swaps the session underneath any replay transaction;
+                // entering replays keep their frozen page until they settle.
+                if self.replay_work.is_some() || slot > 2 {
                     return Ok(());
                 }
                 self.request = self.request.checked_add(1).ok_or_else(|| {
@@ -2991,6 +3069,11 @@ impl Player {
                 self.commands.push(AppCommand::Load { slot, job });
             }
             UiAction::Export => {
+                // The frozen session exports on return; a replay core is not
+                // a savable story state.
+                if self.replay_live() {
+                    return Ok(());
+                }
                 let snapshot = self.core.snapshot();
                 let envelope = SaveEnvelope {
                     format: 1,
@@ -3003,9 +3086,22 @@ impl Player {
                     json: serde_json::to_string(&envelope).unwrap(),
                 });
             }
-            UiAction::Import => self.commands.push(AppCommand::Import),
+            UiAction::Import => {
+                // An import resolves as a load: never under a replay.
+                if self.replay_work.is_some() {
+                    return Ok(());
+                }
+                self.commands.push(AppCommand::Import);
+            }
             UiAction::Rollback => {
-                if self.checkpoints.len() > 1 {
+                // Rollback inside a live replay rewinds the replay's own
+                // checkpoints. Entering and returning transactions would swap
+                // cores underneath the frozen session's candidate.
+                let replay_settled = self
+                    .replay_work
+                    .as_ref()
+                    .is_none_or(|w| w.phase == ReplayPhase::Active);
+                if replay_settled && self.checkpoints.len() > 1 {
                     let s = self.checkpoints[self.checkpoints.len() - 2].clone();
                     self.restore_with_purpose(s, true)?;
                 }
@@ -3023,6 +3119,11 @@ impl Player {
                     .cloned()
                 {
                     self.begin_content(job.purpose, job.objects)?;
+                } else if self.replay_entering() && self.candidate.is_some() {
+                    // Retry the replay candidate's own media in isolation;
+                    // the generic candidate branch below would misread it as
+                    // a restore.
+                    self.begin_replay_media()?;
                 } else if self.candidate.is_some() {
                     let rollback = self.restore_work.as_ref().is_some_and(|work| work.rollback);
                     let purpose = if rollback {
@@ -3334,6 +3435,7 @@ impl Player {
             can_save: self.screen != Screen::Title
                 && self.return_screen != Screen::Title
                 && self.slot_load.is_none(),
+            replay_active: self.replay_live(),
             menu_reading_modes: self.menu_reading_modes(),
             menu_story: self.menu_story_values(),
             paused: self.paused(),

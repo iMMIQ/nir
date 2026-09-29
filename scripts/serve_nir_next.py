@@ -352,6 +352,36 @@ effects_menu_project=build("browser-menu-effects",lambda c:None,setup=menu_effec
 effects_menu_server=ThreadingHTTPServer(("127.0.0.1",4220),partial(SimpleHTTPRequestHandler,directory=str(effects_menu_project)))
 Thread(target=effects_menu_server.serve_forever,daemon=True).start()
 
+def replay_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # Overlay with a locked replay control (profile key "seen") and a live-only
+    # exit; the replay function itself replays the arrival cue and merges a
+    # profile key that must never escape the transaction.
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[[image_menus.system.elements]]\nid = "replay"\nrect = [80,160,420,80]\ncontent = { type = "button", label = "Replay arrival", asset = "menu.blue", action = {type = "replay", function = "replay"}, requires = "seen" }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "exit"\nrect = [80,280,420,80]\ncontent = { type = "button", label = "Exit replay", asset = "menu.blue", action = {type = "exit_replay"} }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,400,420,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+def replay_function(content):
+    content["functions"]["replay"]={
+        "entry":"start",
+        "blocks":{
+            "start":{"ops":[],"terminator":{"type":"activate","cue":"arrival","next":"wait"}},
+            "wait":{"ops":[],"terminator":{"type":"await",
+                "conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"mark","on_cancelled":"mark","on_failed":"mark"}},
+            "mark":{"ops":[{"id":"seen.once","operation":{"type":"profile_merge","key":"replay-seen"}}],
+                    "terminator":{"type":"end","outcome":"replay-done"}}
+        }
+    }
+
+replay_project=build("browser-replay",replay_function,setup=replay_assets)
+replay_server=ThreadingHTTPServer(("127.0.0.1",4221),partial(SimpleHTTPRequestHandler,directory=str(replay_project)))
+Thread(target=replay_server.serve_forever,daemon=True).start()
+
 wipe_project=build("browser-wipe-project",wipe)
 
 wipe_project=build("browser-wipe-project",wipe)

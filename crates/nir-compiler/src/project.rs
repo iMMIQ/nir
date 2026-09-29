@@ -929,6 +929,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .theme
         .image_menus
         .values()
+        .any(nir_format::ImageMenu::uses_replay)
+    {
+        program.requires.retain(|c| c != "ui.replay.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
         .any(nir_format::ImageMenu::uses_history_scrollbar)
     {
         program

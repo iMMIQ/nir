@@ -60,6 +60,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
     "ui.menu-effects.v1",
+    "ui.replay.v1",
     "media.webp.v1",
     "media.mp3.v1",
 ];
@@ -1302,6 +1303,13 @@ pub enum ImageMenuAction {
     Title,
     Menu { menu: String },
     Entry { function: String },
+    /// Isolated replay: freeze the current session, run the function as a
+    /// temporary one, and return to the frozen session afterwards. Unlike
+    /// Entry this never destroys the launching session.
+    Replay { function: String },
+    /// Manual return from an active replay to the frozen session. Only
+    /// enabled while a replay session is live.
+    ExitReplay,
 }
 impl ImageMenuAction {
     pub fn ui_action(&self) -> Option<UiAction> {
@@ -1324,6 +1332,10 @@ impl ImageMenuAction {
             Self::Entry { function } => UiAction::ImageMenuEntry {
                 function: function.clone(),
             },
+            Self::Replay { function } => UiAction::ImageMenuReplay {
+                function: function.clone(),
+            },
+            Self::ExitReplay => UiAction::ExitReplay,
         })
     }
 }
@@ -1883,6 +1895,10 @@ pub enum UiAction {
     ImageMenuEntry {
         function: String,
     },
+    ImageMenuReplay {
+        function: String,
+    },
+    ExitReplay,
     HoverImage {
         id: Option<String>,
     },

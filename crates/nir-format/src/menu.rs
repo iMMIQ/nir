@@ -1276,4 +1276,9 @@ impl ImageMenu {
         self.controls()
             .any(|(_, a, _)| matches!(a, ImageMenuAction::PushMenu { .. } | ImageMenuAction::Back))
     }
+    pub fn uses_replay(&self) -> bool {
+        self.controls().any(|(_, a, _)| {
+            matches!(a, ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay)
+        })
+    }
 }
