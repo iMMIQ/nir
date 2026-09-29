@@ -955,7 +955,6 @@ impl ApplicationHandler for App {
                         && !runtime.modifiers.alt_key()
                         && !runtime.modifiers.super_key() =>
                 {
-                    let state: serde_json::Value = serde_json::from_str(&runtime.engine.state())?;
                     let value_direction = match event.logical_key {
                         Key::Named(NamedKey::ArrowLeft) => Some(0),
                         Key::Named(NamedKey::ArrowRight) => Some(1),
@@ -1012,15 +1011,21 @@ impl ApplicationHandler for App {
                                 runtime.input(action)?;
                             }
                         }
-                        Key::Named(NamedKey::Escape) => runtime.input(
-                            if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0) {
-                                UiAction::Close
-                            } else if state["screen"] == "Story" || state["screen"] == "Title" {
-                                UiAction::Menu
-                            } else {
-                                UiAction::Close
-                            },
-                        )?,
+                        Key::Named(NamedKey::Escape) => {
+                            // Only the Escape arm needs the state report; parse
+                            // it here instead of on every qualifying keypress.
+                            let state: serde_json::Value =
+                                serde_json::from_str(&runtime.engine.state())?;
+                            runtime.input(
+                                if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0) {
+                                    UiAction::Close
+                                } else if state["screen"] == "Story" || state["screen"] == "Title" {
+                                    UiAction::Menu
+                                } else {
+                                    UiAction::Close
+                                },
+                            )?
+                        }
                         Key::Character(ref c) if c.eq_ignore_ascii_case("h") => {
                             runtime.input(UiAction::ToggleInterface)?
                         }
