@@ -1,5 +1,6 @@
 use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
 use crate::audio_source::AudioBuffer;
+use crate::dialog::{self, DialogOutcome, DialogTask};
 use crate::io_worker::{IoReply, IoRequest, IoWorker};
 use crate::loader::{AssetData, Job, Loaded, Loader};
 use crate::{atomic_write, Bundle, Storage};
@@ -70,6 +71,8 @@ struct Runtime {
     jobs: VecDeque<Job>,
     upload: Option<PendingUpload>,
     audio: Option<OutputStream>,
+    /// A running file dialog's outcome channel; input is gated while set.
+    dialog: Option<std::sync::mpsc::Receiver<DialogOutcome>>,
     buffers: BTreeMap<String, AudioBuffer>,
     voices: BTreeMap<(TimeDomain, u32, u32), Voice>,
     audio_paused: BTreeMap<TimeDomain, bool>,
@@ -130,6 +133,7 @@ impl Runtime {
             jobs: VecDeque::new(),
             upload: None,
             audio: OutputStreamBuilder::open_default_stream().ok(),
+            dialog: None,
             buffers: BTreeMap::new(),
             voices: BTreeMap::new(),
             audio_paused: BTreeMap::from([
@@ -188,6 +192,16 @@ impl Runtime {
         engine_result(self.engine.input(action, self.sequence))?;
         self.commands()?;
         self.window.request_redraw();
+        Ok(())
+    }
+    /// Opens a file dialog on its own thread; one dialog at a time, and
+    /// while it runs the owner gates input and pauses the story clock.
+    fn open_dialog(&mut self, task: DialogTask) -> Result<()> {
+        ensure!(
+            self.dialog.is_none(),
+            "E_DIALOG_BUSY: a file dialog is already open"
+        );
+        self.dialog = Some(dialog::open(task)?);
         Ok(())
     }
     fn volume(&self, bus: AudioBus) -> f32 {
@@ -382,31 +396,10 @@ impl Runtime {
                     }
                     AppCommand::ListSaves => self.io.submit(IoRequest::List)?,
                     AppCommand::Export { json } => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("save.nir-save.json")
-                            .save_file()
-                        {
-                            atomic_write(&path, json.as_bytes())?;
-                        }
-                        self.last = Instant::now();
+                        self.open_dialog(DialogTask::Export { json })?;
                     }
                     AppCommand::Import => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("NIR save", &["json"])
-                            .pick_file()
-                        {
-                            let result = fs::read(path)
-                                .map_err(anyhow::Error::from)
-                                .and_then(|b| Ok(nir_content::parse(&b, "imported save")?));
-                            let event = match result {
-                                Ok(envelope) => AppEvent::Loaded {
-                                    envelope: Box::new(envelope),
-                                },
-                                Err(e) => AppEvent::LoadFailed(e.to_string()),
-                            };
-                            engine_result(self.engine.event(event))?;
-                        }
-                        self.last = Instant::now();
+                        self.open_dialog(DialogTask::Import)?;
                     }
                     AppCommand::PromoteContent { request, .. } => {
                         if let Some(at) = self
@@ -448,6 +441,29 @@ impl Runtime {
                 IoReply::Event(event) => engine_result(self.engine.event(event))?,
                 IoReply::Done => {}
                 IoReply::Fatal(message) => bail!(message),
+            }
+        }
+        if let Some(dialog) = &mut self.dialog {
+            match dialog.try_recv() {
+                Ok(DialogOutcome::Exported(Ok(()))) | Ok(DialogOutcome::ImportCancelled) => {
+                    self.dialog = None;
+                }
+                Ok(DialogOutcome::Exported(Err(message))) => {
+                    self.dialog = None;
+                    bail!("{message}");
+                }
+                Ok(DialogOutcome::Imported(Ok(envelope))) => {
+                    self.dialog = None;
+                    engine_result(self.engine.event(AppEvent::Loaded { envelope }))?;
+                }
+                Ok(DialogOutcome::Imported(Err(message))) => {
+                    self.dialog = None;
+                    engine_result(self.engine.event(AppEvent::LoadFailed(message)))?;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    bail!("E_DIALOG_THREAD: dialog ended without a reply")
+                }
             }
         }
         if let Some(loaded) = self.loader.drain() {
@@ -526,7 +542,9 @@ impl Runtime {
             engine_result(self.engine.audio_ended_in(domain, task, session))?;
         }
         let now = Instant::now();
-        if !self.hidden && self.engine.needs_clock() {
+        // A file dialog pauses the story clock for the same reason the
+        // blocking dialog froze it: nothing behind the picker may advance.
+        if !self.hidden && self.dialog.is_none() && self.engine.needs_clock() {
             let elapsed = now
                 .duration_since(self.last)
                 .as_micros()
@@ -572,7 +590,8 @@ impl Runtime {
         Ok(())
     }
     fn busy(&self) -> bool {
-        self.io.outstanding() > 0
+        self.dialog.is_some()
+            || self.io.outstanding() > 0
             || self.loader.outstanding() > 0
             || self.upload.is_some()
             || !self.jobs.is_empty()
@@ -748,6 +767,9 @@ impl ApplicationHandler for App {
         let Some(runtime) = &mut self.runtime else {
             return;
         };
+        // While a file dialog is open the game behind it is inert: input is
+        // gated so engine state cannot change behind the modal picker.
+        let dialog_open = runtime.dialog.is_some();
         let result = (|| -> Result<()> {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
@@ -776,7 +798,7 @@ impl ApplicationHandler for App {
                     engine_result(runtime.engine.hidden(hidden))?;
                     runtime.commands()?;
                 }
-                WindowEvent::CursorMoved { position, .. } => {
+                WindowEvent::CursorMoved { position, .. } if !dialog_open => {
                     let scale = runtime.window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                     if runtime.bar_pointer {
@@ -797,7 +819,7 @@ impl ApplicationHandler for App {
                     engine_result(runtime.engine.hover(-1., -1.))?;
                 }
                 WindowEvent::MouseInput { state, button, .. }
-                    if matches!(button, MouseButton::Left | MouseButton::Right) =>
+                    if !dialog_open && matches!(button, MouseButton::Left | MouseButton::Right) =>
                 {
                     let code = if button == MouseButton::Left { 0 } else { 2 };
                     if button == MouseButton::Left {
@@ -862,7 +884,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                WindowEvent::MouseWheel { delta, .. } => {
+                WindowEvent::MouseWheel { delta, .. } if !dialog_open => {
                     let y = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -878,7 +900,9 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. }
-                    if event.logical_key == Key::Named(NamedKey::Control) && !event.repeat =>
+                    if !dialog_open
+                        && event.logical_key == Key::Named(NamedKey::Control)
+                        && !event.repeat =>
                 {
                     let index = match event.physical_key {
                         PhysicalKey::Code(KeyCode::ControlRight) => 1,
@@ -891,7 +915,8 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. }
-                    if event.state == ElementState::Pressed
+                    if !dialog_open
+                        && event.state == ElementState::Pressed
                         && !event.repeat
                         && !runtime.modifiers.control_key()
                         && !runtime.modifiers.alt_key()
