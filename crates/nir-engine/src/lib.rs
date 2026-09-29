@@ -466,25 +466,7 @@ impl Engine {
                     self.resource_stage("decode_allocate", request, &id, start, bytes.len());
                     result.map_err(js)?;
                 }
-                // PNG decode is atomic. Yield before the next incremental
-                // upload step when it used this turn's soft time allowance.
-                if Micros(profile_clock_us())
-                    .0
-                    .saturating_sub(self.upload_start_us)
-                    >= 4_000
-                {
-                    return Ok(false);
-                }
-                let start = Micros(profile_clock_us());
-                let (complete, used) = self
-                    .renderer
-                    .upload_image_step(&id, self.upload_remaining)
-                    .map_err(js)?;
-                self.resource_stage("upload_enqueued", request, &id, start, used);
-                self.upload_remaining -= used;
-                if !complete {
-                    return Ok(false);
-                }
+                return self.finish_image_upload(request, &id);
             }
             AssetKind::Font => {
                 if self.fonts.insert(id.clone()) {
@@ -496,13 +478,44 @@ impl Engine {
             }
             AssetKind::Audio => {}
         }
-        self.pump(vec![AppEvent::AssetReady { request, asset: id }])?;
-        if let Some(request) = self.pending_locale {
-            if let Some(event) = self.prepare_locale_candidate(request)? {
-                self.pump(vec![event])?;
-            }
+        self.asset_ready(request, &id)
+    }
+    /// Admit an image that a host worker thread decoded and premultiplied
+    /// off the owner thread. The host attests that the encoded object bytes
+    /// were digest-verified before decoding; dimensions and pixel length
+    /// are still re-checked when the pixels are first staged, and the
+    /// row-budgeted upload tail is shared with the bytes path.
+    pub fn resource_decoded(
+        &mut self,
+        request: u32,
+        id: String,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> std::result::Result<bool, String> {
+        if self.upload_start_us == 0 {
+            self.upload_start_us = Micros(profile_clock_us()).0;
         }
-        Ok(true)
+        if !self.player.accepts_resource(request) {
+            return Ok(true);
+        }
+        let asset = self
+            .player
+            .asset_descriptor(&id)
+            .cloned()
+            .ok_or_else(|| js("E_ASSET: unknown resource"))?;
+        if asset.kind != AssetKind::Image {
+            return Err(js("E_ASSET: decoded delivery accepts images only"));
+        }
+        if !self.renderer.image_started(request, &id) {
+            let start = Micros(profile_clock_us());
+            let result =
+                self.renderer
+                    .prepare_image_decoded(request, &id, width, height, pixels.to_vec());
+            self.resource_stage("decode_admit", request, &id, start, pixels.len());
+            result.map_err(js)?;
+        }
+        self.finish_image_upload(request, &id)
     }
     pub fn resource_fault(
         &mut self,
@@ -1014,6 +1027,42 @@ impl Engine {
             end_us: Micros(profile_clock_us()),
             bytes,
         });
+    }
+    /// Row-budgeted image upload with the soft time-slice check, followed by
+    /// the shared ready tail. Returns `false` when more rows remain.
+    fn finish_image_upload(&mut self, request: u32, id: &str) -> std::result::Result<bool, String> {
+        // PNG decode is atomic. Yield before the next incremental
+        // upload step when it used this turn's soft time allowance.
+        if Micros(profile_clock_us())
+            .0
+            .saturating_sub(self.upload_start_us)
+            >= 4_000
+        {
+            return Ok(false);
+        }
+        let start = Micros(profile_clock_us());
+        let (complete, used) = self
+            .renderer
+            .upload_image_step(id, self.upload_remaining)
+            .map_err(js)?;
+        self.resource_stage("upload_enqueued", request, id, start, used);
+        self.upload_remaining -= used;
+        if !complete {
+            return Ok(false);
+        }
+        self.asset_ready(request, id)
+    }
+    fn asset_ready(&mut self, request: u32, id: &str) -> std::result::Result<bool, String> {
+        self.pump(vec![AppEvent::AssetReady {
+            request,
+            asset: id.to_string(),
+        }])?;
+        if let Some(request) = self.pending_locale {
+            if let Some(event) = self.prepare_locale_candidate(request)? {
+                self.pump(vec![event])?;
+            }
+        }
+        Ok(true)
     }
     fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), String> {
         let mut commands = self.player.pump(events, self.work_remaining);
