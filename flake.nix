@@ -29,6 +29,12 @@
               libxkbcommon
               wayland
               xvfb-run
+              # winit dlopens the X11 client libraries at runtime under Xvfb.
+              libx11
+              libxcursor
+              libxi
+              libxrandr
+              libxrender
             ];
 
             nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
@@ -41,6 +47,22 @@
               export CXX="${pkgs.stdenv.cc}/bin/c++"
               export AR="${pkgs.stdenv.cc.bintools}/bin/ar"
               export CXXSTDLIB=stdc++
+              # winit dlopens X11/Wayland/Vulkan at runtime; they are not
+              # link-time dependencies, so expose them to the dynamic loader.
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [
+                pkgs.libx11
+                pkgs.libxcursor
+                pkgs.libxi
+                pkgs.libxrandr
+                pkgs.libxrender
+                pkgs.libxkbcommon
+                pkgs.wayland
+                pkgs.vulkan-loader
+                pkgs.alsa-lib
+              ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              # Headless software Vulkan keeps local player-linux runs
+              # independent of the host GPU driver.
+              export VK_DRIVER_FILES="${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.qemuArch}.json"
             '';
           };
         });

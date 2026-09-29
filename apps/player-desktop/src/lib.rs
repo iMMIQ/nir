@@ -3,6 +3,8 @@
 pub mod audio_envelope;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod desktop;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod loader;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};
 use nir_player::SaveEnvelope;

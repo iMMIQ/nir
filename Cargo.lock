@@ -2820,6 +2820,7 @@ name = "player-desktop"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "image",
  "nir-content",
  "nir-engine",
  "nir-format",

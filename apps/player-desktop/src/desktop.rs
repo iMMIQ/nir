@@ -1,4 +1,5 @@
 use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
+use crate::loader::{AssetData, Job, Loaded, Loader};
 use crate::{atomic_write, Bundle, Storage};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nir_engine::Engine;
@@ -6,13 +7,12 @@ use nir_format::*;
 use nir_player::{AppCommand, AppEvent};
 use nir_presentation::SlotView;
 use nir_render_wgpu::{Renderer, RendererBackend};
-use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::Cursor,
     path::PathBuf,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use winit::{
@@ -27,93 +27,27 @@ use winit::{
 fn engine_result<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|e| anyhow!(e))
 }
-enum Job {
-    Content {
-        request: u32,
-        hashes: Vec<String>,
-        limit: usize,
-    },
-    Asset {
+/// A worker result waiting for owner-thread admission into the engine.
+enum PendingUpload {
+    Bytes {
         request: u32,
         id: String,
-        descriptor: Asset,
+        bytes: Arc<[u8]>,
     },
-}
-enum Loaded {
-    Content {
-        request: u32,
-        data: std::result::Result<Vec<Vec<u8>>, String>,
-    },
-    Asset {
+    Decoded {
         request: u32,
         id: String,
-        data: std::result::Result<(Vec<u8>, Option<SamplesBuffer>), String>,
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
     },
 }
-fn worker(bundle: Arc<Bundle>) -> (mpsc::SyncSender<Job>, mpsc::Receiver<Loaded>) {
-    let (send, jobs) = mpsc::sync_channel::<Job>(1);
-    let (done, receive) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        while let Ok(job) = jobs.recv() {
-            let loaded = match job {
-                Job::Content {
-                    request,
-                    hashes,
-                    limit,
-                } => {
-                    let data = (|| -> Result<_> {
-                        let mut used = 0usize;
-                        let mut data = Vec::new();
-                        ensure!(hashes.len() <= 128, "E_CONTENT_LIMIT");
-                        for hash in hashes {
-                            let size = bundle
-                                .manifest
-                                .objects
-                                .get(&hash)
-                                .context("E_OBJECT_REFERENCE")?
-                                .bytes;
-                            ensure!(size <= limit.saturating_sub(used) as u64, "E_CONTENT_LIMIT");
-                            let bytes = bundle.object(&hash)?;
-                            used += bytes.len();
-                            data.push(bytes);
-                        }
-                        Ok(data)
-                    })()
-                    .map_err(|e| e.to_string());
-                    Loaded::Content { request, data }
-                }
-                Job::Asset {
-                    request,
-                    id,
-                    descriptor,
-                } => {
-                    let data = (|| -> Result<_> {
-                        let bytes = bundle.object(&descriptor.object)?;
-                        let audio = if descriptor.kind == AssetKind::Audio {
-                            let decoder = Decoder::try_from(Cursor::new(bytes.clone()))?;
-                            let channels = decoder.channels();
-                            let rate = decoder.sample_rate();
-                            let samples: Vec<f32> = decoder.collect();
-                            ensure!(
-                                samples.len() as u64 * 4 <= descriptor.decoded_bytes,
-                                "E_AUDIO_SIZE"
-                            );
-                            Some(SamplesBuffer::new(channels, rate, samples))
-                        } else {
-                            None
-                        };
-                        Ok((bytes, audio))
-                    })()
-                    .map_err(|e| e.to_string());
-                    Loaded::Asset { request, id, data }
-                }
-            };
-            if done.send(loaded).is_err() {
-                break;
-            }
+impl PendingUpload {
+    fn request(&self) -> u32 {
+        match self {
+            Self::Bytes { request, .. } | Self::Decoded { request, .. } => *request,
         }
-    });
-    (send, receive)
+    }
 }
 /// A pointer press waiting for release on the same target: button, action,
 /// press position and the input identity observed at press time.
@@ -130,13 +64,11 @@ struct Runtime {
     window: Arc<Window>,
     engine: Engine,
     storage: Storage,
-    send: mpsc::SyncSender<Job>,
-    receive: mpsc::Receiver<Loaded>,
+    loader: Loader,
     jobs: VecDeque<Job>,
-    working: bool,
-    upload: Option<(u32, String, Vec<u8>)>,
+    upload: Option<PendingUpload>,
     audio: Option<OutputStream>,
-    buffers: BTreeMap<String, SamplesBuffer>,
+    buffers: BTreeMap<String, rodio::buffer::SamplesBuffer>,
     voices: BTreeMap<(TimeDomain, u32, u32), Voice>,
     audio_paused: BTreeMap<TimeDomain, bool>,
     sequence: u32,
@@ -186,15 +118,13 @@ impl Runtime {
             renderer,
         ))?;
         engine_result(engine.event(AppEvent::Profile(storage.profile()?)))?;
-        let (send, receive) = worker(bundle.clone());
+        let loader = Loader::new(bundle.clone());
         let mut runtime = Self {
             window,
             engine,
             storage,
-            send,
-            receive,
+            loader,
             jobs: VecDeque::new(),
-            working: false,
             upload: None,
             audio: OutputStreamBuilder::open_default_stream().ok(),
             buffers: BTreeMap::new(),
@@ -311,7 +241,7 @@ impl Runtime {
                         self.jobs.retain(
                             |j| !matches!(j, Job::Asset { request: r, .. } if *r == request),
                         );
-                        if self.upload.as_ref().is_some_and(|u| u.0 == request) {
+                        if self.upload.as_ref().is_some_and(|u| u.request() == request) {
                             self.upload = None;
                         }
                         engine_result(self.engine.host_event(
@@ -563,8 +493,7 @@ impl Runtime {
                     .replace_gpu(create_renderer(self.window.clone())?),
             )?;
         }
-        if let Ok(loaded) = self.receive.try_recv() {
-            self.working = false;
+        if let Some(loaded) = self.loader.drain() {
             match loaded {
                 Loaded::Content { request, data } if self.engine.accepts_content(request) => {
                     match data {
@@ -574,27 +503,53 @@ impl Runtime {
                         }
                     }
                 }
-                Loaded::Asset { request, id, data } if self.engine.accepts_resource(request) => {
-                    match data {
-                        Ok((bytes, audio)) => {
-                            if let Some(audio) = audio {
-                                self.buffers.insert(id.clone(), audio);
-                            }
-                            self.upload = Some((request, id, bytes));
-                        }
-                        Err(message) => {
-                            engine_result(self.engine.resource_failed(request, message))?
-                        }
+                Loaded::Asset {
+                    request, id, data, ..
+                } if self.engine.accepts_resource(request) => match data {
+                    Ok(AssetData::Bytes(bytes)) => {
+                        self.upload = Some(PendingUpload::Bytes { request, id, bytes });
                     }
-                }
+                    Ok(AssetData::Decoded {
+                        width,
+                        height,
+                        pixels,
+                    }) => {
+                        self.upload = Some(PendingUpload::Decoded {
+                            request,
+                            id,
+                            width,
+                            height,
+                            pixels,
+                        });
+                    }
+                    Ok(AssetData::Audio { buffer, bytes }) => {
+                        self.buffers.insert(id.clone(), buffer);
+                        self.upload = Some(PendingUpload::Bytes { request, id, bytes });
+                    }
+                    Err(message) => engine_result(self.engine.resource_failed(request, message))?,
+                },
                 _ => {}
             }
         }
-        if let Some((request, id, bytes)) = self.upload.take() {
-            match self.engine.resource(request, id.clone(), &bytes) {
-                Ok(false) => self.upload = Some((request, id, bytes)),
+        if let Some(pending) = self.upload.take() {
+            let admitted = match &pending {
+                PendingUpload::Bytes { request, id, bytes } => {
+                    self.engine.resource(*request, id.clone(), bytes)
+                }
+                PendingUpload::Decoded {
+                    request,
+                    id,
+                    width,
+                    height,
+                    pixels,
+                } => self
+                    .engine
+                    .resource_decoded(*request, id.clone(), *width, *height, pixels),
+            };
+            match admitted {
+                Ok(false) => self.upload = Some(pending),
                 Ok(true) => {}
-                Err(error) => engine_result(self.engine.resource_failed(request, error))?,
+                Err(error) => engine_result(self.engine.resource_failed(pending.request(), error))?,
             }
         }
         let ended: Vec<_> = self
@@ -621,21 +576,20 @@ impl Runtime {
         }
         engine_result(self.engine.continue_turn())?;
         self.commands()?;
-        if !self.working && self.upload.is_none() {
-            while let Some(job) = self.jobs.pop_front() {
-                let valid = match &job {
-                    Job::Content { request, .. } => self.engine.accepts_content(*request),
-                    Job::Asset { request, .. } => self.engine.accepts_resource(*request),
-                };
-                if !valid {
-                    continue;
-                }
-                self.send
-                    .try_send(job)
-                    .map_err(|_| anyhow!("E_WORKER_UNAVAILABLE"))?;
-                self.working = true;
+        // Engine admission stays one delivery per turn; dispatching ahead
+        // only pipelines object reads and decode on the worker pool.
+        while self.loader.has_capacity() {
+            let Some(job) = self.jobs.pop_front() else {
                 break;
+            };
+            let valid = match &job {
+                Job::Content { request, .. } => self.engine.accepts_content(*request),
+                Job::Asset { request, .. } => self.engine.accepts_resource(*request),
+            };
+            if !valid {
+                continue;
             }
+            self.loader.dispatch(job)?;
         }
         let mut retained: BTreeSet<String> = serde_json::from_str(&self.engine.retained())?;
         retained.extend(self.voices.values().map(|v| v.asset.clone()));
@@ -655,7 +609,7 @@ impl Runtime {
         Ok(())
     }
     fn busy(&self) -> bool {
-        self.working
+        self.loader.outstanding() > 0
             || self.upload.is_some()
             || !self.jobs.is_empty()
             || self.engine.pending_events() > 0
