@@ -30,6 +30,8 @@ fn engine_result<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(|e| anyhow!(e))
 }
 /// A worker result waiting for owner-thread admission into the engine.
+/// Large images admit over several turns (2 MiB row budget per turn), so
+/// drained results queue behind the one currently uploading.
 enum PendingUpload {
     Bytes {
         request: u32,
@@ -69,7 +71,7 @@ struct Runtime {
     io: IoWorker,
     loader: Loader,
     jobs: VecDeque<Job>,
-    upload: Option<PendingUpload>,
+    uploads: VecDeque<PendingUpload>,
     audio: Option<OutputStream>,
     /// A running file dialog's outcome channel; input is gated while set.
     dialog: Option<std::sync::mpsc::Receiver<DialogOutcome>>,
@@ -131,7 +133,7 @@ impl Runtime {
             storage,
             loader,
             jobs: VecDeque::new(),
-            upload: None,
+            uploads: VecDeque::new(),
             audio: OutputStreamBuilder::open_default_stream().ok(),
             dialog: None,
             buffers: BTreeMap::new(),
@@ -258,9 +260,7 @@ impl Runtime {
                         self.jobs.retain(
                             |j| !matches!(j, Job::Asset { request: r, .. } if *r == request),
                         );
-                        if self.upload.as_ref().is_some_and(|u| u.request() == request) {
-                            self.upload = None;
-                        }
+                        self.uploads.retain(|u| u.request() != request);
                         engine_result(self.engine.host_event(
                             "assets_cancelled".into(),
                             serde_json::json!({"request":request}).to_string(),
@@ -480,14 +480,15 @@ impl Runtime {
                     request, id, data, ..
                 } if self.engine.accepts_resource(request) => match data {
                     Ok(AssetData::Bytes(bytes)) => {
-                        self.upload = Some(PendingUpload::Bytes { request, id, bytes });
+                        self.uploads
+                            .push_back(PendingUpload::Bytes { request, id, bytes });
                     }
                     Ok(AssetData::Decoded {
                         width,
                         height,
                         pixels,
                     }) => {
-                        self.upload = Some(PendingUpload::Decoded {
+                        self.uploads.push_back(PendingUpload::Decoded {
                             request,
                             id,
                             width,
@@ -503,14 +504,18 @@ impl Runtime {
                     }) => {
                         self.buffers
                             .insert(id.clone(), AudioBuffer::from_parts(samples, channels, rate));
-                        self.upload = Some(PendingUpload::Bytes { request, id, bytes });
+                        self.uploads
+                            .push_back(PendingUpload::Bytes { request, id, bytes });
                     }
                     Err(message) => engine_result(self.engine.resource_failed(request, message))?,
                 },
                 _ => {}
             }
         }
-        if let Some(pending) = self.upload.take() {
+        // One admission per turn. A partial image upload stays at the front
+        // until its row budget completes; results drained meanwhile queue
+        // behind it instead of replacing it.
+        if let Some(pending) = self.uploads.pop_front() {
             let admitted = match &pending {
                 PendingUpload::Bytes { request, id, bytes } => {
                     self.engine.resource(*request, id.clone(), bytes)
@@ -526,7 +531,7 @@ impl Runtime {
                     .resource_decoded(*request, id.clone(), *width, *height, pixels),
             };
             match admitted {
-                Ok(false) => self.upload = Some(pending),
+                Ok(false) => self.uploads.push_front(pending),
                 Ok(true) => {}
                 Err(error) => engine_result(self.engine.resource_failed(pending.request(), error))?,
             }
@@ -593,7 +598,7 @@ impl Runtime {
         self.dialog.is_some()
             || self.io.outstanding() > 0
             || self.loader.outstanding() > 0
-            || self.upload.is_some()
+            || !self.uploads.is_empty()
             || !self.jobs.is_empty()
             || self.engine.pending_events() > 0
             || (!self.hidden && self.engine.needs_clock())

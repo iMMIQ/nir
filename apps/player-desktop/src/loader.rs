@@ -251,6 +251,13 @@ fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
     match descriptor.kind {
         AssetKind::Image => {
             let (width, height, pixels) = nir_render_wgpu::decode_image(&bytes)?;
+            // The compiler derived the descriptor dimensions from the same
+            // digest-pinned bytes; a mismatch means a forged manifest, and
+            // failing here keeps the pixels from ever reaching admission.
+            ensure!(
+                width == descriptor.width && height == descriptor.height,
+                "E_IMAGE_DIMENSION"
+            );
             Ok(AssetData::Decoded {
                 width,
                 height,

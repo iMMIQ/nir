@@ -131,8 +131,15 @@ impl Iterator for BufferSource {
 #[cfg(any(windows, target_os = "linux"))]
 impl rodio::Source for BufferSource {
     fn current_span_len(&self) -> Option<usize> {
-        if self.looped {
-            None
+        // Report the run of contiguous samples ahead, wrapping to the next
+        // full cycle once the current one is exhausted: rodio's
+        // UniformSourceIterator consumes spans up to 32,768 samples and
+        // rebuilds its rate/channel converters when a span ends, so an
+        // unknown length here (None) would fall it back to 512-sample
+        // spans and reset the resampler phase ~64x more often - audible
+        // on looped assets whose rate differs from the output device.
+        if self.pos >= self.samples.len() {
+            Some(self.samples.len())
         } else {
             Some(self.samples.len() - self.pos)
         }
@@ -266,7 +273,9 @@ mod tests {
         assert_eq!(source.current_span_len(), Some(600));
         assert_eq!(source.total_duration(), Some(Duration::from_millis(300)));
         let looping = buffer.source(0, true);
-        assert_eq!(looping.current_span_len(), None);
+        // Looped sources report spans to the cycle end (and a fresh cycle
+        // once exhausted) so rodio's converter chunks stay long.
+        assert_eq!(looping.current_span_len(), Some(1_000));
         assert_eq!(looping.total_duration(), None);
     }
 }
