@@ -1,4 +1,5 @@
 use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
+use crate::audio_source::AudioBuffer;
 use crate::loader::{AssetData, Job, Loaded, Loader};
 use crate::{atomic_write, Bundle, Storage};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -7,7 +8,7 @@ use nir_format::*;
 use nir_player::{AppCommand, AppEvent};
 use nir_presentation::SlotView;
 use nir_render_wgpu::{Renderer, RendererBackend};
-use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
@@ -68,7 +69,7 @@ struct Runtime {
     jobs: VecDeque<Job>,
     upload: Option<PendingUpload>,
     audio: Option<OutputStream>,
-    buffers: BTreeMap<String, rodio::buffer::SamplesBuffer>,
+    buffers: BTreeMap<String, AudioBuffer>,
     voices: BTreeMap<(TimeDomain, u32, u32), Voice>,
     audio_paused: BTreeMap<TimeDomain, bool>,
     sequence: u32,
@@ -272,35 +273,18 @@ impl Runtime {
                                 .audio
                                 .as_ref()
                                 .context("E_AUDIO_DEVICE: no output device")?;
-                            let source =
-                                self.buffers.get(&asset).context("E_AUDIO_BUFFER")?.clone();
+                            let buffer = self.buffers.get(&asset).context("E_AUDIO_BUFFER")?;
                             let sink = Sink::connect_new(stream.mixer());
                             sink.set_volume(gain * self.volume(bus));
-                            let duration = source.total_duration().unwrap_or_default();
-                            let offset = if looped && !duration.is_zero() {
-                                position_us.0 % duration.as_micros() as u64
-                            } else {
-                                position_us.0
-                            };
-                            let channels = source.channels();
-                            let rate = source.sample_rate();
-                            if looped {
-                                sink.append(EnvelopeSamples::new(
-                                    source
-                                        .repeat_infinite()
-                                        .skip_duration(Duration::from_micros(offset)),
-                                    envelope.clone(),
-                                    channels,
-                                    rate,
-                                ));
-                            } else {
-                                sink.append(EnvelopeSamples::new(
-                                    source.skip_duration(Duration::from_micros(offset)),
-                                    envelope.clone(),
-                                    channels,
-                                    rate,
-                                ));
-                            }
+                            // The offset seek is a frame-index computation on
+                            // shared samples; no per-sample skip pull happens
+                            // on the owner thread.
+                            sink.append(EnvelopeSamples::new(
+                                buffer.source(position_us.0, looped),
+                                envelope.clone(),
+                                buffer.channels(),
+                                buffer.rate(),
+                            ));
                             if self.audio_paused.get(&domain).copied().unwrap_or(true) {
                                 sink.pause();
                             }
@@ -522,8 +506,14 @@ impl Runtime {
                             pixels,
                         });
                     }
-                    Ok(AssetData::Audio { buffer, bytes }) => {
-                        self.buffers.insert(id.clone(), buffer);
+                    Ok(AssetData::Audio {
+                        samples,
+                        channels,
+                        rate,
+                        bytes,
+                    }) => {
+                        self.buffers
+                            .insert(id.clone(), AudioBuffer::from_parts(samples, channels, rate));
                         self.upload = Some(PendingUpload::Bytes { request, id, bytes });
                     }
                     Err(message) => engine_result(self.engine.resource_failed(request, message))?,

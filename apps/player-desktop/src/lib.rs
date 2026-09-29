@@ -1,6 +1,7 @@
 //! Native package and persistence contracts, independent of window/GPU setup.
 #![forbid(unsafe_code)]
 pub mod audio_envelope;
+pub mod audio_source;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod desktop;
 #[cfg(any(windows, target_os = "linux"))]

@@ -9,7 +9,7 @@
 use crate::Bundle;
 use anyhow::{anyhow, ensure, Result};
 use nir_format::{Asset, AssetKind};
-use rodio::{buffer::SamplesBuffer, Decoder, Source};
+use rodio::{Decoder, Source};
 use std::{
     io::Cursor,
     sync::{mpsc, Arc, Condvar, Mutex},
@@ -44,7 +44,9 @@ pub(crate) enum AssetData {
     },
     /// Decoded audio samples plus the encoded bytes for owner admission.
     Audio {
-        buffer: SamplesBuffer,
+        samples: Arc<Vec<f32>>,
+        channels: u16,
+        rate: u32,
         bytes: Arc<[u8]>,
     },
 }
@@ -268,7 +270,9 @@ fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
                 samples.push(sample);
             }
             Ok(AssetData::Audio {
-                buffer: SamplesBuffer::new(channels, rate, samples),
+                samples: Arc::new(samples),
+                channels,
+                rate,
                 bytes,
             })
         }
