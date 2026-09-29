@@ -307,6 +307,18 @@ fn verify_auto_wait_callback(script: &Script) -> Result<()> {
     Ok(())
 }
 
+/// Route-walk state: a branchy route graph lowers into one `main`
+/// function. `entries` maps a command index to the block that continues
+/// there so converging routes merge instead of duplicating content;
+/// each queue entry carries the reachability path for cycle detection.
+#[derive(Debug)]
+struct Routes {
+    episodes: Vec<Episode>,
+    blocks: BTreeMap<String, Value>,
+    entries: BTreeMap<usize, String>,
+    queue: Vec<(usize, BTreeSet<usize>)>,
+    choice_sites: usize,
+}
 struct Adapter {
     source: Source,
     defaults: Option<ImportedDefaults>,
@@ -320,6 +332,9 @@ struct Adapter {
     centered: BTreeSet<String>,
     audio: BTreeMap<String, Value>,
     menus: BTreeMap<String, ImageMenu>,
+    choices: BTreeMap<String, Value>,
+    variables: BTreeMap<String, Value>,
+    choice_sites: usize,
     source_map: BTreeMap<String, SourceLocation>,
     warnings: BTreeSet<String>,
     counter: usize,
@@ -369,6 +384,61 @@ fn references(e: &Expression, name: &str) -> bool {
             .any(|v| matches!(v,Literal::Variable(s) if s==name))
     })
 }
+/// A stock selection dispatch compares the 選択値 variable against exactly one
+/// string literal: the 選択メニュー callback commits the selected option's
+/// text into that variable (選択.lsb evidence), and callers branch on the
+/// comparison (title dispatch evidence: はじめから/つづきから/回想). Returns
+/// that literal.
+fn selection_dispatch(e: &Expression) -> Option<&str> {
+    if !references(e, CHOICE_RESULT) || !e.operations.iter().any(|(op, _, _)| *op == 12) {
+        return None;
+    }
+    let mut literal = None;
+    for (_, _, args) in &e.operations {
+        for arg in args {
+            if let Literal::String(s) = arg {
+                if literal.is_some() {
+                    return None;
+                }
+                literal = Some(s.as_str());
+            }
+        }
+    }
+    literal
+}
+/// The stock choice executor page: creates the 選択メニュー object from its
+/// call parameters, parks until the player picks an option, and leaves the
+/// result in the 選択値 variable.
+const CHOICE_EXECUTOR: &str = "ノベルシステム/選択メニュー/■選択実行.lsb";
+/// The stock selection result variable (engine convention, like
+/// __メッセージ終了).
+const CHOICE_RESULT: &str = "選択値";
+/// One stock dispatch option: its literal text and the label index it jumps to.
+type DispatchOption = (String, usize);
+/// Collects the dispatch chain that must follow a ■選択実行 call: consecutive
+/// conditional jumps, each comparing 選択値 with one string literal. Returns
+/// the (option text, label index) pairs plus the index after the chain;
+/// `None` when the command at `pc` is not such a jump.
+fn choice_chain(
+    script: &Script,
+    page: &str,
+    pc: usize,
+) -> Result<Option<(Vec<DispatchOption>, usize)>> {
+    let mut options = vec![];
+    let mut at = pc;
+    while let Some(c) = script.commands.get(at) {
+        let Body::Jump(target, condition) = &c.body else { break };
+        let Some(literal) = selection_dispatch(condition) else {
+            break;
+        };
+        options.push((literal.to_owned(), local_target(script, page, target)?));
+        at += 1;
+    }
+    if options.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((options, at)))
+}
 fn label(script: &Script, line: u32) -> Result<usize> {
     if line == 0 {
         return Ok(0);
@@ -412,6 +482,9 @@ impl Adapter {
             centered: BTreeSet::new(),
             audio: BTreeMap::new(),
             menus: BTreeMap::new(),
+            choices: BTreeMap::new(),
+            variables: BTreeMap::new(),
+            choice_sites: 0,
             source_map: BTreeMap::new(),
             warnings: BTreeSet::new(),
             counter: 0,
@@ -830,6 +903,294 @@ impl Adapter {
         self.functions
             .insert(name.into(), json!({"entry":"b000000","blocks":table}));
     }
+    /// Advances past commands the route walk ignores: labels, muted/system
+    /// lines, the validated no-op scenario calc/wait, and the replay-index
+    /// conditional jump that never fires on a fresh route.
+    fn skip_forward(&self, script: &Script, mut pc: usize) -> Result<usize> {
+        loop {
+            let c = script
+                .commands
+                .get(pc)
+                .context("E_IMPORT_LIVENOVEL: unexpected route end")?;
+            let skip = c.muted
+                || c.kind == 3
+                || c.kind == 27
+                || match &c.body {
+                    Body::Calc(e) => {
+                        ensure!(
+                            e.operations.iter().all(|(op, name, args)| *op == 1
+                                && name == "__メッセージ終了"
+                                && matches!(args.as_slice(), [Literal::Int(0)])),
+                            "E_IMPORT_LIVENOVEL: unexpected scenario assignment"
+                        );
+                        true
+                    }
+                    Body::Wait(e) => {
+                        ensure!(
+                            e.len() == 3
+                                && references(&e[0], "__メッセージ終了")
+                                && literal_int(&e[1])? == 0
+                                && literal_int(&e[2])? == 0,
+                            "E_IMPORT_LIVENOVEL: unexpected scenario wait"
+                        );
+                        true
+                    }
+                    Body::Jump(_, condition) if references(condition, "回想番号") => {
+                        ensure!(
+                            condition.operations.iter().any(|(op, _, _)| *op == 15),
+                            "E_IMPORT_LIVENOVEL: unexpected replay condition"
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+            if !skip {
+                return Ok(pc);
+            }
+            pc += 1;
+        }
+    }
+    /// The block that continues at a command index; allocates a fresh route
+    /// block id on first visit.
+    fn route_block(&mut self, script: &Script, pc: usize, routes: &mut Routes) -> Result<String> {
+        let pc = self.skip_forward(script, pc)?;
+        if let Some(id) = routes.entries.get(&pc) {
+            return Ok(id.clone());
+        }
+        let id = self.id("route");
+        routes.entries.insert(pc, id.clone());
+        Ok(id)
+    }
+    /// Lowers the route graph from `first` into `main` blocks and returns the
+    /// entry block id. Choices lower to typed interactions whose branch
+    /// targets continue the winning route; all other control flow keeps the
+    /// strict linear-walk shape.
+    fn walk_routes(
+        &mut self,
+        script: &Script,
+        page: &str,
+        first: usize,
+        routes: &mut Routes,
+    ) -> Result<String> {
+        let entry = self.route_block(script, first, routes)?;
+        routes.queue.push((first, BTreeSet::new()));
+        while !routes.queue.is_empty() {
+            let (start, path) = routes.queue.remove(0);
+            let pc = self.skip_forward(script, start)?;
+            ensure!(
+                !path.contains(&pc),
+                "E_IMPORT_LIVENOVEL: unexpected route loop"
+            );
+            let id = routes.entries[&pc].clone();
+            if routes.blocks.contains_key(&id) {
+                // A sibling route already lowered this position; the block
+                // graph itself is the merge point.
+                continue;
+            }
+            let c = &script.commands[pc];
+            self.location = SourceLocation {
+                source: page.to_owned(),
+                index: pc,
+                line: c.line,
+                byte: c.offset,
+                command: c.name().into(),
+            };
+            let mut next_path = path.clone();
+            next_path.insert(pc);
+            match &c.body {
+                Body::Text {
+                    text,
+                    target,
+                    history,
+                    ..
+                } => {
+                    ensure!(
+                        literal_string(target)? == "メッセージボックス"
+                            && history.flag()?
+                            && !text.has_conditions_or_links
+                            && !text.has_ruby,
+                        "E_IMPORT_LIVENOVEL: unsupported text properties"
+                    );
+                    let name = format!("episode{}", routes.episodes.len() + 1);
+                    routes.episodes.push((
+                        pc,
+                        name.clone(),
+                        self.nodes.values().cloned().collect(),
+                        self.audio.clone(),
+                    ));
+                    let waits = text
+                        .glyphs
+                        .iter()
+                        .filter(|g| matches!(g, Glyph::Break(1)))
+                        .count();
+                    let mut blocks = vec![];
+                    for (number, page_glyphs) in text
+                        .glyphs
+                        .split(|g| matches!(g, Glyph::Break(1)))
+                        .enumerate()
+                    {
+                        let mut page_glyphs = page_glyphs.to_vec();
+                        if number < waits
+                            && !page_glyphs
+                                .iter()
+                                .any(|g| matches!(g, Glyph::Char(_) | Glyph::Break(0)))
+                        {
+                            // An image-only page still has the original click wait.
+                            page_glyphs.push(Glyph::Break(0));
+                        }
+                        self.page(&page_glyphs, &mut blocks).with_context(|| {
+                            format!("{}:{} TextIns", self.location.source, self.location.line)
+                        })?;
+                    }
+                    self.finish_function(&name, blocks, json!({"type":"return"}));
+                    let next = self.route_block(script, pc + 1, routes)?;
+                    routes.blocks.insert(
+                        id,
+                        json!({"ops":[],"terminator":{"type":"call","function":name,"next":next}}),
+                    );
+                    routes.queue.push((pc + 1, next_path));
+                }
+                Body::Call {
+                    target,
+                    condition,
+                    params,
+                    ..
+                } => {
+                    let callee = target.page.replace('\\', "/");
+                    if callee == "ノベルシステム/シーン回想/■フラグON.lsb" {
+                        ensure!(
+                            condition.flag()? && params.len() == 1,
+                            "E_IMPORT_LIVENOVEL: unexpected scenario call"
+                        );
+                        let key = format!("lm.replay.{}", literal_int(&params[0])?);
+                        let op_id = self.id("op");
+                        let next = self.route_block(script, pc + 1, routes)?;
+                        routes.blocks.insert(
+                            id,
+                            json!({"ops":[{"id":op_id,"operation":{"type":"profile_merge","key":key}}],"terminator":{"type":"goto","target":next}}),
+                        );
+                        routes.queue.push((pc + 1, next_path));
+                    } else if callee == CHOICE_EXECUTOR {
+                        self.lower_choice(script, page, pc, id, next_path, routes)?;
+                    } else {
+                        bail!("E_IMPORT_LIVENOVEL: unexpected scenario call");
+                    }
+                }
+                Body::Jump(target, condition) => {
+                    ensure!(
+                        condition.flag()?,
+                        "E_IMPORT_LIVENOVEL: conditional route requires adaptation"
+                    );
+                    let next = local_target(script, page, target)?;
+                    // A jump back to the initial dispatch restores the original title menu.
+                    if !routes.episodes.is_empty() && next < first {
+                        routes.blocks.insert(
+                            id,
+                            json!({"ops":[],"terminator":{"type":"end","outcome":"completed"}}),
+                        );
+                    } else {
+                        let cont = self.route_block(script, next, routes)?;
+                        routes.blocks.insert(
+                            id,
+                            json!({"ops":[],"terminator":{"type":"goto","target":cont}}),
+                        );
+                        routes.queue.push((next, next_path));
+                    }
+                }
+                Body::Exit(e) if e.flag()? => {
+                    routes.blocks.insert(
+                        id,
+                        json!({"ops":[],"terminator":{"type":"end","outcome":"completed"}}),
+                    );
+                }
+                _ => bail!(
+                    "E_IMPORT_LIVENOVEL: unsupported route command {}:{} {}",
+                    page,
+                    c.line,
+                    c.name()
+                ),
+            }
+        }
+        Ok(entry)
+    }
+    /// Lowers one stock choice site: the ■選択実行 call plus its 選択値
+    /// dispatch chain become a typed interaction whose branch targets
+    /// continue the winning route at its label. The option's declared value
+    /// is its own text, matching what the source callback commits.
+    fn lower_choice(
+        &mut self,
+        script: &Script,
+        page: &str,
+        pc: usize,
+        id: String,
+        path: BTreeSet<usize>,
+        routes: &mut Routes,
+    ) -> Result<()> {
+        let (options, after) = choice_chain(script, page, pc + 1)?
+            .context("E_IMPORT_CHOICE: missing 選択値 dispatch after the choice call")?;
+        ensure!(
+            options.len() >= 2,
+            "E_IMPORT_CHOICE: dispatch chain needs at least two options"
+        );
+        let mut literals = BTreeSet::new();
+        for (literal, _) in &options {
+            ensure!(
+                literals.insert(literal.as_str()),
+                "E_IMPORT_CHOICE: duplicate option text {literal}"
+            );
+        }
+        ensure!(
+            matches!(script.commands.get(after), Some(c) if matches!(&c.body, Body::Exit(e) if matches!(e.flag(), Ok(true)))),
+            "E_IMPORT_CHOICE: the unreachable dispatch fallthrough must end with Exit"
+        );
+        let choice = self.id("choice");
+        let mut definitions = vec![];
+        let mut branches = BTreeMap::new();
+        let mut chain_path = path.clone();
+        for at in pc + 1..after {
+            chain_path.insert(at);
+        }
+        for (index, (literal, target)) in options.into_iter().enumerate() {
+            let option = format!("o{index}");
+            let text = self.id("text");
+            self.texts.insert(
+                text.clone(),
+                crate::AuthorTextDoc {
+                    source_revision: 1,
+                    contract_revision: 1,
+                    spans: vec![Span::Text {
+                        id: "s0".into(),
+                        text: literal.clone(),
+                        emphasis: false,
+                    }],
+                },
+            );
+            definitions.push(json!({
+                "id": option,
+                "text": text,
+                "value": {"type":"string","value":literal},
+            }));
+            let block = self.route_block(script, target, routes)?;
+            branches.insert(option, block);
+            routes.queue.push((target, chain_path.clone()));
+        }
+        self.choices.insert(choice.clone(), json!({"options": definitions}));
+        self.variables
+            .entry(CHOICE_RESULT.to_string())
+            .or_insert_with(|| json!({"type":"string","value":""}));
+        routes.blocks.insert(
+            id,
+            json!({"ops":[],"terminator":{
+                "type":"interact",
+                "choice": choice,
+                "branches": branches,
+                "on_empty": "failed",
+                "result": CHOICE_RESULT,
+            }}),
+        );
+        routes.choice_sites += 1;
+        Ok(())
+    }
     fn run(&mut self, entry: &str) -> Result<Value> {
         self.defaults = Some(ImportedDefaults::parse(&read_binary(
             &self.source.path("live.lpb")?,
@@ -846,13 +1207,7 @@ impl Adapter {
         let mut first = None;
         for c in &script.commands {
             if let Body::Jump(target, condition) = &c.body {
-                if references(condition, "選択値")
-                    && condition.operations.iter().any(|(op, _, _)| *op == 12)
-                    && condition.operations.iter().any(|(_, _, args)| {
-                        args.iter()
-                            .any(|v| matches!(v,Literal::String(s) if s=="はじめから"))
-                    })
-                {
+                if selection_dispatch(condition) == Some("はじめから") {
                     ensure!(
                         first.is_none(),
                         "E_IMPORT_LIVENOVEL: ambiguous new-game route"
@@ -863,150 +1218,31 @@ impl Adapter {
         }
         let first = first.context("E_IMPORT_LIVENOVEL: missing new-game route")?;
         self.textbox = self.image("グラフィック/立ちポーズ/box.gal")?.0;
-        self.warnings.insert("Stock LiveNovel startup, window/system scripts and asynchronous message handshake are replaced by NIR. This profile targets its linear episode/replay convention, not arbitrary LSB expressions.".into());
+        self.warnings.insert("Stock LiveNovel startup, window/system scripts and asynchronous message handshake are replaced by NIR. This profile targets its episode/replay/choice convention, not arbitrary LSB expressions.".into());
         self.warnings.insert("Save/load, history and settings use NIR UI and save format; LiveMaker save files are not compatible. Menu sound effects and animated cursors are not yet reproduced.".into());
         self.warnings.insert("Text uses the bundled NIR Japanese font and a 32 ms reveal interval; the source text-speed value is retained in import-defaults.json but its unit and source font/style are not yet mapped.".into());
         self.warnings.insert("Source Auto uses a sampled remaining-voice timer plus fixed delay. The imported policy samples the bound voice duration/position and voice-volume preference once per Auto cycle; original device timing and unsupported simultaneous source voice channels remain outside certification.".into());
-        let mut pc = first;
-        let mut seen = BTreeSet::new();
-        let mut episodes: Vec<Episode> = vec![];
-        let mut blocks = vec![];
-        let mut main = vec![];
-        loop {
-            ensure!(
-                pc < script.commands.len() && seen.insert(pc),
-                "E_IMPORT_LIVENOVEL: unexpected route loop"
-            );
-            let c = &script.commands[pc];
-            self.location = SourceLocation {
-                source: page.clone(),
-                index: pc,
-                line: c.line,
-                byte: c.offset,
-                command: c.name().into(),
-            };
-            if c.muted || c.kind == 3 || c.kind == 27 {
-                pc += 1;
-                continue;
-            }
-            match &c.body {
-                Body::Text {
-                    text,
-                    target,
-                    history,
-                    ..
-                } => {
-                    ensure!(
-                        literal_string(target)? == "メッセージボックス"
-                            && history.flag()?
-                            && !text.has_conditions_or_links
-                            && !text.has_ruby,
-                        "E_IMPORT_LIVENOVEL: unsupported text properties"
-                    );
-                    let name = format!("episode{}", episodes.len() + 1);
-                    episodes.push((
-                        pc,
-                        name.clone(),
-                        self.nodes.values().cloned().collect(),
-                        self.audio.clone(),
-                    ));
-                    let waits = text
-                        .glyphs
-                        .iter()
-                        .filter(|g| matches!(g, Glyph::Break(1)))
-                        .count();
-                    for (number, page) in text
-                        .glyphs
-                        .split(|g| matches!(g, Glyph::Break(1)))
-                        .enumerate()
-                    {
-                        let mut page = page.to_vec();
-                        if number < waits
-                            && !page
-                                .iter()
-                                .any(|g| matches!(g, Glyph::Char(_) | Glyph::Break(0)))
-                        {
-                            // An image-only page still has the original click wait.
-                            page.push(Glyph::Break(0));
-                        }
-                        self.page(&page, &mut blocks).with_context(|| {
-                            format!("{}:{} TextIns", self.location.source, self.location.line)
-                        })?;
-                    }
-                    self.finish_function(
-                        &name,
-                        std::mem::take(&mut blocks),
-                        json!({"type":"return"}),
-                    );
-                    main.push(json!({"ops":[],"terminator":{"type":"call","function":name,"next":"NEXT"}}));
-                    pc += 1;
-                }
-                Body::Calc(e) => {
-                    ensure!(
-                        e.operations.iter().all(|(op, name, args)| *op == 1
-                            && name == "__メッセージ終了"
-                            && matches!(args.as_slice(), [Literal::Int(0)])),
-                        "E_IMPORT_LIVENOVEL: unexpected scenario assignment"
-                    );
-                    pc += 1;
-                }
-                Body::Wait(e) => {
-                    ensure!(
-                        e.len() == 3
-                            && references(&e[0], "__メッセージ終了")
-                            && literal_int(&e[1])? == 0
-                            && literal_int(&e[2])? == 0,
-                        "E_IMPORT_LIVENOVEL: unexpected scenario wait"
-                    );
-                    pc += 1;
-                }
-                Body::Jump(target, condition) => {
-                    if references(condition, "回想番号") {
-                        ensure!(
-                            condition.operations.iter().any(|(op, _, _)| *op == 15),
-                            "E_IMPORT_LIVENOVEL: unexpected replay condition"
-                        );
-                        pc += 1;
-                        continue;
-                    }
-                    ensure!(
-                        condition.flag()?,
-                        "E_IMPORT_LIVENOVEL: conditional route requires adaptation"
-                    );
-                    let next = local_target(&script, &page, target)?;
-                    // A jump back to the initial dispatch restores the original title menu.
-                    if !episodes.is_empty() && next < first {
-                        break;
-                    }
-                    pc = next;
-                }
-                Body::Call {
-                    target,
-                    condition,
-                    params,
-                    ..
-                } => {
-                    ensure!(
-                        target.page.replace('\\', "/") == "ノベルシステム/シーン回想/■フラグON.lsb"
-                            && condition.flag()?
-                            && params.len() == 1,
-                        "E_IMPORT_LIVENOVEL: unexpected scenario call"
-                    );
-                    let key = format!("lm.replay.{}", literal_int(&params[0])?);
-                    self.op(&mut main, json!({"type":"profile_merge","key":key}));
-                    pc += 1;
-                }
-                Body::Exit(e) if e.flag()? => break,
-                _ => bail!(
-                    "E_IMPORT_LIVENOVEL: unsupported route command {}:{} {}",
-                    page,
-                    c.line,
-                    c.name()
-                ),
-            }
-        }
-        ensure!(!episodes.is_empty(), "E_IMPORT_LIVENOVEL: no episodes");
-        self.finish_function("main", main, json!({"type":"end","outcome":"completed"}));
+        let mut routes = Routes {
+            episodes: vec![],
+            blocks: BTreeMap::new(),
+            entries: BTreeMap::new(),
+            queue: vec![],
+            choice_sites: 0,
+        };
+        let main_entry = self.walk_routes(&script, &page, first, &mut routes)?;
+        ensure!(
+            !routes.episodes.is_empty(),
+            "E_IMPORT_LIVENOVEL: no episodes"
+        );
+        routes.blocks.insert(
+            "cancelled".into(),
+            json!({"ops":[],"terminator":{"type":"end","outcome":"cancelled"}}),
+        );
+        routes.blocks.insert("failed".into(),json!({"ops":[],"terminator":{"type":"fault","code":"E_IMPORT_TASK","message":"Imported event failed"}}));
+        self.functions
+            .insert("main".into(), json!({"entry": main_entry, "blocks": routes.blocks}));
+        self.choice_sites = routes.choice_sites;
+        let episodes = routes.episodes;
         // Build replay wrappers from the original dispatcher, preserving its order.
         let (_, replay) = self.source.read("シーン回想.lsb")?;
         let (_, replay_ui) = self.source.read("ノベルシステム/シーン回想/■開始.lsb")?;
@@ -1177,7 +1413,7 @@ impl Adapter {
         self.warnings.insert("Replay thumbnails retain original grid coordinates. Locked thumbnails preserve alpha with black RGB; a NIR return button and system-menu access remain available for touch/keyboard navigation.".into());
         self.scenes.insert("title".into(), vec![]);
         Ok(
-            json!({"fragment_format":1,"functions":self.functions,"cues":self.cues,"scenes":self.scenes}),
+            json!({"fragment_format":1,"variables":self.variables,"functions":self.functions,"cues":self.cues,"scenes":self.scenes,"choices":self.choices}),
         )
     }
     fn export_media(&self, root: &Path) -> Result<()> {
@@ -1270,11 +1506,22 @@ pub(super) fn convert(
 ) -> Result<ImportReport> {
     let mut adapter = Adapter::new(source);
     let mut story = adapter.run(entry)?;
+    if adapter.choice_sites > 0 {
+        adapter.warnings.insert("Story choices reuse the NIR typed interaction: the selected option text is committed to the 選択値 variable and dispatches its branch. Stock 選択メニュー chrome (frame skins, hover/select sounds, countdown timers and alignment options) is not reproduced.".into());
+    }
     if options.draft {
         super::ui_preview::prepare_story(&mut story)?;
     }
     let ui = super::ui::analyze_system_menu(&mut adapter.source)?;
-    let mut report=ImportReport{format:1,engine:"livemaker-livenovel116".into(),status:"converted_with_adaptations".into(),written:false,errors:0,text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("Linear LiveNovel route, replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings.",adapter.assets.len()),diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
+    let route_shape = if adapter.choice_sites > 0 {
+        format!(
+            "Branching LiveNovel route with {} typed choice site(s),",
+            adapter.choice_sites
+        )
+    } else {
+        "Linear LiveNovel route,".into()
+    };
+    let mut report=ImportReport{format:1,engine:"livemaker-livenovel116".into(),status:"converted_with_adaptations".into(),written:false,errors:0,text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings.",route_shape,adapter.assets.len()),diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
     report.diagnostics.extend(ui.diagnostics());
     let staging = tempfile::Builder::new()
         .prefix(".nir-import-")
@@ -1921,4 +2168,335 @@ mod tests {
             assert!(menu(&data[..n]).is_err());
         }
     }
+    /// Shared builder for route-walk fixtures: labels, unconditional calls,
+    /// 選択値 dispatch jumps, exits and plain text commands assembled in
+    /// memory (no source tree needed for the walk itself).
+    mod route {
+        use super::super::super::lsb::{Command, Novel, Reference};
+        use super::*;
+        pub(super) fn expr(op: u8, name: &str, args: Vec<Literal>) -> Expression {
+            Expression {
+                literal: None,
+                operations: vec![(op, name.into(), args)],
+                functions: BTreeMap::new(),
+            }
+        }
+        pub(super) fn int(n: i32) -> Expression {
+            Expression {
+                literal: Some(Literal::Int(n)),
+                operations: vec![],
+                functions: BTreeMap::new(),
+            }
+        }
+        pub(super) fn flag() -> Expression {
+            int(1)
+        }
+        /// The exact stock dispatch shape: one literal is assigned, compared
+        /// with the 選択値 variable, and the result is returned.
+        pub(super) fn selection(literal: &str) -> Expression {
+            Expression {
+                literal: None,
+                operations: vec![
+                    (
+                        1,
+                        "____0".into(),
+                        vec![Literal::String(literal.into())],
+                    ),
+                    (
+                        12,
+                        "____2".into(),
+                        vec![
+                            Literal::Variable("選択値".into()),
+                            Literal::Variable("____0".into()),
+                        ],
+                    ),
+                    (1, "____arg".into(), vec![Literal::Variable("____2".into())]),
+                ],
+                functions: BTreeMap::new(),
+            }
+        }
+        pub(super) fn command(kind: u8, line: u32, body: Body) -> Command {
+            Command {
+                kind,
+                indent: 0,
+                muted: false,
+                not_update: false,
+                line,
+                offset: 0,
+                body,
+            }
+        }
+        pub(super) fn label(line: u32) -> Command {
+            command(3, line, Body::Label(String::new()))
+        }
+        pub(super) fn text(line: u32, s: &str) -> Command {
+            command(
+                20,
+                line,
+                Body::Text {
+                    text: Novel {
+                        glyphs: vec![Glyph::Char(s.into())],
+                        counts: BTreeMap::new(),
+                        events: BTreeMap::new(),
+                        has_conditions_or_links: false,
+                        has_ruby: false,
+                    },
+                    target: Expression {
+                        literal: Some(Literal::String("メッセージボックス".into())),
+                        operations: vec![],
+                        functions: BTreeMap::new(),
+                    },
+                    history: flag(),
+                    wait: flag(),
+                    stop: int(0),
+                },
+            )
+        }
+        pub(super) fn exit(line: u32) -> Command {
+            command(6, line, Body::Exit(flag()))
+        }
+        pub(super) fn dispatch(line: u32, literal: &str, target_line: u32) -> Command {
+            command(
+                4,
+                line,
+                Body::Jump(
+                    Reference {
+                        page: String::new(),
+                        line: target_line,
+                    },
+                    selection(literal),
+                ),
+            )
+        }
+        pub(super) fn choice_call(line: u32) -> Command {
+            command(
+                5,
+                line,
+                Body::Call {
+                    target: Reference {
+                        page: "ノベルシステム\\選択メニュー\\■選択実行.lsb".into(),
+                        line: 0,
+                    },
+                    condition: flag(),
+                    has_params: true,
+                    params: vec![],
+                },
+            )
+        }
+        pub(super) fn script(commands: Vec<Command>) -> Script {
+            Script {
+                version: 116,
+                source_sha256: "0".repeat(64),
+                commands,
+            }
+        }
+        pub(super) fn adapter() -> (tempfile::TempDir, Adapter) {
+            let temp = tempfile::tempdir().unwrap();
+            let adapter = Adapter::new(Source::new(temp.path()).unwrap());
+            (temp, adapter)
+        }
+        pub(super) fn walk(adapter: &mut Adapter, script: &Script) -> Result<Routes> {
+            let mut routes = Routes {
+                episodes: vec![],
+                blocks: BTreeMap::new(),
+                entries: BTreeMap::new(),
+                queue: vec![],
+                choice_sites: 0,
+            };
+            adapter.walk_routes(script, "00000001.lsb", 0, &mut routes)?;
+            Ok(routes)
+        }
+    }
+
+    /// The dispatch predicate accepts exactly one literal compared with the
+    /// 選択値 variable and rejects anything looser.
+    #[test]
+    fn selection_dispatch_matches_one_string_literal_only() {
+        use route::{expr, selection};
+        assert_eq!(selection_dispatch(&selection("甲")), Some("甲"));
+        assert_eq!(
+            selection_dispatch(&expr(
+                11,
+                "____arg",
+                vec![
+                    Literal::Variable("選択値".into()),
+                    Literal::String("甲".into())
+                ]
+            )),
+            None,
+            "op 11 is not the stock equality"
+        );
+        assert_eq!(
+            selection_dispatch(&expr(
+                12,
+                "____arg",
+                vec![
+                    Literal::Variable("別の変数".into()),
+                    Literal::String("甲".into())
+                ]
+            )),
+            None,
+            "comparisons on other variables do not dispatch choices"
+        );
+        let mut two = selection("甲");
+        two.operations[0].2.push(Literal::String("乙".into()));
+        assert_eq!(selection_dispatch(&two), None, "ambiguous literal");
+    }
+
+    /// A stock choice site lowers onto the typed interaction core: one
+    /// Interact whose branch targets continue the winning route, the option
+    /// value is the option text the source callback commits, and the result
+    /// variable is declared for the VM-owned typed write.
+    #[test]
+    fn choice_site_lowers_to_typed_interaction_with_route_branches() {
+        let script = route::script(vec![
+            route::label(10),
+            route::text(11, "共通の導入。"),
+            route::choice_call(12),
+            route::dispatch(13, "synthetic-alpha", 20),
+            route::dispatch(14, "synthetic-beta", 30),
+            route::exit(15),
+            route::label(20),
+            route::text(21, "甲ルート。"),
+            route::exit(22),
+            route::label(30),
+            route::text(31, "乙ルート。"),
+            route::exit(32),
+        ]);
+        let (_temp, mut adapter) = route::adapter();
+        let routes = route::walk(&mut adapter, &script).unwrap();
+        assert_eq!(routes.choice_sites, 1);
+        assert_eq!(routes.episodes.len(), 3);
+        let interact = routes
+            .blocks
+            .values()
+            .find(|b| b["terminator"]["type"] == "interact")
+            .unwrap()["terminator"]
+            .clone();
+        let choice_id = interact["choice"].as_str().unwrap().to_owned();
+        let definition = &adapter.choices[&choice_id];
+        let options = definition["options"].as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["id"], "o0");
+        assert_eq!(options[0]["value"], json!({"type":"string","value":"synthetic-alpha"}));
+        assert_eq!(options[1]["value"], json!({"type":"string","value":"synthetic-beta"}));
+        for option in options {
+            let doc = &adapter.texts[option["text"].as_str().unwrap()];
+            assert_eq!(doc.spans.len(), 1);
+        }
+        assert_eq!(
+            adapter.variables["選択値"],
+            json!({"type":"string","value":""})
+        );
+        assert_eq!(interact["result"], "選択値");
+        assert_eq!(interact["on_empty"], "failed");
+        // The interaction itself validates against the runtime schema.
+        let terminator: nir_format::Terminator =
+            serde_json::from_value(interact.clone()).unwrap();
+        assert!(matches!(terminator, nir_format::Terminator::Interact { result, .. } if result.as_deref() == Some("選択値")));
+        let def: nir_format::Choice = serde_json::from_value(definition.clone()).unwrap();
+        assert!(def.options.iter().all(|o| o.value.is_some()));
+        // Branch targets continue at each route's episode call, and every
+        // route reaches its own end.
+        let branch_a = routes.blocks[interact["branches"]["o0"].as_str().unwrap()].clone();
+        let branch_b = routes.blocks[interact["branches"]["o1"].as_str().unwrap()].clone();
+        assert_eq!(branch_a["terminator"]["function"], "episode2");
+        assert_eq!(branch_b["terminator"]["function"], "episode3");
+        let ends: Vec<_> = routes
+            .blocks
+            .values()
+            .filter(|b| b["terminator"]["type"] == "end")
+            .collect();
+        assert_eq!(ends.len(), 2);
+        assert!(ends
+            .iter()
+            .all(|b| b["terminator"]["outcome"] == "completed"));
+        // The unreachable dispatch fallthrough lowers to nothing.
+        assert!(!routes.blocks.values().any(|b| b["terminator"]["type"] == "fault"));
+    }
+
+    /// Converging branch targets merge into one continuation instead of
+    /// duplicating the shared route.
+    #[test]
+    fn converging_choice_branches_merge_into_one_continuation() {
+        let script = route::script(vec![
+            route::label(10),
+            route::text(11, "共通。"),
+            route::choice_call(12),
+            route::dispatch(13, "synthetic-alpha", 20),
+            route::dispatch(14, "synthetic-beta", 20),
+            route::exit(15),
+            route::label(20),
+            route::text(21, "合流ルート。"),
+            route::exit(22),
+        ]);
+        let (_temp, mut adapter) = route::adapter();
+        let routes = route::walk(&mut adapter, &script).unwrap();
+        assert_eq!(routes.episodes.len(), 2);
+        let interact = routes
+            .blocks
+            .values()
+            .find(|b| b["terminator"]["type"] == "interact")
+            .unwrap()["terminator"]
+            .clone();
+        assert_eq!(
+            interact["branches"]["o0"],
+            interact["branches"]["o1"],
+            "both options continue at the merged route"
+        );
+    }
+
+    /// A branch that jumps back onto its own reachability path is a route
+    /// loop, and malformed choice sites are refused with import errors.
+    #[test]
+    fn choice_sites_reject_loops_and_malformed_dispatch() {
+        let (_temp, mut adapter) = route::adapter();
+        let script = route::script(vec![
+            route::label(10),
+            route::text(11, "共通。"),
+            route::choice_call(12),
+            route::dispatch(13, "synthetic-alpha", 10),
+            route::dispatch(14, "synthetic-beta", 20),
+            route::exit(15),
+            route::label(20),
+            route::text(21, "乙。"),
+            route::exit(22),
+        ]);
+        let err = route::walk(&mut adapter, &script).unwrap_err().to_string();
+        assert!(err.contains("route loop"), "{err}");
+        let (_temp, mut adapter) = route::adapter();
+        let script = route::script(vec![
+            route::label(10),
+            route::choice_call(12),
+            route::exit(13),
+        ]);
+        let err = route::walk(&mut adapter, &script).unwrap_err().to_string();
+        assert!(err.contains("E_IMPORT_CHOICE"), "{err}");
+        let (_temp, mut adapter) = route::adapter();
+        let script = route::script(vec![
+            route::label(10),
+            route::choice_call(12),
+            route::dispatch(13, "synthetic-alpha", 20),
+            route::exit(14),
+            route::label(20),
+            route::exit(21),
+        ]);
+        let err = route::walk(&mut adapter, &script).unwrap_err().to_string();
+        assert!(err.contains("at least two options"), "{err}");
+        let (_temp, mut adapter) = route::adapter();
+        let script = route::script(vec![
+            route::label(10),
+            route::choice_call(12),
+            route::dispatch(13, "synthetic-alpha", 20),
+            route::dispatch(14, "synthetic-beta", 30),
+            route::text(15, "生き残る後続。"),
+            route::label(20),
+            route::exit(21),
+            route::label(30),
+            route::exit(31),
+        ]);
+        let err = route::walk(&mut adapter, &script).unwrap_err().to_string();
+        assert!(err.contains("must end with Exit"), "{err}");
+    }
+
 }

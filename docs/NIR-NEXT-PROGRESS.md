@@ -31,7 +31,9 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
 | P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息/UI 目标、来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4–P6 页面效果、Replay、演出组合及多来源认证 | 待实施；不得按已有基础能力视为完成 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息/UI 根上的通用目标与遮罩转场仍待实施 |
+| P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
+| P6 兼容认证与困难案例 | 待实施：ImportReport 映射级别（exact/adapted/approximate/unsupported）与证据类、完整路线认证、能力发行清单 |
 
 Windows 宿主已同步修改，但 Linux 上的公共 Rust 测试不覆盖 cfg(windows) 原生运行路径；不得据此声明 Windows 实机验收通过。实际测试日志保留在本地 `reports/nir-next/`。
 
@@ -608,3 +610,14 @@ P5.1 完成；P5.2（故事交互与类型化结果）待实施。证据：repor
 - P5 关卡核对：并行链中途局部状态改变后存读档/回退不重播（批次 50+51 测试覆盖）；无限循环媒体与 All 的不可完成组合被诊断（本批 E_INFINITE_WAIT）。“第二来源案例复用相同核心”未满足——LiveNovel 导入器尚无 Interact/选项到类型化结果核心的映射（import/*.rs 无相关引用），留待导入器批次。
 
 P5.2 完成；P5 关卡三条中“第二来源复用相同核心”未满足（导入器无 Interact 映射，留待后续批次）。证据：reports/nir-next/batch-51-xtask-test.log、batch-51-xtask-sdk.log、batch-51-core.log、batch-51-player.log、batch-51-browser-typed.log。契约见 TYPED-RESULT-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 52：第二来源选择映射复用类型化结果核心（P5 收口）
+
+- 证据先行：解码标准选择系统三页并据此定型约定——`選択.lsb` 回调把所选项文本 `@ParamStr[0]` 写入 `選択値`（`選択番号 = @ParamStr[1]`）；`■選択実行.lsb` 清空结果变量后按 `@ParamStr` 数组参数（位置/皮肤/音效/倒计时配置，选项文本即 `@ParamStr[0]`）创建 kind 25 Menu 对象并等待关闭；调用方以连续条件跳转对 `選択値` 与单个字符串字面量做操作 12 比较分发（标题分发实测：はじめから/つづきから/回想三条 Jump）。选项的显示文本、分发字面量与提交值三者同源。
+- 导入器降级（livenovel.rs）：识别"无条件调用選択メニュー执行页 + 紧随的選択値 字面量分发链 + 链尾 Exit（后继不可达）"，整个调用点合成一个类型化 Interact——每个字面量声明为选项，`value` 为该字符串（等于源回调提交值），`result` 指向导入器声明的 `選択値` 字符串变量（初值空串，经 fragment `variables` 合入 Program），分支目标为对应标签处续块。提交、写入、快照、恢复、回退全部走批次 51 的同一核心路径，无导入器私有分支；能力 `story.typed-result.v1` 由编译器按实际使用裁剪机制自动声明。
+- 路线图行走：主线行走从线性单指针改为队列驱动图行走（entries 映射命令位置到续块，合流跳转合并为同一续块不复制内容，回到自身可达路径的跳转按路线循环拒绝），剧情内选择可嵌套；主线函数改用显式块 id 组装，剧集函数、回想包装、文本/媒体管线不变。此前用于寻找新游戏路线的标题分发现有 `selection_dispatch` 统一谓词匹配，不再各写一份。
+- 严格拒绝（E_IMPORT_CHOICE）：条件调用选择执行页、调用后缺失分发链、链不足两项、选项文本重复、链尾非 Exit。菜单皮肤、悬停/选择音效、倒计时与对齐参数不迁移；报告状态保持 `converted_with_adaptations`，coverage 按选择位数注明"Branching … typed choice site(s)"并新增差异警告。IMPORT.md 与 TYPED-RESULT-SEMANTICS.md 记录映射契约与证据。
+- 测试：livenovel 单元 6 项新增/重整（selection_dispatch 单字面量谓词、选择点降级为类型化交互并经 nir_format 反序列化校验、合流分支合并、路线循环与四类畸形拒绝）；真实语料回归（RJ061378 全量转换 1357 页 17 函数不变，main+8 回想在 VM 中走完、快照恢复、解锁断言）确认线性路径行为不变（batch-52-corpus.log）。
+- P5 关卡核对（三条全部满足）：并行链中途局部状态改变后存读档/回退不重播（批次 50/51 测试覆盖）；"第二来源案例复用相同核心"（本批：LiveNovel 選択メニュー约定降级到 story.typed-result.v1 核心，import/*.rs 现有 Interact 映射）；无限循环媒体与 All 的不可完成组合被诊断（批次 51 E_INFINITE_WAIT）。
+
+P5 收口；P4 遗留（消息/UI 根遮罩与通用目标）与 P6（映射级别/完整路线认证/发行清单）待后续批次。证据：reports/nir-next/batch-52-corpus.log 及本批五项门禁日志（batch-52-xtask-test.log、batch-52-clippy.log、batch-52-architecture.log、batch-52-xtask-sdk.log、batch-52-browser-full.log）。契约见 IMPORT.md、TYPED-RESULT-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
