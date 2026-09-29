@@ -152,7 +152,12 @@ struct Runtime {
     audio_starts: usize,
 }
 impl Runtime {
-    fn new(window: Arc<Window>, bundle: Arc<Bundle>, data: PathBuf) -> Result<Self> {
+    fn new(
+        window: Arc<Window>,
+        bundle: Arc<Bundle>,
+        data: PathBuf,
+        exe_check: Option<std::thread::JoinHandle<Result<()>>>,
+    ) -> Result<Self> {
         let storage = Storage::open(
             &data,
             &bundle.manifest.game_id,
@@ -160,6 +165,19 @@ impl Runtime {
             &bundle.release,
         )?;
         let renderer = create_renderer(window.clone())?;
+        // The whole-executable digest was hashed on a startup thread while the
+        // renderer initialized; gate runtime construction on its verdict here.
+        if let Some(handle) = exe_check {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(
+                        e.context("E_NATIVE_PLAYER: use the executable packaged with this release")
+                    )
+                }
+                Err(_) => bail!("E_NATIVE_PLAYER: verification thread panicked"),
+            }
+        }
         let mut engine = engine_result(Engine::new(
             bundle.executable()?,
             bundle.release.clone(),
@@ -675,6 +693,7 @@ struct App {
     smoke_advance: Instant,
     advances: u32,
     hidden: bool,
+    exe_check: Option<std::thread::JoinHandle<Result<()>>>,
     /// Set when a return-to-title ending restarted the story: the save cycle
     /// must run at the first dialogue because saves from Title are refused.
     save_at_dialogue: bool,
@@ -795,7 +814,12 @@ impl ApplicationHandler for App {
                         .with_visible(!self.hidden),
                 )?,
             );
-            Runtime::new(window, self.bundle.clone(), self.data.clone())
+            Runtime::new(
+                window,
+                self.bundle.clone(),
+                self.data.clone(),
+                self.exe_check.take(),
+            )
         })();
         match result {
             Ok(runtime) => self.runtime = Some(runtime),
@@ -1112,9 +1136,24 @@ pub fn run() -> Result<()> {
         }
     }
     let bundle = Arc::new(Bundle::open(&root)?);
-    nir_content::verify(&fs::read(&exe)?, &bundle.manifest.player)
-        .context("E_NATIVE_PLAYER: use the executable packaged with this release")?;
+    // Hash the whole executable on a helper thread so startup overlaps the
+    // digest (~14-22 ms warm, more cold) with event-loop and GPU init; the
+    // verdict gates Runtime construction in resumed().
+    let expected_player = bundle.manifest.player.clone();
+    let exe_check = std::thread::spawn(move || -> Result<()> {
+        nir_content::verify(&fs::read(&exe)?, &expected_player)?;
+        Ok(())
+    });
     if verify {
+        match exe_check.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(
+                    e.context("E_NATIVE_PLAYER: use the executable packaged with this release")
+                )
+            }
+            Err(_) => bail!("E_NATIVE_PLAYER: verification thread panicked"),
+        }
         return bundle.verify_all();
     }
     let event_loop = EventLoop::new()?;
@@ -1130,6 +1169,7 @@ pub fn run() -> Result<()> {
         advances: 0,
         save_at_dialogue: false,
         hidden,
+        exe_check: Some(exe_check),
     };
     event_loop.run_app(&mut app)?;
     if let Some(error) = app.error {
