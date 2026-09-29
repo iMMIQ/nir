@@ -32,6 +32,9 @@ jobs:
           python scripts/check_architecture.py
       - name: Package independent sample
         run: |
+          # The restored build cache carries the previous run's sample project;
+          # novelc init refuses to overwrite an existing destination.
+          Remove-Item -Recurse -Force target/windows-sample -ErrorAction SilentlyContinue
           ./dist/novelc.exe init target/windows-sample
           ./dist/novelc.exe -p target/windows-sample resolve
           ./dist/novelc.exe -p target/windows-sample build --target windows --locked

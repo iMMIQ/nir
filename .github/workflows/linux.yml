@@ -49,6 +49,9 @@ jobs:
           # Software Vulkan (lavapipe) keeps the smoke run functional on runners without a GPU.
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
+          # The restored build cache carries the previous run's sample project;
+          # novelc init refuses to overwrite an existing destination.
+          rm -rf target/linux-sample
           ./dist/novelc init target/linux-sample
           ./dist/novelc -p target/linux-sample resolve
           ./dist/novelc -p target/linux-sample build --target linux --locked
