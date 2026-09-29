@@ -1,5 +1,6 @@
 //! Versioned, platform-independent wire contracts. Unknown semantic fields fail closed.
 #![forbid(unsafe_code)]
+pub mod lame;
 mod menu;
 mod transition;
 mod tween;
@@ -57,6 +58,8 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-history-flow.v1",
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
+    "media.webp.v1",
+    "media.mp3.v1",
 ];
 /// Device observation, separate from the deterministic Story task clock.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -29,6 +29,26 @@
         "font"
       ]
     },
+    "AssetPolicy": {
+      "description": "Per-asset override from the asset catalog (`optimize = \"...\"` field).",
+      "oneOf": [
+        {
+          "description": "Follow the global CLI settings.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Images: lossless WebP. Audio: keep WAV (lossless source).",
+          "type": "string",
+          "const": "lossless"
+        },
+        {
+          "description": "Package the original bytes untouched.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
     "AssetSource": {
       "type": "object",
       "properties": {
@@ -62,6 +82,18 @@
         },
         "kind": {
           "$ref": "#/$defs/AssetKind"
+        },
+        "optimize": {
+          "description": "Packaging-time optimization override (`auto` / `lossless` / `none`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AssetPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "rights": {
           "type": "string"

@@ -1,4 +1,4 @@
-use crate::{compile, load_project, runtime_roots, GameManifest, LoadedProject};
+use crate::{compile, load_project, runtime_roots, GameManifest, LoadedProject, OptimizeOptions};
 use anyhow::{bail, Context, Result};
 use nir_format::*;
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,7 @@ pub struct BuildReport {
     pub engine_build: String,
     pub resolved_config: crate::ResolvedConfig,
     pub fonts: BTreeMap<String, crate::FontReport>,
+    pub optimization: crate::OptimizeReport,
 }
 #[derive(Debug, Serialize)]
 pub struct ModuleBuildReport {
@@ -1114,6 +1115,7 @@ pub fn build(root: &Path, sdk: &Path, out: &Path, locked: bool) -> Result<BuildR
         if locked { "release" } else { "dev" },
         locked,
         true,
+        &OptimizeOptions::default(),
     )
 }
 
@@ -1124,6 +1126,7 @@ pub fn build_profile(
     profile: &str,
     locked: bool,
     promote: bool,
+    optimize: &OptimizeOptions,
 ) -> Result<BuildReport> {
     if !matches!(profile, "dev" | "release") {
         bail!("E_PROFILE: expected dev or release");
@@ -1131,7 +1134,7 @@ pub fn build_profile(
     if profile == "release" && !locked {
         bail!("E_RELEASE_LOCK: release builds require --locked");
     }
-    let p = load_project(root)?;
+    let mut p = load_project(root)?;
     let lock = if locked {
         check_lock(&p, sdk)?
     } else {
@@ -1142,17 +1145,36 @@ pub fn build_profile(
     fs::create_dir_all(out.join("channels"))?;
     let mut objects = BTreeMap::new();
     let roots = runtime_roots(&p.program);
+    // Ship-format conversion runs before compilation so descriptors, catalog
+    // digest and capabilities all reflect the packaged bytes.
+    let (optimization, stored) = crate::optimize::optimize_media(
+        &mut p,
+        &roots,
+        optimize,
+        &root.join(".nir").join("cache").join("optimize"),
+    )?;
+    // `load_project` seeds requires with the whole capability list and prunes
+    // to actual use; the container capabilities follow the packaged bytes, so a
+    // release with no WebP/MP3 objects stays playable on older players.
+    let ships =
+        |media: crate::optimize::StoredMedia| stored.values().any(|stored| *stored == media);
+    p.program.requires.retain(|cap| {
+        (cap != "media.webp.v1" || ships(crate::optimize::StoredMedia::Webp))
+            && (cap != "media.mp3.v1" || ships(crate::optimize::StoredMedia::Mp3))
+    });
     for id in &roots {
         let a = p
             .program
             .assets
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("E_ASSET_UNDECLARED: runtime dependency {id}"))?;
-        let (ext, mime) = match a.kind {
-            AssetKind::Image => ("png", "image/png"),
-            AssetKind::Audio => ("wav", "audio/wav"),
-            AssetKind::Font if p.media[id].starts_with(b"OTTO") => ("otf", "font/otf"),
-            AssetKind::Font => ("ttf", "font/ttf"),
+        let (ext, mime) = match stored.get(id).copied() {
+            Some(media) => (media.ext(), media.mime()),
+            None => match a.kind {
+                AssetKind::Font if p.media[id].starts_with(b"OTTO") => ("otf", "font/otf"),
+                AssetKind::Font => ("ttf", "font/ttf"),
+                _ => unreachable!("media assets always have a stored format"),
+            },
         };
         object(out, &mut objects, &p.media[id], ext, mime)?;
     }
@@ -1310,6 +1332,7 @@ pub fn build_profile(
             .into_iter()
             .filter(|(id, _)| roots.contains(id))
             .collect(),
+        optimization,
     };
     let reports = root.join("reports");
     fs::create_dir_all(&reports)?;
@@ -1357,6 +1380,7 @@ pub fn build_windows(
     out: &Path,
     profile: &str,
     locked: bool,
+    optimize: &OptimizeOptions,
 ) -> Result<BuildReport> {
     build_native(
         root,
@@ -1375,6 +1399,7 @@ pub fn build_windows(
             readme: "NIR Windows native player\r\nDouble-click Game.exe. Keep the data folder and NOTICE.txt beside it.\r\nWindows 10/11 x64 with a DirectX 12 capable driver is required.\r\nNo browser, WebView2, web server or network connection is required.\r\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\r\nSaves: %LOCALAPPDATA%\\NIR\\games\\<game-id-hash>\\<profile>\\releases\\<release>\\\r\nSaves are isolated by exact release; retain older game folders to continue older saves.\r\n".into(),
             report: "windows-build.json",
         },
+        optimize,
     )
 }
 /// Reuse content lowering, then publish a native-only graph (no HTML, JS or WASM).
@@ -1384,6 +1409,7 @@ pub fn build_linux(
     out: &Path,
     profile: &str,
     locked: bool,
+    optimize: &OptimizeOptions,
 ) -> Result<BuildReport> {
     build_native(
         root,
@@ -1402,6 +1428,7 @@ pub fn build_linux(
             readme: "NIR Linux native player\nRun ./Game from the bundle directory. Keep the data folder and NOTICE.txt beside it.\nx86_64 Linux with glibc 2.39+ and a Vulkan capable driver is required; audio uses ALSA or PulseAudio.\nNo browser, JavaScript, web server or network connection is required.\nSpace/Enter: advance; Esc: menu; F11: fullscreen; mouse: select; wheel: scroll.\nSaves: $XDG_DATA_HOME/NIR/games/<game-id-hash>/<profile>/releases/<release>/ (default ~/.local/share)\nSaves are isolated by exact release; retain older game folders to continue older saves.\n".into(),
             report: "linux-build.json",
         },
+        optimize,
     )
 }
 /// Deterministic `data/<dir>/<file>` walk in sorted name order.
@@ -1435,6 +1462,7 @@ pub fn build_android(
     out: &Path,
     profile: &str,
     locked: bool,
+    optimize: &OptimizeOptions,
 ) -> Result<BuildReport> {
     let target = NativeTarget {
         player: "android/lib/arm64-v8a/libplayer.so",
@@ -1447,7 +1475,7 @@ pub fn build_android(
         readme: "NIR Android native player\nInstall Game.apk on an Android 8.0+ arm64 device (adb install -r Game.apk, or open the file on the device and allow installs from this source).\nA Vulkan capable driver is required; no Java runtime, browser or network connection is used.\nTouch: tap to advance and select; back gesture or button: menu/close.\nGame data ships inside the APK and is extracted to the app's private storage on first launch.\nSaves: Android/data/<package>/files/NIR/games/<game-id-hash>/<profile>/releases/<release>/ inside the app's external storage, visible over USB.\nExported saves land in Android/data/<package>/files/exports/; import is not available on this platform.\nReinstalling a newer build over an installed one (adb install -r) keeps saves; uninstalling deletes them.\nKeep config/android-signing.pem: Android refuses to update an app signed with a different key.\n".into(),
         report: "android-build.json",
     };
-    let bundle = native_release(root, sdk, profile, locked, &target)?;
+    let bundle = native_release(root, sdk, profile, locked, &target, optimize)?;
     // The signing identity is project state, not build output: generate once,
     // then reuse forever. Losing it strands installed copies (updates must be
     // signed with the same key), so it lives under config/ beside game.toml.
@@ -1552,6 +1580,7 @@ fn native_release(
     profile: &str,
     locked: bool,
     target: &NativeTarget,
+    optimize: &OptimizeOptions,
 ) -> Result<NativeBundle> {
     let player = fs::read(sdk.join(target.player)).with_context(|| {
         format!(
@@ -1566,7 +1595,7 @@ fn native_release(
         target.format
     );
     let intermediate = root.join(".nir").join(target.intermediate);
-    let mut report = build_profile(root, sdk, &intermediate, profile, locked, true)?;
+    let mut report = build_profile(root, sdk, &intermediate, profile, locked, true, optimize)?;
     let web: ReleaseManifest = nir_content::parse(
         &fs::read(intermediate.join(format!("releases/{}.json", report.release)))?,
         "release",
@@ -1634,8 +1663,9 @@ fn build_native(
     profile: &str,
     locked: bool,
     target: &NativeTarget,
+    optimize: &OptimizeOptions,
 ) -> Result<BuildReport> {
-    let bundle = native_release(root, sdk, profile, locked, target)?;
+    let bundle = native_release(root, sdk, profile, locked, target, optimize)?;
     write_native_data(&bundle, &out.join("data"))?;
     fs::write(out.join(format!("{}.next", target.binary)), &bundle.player)?;
     fs::rename(

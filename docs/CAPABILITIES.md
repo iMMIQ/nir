@@ -9,7 +9,7 @@
 | 终结 | Call/Return、Activate/Await/Interact、End/Fault | 单剧情流；跨模块通过具名导出调用 |
 | 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All | 无 Runtime Worker |
 | 模块 | 多模块命名空间、导出链接、共享变量、函数体/正文哈希分包、执行与恢复前准备 | 静态目录与媒体按需准备、有界预取、租约保护及驱逐；无 Edition 或跨发行存档转换 |
-| 图像 | Group/Sprite、层次顺序、裁切、cut/dissolve、方向擦除/Alpha 阈值遮罩、x/y/scale/opacity 动画 | PNG；无旋转、滤镜、视频和独立 Group 混合模式 |
+| 图像 | Group/Sprite、层次顺序、裁切、cut/dissolve、方向擦除/Alpha 阈值遮罩、x/y/scale/opacity 动画 | 来源 PNG，打包默认转有损 WebP（质量 92，alpha 通道无损保留）；无旋转、滤镜、视频和独立 Group 混合模式 |
 | 正文 | 注册字体、样式强调、参数隔离、换行、字素簇揭示、span Marker/Gate、已揭示长文翻阅 | 无 Ruby、NVL、富网页标记 |
 | 翻译维护 | 源/契约/语义修订、契约摘要、已读语义身份、逐文本状态、显式复核、旧源迁移 | 简中/英文、逐模块修订；不迁移跨发行存档，详见 [文本修订](TEXT-REVISIONS.md) |
 | 字体编译 | 静态 OTF/TTF/TTC face、subset/full、UI/正文逐语言有序 FontPlan、覆盖检查、共享字体字集去重、塑形闭包、内容缓存、许可打包 | 无可变/彩色字体、运行时补字；详见 [字体说明](AUTHOR-FONTS.md) 与 [语言/字体计划](LOCALE-FONTS.md) |
@@ -17,10 +17,10 @@
 | 界面 | 标题、对白、选项、菜单、设置、回看分页与单条长记录翻阅、存读档、自动、已读快进 | Fluent 界面内嵌在 SDK |
 | 作品配置/主题 | `web-standard`、player 默认设置、字段来源报告、dialogue.main/choice.main 内置组件替换 | 原图按钮菜单、有序图文/分组裁切/透明命中区、解锁入口和消息框图片／舞台坐标；无任意组件或可执行主题脚本 |
 | 语言 | zh-Hans/en 界面，zh-Hans/en/ja 正文，独立偏好与字体计划；候选准备后原子切换；正文下一实例生效，已存在的对白/选项/历史冻结身份 | 正文按模块/语言获取并校验；不提供日文界面、繁简自动回退或多文字系统认证；详见 [语言/字体计划](LOCALE-FONTS.md) |
-| 音频 | PCM16 WAV、循环 BGM、短音效、合成测试语音、总线偏好与每事件 gain（0–4）相乘、手势解锁 | 无流式压缩音频、真人配音；可听性需要人工设备检查 |
+| 音频 | PCM16 WAV、循环 BGM、短音效、合成测试语音、总线偏好与每事件 gain（0–4）相乘、手势解锁 | 来源 WAV，打包默认非循环资产转 MP3 CBR；无流式播放、真人配音，可听性需要人工设备检查 |
 | 存储 | 按游戏/profile/发行隔离的三槽 IndexedDB、事务确认、修订冲突、导入导出、历史发行入口、独立偏好/Profile | 快照要求相同发行身份；无云同步 |
 | 恢复 | 候选先验证/准备、暂停提交、检查点回退、设备重建 | 无安全热更新 |
-| 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告 | 无 PWA、签名/CDN 调度或高级压缩优化 |
+| 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告、打包媒体优化 | 无 PWA、签名/CDN 调度 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
 | 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
 | 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
@@ -94,3 +94,7 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 `ui.menu-chrome.v1` 允许页面关闭自动添加的导航按钮，保留作者控件、Escape／右键和失败出口。默认开启，旧页面行为不变；转换器可在原页面只使用键盘返回时自动生成该声明，见 [菜单服务](MENU-SERVICES-SEMANTICS.md)。
 
 `ui.menu-navigation.v1` 提供最多八层父页的 push_menu／back，保存有界局部值、逐层 Close 和返回后的新输入实例；旧 menu 替换行为保持兼容。资源、服务与布局状态的边界见 [菜单子页导航](MENU-NAVIGATION-SEMANTICS.md)。
+
+### media.webp.v1 / media.mp3.v1
+
+打包媒体优化按实际发出的对象容器裁剪 `requires`：发行中存在 WebP 对象才声明 `media.webp.v1`，存在 MP3 对象才声明 `media.mp3.v1`；`--no-optimize` 或逐资产例外导致发行不含这两类对象时不声明，旧运行时仍可加载，播放器据此拒绝不支持的组合。默认构建把图像对象转有损 WebP（质量 92，alpha 通道在 ALPH 块中无损保留）、非循环音频转 MP3 CBR；尺寸、`duration_us` 和 `decoded_bytes` 描述符保持源资产值。MP3 对象带 LAME gapless 标签，原生加载器与浏览器 `decodeAudioData` 都按标签裁剪编码器延迟/填充，解码样本数与源 WAV 一致（原生加载器经测试逐样本对齐）。循环播放的音频保持 WAV（样本精确循环），MP3 不能表示的采样率、转换后不缩小的对象和字体不受影响；逐资产例外用 catalog `optimize` 字段，CLI 覆盖与转换缓存见 [编写与维护作品](AUTHORING.md)。

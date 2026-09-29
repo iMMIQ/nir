@@ -38,7 +38,7 @@ wasm-bindgen-futures = "=0.4.50"
 js-sys = "=0.3.77"
 web-sys = "=0.3.77"
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 fluent-bundle = "0.15"
 unic-langid = "0.9"
 clap = { version = "4", features = ["derive"] }

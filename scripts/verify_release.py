@@ -13,7 +13,8 @@ from urllib.request import Request, urlopen
 
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 MIME = {"html": "text/html", "js": "text/javascript", "json": "application/json",
-        "wasm": "application/wasm", "png": "image/png", "wav": "audio/wav",
+        "wasm": "application/wasm", "png": "image/png", "webp": "image/webp",
+        "wav": "audio/wav", "mp3": "audio/mpeg",
         "otf": "font/otf", "ttf": "font/ttf", "txt": "text/plain"}
 
 

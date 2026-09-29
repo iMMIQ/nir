@@ -58,6 +58,21 @@ enum Command {
         locked: bool,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Packaged image container: webp (lossy), webp-lossless, png.
+        #[arg(long, default_value = "webp")]
+        image_format: String,
+        /// Lossy WebP quality, 1-100 (default 92).
+        #[arg(long, default_value_t = 92)]
+        image_quality: u8,
+        /// Packaged audio container: mp3 (CBR), wav.
+        #[arg(long, default_value = "mp3")]
+        audio_format: String,
+        /// MP3 CBR bitrate in kbps (default 160).
+        #[arg(long, default_value_t = 160)]
+        audio_bitrate: u16,
+        /// Package the original PNG/WAV bytes untouched.
+        #[arg(long)]
+        no_optimize: bool,
     },
     Dev {
         #[arg(long, default_value_t = 4173)]
@@ -162,6 +177,45 @@ enum TextCommand {
         out: PathBuf,
     },
     Recover,
+}
+/// Validates the build flags into packaging options; defaults match every
+/// player's decode matrix (WebP q92 images, MP3 CBR 160 audio).
+fn parse_optimize(
+    image_format: &str,
+    image_quality: u8,
+    audio_format: &str,
+    audio_bitrate: u16,
+    no_optimize: bool,
+) -> Result<OptimizeOptions> {
+    if no_optimize {
+        return Ok(OptimizeOptions::none());
+    }
+    let image_format = match image_format {
+        "webp" => ImageFormat::Webp,
+        "webp-lossless" => ImageFormat::WebpLossless,
+        "png" => ImageFormat::Png,
+        other => bail!("E_OPTIMIZE: --image-format must be webp|webp-lossless|png, got {other}"),
+    };
+    if !(1..=100).contains(&image_quality) {
+        bail!("E_OPTIMIZE: --image-quality must be 1..=100, got {image_quality}");
+    }
+    let audio_format = match audio_format {
+        "mp3" => AudioFormat::Mp3,
+        "wav" => AudioFormat::Wav,
+        other => bail!("E_OPTIMIZE: --audio-format must be mp3|wav, got {other}"),
+    };
+    if !MP3_BITRATES.contains(&audio_bitrate) {
+        bail!(
+            "E_OPTIMIZE: --audio-bitrate must be one of {} kbps, got {audio_bitrate}",
+            MP3_BITRATES.map(|kbps| kbps.to_string()).join(", ")
+        );
+    }
+    Ok(OptimizeOptions {
+        image_format,
+        image_quality,
+        audio_format,
+        audio_bitrate_kbps: audio_bitrate,
+    })
 }
 fn main() {
     let cli = Cli::parse();
@@ -322,7 +376,7 @@ fn run(cli: Cli) -> Result<()> {
                 p.program.locales.len()
             );
             let m = sdk_manifest(&sdk)?;
-            println!("SDK: {} ({} files)\nRuntime: desktop WebGPU; PCM WAV; zh-Hans/en\nPreview: http://127.0.0.1:4173",sdk.display(),m.files.len());
+            println!("SDK: {} ({} files)\nRuntime: desktop WebGPU; PNG/WebP images, PCM WAV/MP3 audio; zh-Hans/en\nMedia defaults: images -> WebP q92, audio -> MP3 160kbps (see build --help)\nPreview: http://127.0.0.1:4173",sdk.display(),m.files.len());
         }
         Command::Check { locked } => {
             let p = load_project(&cli.project)?;
@@ -349,6 +403,11 @@ fn run(cli: Cli) -> Result<()> {
             profile,
             locked,
             out,
+            image_format,
+            image_quality,
+            audio_format,
+            audio_bitrate,
+            no_optimize,
         } => {
             if !matches!(target.as_str(), "web" | "windows" | "linux" | "android")
                 || edition != "full"
@@ -356,6 +415,13 @@ fn run(cli: Cli) -> Result<()> {
             {
                 bail!("E_CAPABILITY: supported --target web|windows|linux|android --edition full --profile dev|release");
             }
+            let optimize = parse_optimize(
+                &image_format,
+                image_quality,
+                &audio_format,
+                audio_bitrate,
+                no_optimize,
+            )?;
             let out = out.unwrap_or_else(|| cli.project.join(format!("dist/full/{target}")));
             let report = if target == "windows" {
                 build_windows(
@@ -364,6 +430,7 @@ fn run(cli: Cli) -> Result<()> {
                     &out,
                     &profile,
                     locked || profile == "release",
+                    &optimize,
                 )?
             } else if target == "linux" {
                 build_linux(
@@ -372,6 +439,7 @@ fn run(cli: Cli) -> Result<()> {
                     &out,
                     &profile,
                     locked || profile == "release",
+                    &optimize,
                 )?
             } else if target == "android" {
                 build_android(
@@ -380,6 +448,7 @@ fn run(cli: Cli) -> Result<()> {
                     &out,
                     &profile,
                     locked || profile == "release",
+                    &optimize,
                 )?
             } else {
                 build_profile(
@@ -389,14 +458,21 @@ fn run(cli: Cli) -> Result<()> {
                     &profile,
                     locked || profile == "release",
                     true,
+                    &optimize,
                 )?
             };
             println!(
-                "Built {}\nRelease {}\n{} objects / {} bytes",
+                "Built {}\nRelease {}\n{} objects / {} bytes\nMedia: {} images converted ({} -> {} bytes), {} audio converted ({} -> {} bytes)",
                 out.display(),
                 report.release,
                 report.objects,
-                report.total_bytes
+                report.total_bytes,
+                report.optimization.images.converted,
+                report.optimization.images.bytes_before,
+                report.optimization.images.bytes_after,
+                report.optimization.audio.converted,
+                report.optimization.audio.bytes_before,
+                report.optimization.audio.bytes_after,
             );
         }
         Command::Dev { port, scenario } => {

@@ -17,12 +17,12 @@ nir-render-wgpu.workspace = true
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 winit = "0.30"
 pollster = "0.4"
-rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { version = "0.30", features = ["android-native-activity"] }
 pollster = "0.4"
-rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 ndk = "0.9"
 wgpu = { workspace = true, features = ["vulkan"] }

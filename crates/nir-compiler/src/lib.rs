@@ -17,6 +17,12 @@ pub use config::{
 mod fonts;
 pub use fonts::{FontMode, FontRecipe, FontReport, FONT_TOOL};
 
+pub mod optimize;
+pub use optimize::{
+    AssetPolicy, AudioFormat, ImageFormat, OptimizeOptions, OptimizeReport, MP3_BITRATES,
+    OPTIMIZE_TOOL,
+};
+
 mod texts;
 pub use texts::{
     text_migrate, text_recover, text_review, text_status, text_update, AuthorTextContract,

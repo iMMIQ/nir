@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nir_compiler::{build_profile, diagnostic};
+use nir_compiler::{build_profile, diagnostic, OptimizeOptions};
 use nir_format::ReleaseManifest;
 use std::{
     fs,
@@ -150,7 +150,15 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
     let out = root.join("dist/full/web");
     // An edit during the initial build must still be noticed by the first watch turn.
     let initial_fingerprint = fingerprint(&root)?;
-    let initial = build_profile(&root, &sdk, &out, "dev", true, true)?;
+    let initial = build_profile(
+        &root,
+        &sdk,
+        &out,
+        "dev",
+        true,
+        true,
+        &OptimizeOptions::default(),
+    )?;
     let status = Arc::new(Mutex::new(DevStatus {
         release: initial.release,
         ..Default::default()
@@ -186,7 +194,15 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
                 continue;
             }
             let candidate = root.join(".nir/preview-candidate");
-            let result = build_profile(&root, &sdk, &candidate, "dev", true, true);
+            let result = build_profile(
+                &root,
+                &sdk,
+                &candidate,
+                "dev",
+                true,
+                true,
+                &OptimizeOptions::default(),
+            );
             // Edits during compilation require another stable build before promotion.
             if fingerprint(&root).ok().as_ref() != Some(&current) {
                 pending = None;
@@ -328,7 +344,9 @@ fn serve_request(
             "txt" => "text/plain; charset=utf-8",
             "wasm" => "application/wasm",
             "png" => "image/png",
+            "webp" => "image/webp",
             "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
             "otf" => "font/otf",
             "ttf" => "font/ttf",
             _ => "application/octet-stream",
@@ -592,7 +610,16 @@ mod tests {
         nir_compiler::resolve(&project, &sdk).unwrap();
         let candidate = t.0.join("candidate");
         let live = t.0.join("live");
-        let report = build_profile(&project, &sdk, &candidate, "dev", true, true).unwrap();
+        let report = build_profile(
+            &project,
+            &sdk,
+            &candidate,
+            "dev",
+            true,
+            true,
+            &OptimizeOptions::default(),
+        )
+        .unwrap();
         publish(&candidate, &live, &report.release).unwrap();
         let old = fs::read(live.join("channels/stable.json")).unwrap();
         let r: ReleaseManifest = serde_json::from_slice(

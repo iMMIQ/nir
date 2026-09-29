@@ -246,6 +246,16 @@ fn load_asset(bundle: &Bundle, budget: &Budget, descriptor: &Asset) -> Result<(A
         }
     }
 }
+/// Aligns a tag-unaware (whole-frames) MP3 decode back to the authored
+/// window. The LAME tag's delay is relative to the fixed 528+1 MP3 decoder
+/// delay — symphonia adds the same amount itself when it applies the tag
+/// (demuxer.rs: `528 + 1 + trim`) — so the authored audio in an unaware
+/// decode starts 529 samples per channel further in than the tag delay.
+fn trim_unaware_mp3(samples: &mut Vec<f32>, delay: u32, channels: u16, authored: u64) {
+    let skip = ((529 + delay as usize) * channels as usize).min(samples.len());
+    samples.drain(..skip);
+    samples.truncate(authored as usize);
+}
 fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
     let bytes: Arc<[u8]> = bundle.object(&descriptor.object)?.into();
     match descriptor.kind {
@@ -268,13 +278,32 @@ fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
             let decoder = Decoder::try_from(Cursor::new(bytes.clone()))?;
             let channels = decoder.channels();
             let rate = decoder.sample_rate();
-            // Bound collection by the manifest-declared decode size instead
-            // of buffering the whole stream and checking afterwards.
-            let cap = descriptor.decoded_bytes / 4;
+            // MP3 objects keep the WAV-derived decode budget: their LAME
+            // gapless tag declares how many encoder delay/padding samples
+            // surround the authored audio. Tag-aware decoders (symphonia
+            // here, decodeAudioData in browsers) cut delay and padding
+            // themselves and hand back exactly the authored count; a
+            // tag-unaware decode instead yields whole frames, which always
+            // exceeds the authored count by at least the encoder delay. Trim
+            // only that shape back into alignment. Untagged WAV keeps the
+            // exact manifest cap.
+            let gapless = nir_format::lame::parse(&bytes);
+            let authored = descriptor.decoded_bytes / 4;
+            let cap = match &gapless {
+                Some(tag) => {
+                    authored + (tag.delay + tag.padding + 1152 * 2) as u64 * channels as u64
+                }
+                None => authored,
+            };
             let mut samples: Vec<f32> = Vec::new();
             for sample in decoder {
                 ensure!((samples.len() as u64) < cap, "E_AUDIO_SIZE");
                 samples.push(sample);
+            }
+            if let Some(tag) = &gapless {
+                if samples.len() as u64 > authored {
+                    trim_unaware_mp3(&mut samples, tag.delay, channels, authored);
+                }
             }
             Ok(AssetData::Audio {
                 samples: Arc::new(samples),
@@ -445,6 +474,102 @@ mod tests {
         // results carry none, so the whole budget is free again.
         assert_eq!(decoded.unwrap(), 3 * 2 * 4);
         assert_eq!(failed.unwrap(), 0);
+    }
+
+    /// Decodes audio bytes through the worker path exactly as a packaged
+    /// asset with the given frame count would be decoded.
+    fn decode_audio(bytes: &[u8], frames: u64) -> Vec<f32> {
+        let (_temp, bundle) = bundle_with(&[(bytes.to_vec(), "bin")]);
+        let descriptor = Asset {
+            kind: AssetKind::Audio,
+            object: nir_content::digest(bytes),
+            bytes: bytes.len() as u64,
+            width: 0,
+            height: 0,
+            duration_us: Micros(500_000),
+            decoded_bytes: frames * 4,
+        };
+        match decode_asset(&bundle, &descriptor).unwrap() {
+            AssetData::Audio { samples, .. } => samples.to_vec(),
+            _ => panic!("unexpected asset data for audio bytes"),
+        }
+    }
+
+    #[test]
+    fn mp3_gapless_trim_matches_the_authored_wav_sample_for_sample() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let wav = fs::read(dir.join("gapless-44100-mono.wav")).unwrap();
+        let mp3 = fs::read(dir.join("gapless-44100-mono.mp3")).unwrap();
+        // The tag the trim follows, plus the raw count the decoder yields
+        // before any loader trim — symphonia is tag-aware and already cut
+        // delay and padding, so raw equals the authored count exactly.
+        let gapless = nir_format::lame::parse(&mp3).unwrap();
+        let raw: Vec<f32> = Decoder::try_from(Cursor::new(mp3.clone()))
+            .unwrap()
+            .collect();
+        assert_eq!(raw.len(), 22_050, "tag-aware decode is pre-trimmed");
+        eprintln!(
+            "gapless: delay={} padding={} raw_decoded={} authored={}",
+            gapless.delay,
+            gapless.padding,
+            raw.len(),
+            22_050
+        );
+        let reference = decode_audio(&wav, 22_050);
+        assert_eq!(reference.len(), 22_050);
+        let converted = decode_audio(&mp3, 22_050);
+        assert_eq!(
+            converted.len(),
+            22_050,
+            "trimmed decode must return the authored sample count"
+        );
+        // A 0.5 s chirp tightens from ~200 to ~50 samples per period, so a
+        // one-frame misalignment cannot hide behind a low error floor: slide
+        // the converted stream against the reference and require the best
+        // alignment at offset zero with encoding-level residual only.
+        let window = 18_000usize;
+        let skip = 2_000usize;
+        let mut best = (f32::INFINITY, 0i32);
+        for offset in -2400i32..=2400 {
+            let start = skip as i64 + offset as i64;
+            if start < 0 || (start + window as i64) as usize > converted.len() {
+                continue;
+            }
+            let mut sum = 0.0f64;
+            for i in 0..window {
+                let delta = (reference[skip + i] - converted[start as usize + i]) as f64;
+                sum += delta * delta;
+            }
+            let rms = (sum / window as f64).sqrt() as f32;
+            if rms < best.0 {
+                best = (rms, offset);
+            }
+        }
+        eprintln!("alignment: best offset {} rms {}", best.1, best.0);
+        assert_eq!(best.1, 0, "trimmed stream must start at the first sample");
+        assert!(best.0 < 0.05, "residual beyond encoding noise: {}", best.0);
+    }
+
+    #[test]
+    fn unaware_decode_trim_skips_the_fixed_decoder_delay() {
+        // A tag-unaware decode (whole frames) places the authored audio at
+        // 529 + tag.delay samples per channel: the tag's delay is relative
+        // to the fixed 528+1 MP3 decoder delay. Rebuild that shape around
+        // the fixture's WAV and require the trim to recover it exactly.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let wav = fs::read(dir.join("gapless-44100-mono.wav")).unwrap();
+        let mp3 = fs::read(dir.join("gapless-44100-mono.mp3")).unwrap();
+        let gapless = nir_format::lame::parse(&mp3).unwrap();
+        let authored = decode_audio(&wav, 22_050);
+        let head = 529 + gapless.delay as usize;
+        let total = nir_format::lame::untrimmed_samples(&gapless, 22_050, 1152) as usize;
+        assert!(total >= head + 22_050);
+        let mut unaware = vec![0.0f32; head];
+        unaware.extend_from_slice(&authored);
+        unaware.resize(total, 0.0);
+        trim_unaware_mp3(&mut unaware, gapless.delay, 1, 22_050);
+        assert_eq!(unaware.len(), 22_050);
+        assert_eq!(unaware, authored);
     }
 
     #[test]
