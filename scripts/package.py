@@ -57,6 +57,8 @@ init 默认创建带母版字体的独立最小作品；CLI 自动编译运行�
 
 SDK 内含 Linux 原生播放器 sdk/linux/player-linux。运行 `./novelc -p my-story build --target linux --locked` 输出原生 Linux 版本 dist/full/linux（Vulkan 渲染，无需浏览器）；要求 x86_64、glibc 2.39+ 与 Vulkan 驱动，详见 docs/LINUX.md。
 
+SDK 亦内含 Android 播放器 sdk/android/lib/arm64-v8a/libplayer.so（实验性）。运行 `./novelc -p my-story build --target android --locked` 输出可直接安装的 APK（dist/full/android/Game.apk；Android 8.0+ arm64，Vulkan 渲染）。签名密钥首次构建时自动生成于作品 config/android-signing.pem，更新安装必须保留同一密钥。详见 docs/ANDROID.md。
+
 运行附带的测试工程：
 
 ```

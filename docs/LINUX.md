@@ -4,7 +4,9 @@ Linux 版使用 Rust、winit、wgpu Vulkan 和原生音频输出（ALSA/PulseAud
 
 ## 构建
 
-在 Linux x86_64（参考环境 Ubuntu 24.04）上安装仓库固定 Rust 工具链、C++ 编译器、libclang、Python 3、`libasound2-dev` 和 wasm-bindgen 0.2.100，然后构建配套 SDK：
+本地开发推荐先进入 [项目级 Nix 环境](NIX.md)：`nix develop`，再按该文档安装固定版本的 wasm-bindgen CLI 并构建配套 SDK。环境已提供 C++ 编译器、libclang、Python 3、ALSA 和 Vulkan 库。
+
+面向普通 Linux 分发的正式产物仍在 Linux x86_64（参考环境 Ubuntu 24.04）构建：安装仓库固定 Rust 工具链、C++ 编译器、libclang、Python 3、`libasound2-dev` 和 wasm-bindgen 0.2.100。Nix 环境编译的原生程序可能引用 `/nix/store`，不能直接视为可在未安装 Nix 的机器上运行的发行包。
 
 ```sh
 cargo xtask sdk

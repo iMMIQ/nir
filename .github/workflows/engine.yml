@@ -3,16 +3,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly full pass at 03:17 UTC+8; the only path that records performance baselines.
+    - cron: '17 19 * * *'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: engine-${{ github.ref }}
+  # Event-scoped groups keep a push from cancelling a scheduled baseline
+  # measurement mid-run while pushes still supersede each other.
+  group: engine-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   engine:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -88,8 +93,10 @@ jobs:
           CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
           export CHROMIUM
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
+      - name: NIR next acceptance
+        run: bun run test:nir-next
       - name: Module performance smoke
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
         env:
           NIR_PERF_MODE: ci
           NIR_PERF_SAMPLES: '2'
@@ -107,7 +114,7 @@ jobs:
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance:smoke
           NIR_PERF_LONGRUN_SECONDS=120 TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance --trace=off --grep 'M3 sustained'
       - name: Performance baselines and module scale
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           NIR_PERF_MODE: ci
           NIR_PERF_SCALE_REPETITIONS: '5'

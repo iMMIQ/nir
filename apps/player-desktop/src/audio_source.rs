@@ -128,7 +128,7 @@ impl Iterator for BufferSource {
         }
     }
 }
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 impl rodio::Source for BufferSource {
     fn current_span_len(&self) -> Option<usize> {
         // Report the run of contiguous samples ahead, wrapping to the next
@@ -169,7 +169,7 @@ mod tests {
         (0..len).map(|i| i as f32 * 0.5 - 3.).collect()
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     fn rodio_reference(
         samples: &[f32],
         channels: u16,
@@ -200,7 +200,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     #[test]
     fn finite_sources_match_skip_duration_at_all_offsets() {
         for (channels, rate, frames) in [(1u16, 44_100u32, 5_000), (2, 48_000, 3_731)] {
@@ -224,7 +224,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     #[test]
     fn looped_sources_match_repeat_infinite_skip_at_all_offsets() {
         for (channels, rate, frames) in [(1u16, 44_100u32, 5_000), (2, 48_000, 3_731)] {
@@ -257,7 +257,7 @@ mod tests {
         assert!(buffer.source(u64::MAX / 1_000, false).next().is_none());
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     #[test]
     fn source_reports_shape_and_remaining_duration() {
         use rodio::Source as _;

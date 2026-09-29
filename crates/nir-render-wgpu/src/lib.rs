@@ -113,7 +113,10 @@ pub struct Renderer {
     _instance: wgpu::Instance,
     pub device: wgpu::Device,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    /// None while the window is destroyed (Android suspend): presenting is
+    /// skipped until `rebind_surface` attaches a fresh surface to the live
+    /// device, keeping every other resource intact.
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
@@ -451,7 +454,7 @@ impl Renderer {
             _instance: instance.clone(),
             device,
             queue,
-            surface,
+            surface: Some(surface),
             config,
             format,
             pipeline,
@@ -513,8 +516,27 @@ impl Renderer {
         if self.config.width != w || self.config.height != h {
             self.config.width = w;
             self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
         }
+    }
+    /// Releases the presentation surface while keeping the device, queues and
+    /// every live resource; `render` skips presenting until a surface is
+    /// rebound. Hosts whose window can be destroyed (Android suspend) drop the
+    /// surface here before the window goes away.
+    pub fn release_surface(&mut self) {
+        self.surface = None;
+    }
+    /// Binds a fresh surface (e.g. the window recreated after resume) onto the
+    /// live device, reusing the configuration picked at startup; textures and
+    /// the text atlas survive the swap, so no asset replay is needed.
+    pub fn rebind_surface(&mut self, surface: wgpu::Surface<'static>) {
+        surface.configure(&self.device, &self.config);
+        self.surface = Some(surface);
+    }
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
     }
     pub fn has_image(&self, id: &str) -> bool {
         self.textures.contains_key(id)
@@ -971,7 +993,30 @@ impl Renderer {
         }
         Ok(())
     }
+    /// Acquires the next frame, reconfiguring once on a stale surface. The
+    /// `render` entry point guards the no-surface case, so reaching here
+    /// without one means the surface was released mid-turn.
+    fn acquire_frame(&mut self) -> Result<wgpu::SurfaceTexture> {
+        let Some(surface) = self.surface.as_mut() else {
+            return Err(error("surface released during render"));
+        };
+        match surface.get_current_texture() {
+            Ok(frame) => Ok(frame),
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                surface.configure(&self.device, &self.config);
+                surface
+                    .get_current_texture()
+                    .map_err(|e| error(e.to_string()))
+            }
+            Err(e) => Err(error(e.to_string())),
+        }
+    }
     pub fn render(&mut self, p: &DrawPacket, dpr: f32) -> Result<()> {
+        if self.surface.is_none() {
+            // Released for window destruction (Android suspend): drop the
+            // frame instead of presenting; the rebind repaints.
+            return Ok(());
+        }
         self.prepare(p, dpr, false)?;
         let vertex_start = self.profile_start();
         let vertex_result = (|| -> Result<(usize, usize)> {
@@ -1044,16 +1089,7 @@ impl Renderer {
         let (source_start, target_start) = vertex_result?;
 
         let acquire_start = self.profile_start();
-        let frame_result = match self.surface.get_current_texture() {
-            Ok(f) => Ok(f),
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.config);
-                self.surface
-                    .get_current_texture()
-                    .map_err(|e| error(e.to_string()))
-            }
-            Err(e) => Err(error(e.to_string())),
-        };
+        let frame_result = self.acquire_frame();
         self.profile_end("surface.acquire", acquire_start);
         let frame = frame_result?;
 

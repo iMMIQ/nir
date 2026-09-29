@@ -350,11 +350,11 @@ fn run(cli: Cli) -> Result<()> {
             locked,
             out,
         } => {
-            if !matches!(target.as_str(), "web" | "windows" | "linux")
+            if !matches!(target.as_str(), "web" | "windows" | "linux" | "android")
                 || edition != "full"
                 || !matches!(profile.as_str(), "dev" | "release")
             {
-                bail!("E_CAPABILITY: supported --target web|windows|linux --edition full --profile dev|release");
+                bail!("E_CAPABILITY: supported --target web|windows|linux|android --edition full --profile dev|release");
             }
             let out = out.unwrap_or_else(|| cli.project.join(format!("dist/full/{target}")));
             let report = if target == "windows" {
@@ -367,6 +367,14 @@ fn run(cli: Cli) -> Result<()> {
                 )?
             } else if target == "linux" {
                 build_linux(
+                    &cli.project,
+                    &sdk,
+                    &out,
+                    &profile,
+                    locked || profile == "release",
+                )?
+            } else if target == "android" {
+                build_android(
                     &cli.project,
                     &sdk,
                     &out,

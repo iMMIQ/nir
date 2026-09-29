@@ -19,6 +19,14 @@ winit = "0.30"
 pollster = "0.4"
 rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
+pollster = "0.4"
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk = "0.9"
+wgpu = { workspace = true, features = ["vulkan"] }
+
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
 wgpu = { workspace = true, features = ["dx12"] }

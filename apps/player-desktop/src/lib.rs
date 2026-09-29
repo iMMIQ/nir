@@ -2,13 +2,13 @@
 #![forbid(unsafe_code)]
 pub mod audio_envelope;
 pub mod audio_source;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod desktop;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod dialog;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod io_worker;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod loader;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};

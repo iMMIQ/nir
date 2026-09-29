@@ -9,6 +9,7 @@
     "test:browser:headed": "playwright test --headed",
     "test:backends": "playwright test --config playwright.backends.config.js",
     "test:host": "bun test ./tests/host",
+    "test:nir-next": "playwright test --config playwright.nir-next.config.js",
     "test:performance": "node scripts/run-performance.mjs ci",
     "test:performance:hardware": "node scripts/run-performance.mjs hardware",
     "test:performance:smoke": "node scripts/run-performance.mjs smoke"

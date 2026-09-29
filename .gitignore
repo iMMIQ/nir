@@ -2,6 +2,7 @@
 /dist/
 /reports/
 node_modules/
+/.direnv/
 **/.nir/
 **/dist/
 **/game.local.toml

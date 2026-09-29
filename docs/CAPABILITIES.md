@@ -23,7 +23,7 @@
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告 | 无 PWA、签名/CDN 调度或高级压缩优化 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
 | 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
-| 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；移动端/Safari 实机验收后续安排 |
+| 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
 
 资源账本、准备配方和缓存提供首版所需的分层准备与有界准入；已加入函数体与正文的跨模块按需获取；没有实现附件中完整的通用 DAG 调度、任意资源类型与高级缓存策略。静态声明目录已分包按需加载，字体仍为逐语言计划。v0.1.0 的实际测试列在 TEST-REPORT.md，后续有界事件队列、共享预算、独立暂停令牌、取消和分块上传的验证见 [引擎稳定性进展](ENGINE-STABILITY.md)；逐请求终态预留、迟到存读档回执及交错压力测试见 [请求生命周期进展](REQUEST-LIFECYCLE.md)。
 

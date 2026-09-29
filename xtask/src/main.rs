@@ -1,5 +1,9 @@
 use anyhow::{bail, Context, Result};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd.status().with_context(|| format!("starting {cmd:?}"))?;
     if !status.success() {
@@ -7,14 +11,56 @@ fn run(cmd: &mut Command) -> Result<()> {
     }
     Ok(())
 }
+/// Windows NDK toolchain wrappers are `.cmd` batch files; other hosts ship
+/// plain executables.
+fn android_tool(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.cmd")
+    } else {
+        name.to_owned()
+    }
+}
+/// Locates the NDK toolchain `bin` directory from `ANDROID_NDK_HOME` /
+/// `ANDROID_NDK_ROOT` / `ANDROID_NDK`, probing the prebuilt host tags in
+/// descending likelihood. None means "no NDK here" and skips the Android arm.
+fn android_ndk_tools() -> Option<PathBuf> {
+    let host_tags: &[&str] = if cfg!(target_os = "macos") {
+        &["darwin-x86_64", "darwin-arm64"]
+    } else if cfg!(windows) {
+        &["windows-x86_64"]
+    } else {
+        &["linux-x86_64"]
+    };
+    ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|root| {
+            let prebuilt = Path::new(&root).join("toolchains/llvm/prebuilt");
+            host_tags
+                .iter()
+                .map(|tag| prebuilt.join(tag).join("bin"))
+                .find(|bin| {
+                    bin.join(android_tool("aarch64-linux-android26-clang"))
+                        .is_file()
+                })
+        })
+        .next()
+}
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let e = entry?;
         let name = e.file_name();
-        if ["dist", "reports", ".nir", "game.lock"]
-            .iter()
-            .any(|x| name == *x)
+        if [
+            "dist",
+            "reports",
+            ".nir",
+            "game.lock",
+            // Machine-local Android signing identity, never redistributed.
+            "android-signing.pem",
+        ]
+        .iter()
+        .any(|x| name == *x)
         {
             continue;
         }
@@ -132,6 +178,40 @@ fn main() -> Result<()> {
                 fs::create_dir_all("dist/sdk/linux")?;
                 fs::copy("target/release/player-linux", "dist/sdk/linux/player-linux")?;
             }
+            // The Android player cross-compiles from any host, but only when
+            // an NDK is discoverable; otherwise the SDK ships without it, the
+            // same way a Windows host ships no Linux player.
+            if let Some(tools) = android_ndk_tools() {
+                let mut build = Command::new("cargo");
+                build
+                    .args([
+                        "build",
+                        "--locked",
+                        "-p",
+                        "player-android",
+                        "--target",
+                        "aarch64-linux-android",
+                        "--release",
+                    ])
+                    .env(
+                        "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
+                        tools.join(android_tool("aarch64-linux-android26-clang")),
+                    );
+                let ar = tools.join(android_tool("llvm-ar"));
+                if ar.is_file() {
+                    build.env("CARGO_TARGET_AARCH64_LINUX_ANDROID_AR", ar);
+                }
+                run(&mut build)?;
+                fs::create_dir_all("dist/sdk/android/lib/arm64-v8a")?;
+                fs::copy(
+                    "target/aarch64-linux-android/release/libplayer_android.so",
+                    "dist/sdk/android/lib/arm64-v8a/libplayer.so",
+                )?;
+            } else {
+                println!(
+                    "SDK: Android player skipped (set ANDROID_NDK_HOME to an NDK r27+ install)"
+                );
+            }
             run(Command::new("python3")
                 .args(["scripts/third_party.py", "dist/sdk/THIRD-PARTY.txt"]))?;
             copy_dir(
@@ -223,6 +303,7 @@ fn main() -> Result<()> {
                 "nir-player",
                 "nir-presentation",
                 "nir-render-wgpu",
+                "nir-apk",
                 "player-desktop",
             ] {
                 command.args(["-p", package]);

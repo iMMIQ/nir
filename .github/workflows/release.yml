@@ -21,14 +21,25 @@ jobs:
         with:
           bun-version-file: .bun-version
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target aarch64-linux-android
       - name: Restore Rust dependencies, build artifacts and CLI tools
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Includes native/WASM targets and ~/.cargo/bin (wasm-bindgen).
           save-if: false
       - name: Install native subsetter build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb libxkbcommon-x11-0 openjdk-17-jre-headless
+      - name: Locate NDK and build tools
+        run: |
+          ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort | tail -1)
+          if [ -z "$ndk" ]; then
+            echo "E_NDK: no NDK under $ANDROID_SDK_ROOT/ndk; install one (r27c or newer)" >&2
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          build_tools=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort | tail -1)
+          echo "APKSIGNER=$build_tools/apksigner" >> "$GITHUB_ENV"
+          echo "AAPT2=$build_tools/aapt2" >> "$GITHUB_ENV"
       - name: Install JS dependencies and test host scheduling
         run: |
           bun install --frozen-lockfile
@@ -95,12 +106,22 @@ jobs:
           ./dist/novelc -p examples/rain-letters build --target linux --locked --out dist/rain-letters-linux
           mkdir -p target/tmp
           TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' python3 scripts/verify_linux.py dist/rain-letters-linux
+      - name: Native Android player acceptance
+        env:
+          # Fixed public seed so published sample APKs are byte-identical on
+          # re-runs and update-compatible across versions (a per-run random
+          # key would strand every installed sample).
+          NIR_ANDROID_SIGNING_SEED: nir-rain-letters-sample
+        run: |
+          ./dist/novelc -p examples/rain-letters build --target android --locked --out dist/rain-letters-android
+          python3 scripts/verify_android.py dist/rain-letters-android
       - name: Package and verify release assets
         run: |
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$VERSION"; fi
           test "$(dist/novelc --version)" = "novelc $VERSION"
           test -x dist/sdk/linux/player-linux
+          test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
           python3 scripts/package.py
           python3 scripts/verify_release.py dist/bundle/rain-letters-web
           dist/bundle/novelc release verify --directory dist/bundle/rain-letters-web
@@ -114,7 +135,9 @@ jobs:
         run: |
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           TAG="v$VERSION"
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "NIR $TAG · 叙事引擎与 SDK" --notes-file "docs/releases/$TAG.md" "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz" dist/SHA256SUMS
+          cp dist/rain-letters-android/Game.apk "dist/rain-letters-$VERSION-android-arm64.apk"
+          (cd dist && sha256sum "rain-letters-$VERSION-android-arm64.apk" >> SHA256SUMS)
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "NIR $TAG · 叙事引擎与 SDK" --notes-file "docs/releases/$TAG.md" "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz" "dist/rain-letters-$VERSION-android-arm64.apk" dist/SHA256SUMS
       - name: Retain SDK on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
