@@ -87,16 +87,18 @@ schemas/                       由 SDK 生成的 JSON Schema
 
 ## 从源码构建引擎与 SDK
 
-固定工具链在 `rust-toolchain.toml` 和 `.bun-version`，依赖锁在 `Cargo.lock` 和 `bun.lock`。需要 Rust/rustup、Python 3、C++ 编译器、libclang（Ubuntu：`g++ libclang-dev`）、Bun、Node.js（Playwright 运行时）及桌面 Chromium。
+**推荐使用项目级 Nix 开发环境**，适用于 NixOS 及安装了 Nix 的 Linux（x86_64 / aarch64）。仓库的 `flake.nix` 声明开发依赖，`flake.lock` 固定其版本，无需逐项安装系统编译库。当前未提供 macOS 或 Windows 的 Nix 开发环境。
 
-NixOS 用户先进入项目开发环境（需启用 Nix 的 `nix-command` 和 `flakes`）：
+安装 Nix 并启用 `nix-command` 和 `flakes` 后，在仓库根目录运行（完整说明见 [Nix 开发环境](docs/NIX.md)）：
 
 ```sh
 nix develop
-cargo b
+bun install --frozen-lockfile
 ```
 
-`flake.lock` 固定 Nix 依赖；开发环境提供 GCC、libclang、rustup、Python、Bun 和 Node.js，并配置 bindgen 的库与头文件路径。Rust 版本仍由 `rust-toolchain.toml` 控制，首次构建时 rustup 会下载所需工具链。也可使用 `nix develop --command cargo b` 单次构建。浏览器测试所需的 Chromium 另行准备。
+开发环境提供 Git、GCC、libclang、rustup、Python、Bun、Node.js、Chromium、ALSA 和 X11/Wayland/Vulkan 库，自动配置 bindgen 与浏览器路径。Rust 版本仍由 `rust-toolchain.toml` 控制，首次构建时 rustup 会下载所需工具链；wasm-bindgen CLI 按下面的固定版本安装。也可使用 `nix develop --command cargo b` 单次构建，或通过仓库的 `.envrc` 配合 direnv 自动进入环境。
+
+手动配置环境时，按 `rust-toolchain.toml` 和 `.bun-version` 安装 Rust/rustup 与 Bun，并准备 Python 3、C++ 编译器、libclang（Ubuntu：`g++ libclang-dev`）、Node.js（Playwright 运行时）、Chromium 及 Linux 原生音频依赖（Ubuntu：`libasound2-dev`）。Rust 与 JS 依赖分别由 `Cargo.lock` 和 `bun.lock` 固定。
 
 ```sh
 rustup target add wasm32-unknown-unknown --toolchain 1.98.1
@@ -123,7 +125,7 @@ python3 scripts/verify_sdk.py
 
 日常修改 Core/Player/展示层可先运行 `cargo xtask test --quick` 和 `bun run test:host`；编译器、字体和 CLI 的测试及架构检查仍由完整 `cargo xtask test` 执行。还可用 `cargo xtask test --quick <测试名>` 或 `bun run test:browser tests/browser/modules.spec.js` 定位验证。CI 保留完整测试，并缓存 Rust 依赖编译产物和固定版本的 wasm-bindgen CLI。迁移说明和实测结果见 [构建与测试速度](docs/BUILD-SPEED.md)。
 
-浏览器测试默认使用有窗口的 `/usr/bin/chromium`。可用 `CHROMIUM` 改路径，`NIR_CHROME_ARGS` 添加启动参数。Linux 无桌面环境可尝试 Xvfb，但必须实际检查画布截图；本机无界面模式曾出现 WebGPU 提交成功而画布空白的系统合成问题，不能把它当作通过。测试只在 `?test=1` 下启用只读状态及故障注入接口。
+浏览器测试默认使用有窗口的 Chromium；Nix 环境自动设置 `CHROMIUM`，环境外默认路径为 `/usr/bin/chromium`。可用 `CHROMIUM` 改路径，`NIR_CHROME_ARGS` 添加启动参数。Linux 无桌面环境可尝试 Xvfb，但必须实际检查画布截图；本机无界面模式曾出现 WebGPU 提交成功而画布空白的系统合成问题，不能把它当作通过。测试只在 `?test=1` 下启用只读状态及故障注入接口。
 
 发行晋级、回滚、存档隔离和 WebGPU/WebGL2 验收见 [M4 发行与桌面渲染](docs/M4-RELEASE.md)。
 

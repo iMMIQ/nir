@@ -5,7 +5,7 @@
 - 使用 Bun 1.3.13 管理 JS 依赖，版本与当前 `flake.lock` 的 Bun 一致。`.bun-version` 用于 CI，`package.json` 声明包管理器，`bun.lock` 从原 npm 锁迁移，Playwright 仍固定为 1.63.0。
 - `bun install --frozen-lockfile` 安装锁定依赖；删除 `package-lock.json`，避免维护两份锁。添加依赖或升级时用 Bun，并提交更新后的锁文件。
 - `bun run test:host` 使用 Bun 执行原有 22 项宿主测试。`bunfig.toml` 将默认 `bun test` 的范围限定到 `tests/host`。
-- Playwright 经 `bun run test:browser` 启动，沿用其 Node.js 入口。Nix shell 提供 Bun 和 Node.js；浏览器依赖安装使用 `bunx --no-install playwright install --with-deps chromium`。
+- Playwright 经 `bun run test:browser` 启动，沿用其 Node.js 入口。推荐使用 [Nix 开发环境](NIX.md)，其中提供 Bun、Node.js 和 Chromium，并设置 `CHROMIUM`；无需另行下载 Playwright Chromium。非 Nix 环境的浏览器依赖可使用 `bunx --no-install playwright install --with-deps chromium` 安装。
 - CI 使用固定提交版本的 `Swatinem/rust-cache`，缓存 Rust 依赖、原生/WASM 依赖编译产物和 Cargo 安装的工具。主分支成功运行后保存缓存，PR 可恢复。安装 wasm-bindgen 前检查版本，命中 0.2.100 时直接复用。
 - 完整 `cargo xtask test` 合并展示层测试，一次 Cargo 调用覆盖 113 项和架构检查。增加 `--quick` 和测试参数透传，方便缩短局部修改的反馈时间。
 - CI 按工作流分工：`Engine quality` 独占 fmt、Clippy、Rust 测试、wasm32 检查、架构检查和浏览器验收（含 `tests/nir-next` 33 项，经 `bun run test:nir-next`）；`Native Linux/Windows player` 只保留平台 SDK 打包与原生播放验收，不再重复上述检查（Windows 保留 `cfg(windows)` 代码只能在 Windows 编译的测试与 Clippy）。三个日常工作流均按引用分组 `cancel-in-progress`，事件名并入分组，推送不会打断定时测量。
