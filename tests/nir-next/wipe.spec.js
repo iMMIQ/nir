@@ -5,10 +5,23 @@ test('frozen directional wipe has distinct ends, a soft edge and paused progress
   await page.goto('http://127.0.0.1:4201/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'}).catch(e=>{if(!e.message.includes('interrupted'))throw e;});
   await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
   await page.keyboard.press('Enter');
-  await page.waitForFunction(()=>window.__nir.state().transition>.4&&window.__nir.state().transition<.6);
-  await page.evaluate(()=>window.__nir.hidden(true));
+  // Waiting for a fixed (.4,.6) sampling window can be skipped entirely when
+  // one slow frame advances the wipe past it between polls. Cross a lower
+  // bound instead — a crossing is always observable — and pause from inside
+  // the page on that same frame, so the paused progress cannot drift past
+  // the range the pixel sampling below needs (the edge between the .2 and
+  // .8 sample columns).
+  await page.evaluate(()=>new Promise(resolve=>{
+    (function check(){
+      const p=window.__nir.state().transition;
+      if(p!==null&&p>.45){window.__nir.hidden(true);resolve(p);return;}
+      requestAnimationFrame(check);
+    })();
+  }));
   await page.waitForFunction(()=>window.__nir.state().paused);
   const progress=await page.evaluate(()=>window.__nir.state().transition);
+  expect(progress).toBeGreaterThan(.4);
+  expect(progress).toBeLessThan(.6);
   const screenshot=await page.screenshot({path:'reports/nir-next/wipe-middle.png'});
   const pixels=await page.evaluate(async base64=>{
     const image=await createImageBitmap(new Blob([Uint8Array.from(atob(base64),c=>c.charCodeAt(0))],{type:'image/png'}));

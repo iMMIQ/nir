@@ -114,7 +114,10 @@ if aapt2:
         timeout=120,
     ).stdout
     assert "package: name='one.nir." in badging, badging
-    assert "sdkVersion:'26'" in badging, badging
+    # build-tools 35+ renamed the min-SDK badging key from `sdkVersion` to
+    # `minSdkVersion`; both spellings mean API 26 and either may appear
+    # depending on the installed build-tools.
+    assert "sdkVersion:'26'" in badging or "minSdkVersion:'26'" in badging, badging
     assert "targetSdkVersion:'29'" in badging, badging
     assert "native-code: 'arm64-v8a'" in badging, badging
     assert "launchable-activity: name='android.app.NativeActivity'" in badging, badging

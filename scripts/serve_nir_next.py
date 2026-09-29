@@ -59,7 +59,9 @@ def reading(content):
 def wipe(content):
     for scene,color in [("station",[1.,0.,0.,1.]),("together",[0.,0.,1.,1.])]:
         content["scenes"][scene]=[{"id":"solid","x":0,"y":0,"width":1280,"height":720,"color":color}]
-    content["cues"]["intro"]["effects"].insert(0,{"id":"wipe-stage","scope":"scene","effect":{"type":"stage_present","scene":"together","duration_us":"5000000","transition":{"type":"wipe","direction":"left_to_right","softness":0.2}}})
+    # 10s like the mask fixtures: software renderers must be able to sample
+    # the wipe mid-flight even when a frame stalls for a second or more.
+    content["cues"]["intro"]["effects"].insert(0,{"id":"wipe-stage","scope":"scene","effect":{"type":"stage_present","scene":"together","duration_us":"10000000","transition":{"type":"wipe","direction":"left_to_right","softness":0.2}}})
 
 def mask_assets(project):
     # Original 2x2 alpha data; RGB is deliberately unrelated to the threshold.
