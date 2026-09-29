@@ -478,7 +478,7 @@ impl Engine {
                 let start = Micros(profile_clock_us());
                 let (complete, used) = self
                     .renderer
-                    .upload_image_step(request, &id, bytes, self.upload_remaining)
+                    .upload_image_step(&id, self.upload_remaining)
                     .map_err(js)?;
                 self.resource_stage("upload_enqueued", request, &id, start, used);
                 self.upload_remaining -= used;

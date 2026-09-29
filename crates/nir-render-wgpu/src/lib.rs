@@ -105,6 +105,9 @@ struct ImageUpload {
     width: u32,
     height: u32,
     row: u32,
+    /// False only for bytes-path uploads, which still premultiply rows on
+    /// the owner thread; worker-delivered pixels arrive already converted.
+    premultiplied: bool,
 }
 pub struct Renderer {
     _instance: wgpu::Instance,
@@ -198,7 +201,11 @@ fn srgb(v: f32) -> f32 {
         1.055 * v.powf(1. / 2.4) - 0.055
     }
 }
-fn premultiply_pixel(pixel: &mut [u8; 4]) {
+/// Scalar premultiply reference. The alpha multiply happens in the linear
+/// domain between the two sRGB curves, so the composite is not separable into
+/// per-channel 1D tables; the production path uses the exact 2D table below.
+#[cfg(test)]
+fn premultiply_pixel_scalar(pixel: &mut [u8; 4]) {
     match pixel[3] {
         255 => {}
         0 => pixel[..3].fill(0),
@@ -211,6 +218,63 @@ fn premultiply_pixel(pixel: &mut [u8; 4]) {
             }
         }
     }
+}
+/// 65,536-entry table indexed `[alpha * 256 + channel]`, built once from the
+/// same f32 expression as the scalar reference (including the alpha=255
+/// identity and alpha=0 zero rows), so both paths agree bit for bit.
+static PREMULTIPLY_LUT: std::sync::OnceLock<[u8; 65536]> = std::sync::OnceLock::new();
+fn premultiply_lut() -> &'static [u8; 65536] {
+    PREMULTIPLY_LUT.get_or_init(|| {
+        let mut table = [0u8; 65536];
+        for alpha in 1u16..=254 {
+            let a = alpha as f32 / 255.;
+            for channel in 0u16..=255 {
+                table[(alpha * 256 + channel) as usize] =
+                    (srgb(linear(channel as f32 / 255.) * a) * 255.)
+                        .round()
+                        .clamp(0., 255.) as u8;
+            }
+        }
+        for channel in 0u16..=255 {
+            table[(255 * 256 + channel) as usize] = channel as u8;
+        }
+        table
+    })
+}
+fn premultiply_pixel(pixel: &mut [u8; 4]) {
+    let table = premultiply_lut();
+    match pixel[3] {
+        255 => {}
+        0 => pixel[..3].fill(0),
+        alpha => {
+            for channel in &mut pixel[..3] {
+                *channel = table[(alpha as usize * 256) + *channel as usize];
+            }
+        }
+    }
+}
+/// Batch premultiply of an RGBA8 buffer in place. Host worker threads call
+/// this off the owner thread before delivery; the renderer uses the same
+/// conversion for bytes-path uploads.
+pub fn premultiply_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        premultiply_pixel(pixel);
+    }
+}
+/// Pure PNG/JPEG decode to premultiplied RGBA8 plus dimensions, with no
+/// renderer state. Hosts run this on worker threads and admit the result
+/// through [`Renderer::prepare_image_decoded`].
+pub fn decode_image(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| error(e.to_string()))?;
+    let (width, height) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
+    let mut pixels = image::load_from_memory(bytes)
+        .map_err(|e| error(e.to_string()))?
+        .to_rgba8()
+        .into_raw();
+    premultiply_rgba(&mut pixels);
+    Ok((width, height, pixels))
 }
 impl Renderer {
     pub async fn new(
@@ -463,17 +527,12 @@ impl Renderer {
     }
     /// PNG decoding is atomic; pixel conversion and GPU writes yield by row budget.
     /// A partially uploaded texture never enters the drawable texture map.
-    pub fn upload_image_step(
-        &mut self,
-        request: u32,
-        id: &str,
-        bytes: &[u8],
-        budget: usize,
-    ) -> Result<(bool, usize)> {
+    /// Callers must have run `prepare_image` (bytes path) or
+    /// `prepare_image_decoded` (worker-decoded pixels) for this id first.
+    pub fn upload_image_step(&mut self, id: &str, budget: usize) -> Result<(bool, usize)> {
         if self.has_image(id) {
             return Ok((true, 0));
         }
-        self.prepare_image(request, id, bytes)?;
         let upload = self.uploads.get_mut(id).unwrap();
         let stride = upload.width as usize * 4;
         let rows = (budget / stride).min((upload.height - upload.row) as usize) as u32;
@@ -483,8 +542,10 @@ impl Renderer {
         let start = upload.row as usize * stride;
         let end = start + rows as usize * stride;
         let convert_start = self.profile.start();
-        for pixel in upload.pixels[start..end].as_chunks_mut::<4>().0 {
-            premultiply_pixel(pixel);
+        if !upload.premultiplied {
+            for pixel in upload.pixels[start..end].as_chunks_mut::<4>().0 {
+                premultiply_pixel(pixel);
+            }
         }
         self.profile.end("image.convert", convert_start);
         let write_start = self.profile.start();
@@ -545,6 +606,47 @@ impl Renderer {
                     width: w,
                     height: h,
                     row: 0,
+                    premultiplied: false,
+                },
+            );
+        }
+        Ok(())
+    }
+    /// Admit worker-decoded, worker-premultiplied RGBA8 pixels. The host
+    /// attests that the encoded object bytes were digest-verified before
+    /// decode; dimension and length checks still run here against device
+    /// limits, and the row-budgeted upload path is identical to the bytes
+    /// path minus the on-owner conversion.
+    pub fn prepare_image_decoded(
+        &mut self,
+        request: u32,
+        id: &str,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) -> Result<()> {
+        if !self.image_started(request, id) {
+            if !image_dimensions_allowed(
+                width,
+                height,
+                self.device.limits().max_texture_dimension_2d,
+            ) {
+                return Err(error("image dimensions exceed supported texture limit"));
+            }
+            if pixels.len() as u64 != width as u64 * height as u64 * 4 {
+                return Err(error("decoded pixel length mismatch"));
+            }
+            let texture = self.allocate_texture(id, width, height);
+            self.uploads.insert(
+                id.into(),
+                ImageUpload {
+                    request,
+                    pixels,
+                    texture,
+                    width,
+                    height,
+                    row: 0,
+                    premultiplied: true,
                 },
             );
         }
@@ -1067,6 +1169,55 @@ mod profile_tests {
         (srgb(linear(channel as f32 / 255.) * a) * 255.)
             .round()
             .clamp(0., 255.) as u8
+    }
+
+    #[test]
+    fn premultiply_table_matches_scalar_exactly_over_all_cells() {
+        let table = premultiply_lut();
+        for alpha in 0u16..=255 {
+            for channel in 0u16..=255 {
+                let index = (alpha * 256 + channel) as usize;
+                assert_eq!(
+                    table[index],
+                    original_premultiply_channel(channel as u8, alpha as u8),
+                    "alpha {alpha}, channel {channel}"
+                );
+                let mut pixel = [channel as u8, channel as u8, channel as u8, alpha as u8];
+                let mut reference = pixel;
+                premultiply_pixel(&mut pixel);
+                premultiply_pixel_scalar(&mut reference);
+                assert_eq!(pixel, reference, "alpha {alpha}, channel {channel}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_image_returns_premultiplied_pixels() {
+        let mut image = image::RgbaImage::new(3, 2);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgba([(x * 80) as u8, (y * 120) as u8, 30, 128]);
+        }
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let (width, height, pixels) = decode_image(encoded.get_ref()).unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(pixels.len(), 3 * 2 * 4);
+        for (pixel, expected) in pixels.as_chunks::<4>().0.iter().zip(image.pixels()) {
+            let mut reference = expected.0;
+            premultiply_pixel_scalar(&mut reference);
+            assert_eq!(*pixel, reference);
+        }
+        let mut direct = vec![
+            200u8, 100, 50, 128, //
+            255, 255, 255, 0, //
+            10, 20, 30, 255,
+        ];
+        premultiply_rgba(&mut direct);
+        assert_eq!(direct[4..8], [0, 0, 0, 0]);
+        assert_eq!(direct[8..12], [10, 20, 30, 255]);
+        assert_ne!(direct[0], 200);
     }
 
     #[test]

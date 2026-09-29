@@ -222,6 +222,7 @@ fn main() -> Result<()> {
                 "nir-assets",
                 "nir-player",
                 "nir-presentation",
+                "nir-render-wgpu",
                 "player-desktop",
             ] {
                 command.args(["-p", package]);
