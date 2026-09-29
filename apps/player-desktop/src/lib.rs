@@ -5,6 +5,8 @@ pub mod audio_source;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod desktop;
 #[cfg(any(windows, target_os = "linux"))]
+pub mod io_worker;
+#[cfg(any(windows, target_os = "linux"))]
 pub mod loader;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};

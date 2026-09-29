@@ -1,12 +1,12 @@
 use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
 use crate::audio_source::AudioBuffer;
+use crate::io_worker::{IoReply, IoRequest, IoWorker};
 use crate::loader::{AssetData, Job, Loaded, Loader};
 use crate::{atomic_write, Bundle, Storage};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nir_engine::Engine;
 use nir_format::*;
 use nir_player::{AppCommand, AppEvent};
-use nir_presentation::SlotView;
 use nir_render_wgpu::{Renderer, RendererBackend};
 use rodio::{OutputStream, OutputStreamBuilder, Sink};
 use std::{
@@ -64,7 +64,8 @@ struct Voice {
 struct Runtime {
     window: Arc<Window>,
     engine: Engine,
-    storage: Storage,
+    storage: Arc<Storage>,
+    io: IoWorker,
     loader: Loader,
     jobs: VecDeque<Job>,
     upload: Option<PendingUpload>,
@@ -91,12 +92,12 @@ impl Runtime {
         data: PathBuf,
         exe_check: Option<std::thread::JoinHandle<Result<()>>>,
     ) -> Result<Self> {
-        let storage = Storage::open(
+        let storage = Arc::new(Storage::open(
             &data,
             &bundle.manifest.game_id,
             &bundle.manifest.profile,
             &bundle.release,
-        )?;
+        )?);
         let renderer = create_renderer(window.clone())?;
         // The whole-executable digest was hashed on a startup thread while the
         // renderer initialized; gate runtime construction on its verdict here.
@@ -123,6 +124,7 @@ impl Runtime {
         let mut runtime = Self {
             window,
             engine,
+            io: IoWorker::new(storage.clone()),
             storage,
             loader,
             jobs: VecDeque::new(),
@@ -359,64 +361,26 @@ impl Runtime {
                         }
                     }
                     AppCommand::PersistPreferences { preferences } => {
-                        self.storage.write_preferences(&preferences)?
+                        self.io.submit(IoRequest::WritePreferences(preferences))?
                     }
-                    AppCommand::PersistProfile { keys } => self.storage.merge_profile(keys)?,
+                    AppCommand::PersistProfile { keys } => {
+                        self.io.submit(IoRequest::MergeProfile(keys))?
+                    }
                     AppCommand::Save {
                         slot,
                         expected_revision,
                         job,
                         envelope,
-                    } => {
-                        let event = match self.storage.save(slot, expected_revision, &envelope) {
-                            Ok(()) => AppEvent::Saved {
-                                job,
-                                slot,
-                                revision: envelope.revision,
-                            },
-                            Err(e) => AppEvent::SaveFailed {
-                                job,
-                                message: e.to_string(),
-                            },
-                        };
-                        engine_result(self.engine.event(event))?;
-                    }
+                    } => self.io.submit(IoRequest::Save {
+                        slot,
+                        expected_revision,
+                        job,
+                        envelope,
+                    })?,
                     AppCommand::Load { slot, job } => {
-                        let event = match self.storage.load(slot) {
-                            Ok(Some(envelope)) => AppEvent::SlotLoaded {
-                                job,
-                                envelope: Box::new(envelope),
-                            },
-                            Ok(None) => AppEvent::SlotLoadFailed {
-                                job,
-                                message: "E_SAVE_MISSING".into(),
-                            },
-                            Err(e) => AppEvent::SlotLoadFailed {
-                                job,
-                                message: e.to_string(),
-                            },
-                        };
-                        engine_result(self.engine.event(event))?;
+                        self.io.submit(IoRequest::Load { slot, job })?
                     }
-                    AppCommand::ListSaves => {
-                        let mut rows = Vec::new();
-                        let mut revisions = BTreeMap::new();
-                        for slot in 0..3 {
-                            let value = self.storage.load(slot)?;
-                            if let Some(ref envelope) = value {
-                                revisions.insert(slot, envelope.revision);
-                            }
-                            rows.push(SlotView {
-                                slot,
-                                label: value
-                                    .as_ref()
-                                    .map(|s| format!("#{}", s.revision))
-                                    .unwrap_or_default(),
-                                exists: value.is_some(),
-                            });
-                        }
-                        engine_result(self.engine.event(AppEvent::Slots(rows, revisions)))?;
-                    }
+                    AppCommand::ListSaves => self.io.submit(IoRequest::List)?,
                     AppCommand::Export { json } => {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_file_name("save.nir-save.json")
@@ -476,6 +440,15 @@ impl Runtime {
                 self.engine
                     .replace_gpu(create_renderer(self.window.clone())?),
             )?;
+        }
+        // One storage reply per turn, before new commands: the events land
+        // in the engine the turn after the command that issued them.
+        if let Some(reply) = self.io.drain() {
+            match reply {
+                IoReply::Event(event) => engine_result(self.engine.event(event))?,
+                IoReply::Done => {}
+                IoReply::Fatal(message) => bail!(message),
+            }
         }
         if let Some(loaded) = self.loader.drain() {
             match loaded {
@@ -599,7 +572,8 @@ impl Runtime {
         Ok(())
     }
     fn busy(&self) -> bool {
-        self.loader.outstanding() > 0
+        self.io.outstanding() > 0
+            || self.loader.outstanding() > 0
             || self.upload.is_some()
             || !self.jobs.is_empty()
             || self.engine.pending_events() > 0
