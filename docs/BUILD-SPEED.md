@@ -8,6 +8,8 @@
 - Playwright 经 `bun run test:browser` 启动，沿用其 Node.js 入口。Nix shell 提供 Bun 和 Node.js；浏览器依赖安装使用 `bunx --no-install playwright install --with-deps chromium`。
 - CI 使用固定提交版本的 `Swatinem/rust-cache`，缓存 Rust 依赖、原生/WASM 依赖编译产物和 Cargo 安装的工具。主分支成功运行后保存缓存，PR 可恢复。安装 wasm-bindgen 前检查版本，命中 0.2.100 时直接复用。
 - 完整 `cargo xtask test` 合并展示层测试，一次 Cargo 调用覆盖 113 项和架构检查。增加 `--quick` 和测试参数透传，方便缩短局部修改的反馈时间。
+- CI 按工作流分工：`Engine quality` 独占 fmt、Clippy、Rust 测试、wasm32 检查、架构检查和浏览器验收（含 `tests/nir-next` 33 项，经 `bun run test:nir-next`）；`Native Linux/Windows player` 只保留平台 SDK 打包与原生播放验收，不再重复上述检查（Windows 保留 `cfg(windows)` 代码只能在 Windows 编译的测试与 Clippy）。三个日常工作流均按引用分组 `cancel-in-progress`，事件名并入分组，推送不会打断定时测量。
+- 性能测量分档：PR 与 main 推送只跑 smoke（2 样本、单次规模重复加 120 秒长稳）；完整基线（20 样本、双网络档、5 次规模重复，实测约 27 分钟）改为每夜 03:17（UTC+8）定时与手动 `workflow_dispatch` 运行，Engine 任务超时相应放宽到 60 分钟。
 
 ## 日常运行
 

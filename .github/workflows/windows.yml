@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   windows:
     runs-on: windows-2022
@@ -13,14 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - name: Native checks
+      # fmt, the wasm32 player-web check, and the architecture check run in the
+      # Engine quality workflow on the same triggers. Tests and clippy stay here
+      # because cfg(windows) code only compiles on Windows.
+      - name: Windows-only checks
         run: |
-          cargo fmt --all --check
           cargo test --locked -p player-desktop --lib
           cargo test --locked -p nir-player
-          cargo check --locked -p player-web --target wasm32-unknown-unknown
           cargo clippy --locked -p player-desktop -p player-windows --all-targets -- -D warnings
       - name: Build SDK
         shell: pwsh
@@ -29,7 +33,6 @@ jobs:
           cargo install wasm-bindgen-cli --version 0.2.100 --locked
           cargo xtask sdk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/check_architecture.py
       - name: Package independent sample
         run: |
           # The restored build cache carries the previous run's sample project;

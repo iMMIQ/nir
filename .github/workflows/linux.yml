@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   linux:
     runs-on: ubuntu-24.04
@@ -13,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+        run: rustup toolchain install 1.98.1 --profile minimal --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Native build prerequisites
         run: |
@@ -23,20 +26,14 @@ jobs:
           sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb \
             libx11-6 libxcursor1 libxi6 libxrandr2 libxrender1 \
             libxkbcommon0 libxkbcommon-x11-0
-      - name: Native checks
-        run: |
-          cargo fmt --all --check
-          cargo test --locked -p player-desktop --lib
-          cargo test --locked -p nir-player
-          cargo check --locked -p player-web --target wasm32-unknown-unknown
-          cargo clippy --locked -p player-desktop -p player-windows -p player-linux --all-targets -- -D warnings
+      # fmt, clippy, and Rust tests run in the Engine quality workflow on the
+      # same triggers; this job verifies only the Linux SDK packaging and playback.
       - name: Build SDK
         run: |
           if [ "$("$HOME/.cargo/bin/wasm-bindgen" --version 2>/dev/null || true)" != 'wasm-bindgen 0.2.100' ]; then
             cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
           fi
           cargo xtask sdk
-          python3 scripts/check_architecture.py
       - name: Start virtual audio output
         run: |
           sudo apt-get install -y pulseaudio
