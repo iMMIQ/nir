@@ -2,7 +2,8 @@
 //! separate from generic LSB lowering: native system scripts are replaced explicitly.
 use super::{
     lsb::{Body, Expression, Glyph, Literal, Script},
-    media, read_binary, ImportDiagnostic, ImportOptions, ImportReport, Source, SourceLocation,
+    media, read_binary, ImportDiagnostic, ImportMapping, ImportOptions, ImportReport, Source,
+    SourceLocation,
 };
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{ImageButton, ImageMenu, ImageMenuAction, MenuContent, MenuElement, Node, Span};
@@ -415,6 +416,153 @@ const CHOICE_EXECUTOR: &str = "ノベルシステム/選択メニュー/■選�
 const CHOICE_RESULT: &str = "選択値";
 /// One stock dispatch option: its literal text and the label index it jumps to.
 type DispatchOption = (String, usize);
+/// The compatibility ledger for this profile: one entry per mapping rule the
+/// conversion actually applies, with the behavior level separated from the
+/// evidence class behind it. Every entry below is grounded in decoded stock
+/// scripts (this corpus) or the documented LSB/GAL/LPM formats; none claims
+/// original-runtime or cross-backend verification, which stays an open item
+/// recorded through the fidelity warnings.
+pub(super) fn mapping_ledger(choice_sites: usize) -> Vec<ImportMapping> {
+    let entry = |rule: &str,
+                 level: &str,
+                 evidence: &str,
+                 source_version: &str,
+                 behavior: &str,
+                 capabilities: &[&str],
+                 approximation: Option<&str>| ImportMapping {
+        rule: rule.into(),
+        level: level.into(),
+        evidence: evidence.into(),
+        source_version: source_version.into(),
+        behavior: behavior.into(),
+        capabilities: capabilities.iter().map(|s| (*s).into()).collect(),
+        approximation: approximation.map(str::to_owned),
+    };
+    let mut mappings = vec![
+        entry(
+            "livenovel.startup",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            "Stock startup, window and asynchronous message-handshake scripts are replaced by the NIR session bootstrap; the episode, replay and choice conventions they dispatch to are preserved.",
+            &[],
+            None,
+        ),
+        entry(
+            "livenovel.system-services",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            "Save/load, history and settings use NIR UI and persisted formats; LiveMaker save files are not compatible.",
+            &[],
+            None,
+        ),
+        entry(
+            "livenovel.menu-sfx",
+            "approximate",
+            "decoded-source",
+            "LSB116",
+            "Menu sound effects and animated cursors are not reproduced.",
+            &[],
+            Some("Excluded from the compatibility claim; no NIR counterpart is mapped yet."),
+        ),
+        entry(
+            "livenovel.title-menu",
+            "adapted",
+            "decoded-source",
+            "LPM106",
+            "Title background, normal/hover button images and LPM coordinates generate image-menu elements with pointer and keyboard semantics.",
+            &["ui.menu-elements.v1"],
+            None,
+        ),
+        entry(
+            "livenovel.text.reveal",
+            "approximate",
+            "decoded-source",
+            "LSB116",
+            "Dialogue uses the bundled NIR Japanese font with a 32 ms reveal interval; source box image, position, opacity, 32 px base size and 40 px line height are preserved.",
+            &[],
+            Some("Source font/style and the StatusTextSpeed unit are not mapped (raw value retained in import-defaults.json); original-runtime comparison pending."),
+        ),
+        entry(
+            "livenovel.textbox.fade",
+            "approximate",
+            "decoded-source",
+            "LSB116",
+            "Message-box show/hide fades are represented by immediate visibility changes.",
+            &[],
+            Some("MESON/MESOFF fade durations are dropped; fade timing is not certified against the original runtime."),
+        ),
+        entry(
+            "livenovel.stage.wipe",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            "LiveMaker wipe numbers are represented by a dissolve of the original duration.",
+            &[],
+            None,
+        ),
+        entry(
+            "livenovel.auto-policy",
+            "adapted",
+            "decoded-source",
+            "LPB116",
+            "Fixed Auto wait comes from StatusAutoTextWait with the remaining voice sampled and frozen at each cycle start; page-first and in-page voice bindings follow the decoded callbacks.",
+            &["player.auto-delay-policy.v1", "text.voice-timer.v1"],
+            None,
+        ),
+        entry(
+            "livenovel.media.image",
+            "adapted",
+            "documented",
+            "GAL105/106",
+            "Single-frame 8/24/32-bit GAL decodes to PNG preserving layering, palette, alpha and trailing rects; animated GAL and LCM video are unsupported and excluded.",
+            &[],
+            None,
+        ),
+        entry(
+            "livenovel.media.audio",
+            "adapted",
+            "documented",
+            "LSB116",
+            "WAV PCM16 and Ogg/Vorbis convert to player WAV, six-channel WAV downmixes to stereo, and event volume multiplies the player bus at play time.",
+            &["audio.gain.v1"],
+            None,
+        ),
+        entry(
+            "livenovel.replay",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            "Replay thumbnails keep original grid coordinates, entries unlock through profile keys, and finishing returns through the replay-completed outcome; locked entries use blackened thumbnails and refuse execution.",
+            &["ui.replay.v1"],
+            None,
+        ),
+        entry(
+            "livenovel.settings",
+            "exact",
+            "decoded-source",
+            "LPB116",
+            "BGM/voice/SE volume and Auto wait defaults are decoded from LPB116 with range checks and exact unit conversion; the source digest is retained.",
+            &[],
+            None,
+        ),
+    ];
+    if choice_sites > 0 {
+        mappings.push(entry(
+            "livenovel.story.choice",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            &format!(
+                "{choice_sites} 選択メニュー call site(s) with 選択値 dispatch chains lower to typed interactions whose option values are the committed texts; branches continue each route and converging targets merge."
+            ),
+            &["story.typed-result.v1"],
+            None,
+        ));
+    }
+    mappings
+}
 /// Collects the dispatch chain that must follow a ■選択実行 call: consecutive
 /// conditional jumps, each comparing 選択値 with one string literal. Returns
 /// the (option text, label index) pairs plus the index after the chain;
@@ -1521,7 +1669,8 @@ pub(super) fn convert(
     } else {
         "Linear LiveNovel route,".into()
     };
-    let mut report=ImportReport{format:1,engine:"livemaker-livenovel116".into(),status:"converted_with_adaptations".into(),written:false,errors:0,text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings.",route_shape,adapter.assets.len()),diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
+    let mappings = mapping_ledger(adapter.choice_sites);
+    let mut report=ImportReport{format:2,engine:"livemaker-livenovel116".into(),status:ImportReport::status_from_mappings(&mappings).into(),written:false,errors:0,approximate:mappings.iter().filter(|m|m.approximate()).count(),text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings and per-rule mappings.",route_shape,adapter.assets.len()),mappings,diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
     report.diagnostics.extend(ui.diagnostics());
     let staging = tempfile::Builder::new()
         .prefix(".nir-import-")
@@ -1551,6 +1700,7 @@ pub(super) fn convert(
         "E_IMPORT_EXISTS: output appeared during import"
     );
     fs::rename(project, out)?;
+    super::enforce_acceptance(&report.mappings, options)?;
     Ok(report)
 }
 

@@ -8,11 +8,22 @@ fn options(source: &Path, out: &Path) -> ImportOptions {
         entry: Some("main.lsb".into()),
         line: 0,
         draft: false,
+        // The neutral fixtures exercise both import paths; the approximate
+        // LiveNovel rules are accepted here while dedicated tests assert the
+        // gate itself.
+        accept_approximate: APPROXIMATE_RULES.iter().map(|s| (*s).into()).collect(),
         game_id: "org.nir.test.import".into(),
         title: "Migration fixture".into(),
         locale: "ja".into(),
     }
 }
+/// Every rule the fixtures lower at approximate level; keep in sync with the
+/// importers' mapping ledgers.
+pub(super) const APPROXIMATE_RULES: &[&str] = &[
+    "livenovel.menu-sfx",
+    "livenovel.text.reveal",
+    "livenovel.textbox.fade",
+];
 fn sdk() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -73,6 +84,19 @@ fn japanese_project_checks_and_runs_through_cross_page_call_and_jump() {
     assert_eq!(report.errors, 0);
     assert_eq!(report.text_pages, 2);
     assert!(report.written);
+    assert_eq!(report.format, 2);
+    assert_eq!(report.status, "converted_with_adaptations");
+    assert_eq!(report.approximate, 0);
+    let by_rule = |rule: &str| {
+        report
+            .mappings
+            .iter()
+            .find(|m| m.rule == rule)
+            .unwrap_or_else(|| panic!("missing mapping {rule}"))
+    };
+    assert_eq!(by_rule("lsb.control-flow").level, "exact");
+    assert_eq!(by_rule("lsb.text").level, "adapted");
+    assert!(by_rule("lsb.text").approximation.is_some());
     assert!(crate::text_status(&out).unwrap().ready);
     let p = crate::load_project(&out).unwrap();
     assert_eq!(p.program.default_locale, "ja");
@@ -105,6 +129,10 @@ fn strict_refuses_and_draft_faults_at_unsupported_commands() {
     let report = convert(&opts, &sdk()).unwrap();
     assert!(report.written);
     assert_eq!(report.status, "blocked");
+    assert!(report
+        .mappings
+        .iter()
+        .any(|m| m.rule == "lsb.unsupported-commands" && m.level == "unsupported"));
     assert_eq!(report.diagnostics[0].line, 12);
     assert!(out.join("MIGRATION-INCOMPLETE.txt").exists());
     let p = crate::load_project(&out).unwrap();
@@ -317,4 +345,109 @@ fn real_livenovel_conversion_and_all_routes() {
         }
         eprintln!("{entry}: completed, snapshot restored, {replay_unlocks} replay unlocks");
     }
+}
+
+#[test]
+fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    for sites in [0, 2] {
+        let ledger = livenovel::mapping_ledger(sites);
+        assert!(ledger.len() >= 12);
+        let mut rules = std::collections::BTreeSet::new();
+        for m in &ledger {
+            assert!(rules.insert(m.rule.clone()), "duplicate rule {}", m.rule);
+            assert!(
+                matches!(
+                    m.level.as_str(),
+                    "exact" | "adapted" | "approximate" | "unsupported"
+                ),
+                "{}",
+                m.rule
+            );
+            assert!(
+                matches!(m.evidence.as_str(), "decoded-source" | "documented"),
+                "{}",
+                m.rule
+            );
+            assert_eq!(m.approximate(), m.level == "approximate");
+            if m.approximate() {
+                assert!(
+                    m.approximation.as_deref().is_some_and(|s| !s.is_empty()),
+                    "{}",
+                    m.rule
+                );
+            } else {
+                // Exact and adapted rules carry no approximation statement;
+                // open verification items stay in the fidelity warnings.
+                assert_eq!(m.approximation, None, "{}", m.rule);
+            }
+            assert!(!m.behavior.contains(source.to_string_lossy().as_ref()), "{}", m.rule);
+        }
+        let choice = ledger.iter().find(|m| m.rule == "livenovel.story.choice");
+        assert_eq!(choice.is_some(), sites > 0);
+        if let Some(m) = choice {
+            assert_eq!(m.level, "adapted");
+            assert_eq!(m.evidence, "decoded-source");
+            assert!(m
+                .capabilities
+                .iter()
+                .any(|c| c == "story.typed-result.v1"));
+        }
+        let approximate: Vec<&str> = ledger
+            .iter()
+            .filter(|m| m.approximate())
+            .map(|m| m.rule.as_str())
+            .collect();
+        // Keep in sync with APPROXIMATE_RULES: acceptance names exactly these.
+        assert_eq!(approximate, APPROXIMATE_RULES);
+        assert_eq!(
+            ImportReport::status_from_mappings(&ledger),
+            "converted_with_approximations"
+        );
+        // The gate: unaccepted approximate rules block after publication; a
+        // typo'd acceptance cannot pass because the real rule stays named.
+        // The generic-path conversion above exercises the wiring with an
+        // accepted ledger; the LiveNovel end of the gate runs against the
+        // real corpus.
+        let mut opts = options(&source, &temp.path().join("nowhere"));
+        opts.accept_approximate.clear();
+        let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
+        assert!(denied.to_string().contains("E_IMPORT_APPROXIMATE"), "{denied}");
+        opts.accept_approximate = vec!["livenovel.menu-sfx".into(), "livenovel.textbox.fade".into()];
+        let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
+        assert!(
+            denied.to_string().contains("livenovel.text.reveal"),
+            "{denied}"
+        );
+        opts.accept_approximate = vec!["livenovel.text.reveal".into(), "typo".into()];
+        let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
+        assert!(denied.to_string().contains("livenovel.menu-sfx"), "{denied}");
+        opts.accept_approximate = APPROXIMATE_RULES.iter().map(|s| (*s).into()).collect();
+        enforce_acceptance(&ledger, &opts).unwrap();
+        opts.accept_approximate.clear();
+        opts.draft = true;
+        // Draft keeps its own incomplete contract and skips the gate.
+        enforce_acceptance(&ledger, &opts).unwrap();
+    }
+    // A ledger without approximate or unsupported rules keeps the
+    // converted_with_adaptations claim, and one without adaptations is exact.
+    let exact_only = vec![ImportMapping {
+        rule: "r".into(),
+        level: "exact".into(),
+        evidence: "documented".into(),
+        source_version: "LSB116".into(),
+        behavior: String::new(),
+        capabilities: vec![],
+        approximation: None,
+    }];
+    assert_eq!(
+        ImportReport::status_from_mappings(&exact_only),
+        "converted"
+    );
+    assert_eq!(
+        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0)[..2]),
+        "converted_with_adaptations"
+    );
 }

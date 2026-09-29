@@ -107,6 +107,10 @@ enum ImportCommand {
         /// Write an incomplete migration (fault blocks or a source-derived UI preview).
         #[arg(long)]
         draft: bool,
+        /// Comma-separated approximate mapping rule ids to accept explicitly
+        /// (see the mappings array in import-report.json).
+        #[arg(long, value_delimiter = ',')]
+        accept_approximate: Vec<String>,
         #[arg(long, default_value = "org.nir.imported.livemaker")]
         game_id: String,
         #[arg(long, default_value = "Imported LiveMaker story")]
@@ -277,6 +281,7 @@ fn run(cli: Cli) -> Result<()> {
                 entry,
                 line,
                 draft,
+                accept_approximate,
                 game_id,
                 title,
                 locale,
@@ -288,6 +293,7 @@ fn run(cli: Cli) -> Result<()> {
                         entry,
                         line,
                         draft,
+                        accept_approximate,
                         game_id,
                         title,
                         locale,

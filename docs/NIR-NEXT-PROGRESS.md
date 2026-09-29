@@ -33,7 +33,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
 | P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息/UI 根上的通用目标与遮罩转场仍待实施 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
-| P6 兼容认证与困难案例 | 待实施：ImportReport 映射级别（exact/adapted/approximate/unsupported）与证据类、完整路线认证、能力发行清单 |
+| P6 兼容认证与困难案例 | ImportReport 映射级别与证据类已实现（批次 53，报告格式 2 + 显式近似接受门禁）；完整路线认证（Auto/held skip/隐藏/菜单切换/演出中保存的实包全路线）、能力发行清单仍待实施 |
 
 Windows 宿主已同步修改，但 Linux 上的公共 Rust 测试不覆盖 cfg(windows) 原生运行路径；不得据此声明 Windows 实机验收通过。实际测试日志保留在本地 `reports/nir-next/`。
 
@@ -621,3 +621,13 @@ P5.2 完成；P5 关卡三条中“第二来源复用相同核心”未满足（
 - P5 关卡核对（三条全部满足）：并行链中途局部状态改变后存读档/回退不重播（批次 50/51 测试覆盖）；"第二来源案例复用相同核心"（本批：LiveNovel 選択メニュー约定降级到 story.typed-result.v1 核心，import/*.rs 现有 Interact 映射）；无限循环媒体与 All 的不可完成组合被诊断（批次 51 E_INFINITE_WAIT）。
 
 P5 收口；P4 遗留（消息/UI 根遮罩与通用目标）与 P6（映射级别/完整路线认证/发行清单）待后续批次。证据：reports/nir-next/batch-52-corpus.log 及本批五项门禁日志（batch-52-xtask-test.log、batch-52-clippy.log、batch-52-architecture.log、batch-52-xtask-sdk.log、batch-52-browser-full.log）。契约见 IMPORT.md、TYPED-RESULT-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 53：ImportReport 映射级别与显式近似接受（P6.1）
+
+- 报告格式升为 2：新增 `mappings` 账本与 `approximate` 计数。每条记录规则 ID、行为级别（exact/adapted/approximate/unsupported）、证据类（documented/decoded-source）、源版本（LSB116/LPB116/LPM106/GAL105/106）、规范行为一句话、依赖的目标能力与近似位置/未决项；公共记录不含私有路径或正文。聚合状态由账本推导（converted → converted_with_adaptations → converted_with_approximations；unsupported 维持 blocked/草稿契约），不再是硬编码字符串。
+- 近似是兼容声明而非可忽略 warning：`enforce_acceptance` 在工程与报告发布之后执行，任何未按规则 ID 显式接受的 approximate 规则以 `E_IMPORT_APPROXIMATE` 失败并逐个点名；拼错的 ID 无法静默通过（真实规则仍被点名）。`--draft` 保持自己的 incomplete 契约、跳过该门禁。
+- LiveNovel 账本 13 条（choice 位置按实际位数出现）：settings exact；startup/system-services/title-menu/stage.wipe/auto-policy/media.image/media.audio/replay/story.choice adapted（分别标注 ui.menu-elements.v1、ui.replay.v1、story.typed-result.v1、audio.gain.v1、player.auto-delay-policy.v1+text.voice-timer.v1 等依赖能力）；menu-sfx/text.reveal/textbox.fade 三条 approximate——原版实机与跨后端尚未作为证据类出现，未决项保留在近似说明与保真警告。通用 LSB 路径账本：control-flow exact、text adapted、阻塞时汇总 unsupported。
+- CLI 新增 `--accept-approximate <ids>`（逗号分隔）。中性测试：账本完整性（级别/证据域、exact 与 adapted 不携带近似说明、规则唯一、无私有路径）、三条 approximate 恰为文档所列、状态推导、接受门禁（部分接受点名缺失规则、typo 不放行、全接受通过、draft 跳过）；通用路径两用例补映射断言（converted_with_adaptations + lsb.unsupported-commands）。
+- 本批只改离线导入器/CLI 与报告格式，不触及 Player/运行时；按批次 37/38/42 先例不重复浏览器整套验收。真实语料回归（RJ061378）经 ignored 测试（其 options 预接受三条规则）与独立 CLI 双向验证：不带门禁标志转换在发布后以 E_IMPORT_APPROXIMATE 退出并列出三规则，带 `--accept-approximate` 全列表成功且 1357 页/17 函数不变。
+
+P6.1 完成；P6 余下完整路线认证与能力发行清单，P4 遗留（消息/UI 根遮罩与通用目标）待后续批次。证据：reports/nir-next/batch-53-xtask-test.log、batch-53-clippy.log、batch-53-architecture.log、batch-53-xtask-sdk.log、batch-53-verify-sdk.log、batch-53-corpus.log、batch-53-corpus-gate.log。契约见 IMPORT.md（映射级别、证据与近似接受一节）。完整 P0–P6 计划未完成；未提交或推送。

@@ -43,7 +43,25 @@
 
 GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引用、透明度、调色板、图层合成与尾部矩形列表。动画 GAL、LCM 视频和归档解包尚未支持；本配置不会导入未引用的动画光标。解码由 Rust 在同一个 `novelc` 内完成，没有外部媒体进程。
 
-**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。原 wipe、声音／消息框渐变、回想菜单音乐、菜单音效、动画光标、逐字符原字体样式尚未完整复刻。报告状态为 `converted_with_adaptations`，逐项列出这些差异；不是无差异转换认证。
+**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。原 wipe、声音／消息框渐变、回想菜单音乐、菜单音效、动画光标、逐字符原字体样式尚未完整复刻。报告逐项列出这些差异；不是无差异转换认证。
+
+### 映射级别、证据与近似接受（报告格式 2）
+
+`import-report.json` 的 `mappings` 数组按规则记录兼容结论，行为级别与证据强度分开：
+
+- **级别（行为结论）**：`exact`（行为经等价机制保留）、`adapted`（以不同但有界面的 NIR 机制替代，差异已记录）、`approximate`（存在已知分歧、等价性未认证）、`unsupported`（无法映射；严格模式报错，草稿降级为故障块）。
+- **证据（结论依据）**：`documented`（公开格式文档）或 `decoded-source`（从固定源码解码定型）。原版实机对照与跨后端验证尚未作为证据类出现，相关未决项保留在近似说明与保真警告中。
+- 每条记录包含规则 ID、源版本（LSB116／LPB116／LPM106／GAL105/106）、规范行为一句话、依赖的目标能力与近似位置/未决项；公共记录不含私有路径或正文。
+
+聚合状态由账本推导：含 `approximate` 时为 `converted_with_approximations`，否则含 `adapted` 为 `converted_with_adaptations`，全部 `exact` 才是 `converted`。近似不是可忽略的 warning：未显式接受的近似规则会让命令在工程与报告写出后以 `E_IMPORT_APPROXIMATE` 退出，并逐个点名规则；接受必须按规则 ID 显式给出：
+
+```sh
+./novelc import livemaker "/path/to/extracted-game" --out imported-story \
+  --game-id org.example.story --title "My Story" \
+  --accept-approximate livenovel.menu-sfx,livenovel.text.reveal,livenovel.textbox.fade
+```
+
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-sfx`（菜单音效／动画光标不复现）、`livenovel.text.reveal`（字体样式与字速单位未映射）、`livenovel.textbox.fade`（消息框渐变以立即显隐替代）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 
@@ -82,7 +100,7 @@ LiveNovel 另导出 `import-menu-items.json`，从原初始化脚本的字面量
 
 转换仅沿入口的可达控制流进行。遇到未支持指令后，该路径的分析停止；报告不宣称覆盖后续内容。可先用 `inspect` 查看全包结构。
 
-默认严格模式遇到阻塞项不生成目录，JSON 报告写到 stdout，命令以非零状态退出。报告保留源文件、指令索引、LineNo、字节偏移和 NIR ID 映射。
+默认严格模式遇到阻塞项不生成目录，JSON 报告写到 stdout，命令以非零状态退出。报告保留源文件、指令索引、LineNo、字节偏移和 NIR ID 映射。通用路径同样携带映射账本：`lsb.control-flow`（exact）、`lsb.text`（adapted，正文排版由 NIR 阅读器呈现、媒体仅报告不转换）；阻塞时另有一条 `lsb.unsupported-commands`（unsupported）汇总未支持位置。
 
 ```sh
 ./novelc import livemaker "/path/to/extracted-game" --out migration-draft --draft
