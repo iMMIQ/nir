@@ -207,8 +207,10 @@ async function chapterMedia(project, id) {
   await fs.writeFile(path.join(source, `${id}.wav`), audio);
   // The first cue needs one chapter-private descriptor. Its catalog also
   // contains this chapter's future media metadata, without fetching that media.
+  // The generated entries opt out of packaging conversion: the ancillary
+  // chunks above are what make each chapter's objects distinct.
   await fs.appendFile(path.join(project, 'assets/catalog.toml'), `\n[[assets]]\nid = "media.${id}.marker"\nkind = "image"\nsource = "source/station.png"\nrights = "CC0-1.0"\nexpected_size = [1280, 720]\n`);
-  await fs.appendFile(path.join(project, 'assets/catalog.toml'), `\n[[assets]]\nid = "media.${id}.image"\nkind = "image"\nsource = "source/${id}.png"\nrights = "CC0-1.0"\nexpected_size = [1280, 720]\n\n[[assets]]\nid = "media.${id}.audio"\nkind = "audio"\nsource = "source/${id}.wav"\nrights = "CC0-1.0"\n`);
+  await fs.appendFile(path.join(project, 'assets/catalog.toml'), `\n[[assets]]\nid = "media.${id}.image"\nkind = "image"\nsource = "source/${id}.png"\nrights = "CC0-1.0"\noptimize = "none"\nexpected_size = [1280, 720]\n\n[[assets]]\nid = "media.${id}.audio"\nkind = "audio"\nsource = "source/${id}.wav"\nrights = "CC0-1.0"\noptimize = "none"\n`);
 }
 
 function withMediaCue(program, id, catalogResident) {

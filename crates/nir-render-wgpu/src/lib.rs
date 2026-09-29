@@ -264,9 +264,9 @@ pub fn premultiply_rgba(pixels: &mut [u8]) {
         premultiply_pixel(pixel);
     }
 }
-/// Pure PNG/JPEG decode to premultiplied RGBA8 plus dimensions, with no
-/// renderer state. Hosts run this on worker threads and admit the result
-/// through [`Renderer::prepare_image_decoded`].
+/// Pure PNG/WebP decode (format sniffed from the bytes) to premultiplied
+/// RGBA8 plus dimensions, with no renderer state. Hosts run this on worker
+/// threads and admit the result through [`Renderer::prepare_image_decoded`].
 pub fn decode_image(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()

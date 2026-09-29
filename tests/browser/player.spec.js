@@ -178,7 +178,7 @@ test('independent pauses, viewport changes, touch and actual device recovery', a
 test('required resource failure keeps scene and retry succeeds', async ({ page }) => {
   await boot(page);
   let failed=false;
-  await page.route('**/objects/*.wav', async route => {
+  await page.route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/, async route => {
     if(!failed){failed=true;await route.abort('failed');}else await route.continue();
   });
   await page.keyboard.press('Space');
@@ -224,13 +224,17 @@ test('real tab visibility freezes Story and resumes through visibilitychange',as
 });
 
 test('actual device loss during a dissolve preserves progress', async ({ page }) => {
+  // A healthy run finishes in ~11 s; a stalled observation must fail fast with
+  // diagnostics instead of burning the suite-wide 180 s timeout.
+  test.setTimeout(60000);
   await boot(page); await start(page);
   // Observe before triggering the transition: remote-control round trips may
   // otherwise miss its entire lifetime on a busy browser.
   await page.evaluate(()=>{
+    window.__transitionSeen=false;
     window.__transitionPause=new Promise(resolve=>{
       const observe=()=>{const t=window.__nir.state().transition;
-        if(t!==null&&t>0&&t<1)window.__nir.action({type:'menu'}).then(resolve);
+        if(t!==null&&t>0&&t<1){window.__transitionSeen=true;window.__nir.action({type:'menu'}).then(resolve);}
         else requestAnimationFrame(observe);
       };
       requestAnimationFrame(observe);
@@ -240,6 +244,16 @@ test('actual device loss during a dissolve preserves progress', async ({ page })
   // Deliberately outlast the transition to verify that browser-side observation
   // freezes it even when the test driver is late returning for the result.
   await page.waitForTimeout(700);
+  // If the dissolve never started (e.g. keyboard focus left the headed window
+  // and the presses went elsewhere), the in-page promise stays pending forever
+  // and awaiting it would hang until the suite timeout; poll a flag instead so
+  // the failure is bounded and carries the runner state.
+  try {
+    await page.waitForFunction(()=>window.__transitionSeen,null,{timeout:10000,polling:50});
+  } catch {
+    await fs.writeFile('reports/stalled-diagnostics.json',JSON.stringify(await page.evaluate(()=>window.__nir.diagnostics()),null,2));
+    throw new Error(`dissolve never observed: ${JSON.stringify(await state(page))}`);
+  }
   expect(await page.evaluate(()=>window.__transitionPause)).toBe(true);
   await page.waitForFunction(()=>window.__nir.state().screen==='Menu');
   const before=await state(page);
@@ -401,8 +415,8 @@ test('leaving preparation cancels its fetch and a new request still succeeds', a
   await boot(page);
   let intercepted=false,release;
   const gate=new Promise(resolve=>release=resolve);
-  const cancelled=[];page.on('requestfailed',request=>{if(request.url().endsWith('.wav'))cancelled.push(request.url());});
-  await page.route('**/objects/*.wav',async route=>{
+  const cancelled=[];page.on('requestfailed',request=>{if(/\.(wav|mp3)$/.test(request.url()))cancelled.push(request.url());});
+  await page.route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/,async route=>{
     if(!intercepted){intercepted=true;await gate;}
     await route.continue().catch(()=>{});
   });

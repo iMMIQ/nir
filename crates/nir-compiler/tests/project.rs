@@ -255,13 +255,28 @@ fn staged_release_has_hashed_fixed_launch_and_no_channel() {
     let sdk = test_sdk();
     resolve(project.path(), sdk.path()).unwrap();
     let out = project.path().join("dist/staged");
-    assert!(
-        build_profile(project.path(), sdk.path(), &out, "release", false, false)
-            .unwrap_err()
-            .to_string()
-            .contains("E_RELEASE_LOCK")
-    );
-    let report = build_profile(project.path(), sdk.path(), &out, "release", true, false).unwrap();
+    assert!(build_profile(
+        project.path(),
+        sdk.path(),
+        &out,
+        "release",
+        false,
+        false,
+        &OptimizeOptions::default()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("E_RELEASE_LOCK"));
+    let report = build_profile(
+        project.path(),
+        sdk.path(),
+        &out,
+        "release",
+        true,
+        false,
+        &OptimizeOptions::default(),
+    )
+    .unwrap();
     assert!(project.path().join("reports/build.json").exists());
     assert!(project.path().join("reports/dependencies.json").exists());
     assert!(!out.join("channels/stable.json").exists());
@@ -734,6 +749,64 @@ fn reading_menu_actions_emit_only_their_used_capability() {
         .iter()
         .any(|c| c == "ui.menu-reading.v1"));
     compile(&loaded.program).unwrap();
+}
+
+#[test]
+fn media_capabilities_follow_the_packaged_containers() {
+    let d = project();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    // load_project seeds the whole capability list; packaging prunes the
+    // container capabilities back to the bytes that actually ship.
+    assert!(load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "media.webp.v1"));
+    let requires_of = |out: &Path, report: &BuildReport| -> Vec<String> {
+        let release: nir_format::ReleaseManifest = serde_json::from_slice(
+            &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+        )
+        .unwrap();
+        let bytes = fs::read(out.join(&release.objects[&release.program].path)).unwrap();
+        let exe: nir_format::RuntimeExecutable = serde_json::from_slice(&bytes).unwrap();
+        exe.program.requires
+    };
+    let out = d.path().join("dist/converted");
+    let report = build_profile(
+        d.path(),
+        sdk.path(),
+        &out,
+        "dev",
+        false,
+        false,
+        &OptimizeOptions::default(),
+    )
+    .unwrap();
+    for cap in ["media.webp.v1", "media.mp3.v1"] {
+        assert!(
+            requires_of(&out, &report).iter().any(|c| c == cap),
+            "{cap} missing after default packaging"
+        );
+    }
+    let out = d.path().join("dist/plain");
+    let report = build_profile(
+        d.path(),
+        sdk.path(),
+        &out,
+        "dev",
+        false,
+        false,
+        &OptimizeOptions::none(),
+    )
+    .unwrap();
+    for cap in ["media.webp.v1", "media.mp3.v1"] {
+        assert!(
+            !requires_of(&out, &report).iter().any(|c| c == cap),
+            "{cap} declared without shipped objects"
+        );
+    }
 }
 
 #[test]

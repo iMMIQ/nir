@@ -23,6 +23,10 @@ for root in roots:
 # Notices are digested into the SDK identity, so they must be byte-identical
 # across build hosts; Windows defaults to cp1252 for text mode otherwise.
 chunks = ["NIR third-party notices. Versions are taken from Cargo.lock.\n", *[Path(name).read_text(encoding="utf-8") for name in ("LICENSE-NOTICE.md", "LICENSE", "COPYING")]]
+# Some crates (symphonia 0.5.x) declare MPL-2.0 but publish no license file;
+# the license is one canonical document, bundled here so notices stay
+# complete without network access during the build.
+MPL_2_0 = (Path(__file__).parent / "notices" / "MPL-2.0.txt").read_text(encoding="utf-8")
 for p in sorted((packages[key] for key in seen), key=lambda p: (p["name"], p["version"])):
     chunks.append(f'\n=== {p["name"]} {p["version"]} — {p.get("license") or "workspace"} ===\n')
     directory = Path(p["manifest_path"]).parent
@@ -31,9 +35,19 @@ for p in sorted((packages[key] for key in seen), key=lambda p: (p["name"], p["ve
         extra = directory / p["license_file"]
         if extra not in paths:
             paths.append(extra)
-    if p["name"] == "hb-subset":
-        paths.append(directory / "harfbuzz/COPYING")
-    for path in paths:
-        chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    # Vendored-notice special cases: these crates build third-party sources
+    # whose own notices live inside the vendored tree, not at the crate root.
+    for extra in {
+        "hb-subset": ("harfbuzz/COPYING",),
+        "libwebp-sys": ("vendor/COPYING", "vendor/PATENTS"),
+        "mp3lame-sys": ("lame-3.100/COPYING", "lame-3.100/LICENSE"),
+    }.get(p["name"], ()):
+        candidate = directory / extra
+        if candidate.is_file() and candidate not in paths:
+            paths.append(candidate)
+    bodies = [path.read_text(encoding="utf-8", errors="replace") for path in paths]
+    if not bodies and p.get("license") == "MPL-2.0":
+        bodies.append(MPL_2_0)
+    chunks.extend(bodies)
 Path(sys.argv[1]).write_text("\n".join(chunks), encoding="utf-8", newline="\n")
 print(f"Collected {len(seen)} package notices")

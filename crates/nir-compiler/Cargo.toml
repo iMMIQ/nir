@@ -23,6 +23,8 @@ tempfile = "3"
 schemars.workspace = true
 encoding_rs = "0.8"
 lewton = "=0.10.2"
+webp = "0.3"
+mp3lame-encoder = "0.2"
 
 [dev-dependencies]
 rustybuzz = "0.14"

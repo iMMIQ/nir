@@ -108,6 +108,9 @@ struct AssetSource {
     expected_size: Option<[u32; 2]>,
     #[serde(default)]
     font: Option<crate::FontRecipe>,
+    /// Packaging-time optimization override (`auto` / `lossless` / `none`).
+    #[serde(default)]
+    optimize: Option<crate::optimize::AssetPolicy>,
 }
 #[derive(Debug)]
 pub struct LoadedProject {
@@ -119,6 +122,7 @@ pub struct LoadedProject {
     pub resolved_config: crate::ResolvedConfig,
     pub fonts: BTreeMap<String, crate::FontReport>,
     pub font_notices: BTreeMap<String, String>,
+    pub asset_optimize: BTreeMap<String, crate::optimize::AssetPolicy>,
 }
 pub fn relative(root: &Path, base: &Path, name: &str) -> Result<PathBuf> {
     let name_path = Path::new(name);
@@ -615,6 +619,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     let mut font_notices = BTreeMap::new();
     let mut media = BTreeMap::new();
     let mut provenance = BTreeMap::new();
+    let mut asset_optimize = BTreeMap::new();
     let mut normalized = BTreeMap::new();
     for catalog in &manifest.inputs.asset_catalogs {
         let path = relative(&root, &root, catalog)?;
@@ -701,6 +706,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 bail!("E_DUPLICATE: asset {}", source.id);
             }
             provenance.insert(source.id.clone(), source.rights);
+            asset_optimize.insert(source.id.clone(), source.optimize.unwrap_or_default());
             media.insert(source.id, bytes);
         }
     }
@@ -936,6 +942,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         resolved_config,
         fonts,
         font_notices,
+        asset_optimize,
     })
 }
 fn wav_info(b: &[u8]) -> Result<(u64, u64)> {

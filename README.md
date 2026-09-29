@@ -32,6 +32,8 @@ NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览
 
 作品输出位于 `dist/full/web/`。完整上传该目录即可，可部署到子路径。保留 `NOTICE.txt`。部署时先上传对象和发行清单，最后更新 `channels/stable.json`；不要删除仍可能被旧会话引用的对象。源码目录、测试、源素材路径和本地配置不会作为运行目录复制进去。
 
+构建默认做打包优化：图像转有损 WebP（质量 92，alpha 无损保留）、非循环音频转 MP3；循环音频保持 WAV，逐资产可用 catalog `optimize` 字段例外，`--no-optimize` 打包原始字节。详见 [编写说明](docs/AUTHORING.md) 的打包媒体优化。
+
 ## 外部引擎导入
 
 SDK 的 `novelc` 内置 Rust 导入工具，无需 Python。当前实验性支持 LiveMaker LSB 116 的结构检查、基础控制流和同步对白迁移；识别到已适配的 LiveNovel 配置时，还可迁移事件、原图标题／回想菜单、GAL 图像及 WAV/Ogg 声音。未支持的语义会报告阻塞项，原引擎效果的替代会列入报告。运行 `novelc import inspect <游戏目录>` 检查原包，或 `novelc import livemaker <游戏目录> --out <新工程目录>` 转换。具体范围、草稿模式和限制见 [外部引擎导入](docs/IMPORT.md)。
