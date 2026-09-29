@@ -27,6 +27,17 @@ pub struct Engine {
     upload_remaining: usize,
     upload_start_us: u64,
     visual_invalidated: bool,
+    /// The last projection may be stale: a pumped event did work, a view
+    /// mutation set `visual_invalidated`, or the safety valve tripped.
+    /// Direct view mutators (focus, hover, gestures, scrolling) mark that
+    /// flag, which the draw gate treats as dirty alongside this one.
+    state_dirty: bool,
+    /// Semantics JSON from the last projection; cloned while the packet
+    /// is still clean instead of being rebuilt every frame.
+    semantics: String,
+    /// Frames served from the cache since the last projection; the safety
+    /// valve reprojects periodically to bound a missed dirty signal.
+    cached_draws: u32,
     profiling: bool,
     profile_records: VecDeque<HostProfile>,
 }
@@ -37,6 +48,9 @@ struct HostProfile {
     end_us: u64,
 }
 const MAX_PENDING_HOST_PROFILES: usize = 128;
+/// Clean frames served before the projection is rebuilt unconditionally,
+/// bounding visual drift if a change ever slips past the dirty signals.
+const REPROJECT_SAFETY_FRAMES: u32 = 16;
 fn profile_clock_us() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -83,6 +97,9 @@ impl Engine {
             upload_remaining: 2 * 1024 * 1024,
             upload_start_us: 0,
             visual_invalidated: true,
+            state_dirty: true,
+            semantics: String::new(),
+            cached_draws: 0,
             profiling: false,
             profile_records: VecDeque::new(),
         };
@@ -859,55 +876,77 @@ impl Engine {
             || (self.player.active_menu_id().is_some() && self.player.error.is_none()))
             && self.player.is_loading();
         if self.ready && !waiting_for_title {
-            let projection_start = self.profile_start();
-            let mut projected = self.reading.project(
-                &self.player.model(),
-                (
-                    self.player.generation.session,
-                    self.player.current_interaction(),
-                ),
-                width,
-                height,
-                &self.messages,
-                &mut self.renderer.text,
-            );
-            if let Some(node) =
-                self.keyboard_focus
-                    .node(&projected, self.input_identity(), self.player.screen)
-            {
-                let [x, y, w, h] = node.rect;
-                for rect in [
-                    [x, y, w, 2.],
-                    [x, y + h - 2., w, 2.],
-                    [x, y, 2., h],
-                    [x + w - 2., y, 2., h],
-                ] {
-                    projected.quads.push(nir_presentation::Quad {
-                        rect,
-                        color: [1., 0.85, 0.35, 1.],
-                        asset: None,
-                        clip: None,
-                    });
+            // The projection is a pure function of the player model and the
+            // reading state, so it only needs rebuilding when something could
+            // have changed them: a pumped event that did work, a direct view
+            // mutation (tracked by `visual_invalidated`), history still
+            // settling, or the safety valve that bounds a missed signal.
+            let dirty = self.state_dirty
+                || self.visual_invalidated
+                || self.reading.history_pending()
+                || self.cached_draws >= REPROJECT_SAFETY_FRAMES;
+            if dirty {
+                let projection_start = self.profile_start();
+                let mut projected = self.reading.project(
+                    &self.player.model(),
+                    (
+                        self.player.generation.session,
+                        self.player.current_interaction(),
+                    ),
+                    width,
+                    height,
+                    &self.messages,
+                    &mut self.renderer.text,
+                );
+                if let Some(node) =
+                    self.keyboard_focus
+                        .node(&projected, self.input_identity(), self.player.screen)
+                {
+                    let [x, y, w, h] = node.rect;
+                    for rect in [
+                        [x, y, w, 2.],
+                        [x, y + h - 2., w, 2.],
+                        [x, y, 2., h],
+                        [x + w - 2., y, 2., h],
+                    ] {
+                        projected.quads.push(nir_presentation::Quad {
+                            rect,
+                            color: [1., 0.85, 0.35, 1.],
+                            asset: None,
+                            clip: None,
+                        });
+                    }
+                } else {
+                    self.keyboard_focus.clear();
                 }
+                self.profile_end("projection", projection_start);
+                let draw_start = self.profile_start();
+                let needs_render = self.visual_invalidated || !self.packet.visual_eq(&projected);
+                self.packet = projected;
+                self.profile_end("draw", draw_start);
+                if needs_render {
+                    self.visual_invalidated = true;
+                    self.renderer.render(&self.packet, dpr).map_err(js)?;
+                    self.visual_invalidated = false;
+                }
+                self.renderer.retain(&self.player.retained_assets());
+                self.state_dirty = false;
+                self.cached_draws = 0;
+                let semantics_start = self.profile_start();
+                self.semantics = self.build_semantics();
+                self.profile_end("semantics", semantics_start);
             } else {
-                self.keyboard_focus.clear();
+                self.cached_draws += 1;
             }
-            self.profile_end("projection", projection_start);
-            let draw_start = self.profile_start();
-            let needs_render = self.visual_invalidated || !self.packet.visual_eq(&projected);
-            self.packet = projected;
-            self.profile_end("draw", draw_start);
-            if needs_render {
-                self.visual_invalidated = true;
-                self.renderer.render(&self.packet, dpr).map_err(js)?;
-                self.visual_invalidated = false;
-            }
-            self.renderer.retain(&self.player.retained_assets());
+        } else {
+            // Boot and title swaps still report live semantics from the
+            // default packet until the first projection runs.
+            self.semantics = self.build_semantics();
         }
-        let semantics_start = self.profile_start();
-        let semantics = serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"announcement_locale":self.packet.announcement_locale,"locale":self.packet.locale,"ready":self.ready}).to_string();
-        self.profile_end("semantics", semantics_start);
-        Ok(semantics)
+        Ok(self.semantics.clone())
+    }
+    fn build_semantics(&self) -> String {
+        serde_json::json!({"nodes":self.packet.semantics,"announcement":self.packet.announcement,"announcement_locale":self.packet.announcement_locale,"locale":self.packet.locale,"ready":self.ready}).to_string()
     }
     pub fn needs_clock(&self) -> bool {
         self.ready && (self.player.needs_clock() || self.reading.history_pending())
@@ -1065,8 +1104,23 @@ impl Engine {
         Ok(true)
     }
     fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), String> {
+        // Bare clock events cost one admission unit each inside the player
+        // and only dirty the view when the turn did work beyond admission;
+        // every other event changes evaluation state unconditionally.
+        let clock_only = events.iter().all(|event| {
+            matches!(
+                event,
+                AppEvent::Tick { .. }
+                    | AppEvent::TickDomains { .. }
+                    | AppEvent::ContinueStoryTime { .. }
+            )
+        });
+        let admitted = events.len() as u32;
+        let mut work = 0u32;
         let mut commands = self.player.pump(events, self.work_remaining);
-        self.work_remaining -= self.player.work_used();
+        let used = self.player.work_used();
+        work += used;
+        self.work_remaining -= used;
         let mut rounds = 0;
         while !commands.is_empty() {
             rounds += 1;
@@ -1115,8 +1169,11 @@ impl Engine {
                 break;
             }
             commands = self.player.pump(events, self.work_remaining);
-            self.work_remaining -= self.player.work_used();
+            let used = self.player.work_used();
+            work += used;
+            self.work_remaining -= used;
         }
+        self.state_dirty |= !clock_only || work > admitted;
         Ok(())
     }
 
