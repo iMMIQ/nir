@@ -400,6 +400,32 @@ compose_project=build("browser-compose",compose)
 compose_server=ThreadingHTTPServer(("127.0.0.1",4222),partial(SimpleHTTPRequestHandler,directory=str(compose_project)))
 Thread(target=compose_server.serve_forever,daemon=True).start()
 
+def typed_result(content):
+    # The story opens on a typed interaction: the VM writes the chosen
+    # option's declared value, a switch turns that value into different
+    # dialogue, and a declared cancel path exits without any write.
+    content["variables"]["picked"]={"type":"i32","value":0}
+    for option,value in zip(content["choices"]["route"]["options"],[1,2]):
+        option["value"]={"type":"i32","value":value}
+    blocks=content["functions"]["main"]["blocks"]
+    blocks["choose"]["terminator"]={
+        "type":"interact","choice":"route",
+        "branches":{"walk":"typed_commit","stay":"typed_commit"},
+        "on_empty":"failed","result":"picked","on_cancel":"typed_cancel"}
+    blocks["typed_commit"]={"ops":[],"terminator":{"type":"switch",
+        "value":{"type":"var","name":"picked"},
+        "cases":{"1":"walk_line","2":"stay_line"},"default":"failed"}}
+    blocks["typed_cancel"]={"ops":[],"terminator":{"type":"activate","cue":"arrival","next":"wait_cancel"}}
+    blocks["wait_cancel"]={"ops":[],"terminator":{"type":"await",
+        "conditions":[{"task":"line","milestone":{"type":"finished"}}],
+        "next":"cancel_end","on_cancelled":"cancelled","on_failed":"failed"}}
+    blocks["cancel_end"]={"ops":[],"terminator":{"type":"end","outcome":"gave_up"}}
+    content["functions"]["main"]["entry"]="choose"
+
+typed_project=build("browser-typed-result",typed_result)
+typed_server=ThreadingHTTPServer(("127.0.0.1",4223),partial(SimpleHTTPRequestHandler,directory=str(typed_project)))
+Thread(target=typed_server.serve_forever,daemon=True).start()
+
 wipe_project=build("browser-wipe-project",wipe)
 
 wipe_project=build("browser-wipe-project",wipe)

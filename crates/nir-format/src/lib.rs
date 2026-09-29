@@ -62,6 +62,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-effects.v1",
     "ui.replay.v1",
     "task.compose.v1",
+    "story.typed-result.v1",
     "media.webp.v1",
     "media.mp3.v1",
 ];
@@ -806,6 +807,13 @@ pub enum Terminator {
         choice: String,
         branches: BTreeMap<String, String>,
         on_empty: String,
+        /// Typed-result mode: the chosen option's declared value is written to
+        /// this variable by the VM before the branch. The host never writes.
+        #[serde(default)]
+        result: Option<String>,
+        /// Explicit cancel target; absent means the interaction is modal.
+        #[serde(default)]
+        on_cancel: Option<String>,
     },
     End {
         outcome: String,
@@ -1198,6 +1206,10 @@ pub struct ChoiceOption {
     pub visible: Option<Expr>,
     #[serde(default)]
     pub enabled: Option<Expr>,
+    /// Typed result committed by the VM when an Interact declares `result`.
+    /// Every option must carry one of the target variable's type.
+    #[serde(default)]
+    pub value: Option<Value>,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1975,6 +1987,14 @@ pub enum UiAction {
     Choose {
         option: String,
     },
+    /// Move the semantic selection cursor of the pending typed-result
+    /// interaction. An observation: no input identity, no story progress.
+    SelectChoice {
+        option: String,
+    },
+    /// Cancel the pending typed-result interaction through its declared
+    /// cancel target. Hosts only offer this while a cancel affordance exists.
+    CancelChoice,
     Menu,
     Close,
     Settings,

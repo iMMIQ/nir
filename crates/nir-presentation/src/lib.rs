@@ -41,6 +41,9 @@ pub struct ChoiceView {
     pub id: String,
     pub label: String,
     pub enabled: bool,
+    /// Semantic selection cursor of a typed-result interaction. Hover and
+    /// keyboard focus are transients and never set this.
+    pub selected: bool,
     pub locale: String,
     pub font_plan_digest: String,
     pub font_assets: Vec<String>,
@@ -85,6 +88,8 @@ pub struct UiModel {
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
     pub choices: Vec<ChoiceView>,
+    /// The pending interaction declares an explicit cancel target.
+    pub choice_cancellable: bool,
     pub prefs: Preferences,
     pub ui_locale: String,
     pub ui_fonts: Vec<String>,
@@ -1516,7 +1521,7 @@ fn project_measured(
                                 option: c.id.clone(),
                             },
                             [x, row_y, w, h],
-                            false,
+                            c.selected,
                             t,
                         );
                         p.quads.last_mut().unwrap().clip = Some(viewport);
@@ -1551,6 +1556,15 @@ fn project_measured(
                         },
                         m,
                         messages,
+                    );
+                }
+                if m.choice_cancellable {
+                    p.button(
+                        msg("cancel"),
+                        UiAction::CancelChoice,
+                        [x, y + view_height + 14., w, 36.],
+                        false,
+                        t,
                     );
                 }
             }

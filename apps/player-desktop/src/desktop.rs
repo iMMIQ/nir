@@ -955,7 +955,7 @@ impl ApplicationHandler for App {
                     }
                     let hidden = !runtime.focused || runtime.occluded;
                     if hidden {
-                        runtime.engine.focus_control(None);
+                        engine_result(runtime.engine.focus_control(None))?;
                         runtime.held_controls = [false; 2];
                         runtime.pointer_down = None;
                         runtime.bar_pointer = false;
@@ -993,7 +993,7 @@ impl ApplicationHandler for App {
                     let code = if button == MouseButton::Left { 0 } else { 2 };
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
-                            runtime.engine.focus_control(None);
+                            engine_result(runtime.engine.focus_control(None))?;
                             if engine_result(runtime.engine.pointer_gesture(
                                 0,
                                 runtime.cursor.0,
@@ -1020,7 +1020,7 @@ impl ApplicationHandler for App {
                             .engine
                             .pointer_action(runtime.cursor.0, runtime.cursor.1, code);
                     if state == ElementState::Pressed {
-                        runtime.engine.focus_control(None);
+                        engine_result(runtime.engine.focus_control(None))?;
                         runtime.pointer_down = hit.map(|action| {
                             (
                                 button,
@@ -1088,7 +1088,7 @@ impl ApplicationHandler for App {
                                 return Ok(());
                             }
                             runtime.touch_id = Some(touch.id);
-                            runtime.engine.focus_control(None);
+                            engine_result(runtime.engine.focus_control(None))?;
                             if engine_result(runtime.engine.pointer_gesture(
                                 0,
                                 runtime.cursor.0,
@@ -1253,7 +1253,7 @@ impl ApplicationHandler for App {
                                 Key::Named(NamedKey::ArrowUp) => 4,
                                 _ => 5,
                             };
-                            runtime.engine.navigate_focus(direction);
+                            engine_result(runtime.engine.navigate_focus(direction))?;
                             if let Some((x, y)) = runtime.engine.focused_center() {
                                 engine_result(runtime.engine.hover(x, y))?;
                                 runtime.commands()?;
@@ -1273,7 +1273,11 @@ impl ApplicationHandler for App {
                             let state: serde_json::Value =
                                 serde_json::from_str(&runtime.engine.state())?;
                             runtime.input(
-                                if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0) {
+                                if state["choice"]["on_cancel"].is_string() {
+                                    // A cancellable interaction owns Escape.
+                                    UiAction::CancelChoice
+                                } else if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0)
+                                {
                                     UiAction::Close
                                 } else if state["screen"] == "Story" || state["screen"] == "Title" {
                                     UiAction::Menu

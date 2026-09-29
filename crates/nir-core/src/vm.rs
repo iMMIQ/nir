@@ -173,6 +173,19 @@ pub struct OfferedChoice {
     pub branches: BTreeMap<String, String>,
     pub deadline_us: Option<Micros>,
     pub default: Option<String>,
+    /// Typed-result mode: the variable the chosen option's value writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Explicit cancel target; absent means the interaction is modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_cancel: Option<String>,
+    /// Typed values of the offered options, by option id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, Value>,
+    /// Semantic selection cursor for typed-result interactions; hover and
+    /// keyboard focus are presentation transients and never reach this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,6 +248,18 @@ pub enum CoreInput {
     Choose {
         interaction: u32,
         option: String,
+        sequence: u32,
+    },
+    /// Move the semantic selection cursor of a typed-result interaction.
+    /// No story progress, no checkpoint; snapshot-relevant only.
+    SelectChoice {
+        interaction: u32,
+        option: String,
+        sequence: u32,
+    },
+    /// Cancel a typed-result interaction through its declared cancel target.
+    CancelChoice {
+        interaction: u32,
         sequence: u32,
     },
     Time {
@@ -837,13 +862,60 @@ impl Core {
                         && c.options.iter().any(|o| o.id == option && o.enabled)
                     {
                         self.state.last_input = sequence;
+                        // The VM owns the typed write; the host only names an
+                        // offered option and never supplies the value itself.
+                        let typed = c
+                            .result
+                            .as_ref()
+                            .and_then(|target| Some((target.clone(), c.values.get(&option)?.clone())));
                         let dest = c.branches[&option].clone();
+                        if let Some((target, value)) = typed {
+                            self.write(&target, value)?;
+                        }
                         self.trace(format!("choose:{option}"));
                         self.state.choice = None;
                         self.jump(dest);
                         self.state.unsuspended_ops = 0;
                         self.intents.push(CoreIntent::Checkpoint);
                     }
+                }
+            }
+            CoreInput::SelectChoice {
+                interaction,
+                option,
+                sequence,
+            } => {
+                let _ = sequence;
+                if let Some(c) = &mut self.state.choice {
+                    if c.interaction == interaction
+                        && c.result.is_some()
+                        && c.options.iter().any(|o| o.id == option && o.enabled)
+                    {
+                        // A cursor move is an observation on a suspended
+                        // interaction: no input identity, no story progress.
+                        c.selected = Some(option);
+                    }
+                }
+            }
+            CoreInput::CancelChoice {
+                interaction,
+                sequence,
+            } => {
+                if sequence <= self.state.last_input {
+                    return Ok(());
+                }
+                let dest = self
+                    .state
+                    .choice
+                    .as_ref()
+                    .and_then(|c| (c.interaction == interaction).then(|| c.on_cancel.clone()).flatten());
+                if let Some(dest) = dest {
+                    self.state.last_input = sequence;
+                    self.trace("input:cancel");
+                    self.state.choice = None;
+                    self.jump(dest);
+                    self.state.unsuspended_ops = 0;
+                    self.intents.push(CoreIntent::Checkpoint);
                 }
             }
             CoreInput::AudioEnded { task } => {
@@ -1293,6 +1365,8 @@ impl Core {
                 choice,
                 branches,
                 on_empty,
+                result,
+                on_cancel,
             } => {
                 let c = self.program().choices[&choice].clone();
                 let mut options = vec![];
@@ -1326,6 +1400,29 @@ impl Core {
                             .ok_or_else(|| self.error("E_TIME", "choice deadline overflow"))
                     })
                     .transpose()?;
+                // Typed-result mode carries the declared values of the offered
+                // options and a semantic selection cursor; the host selects
+                // among ids, never values. The cursor starts at the declared
+                // default when it is offered, else at the first enabled row.
+                let values = result.as_ref().map(|_| {
+                    options
+                        .iter()
+                        .filter_map(|o| {
+                            c.options
+                                .iter()
+                                .find(|d| &d.id == &o.id)
+                                .and_then(|d| d.value.clone())
+                                .map(|value| (o.id.clone(), value))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                });
+                let selected = values.as_ref().and_then(|_| {
+                    c.default
+                        .as_ref()
+                        .filter(|d| options.iter().any(|o| &o.id == *d && o.enabled))
+                        .or_else(|| options.iter().find(|o| o.enabled).map(|o| &o.id))
+                        .cloned()
+                });
                 self.state.choice = Some(OfferedChoice {
                     id: choice,
                     locale: self.state.locale.clone(),
@@ -1337,6 +1434,10 @@ impl Core {
                     branches,
                     deadline_us,
                     default: c.default,
+                    result,
+                    on_cancel,
+                    values: values.unwrap_or_default(),
+                    selected,
                 });
                 self.state.unsuspended_ops = 0;
                 self.intents.push(CoreIntent::Checkpoint);
@@ -2115,6 +2216,15 @@ impl Core {
             if let Some(c) = self.state.choice.clone() {
                 if c.deadline_us.is_some_and(|v| v.0 <= next) {
                     if let Some(option) = c.default {
+                        // A timeout commits the default option, typed value
+                        // included, exactly like an explicit choice.
+                        if let (Some(target), Some(value)) =
+                            (&c.result, c.values.get(&option))
+                        {
+                            let target = target.clone();
+                            let value = value.clone();
+                            self.write(&target, value)?;
+                        }
                         self.state.choice = None;
                         self.jump(c.branches[&option].clone());
                         self.trace(format!("timeout:{option}"));
@@ -2540,7 +2650,20 @@ impl Core {
             }
         }
         if let Some(c) = &s.choice {
-            if !matches!(&block.terminator,Terminator::Interact{choice,branches,..} if choice==&c.id&&branches==&c.branches)
+            let Terminator::Interact {
+                choice,
+                branches,
+                on_empty: _,
+                result,
+                on_cancel,
+            } = &block.terminator
+            else {
+                return Err(fail("choice continuation mismatch"));
+            };
+            if choice != &c.id
+                || branches != &c.branches
+                || result != &c.result
+                || on_cancel != &c.on_cancel
                 || top.op != block.ops.len()
                 || c.interaction >= s.next_id
                 || !p.locales.contains_key(&c.locale)
@@ -2561,6 +2684,33 @@ impl Core {
                 .is_some_and(|d| !c.options.iter().any(|o| &o.id == d && o.enabled))
             {
                 return Err(fail("unavailable timeout default"));
+            }
+            // Typed-result snapshots: the values are exactly the declared
+            // values of the offered options, the cursor names a live enabled
+            // row, and non-result interactions carry neither.
+            let definition = p.choices.get(&c.id).ok_or_else(|| fail("missing choice"))?;
+            let expected: BTreeMap<_, _> = c
+                .options
+                .iter()
+                .filter_map(|o| {
+                    definition
+                        .options
+                        .iter()
+                        .find(|d| &d.id == &o.id)
+                        .and_then(|d| d.value.clone())
+                        .map(|value| (o.id.clone(), value))
+                })
+                .collect();
+            if c.result.is_some() {
+                if &expected != &c.values
+                    || c.selected
+                        .as_ref()
+                        .is_none_or(|id| !c.options.iter().any(|o| &o.id == id && o.enabled))
+                {
+                    return Err(fail("invalid typed-result interaction"));
+                }
+            } else if !c.values.is_empty() || c.selected.is_some() {
+                return Err(fail("plain interaction carries no result state"));
             }
         }
         for (index, f) in s.frames.iter().enumerate() {

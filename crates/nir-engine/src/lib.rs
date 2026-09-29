@@ -257,12 +257,44 @@ impl Engine {
     ) -> Option<UiAction> {
         nir_presentation::control_value_action(&self.packet, id, expected, direction)
     }
-    pub fn focus_control(&mut self, id: Option<u32>) {
+    pub fn focus_control(&mut self, id: Option<u32>) -> std::result::Result<(), String> {
         self.keyboard_focus
             .select(&self.packet, self.input_identity(), self.player.screen, id);
         self.visual_invalidated = true;
+        self.sync_focus_selection()
     }
-    pub fn navigate_focus(&mut self, direction: u8) -> Option<u32> {
+    /// Keyboard focus that lands on a choice row of a typed-result interaction
+    /// moves the semantic selection cursor. The observation rides the normal
+    /// action path; it carries no input identity and cannot progress the story.
+    fn sync_focus_selection(&mut self) -> std::result::Result<(), String> {
+        let option = self
+            .keyboard_focus
+            .node(&self.packet, self.input_identity(), self.player.screen)
+            .and_then(|node| match &node.action {
+                UiAction::Choose { option } => Some(option.clone()),
+                _ => None,
+            });
+        let Some(option) = option else {
+            return Ok(());
+        };
+        if !self
+            .player
+            .core()
+            .state()
+            .choice
+            .as_ref()
+            .is_some_and(|c| c.result.is_some())
+        {
+            return Ok(());
+        }
+        self.pump(vec![AppEvent::Action {
+            action: UiAction::SelectChoice { option },
+            interaction: self.player.current_interaction(),
+            sequence: 0,
+            session: self.player.generation.session,
+        }])
+    }
+    pub fn navigate_focus(&mut self, direction: u8) -> std::result::Result<Option<u32>, String> {
         let identity = self.input_identity();
         let screen = self.player.screen;
         let current = self
@@ -348,7 +380,8 @@ impl Engine {
                         self.keyboard_focus.select(&projected, identity, screen, id);
                         self.packet = projected;
                         self.visual_invalidated = true;
-                        return id;
+                        self.sync_focus_selection()?;
+                        return Ok(id);
                     }
                 }
             }
@@ -357,7 +390,8 @@ impl Engine {
             .keyboard_focus
             .navigate(&self.packet, identity, screen, direction);
         self.visual_invalidated = true;
-        id
+        self.sync_focus_selection()?;
+        Ok(id)
     }
     pub fn focused_center(&self) -> Option<(f32, f32)> {
         let n =
@@ -984,6 +1018,11 @@ impl Engine {
             "paused": self.player.paused(),
             "loading": self.player.is_loading(),
             "has_dialogue": c.dialogue().is_some(),
+            "choice_cancellable": c
+                .state()
+                .choice
+                .as_ref()
+                .is_some_and(|choice| choice.on_cancel.is_some()),
             "frames": self.renderer.submitted,
             "backend": self.renderer.backend.as_str(),
             "resident_bytes": self.player.memory_used(),

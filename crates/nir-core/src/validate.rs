@@ -3014,9 +3014,16 @@ fn validate_runtime_function(
         if let Terminator::Await { conditions, .. } = &block.terminator {
             for condition in conditions {
                 if let Some(definitions) = view.task_definitions.get(&condition.task) {
+                    // A looped-audio leaf anywhere in a def's tree makes its
+                    // natural Finished unreachable: sequences stall at it and
+                    // parallels never see all children finished. Ending it by
+                    // control or a stop child resolves as cancellation, not
+                    // as the awaited milestone.
                     if condition.milestone == Milestone::Finished
                         && definitions.iter().all(|effect| {
-                            matches!(effect.as_ref(), Effect::Audio { looped: true, .. })
+                            effect
+                                .as_ref()
+                                .effect_tree_any(&|e| matches!(e, Effect::Audio { looped: true, .. }))
                         })
                     {
                         return Err(err("E_INFINITE_WAIT", &at, &condition.task));
@@ -3037,9 +3044,18 @@ fn validate_runtime_function(
             }
         }
         if let Terminator::Interact {
-            choice, branches, ..
+            choice,
+            branches,
+            result,
+            on_cancel,
+            ..
         } = &block.terminator
         {
+            if result.is_some() || on_cancel.is_some() {
+                if !view.requires.iter().any(|c| c == "story.typed-result.v1") {
+                    return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
+                }
+            }
             if let Some(definition) = view.choices.get(choice) {
                 if definition.options.len() != branches.len()
                     || definition
@@ -3048,6 +3064,20 @@ fn validate_runtime_function(
                         .any(|option| !branches.contains_key(&option.id))
                 {
                     return Err(err("E_CHOICE", &at, "branch coverage"));
+                }
+                if let Some(target) = result {
+                    let ty = view
+                        .variables
+                        .get(target)
+                        .map(Value::ty)
+                        .ok_or_else(|| err("E_VARIABLE", &at, target))?;
+                    if definition
+                        .options
+                        .iter()
+                        .any(|option| option.value.as_ref().is_none_or(|v| v.ty() != ty))
+                    {
+                        return Err(err("E_TYPE", &at, "typed-result option values"));
+                    }
                 }
             }
         }
@@ -3402,11 +3432,15 @@ fn outgoing(t: &Terminator) -> Vec<&str> {
             ..
         } => vec![next, on_cancelled, on_failed],
         Terminator::Interact {
-            branches, on_empty, ..
+            branches,
+            on_empty,
+            on_cancel,
+            ..
         } => branches
             .values()
             .map(String::as_str)
             .chain(std::iter::once(on_empty.as_str()))
+            .chain(on_cancel.iter().map(String::as_str))
             .collect(),
         _ => vec![],
     }
@@ -4123,9 +4157,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                             .get(c.task.as_str())
                             .ok_or_else(|| err("E_TASK", &at, &c.task))?;
                         if c.milestone == Milestone::Finished
-                            && defs
-                                .iter()
-                                .all(|e| matches!(e, Effect::Audio { looped: true, .. }))
+                            && defs.iter().all(|e| {
+                                e.effect_tree_any(&|x| matches!(x, Effect::Audio { looped: true, .. }))
+                            })
                         {
                             return Err(err("E_INFINITE_WAIT", &at, &c.task));
                         }
@@ -4140,8 +4174,17 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     }
                 }
                 Terminator::Interact {
-                    choice, branches, ..
+                    choice,
+                    branches,
+                    result,
+                    on_cancel,
+                    ..
                 } => {
+                    if result.is_some() || on_cancel.is_some() {
+                        if !p.requires.iter().any(|c| c == "story.typed-result.v1") {
+                            return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
+                        }
+                    }
                     let c = p
                         .choices
                         .get(choice)
@@ -4150,6 +4193,19 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         || c.options.iter().any(|o| !branches.contains_key(&o.id))
                     {
                         return Err(err("E_CHOICE", &at, "branch coverage"));
+                    }
+                    if let Some(target) = result {
+                        let ty = p
+                            .variables
+                            .get(target)
+                            .map(Value::ty)
+                            .ok_or_else(|| err("E_VARIABLE", &at, target))?;
+                        if c.options
+                            .iter()
+                            .any(|o| o.value.as_ref().is_none_or(|v| v.ty() != ty))
+                        {
+                            return Err(err("E_TYPE", &at, "typed-result option values"));
+                        }
                     }
                 }
                 _ => {}
@@ -4892,6 +4948,7 @@ mod runtime_tests {
                     text: "m.label".into(),
                     visible: None,
                     enabled: None,
+                    value: None,
                 }],
                 timeout_us: None,
                 default: None,
@@ -4910,6 +4967,8 @@ mod runtime_tests {
                             choice: "m.choice".into(),
                             branches: BTreeMap::from([("no".into(), "done".into())]),
                             on_empty: "done".into(),
+                            result: None,
+                            on_cancel: None,
                         },
                         vec![],
                     ),

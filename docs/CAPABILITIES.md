@@ -103,6 +103,10 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 Cue 内可声明 `sequence` / `parallel_all` 有限组合：组合是一个自主任务，主 VM 停驻于等待、选项或内容屏障时链仍自行前进；子项经与顶层效果完全相同的派生路径获得作用域继承、所有权检查与启动时刻属性捕获。结果归并失败 > 取消 > 完成，已完成副作用不回滚，零时长链逐派生计入执行预算且无限循环不可表达。子项不得为 StagePresent/Dialogue，不得被故事按名等待或控制（Await/TaskControl 只认顶层效果 ID），嵌套深度 ≤ 8、单 Cue 叶子数 ≤ 256；能力裁剪、媒体根与激活配方遍历全树。链中途存读档/回退只续播不重播。见 [有限任务组合](COMPOSE-SEMANTICS.md)。不含剧情副作用、条件子项或来源动画序列自动映射。
 
+### story.typed-result.v1
+
+Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以 `value` 携带常量值：VM 校验后由唯一 VM 写入声明值再走分支，宿主只报告选项 id；超时按显式选择 default 提交其声明值；取消跳转 `on_cancel` 且不写任何值，未声明取消路径的交互是模态的。类型化交互携带语义选择游标（default 行，缺省首个启用行）进入快照，悬停与键盘焦点保持呈现瞬态；源与 Runtime 校验目标变量、逐选项值类型与取消目标块，恢复对 values/selected/result 声明一致性做权威校验；效果树任何位置的循环音频使自然 Finished 不可达，一律 E_INFINITE_WAIT。见 [类型化交互结果](TYPED-RESULT-SEMANTICS.md)。不含故事内文本输入、IME 或来源交互的自动映射。
+
 ### media.webp.v1 / media.mp3.v1
 
 打包媒体优化按实际发出的对象容器裁剪 `requires`：发行中存在 WebP 对象才声明 `media.webp.v1`，存在 MP3 对象才声明 `media.mp3.v1`；`--no-optimize` 或逐资产例外导致发行不含这两类对象时不声明，旧运行时仍可加载，播放器据此拒绝不支持的组合。默认构建把图像对象转有损 WebP（质量 92，alpha 通道在 ALPH 块中无损保留）、非循环音频转 MP3 CBR；尺寸、`duration_us` 和 `decoded_bytes` 描述符保持源资产值。MP3 对象带 LAME gapless 标签，原生加载器与浏览器 `decodeAudioData` 都按标签裁剪编码器延迟/填充，解码样本数与源 WAV 一致（原生加载器经测试逐样本对齐）。循环播放的音频保持 WAV（样本精确循环），MP3 不能表示的采样率、转换后不缩小的对象和字体不受影响；逐资产例外用 catalog `optimize` 字段，CLI 覆盖与转换缓存见 [编写与维护作品](AUTHORING.md)。

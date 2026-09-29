@@ -127,7 +127,7 @@ fn sequence_advances_while_the_vm_awaits_dialogue() {
 /// caps depth and total leaves.
 #[test]
 fn zero_duration_chain_chases_within_one_commit_and_pays_budget() {
-    let mut c = start(program(json!([
+    let c = start(program(json!([
         stage(),
         chain(&[move_x(10., 0), {
             let mut m = move_x(20., 0); m["id"] = json!("step2"); m
@@ -264,7 +264,7 @@ fn task_control_finishes_or_cancels_the_whole_chain() {
 /// and no second AudioStart is emitted after the restore.
 #[test]
 fn save_and_restore_mid_chain_resumes_without_replay() {
-    let mut c = start(program(json!([
+    let c = start(program(json!([
         stage(),
         chain(&[
             json!({"id":"ring","scope":"session","effect":{"type":"audio","asset":"audio.bell","bus":"bgm","looped":false}}),

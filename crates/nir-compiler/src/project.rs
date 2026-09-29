@@ -769,6 +769,27 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .functions
         .values()
         .flat_map(|f| f.blocks.values())
+        .any(|b| {
+            matches!(
+                &b.terminator,
+                Terminator::Interact {
+                    result: Some(_),
+                    ..
+                } | Terminator::Interact {
+                    on_cancel: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "story.typed-result.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
         .flat_map(|b| &b.ops)
         .any(|op| matches!(op.operation, Operation::DialogueVoice { .. }))
     {

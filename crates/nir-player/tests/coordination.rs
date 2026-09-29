@@ -57,6 +57,52 @@ fn playing() -> Player {
     ready(&mut p, c);
     p
 }
+/// A rain.json variant whose story opens on a typed interaction: the route
+/// options carry i32 values written to `picked`, and `mode` picks between
+/// plain, typed, and typed-plus-cancel destinations.
+fn typed_program(mode: &str) -> Program {
+    let mut p: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    if mode != "plain" {
+        p.requires.push("story.typed-result.v1".into());
+    }
+    p.variables.insert(
+        "picked".into(),
+        serde_json::from_value(serde_json::json!({"type":"i32","value":0})).unwrap(),
+    );
+    for (option, value) in p.choices.get_mut("route").unwrap().options.iter_mut().zip([1, 2]) {
+        option.value =
+            Some(serde_json::from_value(serde_json::json!({"type":"i32","value":value})).unwrap());
+    }
+    let f = p.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({"terminator":{
+            "type":"interact","choice":"route",
+            "branches":{"walk":"after_walk","stay":"after_stay"},"on_empty":"failed",
+            "result":(mode != "plain").then(|| "picked"),
+            "on_cancel":(mode == "cancel").then(|| "gave_up")}}))
+        .unwrap(),
+    );
+    for (block, outcome) in [("after_walk", "walk"), ("after_stay", "stay"), ("gave_up", "gave_up")] {
+        f.blocks.insert(
+            block.into(),
+            serde_json::from_value(serde_json::json!({"terminator":{"type":"end","outcome":outcome}}))
+                .unwrap(),
+        );
+    }
+    p
+}
+fn typed_playing(mode: &str) -> Player {
+    let mut p = Player::new(typed_program(mode), "release".into(), "Test".into()).unwrap();
+    let c = p.pump(vec![], 1000);
+    ready(&mut p, c);
+    let c = action(&mut p, UiAction::NewGame);
+    ready(&mut p, c);
+    assert!(p.core().state().choice.is_some(), "typed interaction pending");
+    p
+}
 #[test]
 fn stale_asset_callbacks_cannot_commit() {
     let mut p = player();
@@ -221,6 +267,95 @@ fn consecutive_rollbacks_keep_the_earlier_checkpoints() {
     assert!(p.generation.session > epoch);
     assert!(p.paused());
     assert!(p.error.is_none(), "{:?}", p.error);
+}
+
+#[test]
+fn typed_interaction_save_and_load_restores_the_selection() {
+    let mut p = typed_playing("typed");
+    let interaction = p.current_interaction();
+    // The semantic cursor moves through the same action path the engine's
+    // focus sync uses; hover and keyboard focus stay presentation-only.
+    let c = action(&mut p, UiAction::SelectChoice { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(
+        p.core().state().choice.as_ref().unwrap().selected.as_deref(),
+        Some("stay")
+    );
+    let snapshot = p.core().snapshot();
+    let digest = nir_content::digest(&serde_json::to_vec(&snapshot).unwrap());
+    let epoch = p.generation.session;
+    let c = p.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(SaveEnvelope {
+                format: 1,
+                slot: 0,
+                revision: 1,
+                snapshot,
+                digest,
+            }),
+        }],
+        1000,
+    );
+    ready(&mut p, c);
+    assert!(p.generation.session > epoch);
+    assert!(p.paused());
+    action(&mut p, UiAction::Continue);
+    // The pending interaction and its cursor restore together; restored
+    // interactions receive fresh identities on top of the session change.
+    let choice = p.core().state().choice.as_ref().unwrap();
+    assert_ne!(choice.interaction, interaction);
+    assert_eq!(choice.selected.as_deref(), Some("stay"));
+    assert_eq!(choice.result.as_deref(), Some("picked"));
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+}
+
+#[test]
+fn rollback_after_a_typed_commit_rewinds_the_write() {
+    let mut p = typed_playing("typed");
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+    // The offer checkpoint precedes the commit, so rollback re-suspends the
+    // interaction with the typed variable back at its prior value.
+    let epoch = p.generation.session;
+    let c = action(&mut p, UiAction::Rollback);
+    ready(&mut p, c);
+    assert!(p.generation.session > epoch);
+    assert!(p.paused());
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
+    assert_eq!(p.core().state().outcome, None);
+    let choice = p.core().state().choice.as_ref().expect("interaction re-offered");
+    assert_eq!(choice.selected.as_deref(), Some("walk"));
+    action(&mut p, UiAction::Continue);
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+}
+
+#[test]
+fn player_cancel_branches_without_a_typed_write() {
+    let mut p = typed_playing("cancel");
+    let before = p.core().state().last_input;
+    let c = action(&mut p, UiAction::CancelChoice);
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("gave_up"));
+    assert_eq!(p.core().state().last_input, before + 1);
+
+    // Without a declared cancel target the affordance is refused: the
+    // interaction stays pending and nothing is written.
+    let mut p = typed_playing("typed");
+    let c = action(&mut p, UiAction::CancelChoice);
+    ready(&mut p, c);
+    assert!(p.core().state().choice.is_some());
+    assert_eq!(p.core().state().outcome, None);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
 }
 
 #[test]
@@ -1002,6 +1137,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             id: "walk".into(),
             label: "Walk".into(),
             enabled: true,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1010,6 +1146,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             id: "stay".into(),
             label: "Stay".into(),
             enabled: false,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1245,6 +1382,7 @@ fn measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions() {
                 format!("{i} 沿着河边，一起走回去。留在车站，读完这封信。")
             },
             enabled: i != 7,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1928,6 +2066,7 @@ fn shared_primary_router_obeys_available_title_actions_and_choice_focus() {
         id: "one".into(),
         label: "one".into(),
         enabled: true,
+        selected: false,
         locale: "en".into(),
         font_plan_digest: String::new(),
         font_assets: vec![],

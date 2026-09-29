@@ -1144,6 +1144,8 @@ fn prefetch_prediction_stops_at_uncertain_or_terminal_control_flow() {
                 ("stay".into(), "stay_begin".into()),
             ]),
             on_empty: "failed".into(),
+            result: None,
+            on_cancel: None,
         },
     ] {
         assert!(prediction_fixture(1, Some(stop))

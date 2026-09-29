@@ -595,3 +595,16 @@ P4.2 完成；P5（Sequence/ParallelAll 组合）待实施。证据：reports/ni
 - 浏览器验收（端口 4222，compose.spec.js 1 项 + 整套通过）：真实 Web 播放器中主 VM 等待对白揭示时，先淡面板（background_opacity→0.2）再淡正文（text_opacity→0.35）的序列链自行按序走完两段，无页面错误（batch-50-browser-compose.log）。SDK 已用修复后的编译器重建。
 
 P5.1 完成；P5.2（故事交互与类型化结果）待实施。证据：reports/nir-next/batch-50-xtask-test.log、batch-50-xtask-sdk.log、batch-50-core.log、batch-50-player.log、batch-50-browser-compose.log。契约见 COMPOSE-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 51：故事交互与类型化结果（P5.2）
+
+- 新增 `story.typed-result.v1`：Interact 扩展 `result`（目标变量）与 `on_cancel`（取消路径块），选项以 `value` 携带常量值。值由唯一 VM 写入——宿主只报告选项 id，`OfferedChoice.values` 是呈现快照，提交以声明为准；超时按显式选择 default 行提交其声明值。取消是完整输入（last_input、Checkpoint、`input:cancel` 痕迹），跳转 `on_cancel` 且不写任何值；未声明取消路径的交互是模态的，派发点复查即拒绝。
+- 语义选择游标：类型化交互携带 `OfferedChoice.selected`（进入交互时为 default 行，缺省首个启用行），进入 Core 快照并随恢复返回；悬停与键盘焦点保持呈现瞬态、永不进快照。`SelectChoice` 是对挂起交互的观察——无输入身份、不推进 last_input、无检查点、序列号被忽略，未知/陈旧/禁用一律忽略。引擎把落在选项行上的键盘焦点经 `sync_focus_selection` 以普通动作路径（`AppEvent::Action`，序列 0）同步为游标观察。
+- 校验（源与 Runtime 共用 + 恢复权威校验）：目标变量存在（E_VARIABLE）、逐选项带值且类型匹配（E_TYPE）、on_cancel 命名同函数块（E_BLOCK）、能力门控 E_CAPABILITY（编译器按实际使用裁剪）；恢复时 values 逐项等于声明、selected 命名存活启用行、result/on_cancel 与规范终结符一致、普通交互不携带结果状态，损坏即拒绝。恢复的交互获得全新交互身份（含会话轮换）。
+- E_INFINITE_WAIT 推广：定义的效果树内任何位置出现循环音频叶子都使自然 Finished 不可达（序列停在该叶子、ParallelAll 永远等不齐），包级与源级两站点对整棵效果树扫描——直接 Await 循环音频、sequence/parallel_all 内嵌循环子项一律诊断，非循环音频保持可等待。
+- 宿主集成：`UiAction::SelectChoice`/`CancelChoice`；Web host 的 Escape 在可取消交互上优先取消，紧凑状态暴露 `choice_cancellable`；桌面 Escape 路径与呈现层取消出口据同一状态渲染。
+- Core 契约 8 项（typed_result_contract.rs）：提交先写值后分支、普通交互不携带结果状态、取消无写入且陈旧取消拒绝、游标观察与快照恢复零进度、超时提交 default 值、恢复七类篡改拒绝、源校验五类拒绝、循环音频三形态 E_INFINITE_WAIT（含非循环反例）。Player 协调 3 项：交互中途存读档恢复挂起交互与游标（恢复身份轮换用 assert_ne 断言）、类型化提交后回退撤销写入并重新挂起、取消分支无写入且未声明路径时拒绝（batch-51-core.log、batch-51-player.log）。
+- 浏览器验收（端口 4223，typed-result.spec.js 4 项 + 整套通过）：选项声明值经 Switch 驱动不同对白、键盘焦点移动语义游标且 sequence/interaction 不变、Escape 经声明路径取消且 picked 保持 0、交互中途存读档恢复游标后照常提交（batch-51-browser-typed.log）。SDK 已重建并核对夹具 wasm 与 dist/sdk 哈希一致。
+- P5 关卡核对：并行链中途局部状态改变后存读档/回退不重播（批次 50+51 测试覆盖）；无限循环媒体与 All 的不可完成组合被诊断（本批 E_INFINITE_WAIT）。“第二来源案例复用相同核心”未满足——LiveNovel 导入器尚无 Interact/选项到类型化结果核心的映射（import/*.rs 无相关引用），留待导入器批次。
+
+P5.2 完成；P5 关卡三条中“第二来源复用相同核心”未满足（导入器无 Interact 映射，留待后续批次）。证据：reports/nir-next/batch-51-xtask-test.log、batch-51-xtask-sdk.log、batch-51-core.log、batch-51-player.log、batch-51-browser-typed.log。契约见 TYPED-RESULT-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。

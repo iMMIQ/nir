@@ -2821,6 +2821,53 @@ impl Player {
                     )?;
                 }
             }
+            UiAction::CancelChoice => {
+                // Only the pending interaction's own declaration authorizes a
+                // cancel; hosts offer the affordance from the same state.
+                if self.screen == Screen::Story
+                    && !self.paused()
+                    && self
+                        .core
+                        .state()
+                        .choice
+                        .as_ref()
+                        .is_some_and(|c| c.interaction == interaction && c.on_cancel.is_some())
+                {
+                    self.skip = false;
+                    self.held_skip = false;
+                    self.step(
+                        CoreInput::CancelChoice {
+                            interaction,
+                            sequence,
+                        },
+                        budget,
+                    )?;
+                }
+            }
+            UiAction::SelectChoice { option } => {
+                // A focus-following cursor move on a typed-result interaction.
+                // It observes a suspended interaction, so sequence identity is
+                // irrelevant by construction.
+                if self.screen == Screen::Story && !self.paused() {
+                    let typed = self
+                        .core
+                        .state()
+                        .choice
+                        .as_ref()
+                        .filter(|c| c.interaction == interaction && c.result.is_some())
+                        .map(|c| c.interaction);
+                    if let Some(interaction) = typed {
+                        self.step(
+                            CoreInput::SelectChoice {
+                                interaction,
+                                option,
+                                sequence: 0,
+                            },
+                            budget,
+                        )?;
+                    }
+                }
+            }
             UiAction::Continue => {
                 self.pauses.remove("restored");
                 if self.prepare.is_none() {
@@ -3385,6 +3432,7 @@ impl Player {
                             id: o.id.clone(),
                             label: o.label.clone(),
                             enabled: o.enabled,
+                            selected: c.selected.as_deref() == Some(o.id.as_str()),
                             locale: c.locale.clone(),
                             font_plan_digest: c.font_plan_digest.clone(),
                             font_assets: self.core.program().locale_config.text[&c.locale]
@@ -3394,6 +3442,11 @@ impl Player {
                         .collect()
                 })
                 .unwrap_or_default(),
+            choice_cancellable: c
+                .state()
+                .choice
+                .as_ref()
+                .is_some_and(|c| c.on_cancel.is_some()),
             prefs: self.preferences.clone(),
             ui_locale: ui_locale.into(),
             ui_fonts: ui_plan.fonts.clone(),
