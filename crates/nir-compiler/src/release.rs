@@ -53,6 +53,13 @@ pub fn sdk_manifest(sdk: &Path) -> Result<SdkManifest> {
             nir_content::digest(&fs::read(native)?),
         );
     }
+    let native = sdk.join("android/lib/arm64-v8a/libplayer.so");
+    if native.try_exists()? {
+        files.insert(
+            "android/lib/arm64-v8a/libplayer.so".into(),
+            nir_content::digest(&fs::read(native)?),
+        );
+    }
     Ok(SdkManifest {
         format: 1,
         compiler_version: env!("CARGO_PKG_VERSION").into(),
@@ -1397,14 +1404,155 @@ pub fn build_linux(
         },
     )
 }
-fn build_native(
+/// Deterministic `data/<dir>/<file>` walk in sorted name order.
+fn collect_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<(String, nir_apk::EntrySource)>,
+) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if e.file_type()?.is_dir() {
+            collect_files(&e.path(), &format!("{prefix}{name}/"), out)?;
+        } else {
+            out.push((
+                format!("{prefix}{name}"),
+                nir_apk::EntrySource::File(e.path()),
+            ));
+        }
+    }
+    Ok(())
+}
+/// Lower through the web path, then package the player and the content graph
+/// into a signed APK. No Java, Gradle or Android SDK is needed at build time;
+/// the manifest, zip and APK Signature Scheme v2 block all come from
+/// `nir-apk`.
+pub fn build_android(
     root: &Path,
     sdk: &Path,
     out: &Path,
     profile: &str,
     locked: bool,
-    target: &NativeTarget,
 ) -> Result<BuildReport> {
+    let target = NativeTarget {
+        player: "android/lib/arm64-v8a/libplayer.so",
+        code: "E_SDK_ANDROID",
+        host: "an NDK-equipped host",
+        format: "ELF",
+        magic: b"\x7fELF",
+        intermediate: "android-content",
+        binary: "Game.apk",
+        readme: "NIR Android native player\nInstall Game.apk on an Android 8.0+ arm64 device (adb install -r Game.apk, or open the file on the device and allow installs from this source).\nA Vulkan capable driver is required; no Java runtime, browser or network connection is used.\nTouch: tap to advance and select; back gesture or button: menu/close.\nGame data ships inside the APK and is extracted to the app's private storage on first launch.\nSaves: Android/data/<package>/files/NIR/games/<game-id-hash>/<profile>/releases/<release>/ inside the app's external storage, visible over USB.\nExported saves land in Android/data/<package>/files/exports/; import is not available on this platform.\nReinstalling a newer build over an installed one (adb install -r) keeps saves; uninstalling deletes them.\nKeep config/android-signing.pem: Android refuses to update an app signed with a different key.\n".into(),
+        report: "android-build.json",
+    };
+    let bundle = native_release(root, sdk, profile, locked, &target)?;
+    // The signing identity is project state, not build output: generate once,
+    // then reuse forever. Losing it strands installed copies (updates must be
+    // signed with the same key), so it lives under config/ beside game.toml.
+    // NIR_ANDROID_SIGNING_SEED overrides the file for reproducible sample
+    // builds (CI pins it so published sample APKs stay byte-identical and
+    // update-compatible); its holder can sign for the sample, which is
+    // acceptable only for throwaway example identities.
+    let key_path = root.join("config/android-signing.pem");
+    let key = if let Ok(seed) = std::env::var("NIR_ANDROID_SIGNING_SEED") {
+        nir_apk::key::SigningIdentity::from_seed_phrase(&seed)
+            .context("E_SIGNING_KEY: NIR_ANDROID_SIGNING_SEED is not usable")?
+    } else if key_path.exists() {
+        nir_apk::key::SigningIdentity::load(&key_path)
+            .context("E_SIGNING_KEY: config/android-signing.pem is not a valid signing identity")?
+    } else {
+        let key = nir_apk::key::SigningIdentity::generate()?;
+        fs::create_dir_all(key_path.parent().unwrap())?;
+        // Unique temporary name plus rename, so a concurrent or interrupted
+        // first save cannot leave a torn identity behind; re-loading after
+        // the rename signs with whatever actually won on disk.
+        let temporary = key_path.with_extension(format!("pem.{}.next", std::process::id()));
+        key.save(&temporary)
+            .context("E_SIGNING_KEY: could not write config/android-signing.pem")?;
+        fs::rename(&temporary, &key_path)
+            .context("E_SIGNING_KEY: could not write config/android-signing.pem")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                .context("E_SIGNING_KEY: could not restrict config/android-signing.pem")?;
+        }
+        nir_apk::key::SigningIdentity::load(&key_path)
+            .context("E_SIGNING_KEY: could not reload config/android-signing.pem")?
+    };
+    // Stage the exact desktop data layout, then zip it as APK assets; the
+    // player extracts assets/data/** on first launch and verifies digests.
+    // The staging tree is rebuilt from scratch so objects dropped from the
+    // game cannot linger from an earlier build (the walk below packages
+    // whatever is on disk, not the manifest).
+    let stage = root.join(".nir/android-content/package");
+    if stage.try_exists()? {
+        fs::remove_dir_all(&stage)?;
+    }
+    write_native_data(&bundle, &stage.join("data"))?;
+    // The library streams from the SDK copy (page-aligned for the loader);
+    // its digest was checked against the manifest above.
+    let mut entries = vec![(
+        "lib/arm64-v8a/libplayer.so".to_owned(),
+        nir_apk::EntrySource::File(sdk.join(target.player)),
+    )];
+    collect_files(&stage, "assets/", &mut entries)?;
+    // A human-readable notice beside the hashed object copy, so a shared APK
+    // carries its license text without unpacking the object graph.
+    entries.push((
+        "assets/NOTICE.txt".to_owned(),
+        nir_apk::EntrySource::File(bundle.intermediate.join("NOTICE.txt")),
+    ));
+    // Package name is derived from the game id so rebuilds update in place
+    // and distinct games never collide; the `g` prefix keeps the segment
+    // leading-letter (hex may start with a digit). min/target SDK match the
+    // player's AAudio (26) and the no-Java NativeActivity layout (29).
+    let manifest = nir_apk::ManifestSpec {
+        package: format!(
+            "one.nir.g{}",
+            &nir_content::digest(bundle.manifest.game_id.as_bytes())[..15]
+        ),
+        version_code: 1,
+        version_name: bundle.manifest.version.clone(),
+        label: bundle.manifest.title.clone(),
+        min_sdk: 26,
+        target_sdk: 29,
+        lib_name: "player".to_owned(),
+    };
+    nir_apk::build_apk(&out.join("Game.apk"), &manifest, &entries, &key)?;
+    fs::copy(
+        bundle.intermediate.join("NOTICE.txt"),
+        out.join("NOTICE.txt"),
+    )?;
+    fs::write(out.join("README.txt"), target.readme.clone())?;
+    fs::write(
+        root.join("reports").join(target.report),
+        serde_json::to_vec_pretty(&bundle.report)?,
+    )?;
+    Ok(bundle.report)
+}
+/// Shared prefix of every native build: read and sanity-check the platform
+/// player, lower the content through the web path into the platform's
+/// intermediate directory, strip the web-only engine objects, and derive the
+/// native release manifest plus the adjusted report the caller completes.
+struct NativeBundle {
+    /// The platform's intermediate web-build directory under `.nir/`.
+    intermediate: PathBuf,
+    manifest: NativeRelease,
+    report: BuildReport,
+    player: Vec<u8>,
+    /// Serialized `NativeRelease`; its digest becomes `report.release`.
+    release_bytes: Vec<u8>,
+}
+fn native_release(
+    root: &Path,
+    sdk: &Path,
+    profile: &str,
+    locked: bool,
+    target: &NativeTarget,
+) -> Result<NativeBundle> {
     let player = fs::read(sdk.join(target.player)).with_context(|| {
         format!(
             "{}: {} player missing; build the SDK on {}",
@@ -1444,24 +1592,52 @@ fn build_native(
         program: web.program,
         objects,
     };
-    let data = out.join("data");
-    fs::create_dir_all(data.join("objects"))?;
-    fs::create_dir_all(data.join("releases"))?;
-    for (id, object) in &manifest.objects {
-        let bytes = fs::read(intermediate.join(&object.path))?;
-        nir_content::verify(&bytes, id)?;
-        fs::write(data.join(&object.path), bytes)?;
-    }
-    let bytes = serde_json::to_vec(&manifest)?;
-    report.release = nir_content::digest(&bytes);
+    let release_bytes = serde_json::to_vec(&manifest)?;
+    report.release = nir_content::digest(&release_bytes);
     report.objects = manifest.objects.len();
     report.total_bytes =
         manifest.objects.values().map(|o| o.bytes).sum::<u64>() + player.len() as u64;
+    Ok(NativeBundle {
+        intermediate,
+        manifest,
+        report,
+        player,
+        release_bytes,
+    })
+}
+/// Writes the shared native data tree (objects, release manifests, pointer)
+/// into `data/`; both the desktop folders and the Android APK staging area
+/// lay the content out exactly this way.
+fn write_native_data(bundle: &NativeBundle, data: &Path) -> Result<()> {
+    fs::create_dir_all(data.join("objects"))?;
+    fs::create_dir_all(data.join("releases"))?;
+    for (id, object) in &bundle.manifest.objects {
+        let bytes = fs::read(bundle.intermediate.join(&object.path))?;
+        nir_content::verify(&bytes, id)?;
+        fs::write(data.join(&object.path), bytes)?;
+    }
     fs::write(
-        data.join(format!("releases/{}.json", report.release)),
-        bytes,
+        data.join(format!("releases/{}.json", bundle.report.release)),
+        &bundle.release_bytes,
     )?;
-    fs::write(out.join(format!("{}.next", target.binary)), &player)?;
+    fs::write(
+        data.join("release.txt.next"),
+        format!("{}\n", bundle.report.release),
+    )?;
+    fs::rename(data.join("release.txt.next"), data.join("release.txt"))?;
+    Ok(())
+}
+fn build_native(
+    root: &Path,
+    sdk: &Path,
+    out: &Path,
+    profile: &str,
+    locked: bool,
+    target: &NativeTarget,
+) -> Result<BuildReport> {
+    let bundle = native_release(root, sdk, profile, locked, target)?;
+    write_native_data(&bundle, &out.join("data"))?;
+    fs::write(out.join(format!("{}.next", target.binary)), &bundle.player)?;
     fs::rename(
         out.join(format!("{}.next", target.binary)),
         out.join(target.binary),
@@ -1474,18 +1650,16 @@ fn build_native(
         fs::set_permissions(out.join(target.binary), fs::Permissions::from_mode(0o755))
             .with_context(|| format!("{}: mark {} executable", target.code, target.binary))?;
     }
-    fs::copy(intermediate.join("NOTICE.txt"), out.join("NOTICE.txt"))?;
+    fs::copy(
+        bundle.intermediate.join("NOTICE.txt"),
+        out.join("NOTICE.txt"),
+    )?;
     fs::write(out.join("README.txt"), target.readme.clone())?;
     fs::write(
         root.join("reports").join(target.report),
-        serde_json::to_vec_pretty(&report)?,
+        serde_json::to_vec_pretty(&bundle.report)?,
     )?;
-    fs::write(
-        data.join("release.txt.next"),
-        format!("{}\n", report.release),
-    )?;
-    fs::rename(data.join("release.txt.next"), data.join("release.txt"))?;
-    Ok(report)
+    Ok(bundle.report)
 }
 
 pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
@@ -1503,6 +1677,8 @@ pub fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
             ".git",
             "target",
             "node_modules",
+            // Machine-local signing identity, never redistributed in templates.
+            "android-signing.pem",
         ]
         .iter()
         .any(|v| name == *v)

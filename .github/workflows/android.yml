@@ -1,0 +1,65 @@
+name: Native Android player
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy --target wasm32-unknown-unknown --target aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Native build prerequisites
+        run: |
+          sudo apt-get update
+          # The SDK also builds the Linux player on this host (alsa headers at
+          # build time); the Android player cross-compiles through the NDK.
+          sudo apt-get install -y g++ libclang-dev libasound2-dev openjdk-17-jre-headless
+      - name: Locate NDK and build tools
+        run: |
+          ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort | tail -1)
+          if [ -z "$ndk" ]; then
+            echo "E_NDK: no NDK under $ANDROID_SDK_ROOT/ndk; install one (r27c or newer)" >&2
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          build_tools=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort | tail -1)
+          echo "APKSIGNER=$build_tools/apksigner" >> "$GITHUB_ENV"
+          echo "AAPT2=$build_tools/aapt2" >> "$GITHUB_ENV"
+          "$build_tools/aapt2" version
+      # fmt and the host test suite run in the Engine quality workflow; this
+      # job verifies the android-only cfg surface and the APK packaging, which
+      # only compile for the android target.
+      - name: Clippy for the android target
+        run: cargo clippy --locked -p player-desktop -p player-android --target aarch64-linux-android --all-targets -- -D warnings
+      - name: Build SDK
+        run: |
+          if [ "$("$HOME/.cargo/bin/wasm-bindgen" --version 2>/dev/null || true)" != 'wasm-bindgen 0.2.100' ]; then
+            cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
+          fi
+          cargo xtask sdk
+          test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
+      - name: Package independent sample
+        run: |
+          rm -rf target/android-sample
+          ./dist/novelc init target/android-sample
+          ./dist/novelc -p target/android-sample resolve
+          ./dist/novelc -p target/android-sample build --target android --locked
+          python3 scripts/verify_android.py target/android-sample/dist/full/android
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: native-android-evidence
+          path: |
+            reports/android/
+            target/android-sample/dist/full/android/
+          retention-days: 7

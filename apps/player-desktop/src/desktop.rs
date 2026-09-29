@@ -1,5 +1,6 @@
 use crate::audio_envelope::{Envelope, EnvelopeSamples, Ramp};
 use crate::audio_source::AudioBuffer;
+#[cfg(any(windows, target_os = "linux"))]
 use crate::dialog::{self, DialogOutcome, DialogTask};
 use crate::io_worker::{IoReply, IoRequest, IoWorker};
 use crate::loader::{AssetData, Job, Loaded, Loader};
@@ -17,11 +18,15 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[cfg(any(windows, target_os = "linux"))]
+use winit::event_loop::EventLoop;
+#[cfg(target_os = "android")]
+use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::{Fullscreen, Window, WindowId},
 };
@@ -65,8 +70,14 @@ struct Voice {
     asset: String,
 }
 struct Runtime {
-    window: Arc<Window>,
+    /// None only while the window is destroyed (Android suspend); desktop
+    /// hosts keep the same window for the process lifetime.
+    window: Option<Arc<Window>>,
     engine: Engine,
+    /// The instance the renderer's device lives in; it must also create any
+    /// replacement surface (a fresh instance cannot configure against the
+    /// live device). Kept for the process lifetime.
+    instance: wgpu::Instance,
     storage: Arc<Storage>,
     io: IoWorker,
     loader: Loader,
@@ -74,6 +85,7 @@ struct Runtime {
     uploads: VecDeque<PendingUpload>,
     audio: Option<OutputStream>,
     /// A running file dialog's outcome channel; input is gated while set.
+    #[cfg(any(windows, target_os = "linux"))]
     dialog: Option<std::sync::mpsc::Receiver<DialogOutcome>>,
     buffers: BTreeMap<String, AudioBuffer>,
     voices: BTreeMap<(TimeDomain, u32, u32), Voice>,
@@ -86,9 +98,15 @@ struct Runtime {
     modifiers: ModifiersState,
     pointer_down: Option<PendingPointer>,
     bar_pointer: bool,
+    /// The finger driving the current touch sequence; secondary contacts are
+    /// ignored because the engine tracks a single pointer.
+    touch_id: Option<u64>,
     focused: bool,
     occluded: bool,
     audio_starts: usize,
+    /// Where `Export` replies land on Android, which has no file picker.
+    #[cfg(target_os = "android")]
+    exports: PathBuf,
 }
 impl Runtime {
     fn new(
@@ -96,6 +114,7 @@ impl Runtime {
         bundle: Arc<Bundle>,
         data: PathBuf,
         exe_check: Option<std::thread::JoinHandle<Result<()>>>,
+        #[cfg(target_os = "android")] exports: PathBuf,
     ) -> Result<Self> {
         let storage = Arc::new(Storage::open(
             &data,
@@ -103,7 +122,7 @@ impl Runtime {
             &bundle.manifest.profile,
             &bundle.release,
         )?);
-        let renderer = create_renderer(window.clone())?;
+        let (renderer, instance) = create_renderer(window.clone())?;
         // The whole-executable digest was hashed on a startup thread while the
         // renderer initialized; gate runtime construction on its verdict here.
         if let Some(handle) = exe_check {
@@ -127,14 +146,16 @@ impl Runtime {
         engine_result(engine.event(AppEvent::Profile(storage.profile()?)))?;
         let loader = Loader::new(bundle.clone());
         let mut runtime = Self {
-            window,
+            window: Some(window),
             engine,
+            instance,
             io: IoWorker::new(storage.clone()),
             storage,
             loader,
             jobs: VecDeque::new(),
             uploads: VecDeque::new(),
             audio: OutputStreamBuilder::open_default_stream().ok(),
+            #[cfg(any(windows, target_os = "linux"))]
             dialog: None,
             buffers: BTreeMap::new(),
             voices: BTreeMap::new(),
@@ -150,9 +171,12 @@ impl Runtime {
             modifiers: ModifiersState::default(),
             pointer_down: None,
             bar_pointer: false,
+            touch_id: None,
             focused: true,
             occluded: false,
             audio_starts: 0,
+            #[cfg(target_os = "android")]
+            exports,
         };
         runtime.commands()?;
         Ok(runtime)
@@ -193,11 +217,48 @@ impl Runtime {
         self.sample_audio_positions()?;
         engine_result(self.engine.input(action, self.sequence))?;
         self.commands()?;
-        self.window.request_redraw();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        Ok(())
+    }
+    fn dialog_open(&self) -> bool {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.dialog.is_some()
+        }
+        #[cfg(target_os = "android")]
+        {
+            false
+        }
+    }
+    /// Detaches a window that the system is about to destroy (Android
+    /// suspend): the presentation surface goes first so the renderer never
+    /// outlives the raw window handle, then the window reference itself.
+    fn suspend_window(&mut self) {
+        self.engine.release_surface();
+        self.window = None;
+        self.touch_id = None;
+        self.pointer_down = None;
+        self.bar_pointer = false;
+    }
+    /// Attaches the window recreated after a resume and rebinds its surface
+    /// onto the live device; no asset replay happens, so the story, textures
+    /// and audio continue where they left off.
+    fn resume_window(&mut self, window: Arc<Window>) -> Result<()> {
+        // The surface must come from the instance that owns the live device;
+        // a fresh instance would configure against a foreign device id.
+        let surface = create_surface_on(&self.instance, window.clone())?;
+        engine_result(self.engine.rebind_surface(surface))?;
+        self.window = Some(window);
+        // A frozen process would otherwise feed one clamped-but-large elapsed
+        // into the story clock on the first turn after resume.
+        self.last = Instant::now();
         Ok(())
     }
     /// Opens a file dialog on its own thread; one dialog at a time, and
     /// while it runs the owner gates input and pauses the story clock.
+    #[cfg(any(windows, target_os = "linux"))]
     fn open_dialog(&mut self, task: DialogTask) -> Result<()> {
         ensure!(
             self.dialog.is_none(),
@@ -395,11 +456,34 @@ impl Runtime {
                         self.io.submit(IoRequest::Load { slot, job })?
                     }
                     AppCommand::ListSaves => self.io.submit(IoRequest::List)?,
+                    #[cfg(any(windows, target_os = "linux"))]
                     AppCommand::Export { json } => {
                         self.open_dialog(DialogTask::Export { json })?;
                     }
+                    #[cfg(any(windows, target_os = "linux"))]
                     AppCommand::Import => {
                         self.open_dialog(DialogTask::Import)?;
+                    }
+                    #[cfg(target_os = "android")]
+                    AppCommand::Export { json } => {
+                        // No system picker on Android: the export lands in the
+                        // app's external files dir, reachable over USB/adb and
+                        // from desktop file managers while the device is
+                        // connected. The timestamp keeps repeated exports.
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        atomic_write(
+                            &self.exports.join(format!("nir-export-{stamp}.json")),
+                            json.as_bytes(),
+                        )?;
+                    }
+                    #[cfg(target_os = "android")]
+                    AppCommand::Import => {
+                        engine_result(self.engine.event(AppEvent::LoadFailed(
+                            "E_DIALOG: import is unavailable on this platform".into(),
+                        )))?;
                     }
                     AppCommand::PromoteContent { request, .. } => {
                         if let Some(at) = self
@@ -429,10 +513,13 @@ impl Runtime {
         self.engine.begin_turn();
         if self.engine.device_lost() {
             engine_result(self.engine.begin_recovery())?;
-            engine_result(
-                self.engine
-                    .replace_gpu(create_renderer(self.window.clone())?),
-            )?;
+            let window = self
+                .window
+                .clone()
+                .context("E_WINDOW: no window to recover")?;
+            let (renderer, instance) = create_renderer(window)?;
+            engine_result(self.engine.replace_gpu(renderer))?;
+            self.instance = instance;
         }
         // One storage reply per turn, before new commands: the events land
         // in the engine the turn after the command that issued them.
@@ -443,6 +530,7 @@ impl Runtime {
                 IoReply::Fatal(message) => bail!(message),
             }
         }
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(dialog) = &mut self.dialog {
             match dialog.try_recv() {
                 Ok(DialogOutcome::Exported(Ok(()))) | Ok(DialogOutcome::ImportCancelled) => {
@@ -549,7 +637,7 @@ impl Runtime {
         let now = Instant::now();
         // A file dialog pauses the story clock for the same reason the
         // blocking dialog froze it: nothing behind the picker may advance.
-        if !self.hidden && self.dialog.is_none() && self.engine.needs_clock() {
+        if !self.hidden && !self.dialog_open() && self.engine.needs_clock() {
             let elapsed = now
                 .duration_since(self.last)
                 .as_micros()
@@ -580,14 +668,16 @@ impl Runtime {
         let mut retained: BTreeSet<String> = serde_json::from_str(&self.engine.retained())?;
         retained.extend(self.voices.values().map(|v| v.asset.clone()));
         self.buffers.retain(|id, _| retained.contains(id));
-        let size = self.window.inner_size();
-        if !self.hidden && size.width > 0 && size.height > 0 {
-            let scale = self.window.scale_factor().clamp(1., 2.) as f32;
-            engine_result(self.engine.draw(
-                size.width as f32 / scale,
-                size.height as f32 / scale,
-                scale,
-            ))?;
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            if !self.hidden && size.width > 0 && size.height > 0 {
+                let scale = window.scale_factor().clamp(1., 2.) as f32;
+                engine_result(self.engine.draw(
+                    size.width as f32 / scale,
+                    size.height as f32 / scale,
+                    scale,
+                ))?;
+            }
         }
         if let Some(error) = self.engine.gpu_error() {
             bail!("E_GPU: {error}");
@@ -595,7 +685,7 @@ impl Runtime {
         Ok(())
     }
     fn busy(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog_open()
             || self.io.outstanding() > 0
             || self.loader.outstanding() > 0
             || !self.uploads.is_empty()
@@ -605,28 +695,55 @@ impl Runtime {
             || !self.voices.is_empty()
     }
 }
-fn create_renderer(window: Arc<Window>) -> Result<Renderer> {
+/// Vulkan on Android; the driver coverage matches the desktop native ports
+/// (no GLES fallback backend exists yet).
+#[cfg(target_os = "android")]
+fn surface_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN
+}
+#[cfg(windows)]
+fn surface_backends() -> wgpu::Backends {
+    wgpu::Backends::DX12
+}
+#[cfg(target_os = "linux")]
+fn surface_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN
+}
+/// Creates the presentation surface on `instance`; the instance outlives the
+/// call so the surface and the device it is configured with always share one
+/// wgpu instance.
+fn create_surface_on(
+    instance: &wgpu::Instance,
+    window: Arc<Window>,
+) -> Result<nir_render_wgpu::wgpu::Surface<'static>> {
+    Ok(instance.create_surface(window)?)
+}
+fn create_renderer(window: Arc<Window>) -> Result<(Renderer, wgpu::Instance)> {
     let size = window.inner_size();
     #[cfg(windows)]
-    let (backends, backend) = (wgpu::Backends::DX12, RendererBackend::Dx12);
-    #[cfg(target_os = "linux")]
-    let (backends, backend) = (wgpu::Backends::VULKAN, RendererBackend::Vulkan);
+    let backend = RendererBackend::Dx12;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let backend = RendererBackend::Vulkan;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends,
+        backends: surface_backends(),
         ..Default::default()
     });
-    let surface = instance.create_surface(window)?;
-    Ok(pollster::block_on(Renderer::new(
+    let surface = create_surface_on(&instance, window)?;
+    let renderer = pollster::block_on(Renderer::new(
         &instance,
         surface,
         size.width.max(1),
         size.height.max(1),
         backend,
-    ))?)
+    ))?;
+    Ok((renderer, instance))
 }
 struct App {
     bundle: Arc<Bundle>,
     data: PathBuf,
+    /// Android export target (the app's external files dir).
+    #[cfg(target_os = "android")]
+    exports: PathBuf,
     runtime: Option<Runtime>,
     error: Option<anyhow::Error>,
     smoke: Option<PathBuf>,
@@ -639,6 +756,14 @@ struct App {
     /// Set when a return-to-title ending restarted the story: the save cycle
     /// must run at the first dialogue because saves from Title are refused.
     save_at_dialogue: bool,
+}
+/// Desktop sets a sensible logical size; Android ignores size/title and gets
+/// the fullscreen system window either way.
+fn window_attributes(title: &str, hidden: bool) -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(1024., 768.))
+        .with_visible(!hidden)
 }
 impl App {
     fn update(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -744,23 +869,34 @@ impl App {
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.runtime.is_some() {
+        if let Some(runtime) = &mut self.runtime {
+            // Android resume: the window was destroyed at suspend, so a fresh
+            // one is created and its surface rebound onto the live device.
+            let result =
+                (|| -> Result<()> {
+                    runtime.resume_window(Arc::new(event_loop.create_window(window_attributes(
+                        &self.bundle.manifest.title,
+                        self.hidden,
+                    ))?))
+                })();
+            if let Err(error) = result {
+                self.failed(event_loop, error);
+            }
             return;
         }
         let result = (|| -> Result<Runtime> {
             let window = Arc::new(
-                event_loop.create_window(
-                    Window::default_attributes()
-                        .with_title(&self.bundle.manifest.title)
-                        .with_inner_size(LogicalSize::new(1024., 768.))
-                        .with_visible(!self.hidden),
-                )?,
+                event_loop
+                    .create_window(window_attributes(&self.bundle.manifest.title, self.hidden))?,
             );
+            let data = self.data.clone();
             Runtime::new(
                 window,
                 self.bundle.clone(),
-                self.data.clone(),
+                data,
                 self.exe_check.take(),
+                #[cfg(target_os = "android")]
+                self.exports.clone(),
             )
         })();
         match result {
@@ -768,13 +904,41 @@ impl ApplicationHandler for App {
             Err(error) => self.failed(event_loop, error),
         }
     }
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(runtime) = &mut self.runtime else {
+            return;
+        };
+        // The process may be killed any time after this returns: give the
+        // storage worker a bounded window to land pending saves before the
+        // surface and window go away. Replies are pumped into the engine so a
+        // load completing here is not lost; nothing draws while suspended.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.io.outstanding() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            if let Some(reply) = runtime.io.drain() {
+                match reply {
+                    IoReply::Event(event) => {
+                        if engine_result(runtime.engine.event(event)).is_err() {
+                            break;
+                        }
+                    }
+                    IoReply::Done => {}
+                    IoReply::Fatal(_) => break,
+                }
+            }
+        }
+        runtime.suspend_window();
+    }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(runtime) = &mut self.runtime else {
             return;
         };
+        let Some(window) = runtime.window.clone() else {
+            return;
+        };
         // While a file dialog is open the game behind it is inert: input is
         // gated so engine state cannot change behind the modal picker.
-        let dialog_open = runtime.dialog.is_some();
+        let dialog_open = runtime.dialog_open();
         let result = (|| -> Result<()> {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
@@ -804,7 +968,7 @@ impl ApplicationHandler for App {
                     runtime.commands()?;
                 }
                 WindowEvent::CursorMoved { position, .. } if !dialog_open => {
-                    let scale = runtime.window.scale_factor().clamp(1., 2.) as f32;
+                    let scale = window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                     if runtime.bar_pointer {
                         engine_result(runtime.engine.pointer_gesture(
@@ -904,6 +1068,124 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // Touch drives the same pointer semantics as the mouse arms:
+                // Started/Ended replay the press/release pairing (including
+                // the movement slop and input-identity checks), Moved feeds
+                // the scroll-bar drag or hover, Cancelled aborts. Android
+                // delivers only Touch events (physical pixels); desktop
+                // touchscreens route here as well.
+                WindowEvent::Touch(touch) if !dialog_open => {
+                    let scale = window.scale_factor().clamp(1., 2.) as f32;
+                    runtime.cursor = (
+                        touch.location.x as f32 / scale,
+                        touch.location.y as f32 / scale,
+                    );
+                    // Single-pointer engine: the first finger owns the
+                    // gesture until it ends; later contacts are ignored.
+                    match touch.phase {
+                        TouchPhase::Started => {
+                            if runtime.touch_id.is_some() {
+                                return Ok(());
+                            }
+                            runtime.touch_id = Some(touch.id);
+                            runtime.engine.focus_control(None);
+                            if engine_result(runtime.engine.pointer_gesture(
+                                0,
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            ))? {
+                                runtime.bar_pointer = true;
+                                runtime.pointer_down = None;
+                                return Ok(());
+                            }
+                            let hit = runtime.engine.pointer_action(
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            );
+                            runtime.pointer_down = hit.map(|action| {
+                                (
+                                    MouseButton::Left,
+                                    action,
+                                    runtime.cursor,
+                                    runtime.engine.input_identity(),
+                                )
+                            });
+                        }
+                        TouchPhase::Moved => {
+                            if runtime.touch_id != Some(touch.id) {
+                                return Ok(());
+                            }
+                            if runtime.bar_pointer {
+                                engine_result(runtime.engine.pointer_gesture(
+                                    1,
+                                    runtime.cursor.0,
+                                    runtime.cursor.1,
+                                    0,
+                                ))?;
+                            } else {
+                                engine_result(
+                                    runtime.engine.hover(runtime.cursor.0, runtime.cursor.1),
+                                )?;
+                            }
+                        }
+                        TouchPhase::Ended => {
+                            if runtime.touch_id != Some(touch.id) {
+                                return Ok(());
+                            }
+                            runtime.touch_id = None;
+                            if runtime.bar_pointer {
+                                runtime.bar_pointer = false;
+                                engine_result(runtime.engine.pointer_gesture(
+                                    2,
+                                    runtime.cursor.0,
+                                    runtime.cursor.1,
+                                    0,
+                                ))?;
+                                return Ok(());
+                            }
+                            let hit = runtime.engine.pointer_action(
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            );
+                            if let Some((pressed, action, origin, identity)) =
+                                runtime.pointer_down.take()
+                            {
+                                if pressed == MouseButton::Left
+                                    && hit
+                                        .as_ref()
+                                        .is_some_and(|hit| action.same_pointer_target(hit))
+                                    && runtime.engine.input_identity() == identity
+                                    && (matches!(
+                                        action,
+                                        UiAction::MenuValue {
+                                            value: nir_format::MenuValueInput::Number(_),
+                                            ..
+                                        }
+                                    ) || (runtime.cursor.0 - origin.0)
+                                        .hypot(runtime.cursor.1 - origin.1)
+                                        < 20.)
+                                {
+                                    if let Some(hit) = hit {
+                                        runtime.input(hit)?;
+                                    }
+                                }
+                            }
+                        }
+                        TouchPhase::Cancelled => {
+                            if runtime.touch_id != Some(touch.id) {
+                                return Ok(());
+                            }
+                            runtime.touch_id = None;
+                            runtime.pointer_down = None;
+                            runtime.bar_pointer = false;
+                            engine_result(runtime.engine.pointer_gesture(3, 0., 0., 0))?;
+                            engine_result(runtime.engine.hover(-1., -1.))?;
+                        }
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. }
                     if !dialog_open
                         && event.logical_key == Key::Named(NamedKey::Control)
@@ -976,15 +1258,17 @@ impl ApplicationHandler for App {
                                 engine_result(runtime.engine.hover(x, y))?;
                                 runtime.commands()?;
                             }
-                            runtime.window.request_redraw();
+                            window.request_redraw();
                         }
                         Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
                             if let Some(action) = runtime.engine.primary_action() {
                                 runtime.input(action)?;
                             }
                         }
-                        Key::Named(NamedKey::Escape) => {
-                            // Only the Escape arm needs the state report; parse
+                        // Android's back button surfaces as BrowserBack; it
+                        // shares Escape's menu/close depth logic.
+                        Key::Named(NamedKey::Escape | NamedKey::BrowserBack) => {
+                            // Only this arm needs the state report; parse
                             // it here instead of on every qualifying keypress.
                             let state: serde_json::Value =
                                 serde_json::from_str(&runtime.engine.state())?;
@@ -1001,13 +1285,13 @@ impl ApplicationHandler for App {
                         Key::Character(ref c) if c.eq_ignore_ascii_case("h") => {
                             runtime.input(UiAction::ToggleInterface)?
                         }
-                        Key::Named(NamedKey::F11) => runtime.window.set_fullscreen(
-                            if runtime.window.fullscreen().is_some() {
+                        Key::Named(NamedKey::F11) => {
+                            window.set_fullscreen(if window.fullscreen().is_some() {
                                 None
                             } else {
                                 Some(Fullscreen::Borderless(None))
-                            },
-                        ),
+                            })
+                        }
                         Key::Character(c) if c == "1" || c == "2" || c == "3" => {
                             let index = c.parse::<usize>().unwrap() - 1;
                             let actions: Vec<_> = runtime
@@ -1061,6 +1345,7 @@ fn default_data_root() -> Result<PathBuf> {
         .join(".local/share/NIR/games"))
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 pub fn run() -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut root = exe.parent().context("E_PACKAGE_ROOT")?.join("data");
@@ -1124,4 +1409,121 @@ pub fn run() -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Android entry. The AndroidApp handle supplies the storage roots and APK
+/// assets; `native_library` is the installed libplayer.so path used for the
+/// whole-player digest attestation (None skips the check).
+#[cfg(target_os = "android")]
+pub fn run_android(
+    app: android_activity::AndroidApp,
+    native_library: Option<PathBuf>,
+) -> Result<()> {
+    let files = app
+        .internal_data_path()
+        .context("E_STORAGE_ROOT: internal data path unavailable")?;
+    let root = extract_content(&app, &files)?;
+    // Saves and exports live in the external files dir (Android/data/<pkg>/
+    // files, visible over USB) so the documented backup path works; the rare
+    // device without one falls back to internal storage.
+    let external = app.external_data_path().unwrap_or_else(|| files.clone());
+    let data = external.join("NIR/games");
+    let exports = external.join("exports");
+    fs::create_dir_all(&exports).ok();
+    let bundle = Arc::new(Bundle::open(&root)?);
+    // Same helper-thread attestation as the desktop: the installed native
+    // library is hashed while the event loop and GPU come up, and the verdict
+    // gates runtime construction in resumed().
+    let expected_player = bundle.manifest.player.clone();
+    let exe_check = native_library.map(|path| {
+        std::thread::spawn(move || -> Result<()> {
+            nir_content::verify(&fs::read(path)?, &expected_player)?;
+            Ok(())
+        })
+    });
+    let event_loop = winit::event_loop::EventLoop::builder()
+        .with_android_app(app)
+        .build()?;
+    let mut app = App {
+        bundle,
+        data,
+        exports,
+        runtime: None,
+        error: None,
+        smoke: None,
+        smoke_step: 0,
+        started: Instant::now(),
+        smoke_advance: Instant::now(),
+        advances: 0,
+        save_at_dialogue: false,
+        hidden: false,
+        exe_check,
+    };
+    event_loop.run_app(&mut app)?;
+    if let Some(error) = app.error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Streams the packaged `data/` tree out of the APK into filesDir once.
+/// Unchanged content-addressed files (same name and size) are skipped, so an
+/// app update only copies content that actually changed; the digests
+/// Bundle::open re-verifies still cover the extracted copies. `release.txt`
+/// is the one fixed-name file whose content changes every release (its size
+/// never does), so it is always rewritten.
+#[cfg(target_os = "android")]
+fn extract_content(app: &android_activity::AndroidApp, files: &std::path::Path) -> Result<PathBuf> {
+    use std::{ffi::CString, io::Read};
+    fn walk(
+        manager: &ndk::asset::AssetManager,
+        apk_dir: &str,
+        out_dir: &std::path::Path,
+    ) -> Result<()> {
+        let dir_c = CString::new(apk_dir.to_owned())
+            .with_context(|| format!("E_PACKAGE_PATH: {apk_dir}"))?;
+        let Some(mut dir) = manager.open_dir(&dir_c) else {
+            bail!("E_PACKAGE_ROOT: {apk_dir} missing from APK assets");
+        };
+        let mut names = Vec::new();
+        while let Some(name) = dir.with_next(|c| c.to_bytes().to_vec()) {
+            names.push(name);
+        }
+        for name in names {
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if name.is_empty() || name.contains(['\\', ':']) || name.split('/').any(|s| s == "..") {
+                bail!("E_PACKAGE_PATH: invalid asset name {name:?}");
+            }
+            let apk_path = format!("{apk_dir}/{name}");
+            let out_path = out_dir.join(&name);
+            let asset_c = CString::new(apk_path.clone())
+                .with_context(|| format!("E_PACKAGE_PATH: {apk_path}"))?;
+            if let Some(mut asset) = manager.open(&asset_c) {
+                let len = asset.length();
+                // Only the content-addressed trees are immutable; the release
+                // pointer is fixed-name and fixed-size, so skipping it on a
+                // size match would pin every update to the old release.
+                let addressable = apk_path != "data/release.txt";
+                if addressable
+                    && matches!(fs::metadata(&out_path), Ok(m) if m.len() as usize == len)
+                {
+                    continue;
+                }
+                let mut bytes = Vec::with_capacity(len);
+                asset
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("E_PACKAGE_READ: {apk_path}"))?;
+                atomic_write(&out_path, &bytes)?;
+            } else {
+                fs::create_dir_all(&out_path)
+                    .with_context(|| format!("E_PACKAGE_PATH: {out_path:?}"))?;
+                walk(manager, &apk_path, &out_path)?;
+            }
+        }
+        Ok(())
+    }
+    let root = files.join("data");
+    fs::create_dir_all(&root).context("E_PACKAGE_ROOT")?;
+    walk(&app.asset_manager(), "data", &root)?;
+    Ok(root)
 }

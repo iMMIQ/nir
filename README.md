@@ -44,6 +44,10 @@ SDK 的 `novelc` 内置 Rust 导入工具，无需 Python。当前实验性支�
 
 在 Linux x86_64 构建 `cargo xtask sdk` 后，运行 `novelc -p my-story resolve` 和 `novelc -p my-story build --target linux --locked`。分发完整 `dist/full/linux/` 目录（打包为 tar.gz），玩家运行 `./Game`，无需浏览器或本地服务器。使用 Vulkan 原生渲染，详见 [Linux 发布与验证](docs/LINUX.md)。
 
+## Android 原生发布（实验性）
+
+SDK 含 NDK 交叉编译的 `sdk/android/lib/arm64-v8a/libplayer.so` 时，作者运行 `novelc -p my-story build --target android --locked` 即得到可直接安装的 `dist/full/android/Game.apk`（Android 8.0+ arm64，Vulkan 渲染），全程无需 Java、Gradle 或 Android SDK：清单、打包与 v2 签名由 novelc 内置完成。签名密钥自动生成于作品 `config/android-signing.pem`，更新安装必须保留。当前为实验性：构建与签名经结构验证，真机验收见 [Android 发布与验证](docs/ANDROID.md)。
+
 ## 作品结构
 
 ```text

@@ -1013,6 +1013,22 @@ impl Engine {
         self.ready = false;
         self.pump(vec![AppEvent::DeviceLost])
     }
+    /// Releases the presentation surface for hosts whose window can be
+    /// destroyed (Android suspend). Rendering is skipped until a new surface
+    /// is bound; the device, queues and resources all stay live.
+    pub fn release_surface(&mut self) {
+        self.renderer.release_surface();
+    }
+    /// Binds a recreated window's surface onto the live device without the
+    /// full asset replay `replace_gpu` performs; the next draw repaints.
+    pub fn rebind_surface(
+        &mut self,
+        surface: nir_render_wgpu::wgpu::Surface<'static>,
+    ) -> std::result::Result<(), String> {
+        self.renderer.rebind_surface(surface);
+        self.visual_invalidated = true;
+        Ok(())
+    }
     pub fn replace_gpu(&mut self, replacement: Renderer) -> std::result::Result<(), String> {
         if replacement.backend != self.renderer.backend {
             return Err(js("E_RENDER_BACKEND: recovery must use the active backend"));

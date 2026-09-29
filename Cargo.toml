@@ -7,6 +7,7 @@ members = [
     "apps/player-desktop",
     "apps/player-windows",
     "apps/player-linux",
+    "apps/player-android",
     "tools/novelc",
     "xtask",
 ]
@@ -26,6 +27,7 @@ sha2 = "0.10"
 flate2 = "1"
 toml = "0.8"
 rand_chacha = { version = "0.3", features = ["serde1"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = "0.6"
 unicode-segmentation = "=1.12.0"
 cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash"] }
@@ -50,6 +52,7 @@ nir-presentation = { path = "crates/nir-presentation" }
 nir-player = { path = "crates/nir-player" }
 nir-render-wgpu = { path = "crates/nir-render-wgpu" }
 nir-platform-web = { path = "crates/nir-platform-web" }
+nir-apk = { path = "crates/nir-apk" }
 nir-compiler = { path = "crates/nir-compiler" }
 nir-engine = { path = "crates/nir-engine" }
 
