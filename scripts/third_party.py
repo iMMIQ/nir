@@ -20,7 +20,9 @@ def visit(key):
         visit(dep["pkg"])
 for root in roots:
     visit(root)
-chunks = ["NIR third-party notices. Versions are taken from Cargo.lock.\n", *[Path(name).read_text() for name in ("LICENSE-NOTICE.md", "LICENSE", "COPYING")]]
+# Notices are digested into the SDK identity, so they must be byte-identical
+# across build hosts; Windows defaults to cp1252 for text mode otherwise.
+chunks = ["NIR third-party notices. Versions are taken from Cargo.lock.\n", *[Path(name).read_text(encoding="utf-8") for name in ("LICENSE-NOTICE.md", "LICENSE", "COPYING")]]
 for p in sorted((packages[key] for key in seen), key=lambda p: (p["name"], p["version"])):
     chunks.append(f'\n=== {p["name"]} {p["version"]} — {p.get("license") or "workspace"} ===\n')
     directory = Path(p["manifest_path"]).parent
@@ -32,6 +34,6 @@ for p in sorted((packages[key] for key in seen), key=lambda p: (p["name"], p["ve
     if p["name"] == "hb-subset":
         paths.append(directory / "harfbuzz/COPYING")
     for path in paths:
-        chunks.append(path.read_text(errors="replace"))
-Path(sys.argv[1]).write_text("\n".join(chunks))
+        chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+Path(sys.argv[1]).write_text("\n".join(chunks), encoding="utf-8", newline="\n")
 print(f"Collected {len(seen)} package notices")
