@@ -218,6 +218,9 @@ impl ImageMenu {
     }
     pub fn validate_elements(&self) -> Result<()> {
         self.validate_state()?;
+        if let Some(effects) = &self.effects {
+            effects.validate()?;
+        }
         let fail = || {
             Diagnostic::new(
                 "E_VIEW",
@@ -473,6 +476,105 @@ impl ImageMenu {
     }
 }
 
+/// Finite page presentation effects. Sounds and music run in the foreground
+/// UI audio domain; fades multiply the whole page's draw alpha. The state is
+/// transient per menu instance and never enters story snapshots, and restore
+/// projections never replay these effects.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MenuEffects {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enter: Option<MenuTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<MenuTransition>,
+    /// One-shot sound when a control action is accepted. Restore-driven
+    /// projections do not fire it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub click: Option<String>,
+    /// Looping page music in the foreground domain. Never part of any
+    /// wait-for-completion set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music: Option<MenuMusic>,
+}
+/// One page boundary: an optional one-shot sound plus a bounded fade.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MenuTransition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
+    #[serde(default)]
+    pub fade_us: Micros,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MenuMusic {
+    pub asset: String,
+    #[serde(default)]
+    pub bus: AudioBus,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub gain: f32,
+}
+fn one() -> f32 {
+    1.
+}
+fn is_one(value: &f32) -> bool {
+    *value == 1.
+}
+impl MenuEffects {
+    pub fn assets(&self) -> Vec<&str> {
+        self.enter
+            .iter()
+            .chain(&self.close)
+            .filter_map(|t| t.sound.as_deref())
+            .chain(self.click.as_deref())
+            .chain(self.music.as_ref().map(|m| m.asset.as_str()))
+            .collect()
+    }
+    fn validate(&self) -> Result<()> {
+        let fail = || {
+            Diagnostic::new(
+                "E_VIEW_EFFECTS",
+                "theme.image_menus.effects",
+                "invalid menu effect sound, music, gain, or fade duration",
+            )
+        };
+        let asset = |id: &str| !id.is_empty() && id.len() <= 128;
+        for transition in [&self.enter, &self.close].into_iter().flatten() {
+            if transition.fade_us.0 > 2_000_000
+                || transition.sound.as_deref().is_some_and(|s| !asset(s))
+            {
+                return Err(fail());
+            }
+        }
+        if self.click.as_deref().is_some_and(|s| !asset(s)) {
+            return Err(fail());
+        }
+        if let Some(music) = &self.music {
+            if !asset(&music.asset)
+                || !music.gain.is_finite()
+                || !(0. ..=4.).contains(&music.gain)
+            {
+                return Err(fail());
+            }
+        }
+        Ok(())
+    }
+}
+impl ImageMenu {
+    pub fn uses_effects(&self) -> bool {
+        self.effects.is_some()
+    }
+    /// Menu media closure including effect sounds and page music.
+    pub fn effect_assets(&self) -> BTreeSet<String> {
+        self.effects
+            .iter()
+            .flat_map(|e| e.assets().into_iter().map(str::to_owned))
+            .collect()
+    }
+}
 /// UI-local data never aliases VM variables or snapshot slots.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -867,13 +969,25 @@ impl ImageMenu {
             )
             .collect()
     }
+    /// Assets a page needs resident before it may present and play its page
+    /// effects: every image plus the effect sounds and looping music, so a
+    /// prepared page never addresses an undecoded buffer.
+    pub fn prepared_assets(&self) -> BTreeSet<String> {
+        let mut assets = self.image_assets();
+        assets.extend(self.effect_assets());
+        assets
+    }
 }
 
 impl Theme {
     /// Preserve legacy title-page preparation, excluding overlay-only pages.
+    /// Effect sounds and music ride along so boot decodes them with the page.
     pub fn title_image_assets(&self) -> BTreeSet<String> {
         let Some(root) = self.menu_overlay.as_deref() else {
-            return self.image_assets();
+            // No overlay: every page is title-reachable, effects included.
+            let mut assets = self.image_assets();
+            assets.extend(self.image_menus.values().flat_map(ImageMenu::effect_assets));
+            return assets;
         };
         let closure = |roots: Vec<String>| {
             let mut pending = roots;
@@ -910,7 +1024,7 @@ impl Theme {
                 self.image_menus
                     .iter()
                     .filter(|(id, _)| title.contains(*id))
-                    .flat_map(|(_, menu)| menu.image_assets()),
+                    .flat_map(|(_, menu)| menu.prepared_assets()),
             )
             .collect()
     }

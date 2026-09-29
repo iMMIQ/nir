@@ -10,6 +10,8 @@ mod clock;
 mod menu;
 use menu::{MenuSession, SaveConfirmation};
 mod content;
+mod effects;
+use effects::{DeferredExitKind, MenuEffectsState};
 mod pause;
 use clock::ForegroundClockDemand;
 pub use clock::ForegroundClockToken;
@@ -354,6 +356,8 @@ pub struct Player {
     ui_pauses: Pauses,
     ui_clock_us: Micros,
     ui_clock_demand: ForegroundClockDemand,
+    menu_effects: MenuEffectsState,
+    menu_effects_clock: Option<ForegroundClockToken>,
     audio_paused: BTreeMap<TimeDomain, bool>,
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
@@ -485,6 +489,8 @@ impl Player {
             ui_pauses: Pauses::default(),
             ui_clock_us: Micros(0),
             ui_clock_demand: ForegroundClockDemand::default(),
+            menu_effects: MenuEffectsState::new(1),
+            menu_effects_clock: None,
             audio_paused: BTreeMap::from([
                 (TimeDomain::Story, true),
                 (TimeDomain::ForegroundUi, true),
@@ -840,6 +846,12 @@ impl Player {
     pub fn foreground_clock(&self) -> Micros {
         self.ui_clock_us
     }
+    /// Opacity of the active menu page while a page effect fade runs
+    /// (1.0 otherwise, including under reduced motion).
+    pub fn menu_opacity(&self) -> f32 {
+        self.menu_effects
+            .opacity(self.ui_clock_us.0, self.preferences.reduced_motion)
+    }
     pub fn acquire_foreground_clock(&self) -> Option<ForegroundClockToken> {
         self.ui_clock_demand.acquire()
     }
@@ -919,13 +931,15 @@ impl Player {
         if let Some(pending) = &s.pending {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
-        // Keep only the active overlay's images; hidden pages do not pin media.
+        // Keep only the active overlay's media; hidden pages pin nothing. The
+        // page's effect sounds and music stay resident with its images, or the
+        // host prunes the decoded buffers the moment the page needs them.
         if self.screen == Screen::Menu {
             if let Some(menu) = self
                 .active_menu_id()
                 .and_then(|id| core.program().theme.image_menus.get(id))
             {
-                a.extend(menu.image_assets());
+                a.extend(menu.prepared_assets());
             }
         }
         a.extend(core.program().theme.dialogue.background.iter().cloned());
@@ -1642,6 +1656,12 @@ impl Player {
                 self.report(e, true);
             }
         }
+        // Advance finite UI effect fades, then commit any page that became
+        // prepared. Runs after the event loop so prepare completions inside
+        // this turn are visible without waiting for the next host frame.
+        if let Err(e) = self.update_menu_effects(&mut remaining) {
+            self.report(e, true);
+        }
         if let Err(e) = self.sync_menu_state() {
             self.report(e, true);
         }
@@ -1898,6 +1918,11 @@ impl Player {
             } => {
                 if domain == TimeDomain::Story && session == self.generation.session {
                     self.step(CoreInput::AudioEnded { task }, budget)?;
+                } else if domain == TimeDomain::ForegroundUi
+                    && session == self.generation.session
+                    && self.menu_effects.sounds.remove(&task).is_some()
+                {
+                    self.observe("ui_sound_ended", None);
                 }
             }
             AppEvent::AudioFailed {
@@ -1917,6 +1942,19 @@ impl Player {
                     d.details.as_mut().unwrap().task = Some(task);
                     self.report(d, false);
                     self.step(CoreInput::TaskFailed { task, message }, budget)?;
+                } else if domain == TimeDomain::ForegroundUi
+                    && session == self.generation.session
+                    && self.menu_effects.sounds.remove(&task).is_some()
+                {
+                    // Menu page effect voices are best effort; a failed one
+                    // never faults the session or cancels the transition.
+                    self.observe_from(
+                        "ui_sound_failed",
+                        None,
+                        Some(session),
+                        Some(task),
+                        None,
+                    );
                 } else {
                     self.observe_from(
                         "stale_audio_discarded",
@@ -2208,7 +2246,7 @@ impl Player {
         if self.screen == Screen::Menu {
             if let Some(id) = self.active_menu_id() {
                 if self.core.program().theme.image_menus[id]
-                    .image_assets()
+                    .prepared_assets()
                     .is_subset(&prep.assets)
                 {
                     self.prepared_menu = Some(self.menu_asset_stamp(id));
@@ -2464,6 +2502,10 @@ impl Player {
         sequence: u32,
         budget: &mut u32,
     ) -> Result<()> {
+        // A close fade locks the old page's input for its finite duration.
+        if self.menu_effects.closing.is_some() {
+            return Ok(());
+        }
         self.sync_menu_state()?;
         let a = match a {
             UiAction::ConfirmSave { token } => {
@@ -2519,7 +2561,9 @@ impl Player {
             control,
         } = a
         {
-            let Some(action) = self.resolve_menu_control(instance, revision, &control)? else {
+            let Some(action) =
+                self.resolve_menu_control(instance, revision, &control, interaction, sequence)?
+            else {
                 return Ok(());
             };
             action
@@ -2753,20 +2797,16 @@ impl Player {
                 if self.pop_menu()? {
                     return Ok(());
                 }
-                self.cancel_menu_preparation();
-                self.screen = self.return_screen;
-                self.pauses.remove("menu");
-                self.status.clear();
-                if cancelled_slot_restore && self.screen == Screen::Story && self.prepare.is_none()
-                {
-                    if let Some(pending) = &self.core.state().pending {
-                        self.begin_prepare(
-                            Purpose::Activation,
-                            pending.id,
-                            self.validated.cue_assets(&pending.cue),
-                        )?;
-                    }
+                if self.begin_menu_close(
+                    DeferredExitKind::CloseScreen {
+                        cancelled_slot_restore,
+                    },
+                    interaction,
+                    sequence,
+                ) {
+                    return Ok(());
                 }
+                self.commit_close(cancelled_slot_restore)?;
             }
             UiAction::Title => {
                 self.image_menu = "title".into();
@@ -3285,6 +3325,9 @@ impl Player {
             history_total: c.state().history.len(),
             menu_history: self.menu_history_model(c, screen),
             menu_history_flow: self.menu_history_flow_model(screen),
+            menu_opacity: self
+                .menu_effects
+                .opacity(self.ui_clock_us.0, self.preferences.reduced_motion),
             slots: self.slots.clone(),
             save_confirmation: self.save_confirmation.as_ref().map(|c| (c.token, c.slot)),
             busy_slots: self.save_jobs.values().map(|(slot, _)| *slot).collect(),
@@ -3422,6 +3465,7 @@ mod media_tests {
                 elements: vec![],
                 background: "bg.station".into(),
                 buttons: vec![button],
+                effects: None,
             },
         );
         let mut player = Player::new(program, "release".into(), "Test".into()).unwrap();
@@ -3491,6 +3535,7 @@ mod media_tests {
                 elements: vec![],
                 background: "bg.river".into(),
                 buttons: vec![],
+                effects: None,
             },
         );
         program.theme.dialogue.background = Some("bg.station".into());
@@ -3580,6 +3625,7 @@ mod media_tests {
                 elements: vec![],
                 background: "missing".into(),
                 buttons: vec![],
+                effects: None,
             },
         );
         assert!(Player::new(program, "release".into(), "Test".into()).is_err());

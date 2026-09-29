@@ -102,6 +102,10 @@ pub struct UiModel {
     pub history_total: usize,
     pub menu_history: std::collections::BTreeMap<String, Vec<MenuHistoryRow>>,
     pub menu_history_flow: Option<std::sync::Arc<[MenuHistoryRow]>>,
+    /// Authored menu page opacity from finite enter/close fades; 1 when no
+    /// fade is active. Applies to the whole menu layer, never the story
+    /// scene below it.
+    pub menu_opacity: f32,
     pub slots: Vec<SlotView>,
     pub save_confirmation: Option<(u32, u32)>,
     pub busy_slots: std::collections::BTreeSet<u32>,
@@ -1101,6 +1105,12 @@ fn project_measured(
             let scale = (width / m.stage[0]).min(height / m.stage[1]);
             let ox = (width - m.stage[0] * scale) / 2.;
             let oy = (height - m.stage[1] * scale) / 2.;
+            // The fade owns everything this branch paints, never the story
+            // scene already projected underneath the overlay.
+            let fade_quads = p.quads.len();
+            let fade_texts = p.texts.len();
+            let fade_flows = p.history_flow.is_some();
+            let fade_bars = p.history_bar_view.is_some();
             p.quads.push(Quad {
                 rect: [ox, oy, m.stage[0] * scale, m.stage[1] * scale],
                 color: [1.; 4],
@@ -1197,6 +1207,21 @@ fn project_measured(
                     false,
                     t,
                 );
+            }
+            let opacity = m.menu_opacity.clamp(0., 1.);
+            if opacity < 1. {
+                for quad in &mut p.quads[fade_quads..] {
+                    quad.color[3] *= opacity;
+                }
+                for text in &mut p.texts[fade_texts..] {
+                    text.color[3] *= opacity;
+                }
+                if fade_flows {
+                    p.history_flow.as_mut().unwrap().color[3] *= opacity;
+                }
+                if fade_bars {
+                    p.history_bar_view.as_mut().unwrap().quad.color[3] *= opacity;
+                }
             }
         }
         Screen::Title => {

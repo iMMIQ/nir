@@ -374,7 +374,7 @@ impl Player {
         {
             return Ok(());
         }
-        let assets = self.core.program().theme.image_menus[id].image_assets();
+        let assets = self.core.program().theme.image_menus[id].prepared_assets();
         self.begin_prepare(Purpose::Menu, 0, assets)
     }
     pub fn active_menu_id(&self) -> Option<&str> {
@@ -614,6 +614,8 @@ impl Player {
         instance: u32,
         revision: u32,
         control: &str,
+        interaction: u32,
+        sequence: u32,
     ) -> Result<Option<UiAction>> {
         if self.menu_peek
             || self.active_menu_id().is_none()
@@ -661,6 +663,9 @@ impl Player {
             }
         }
         let next = MenuSession::next(self.menu_session.revision)?;
+        // The click effect is acceptance feedback: it plays only on this
+        // verified commit, never on rejected input or restore projections.
+        let click = self.active_menu_effects().and_then(|e| e.click);
         if let ImageMenuAction::SetLocal { local, value } = &action {
             // Validate again at the mutation boundary, independently of projection.
             if menu
@@ -676,6 +681,9 @@ impl Player {
         }
         self.menu_session.revision = next;
         self.hovered_image = None;
+        if let Some(asset) = click {
+            self.play_ui_sound(&asset);
+        }
         match &action {
             ImageMenuAction::PushMenu { menu } => {
                 self.push_menu(menu)?;
@@ -696,23 +704,22 @@ impl Player {
                 // Only this verified menu request may combine closing the
                 // overlay with a reading action. Existing raw toggles retain
                 // their existing semantics and cannot bypass menu identity.
-                self.cancel_menu_preparation();
-                self.screen = Screen::Story;
-                self.pauses.remove("menu");
-                self.status.clear();
-                Ok(Some(match mode {
-                    MenuReadingMode::Auto => {
-                        self.auto = false;
-                        UiAction::ToggleAuto
-                    }
-                    MenuReadingMode::SkipRead => {
-                        self.skip = false;
-                        UiAction::ToggleSkip
-                    }
-                    MenuReadingMode::PeekStory => unreachable!("handled above"),
-                }))
+                if self.begin_menu_close(
+                    DeferredExitKind::ReadingClose { mode: *mode },
+                    interaction,
+                    sequence,
+                ) {
+                    return Ok(None);
+                }
+                Ok(Some(self.commit_reading_close(*mode)?))
             }
             ImageMenuAction::HistoryPage { window, delta } => {
+                let Some(menu) = self
+                    .active_menu_id()
+                    .and_then(|id| self.core.program().theme.image_menus.get(id))
+                else {
+                    return Ok(None);
+                };
                 if menu
                     .element_state(
                         window,
@@ -774,6 +781,248 @@ impl Player {
             }
             _ => Ok(action.ui_action()),
         }
+    }
+
+    fn active_menu_effects(&self) -> Option<nir_format::MenuEffects> {
+        self.active_menu_id()
+            .and_then(|id| self.core.program().theme.image_menus.get(id))
+            .and_then(|menu| menu.effects.clone())
+    }
+
+    /// A foreground-domain one-shot owned by the menu effects voice table.
+    fn play_ui_sound(&mut self, asset: &str) {
+        let session = self.generation.session;
+        let task = self.menu_effects.alloc_task();
+        self.menu_effects.sounds.insert(
+            task,
+            effects::UiVoice { task, session },
+        );
+        self.commands.push(AppCommand::AudioStart {
+            domain: TimeDomain::ForegroundUi,
+            task,
+            asset: asset.into(),
+            bus: AudioBus::Sfx,
+            looped: false,
+            position_us: Micros(0),
+            gain: 1.,
+            envelope: 1.,
+            session,
+        });
+    }
+
+    fn start_menu_music(&mut self, music: &nir_format::MenuMusic) {
+        let session = self.generation.session;
+        let task = self.menu_effects.alloc_task();
+        self.menu_effects.music = Some(effects::UiVoice { task, session });
+        self.commands.push(AppCommand::AudioStart {
+            domain: TimeDomain::ForegroundUi,
+            task,
+            asset: music.asset.clone(),
+            bus: music.bus,
+            looped: true,
+            position_us: Micros(0),
+            gain: music.gain,
+            envelope: 1.,
+            session,
+        });
+    }
+
+    /// Looping page music is never awaited; it stops the moment its page
+    /// stops being the active surface.
+    fn stop_menu_music(&mut self) {
+        if let Some(voice) = self.menu_effects.music.take() {
+            self.commands.push(AppCommand::AudioStop {
+                session: voice.session,
+                domain: TimeDomain::ForegroundUi,
+                task: voice.task,
+            });
+        }
+    }
+
+    fn menu_page_ready(&self, id: &str) -> bool {
+        match self.screen {
+            // Overlay pages play only once their own media is resident; the
+            // stamp carries page identity and the full generation.
+            Screen::Menu => self.prepared_menu.as_ref() == Some(&self.menu_asset_stamp(id)),
+            // Title closure pages are all prepared at boot (and re-prepared
+            // by a device recovery), so readiness is simply "not loading":
+            // the Preparing gap never sounds.
+            Screen::Title => {
+                !self.is_loading()
+                    && self.failed_admission.is_none()
+                    && self.error.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn fire_menu_enter(&mut self, id: &str, instance: u32) {
+        let config = self
+            .core
+            .program()
+            .theme
+            .image_menus
+            .get(id)
+            .and_then(|menu| menu.effects.clone());
+        self.menu_effects.entered = Some((id.to_owned(), instance));
+        // Ownership moves to the new page first; its music replaces the old.
+        self.stop_menu_music();
+        let Some(effects) = config else { return };
+        if let Some(enter) = &effects.enter {
+            if let Some(sound) = &enter.sound {
+                self.play_ui_sound(sound);
+            }
+            if enter.fade_us.0 > 0 && !self.preferences.reduced_motion {
+                // Without a clock lease the fade could never advance; enter at
+                // full opacity rather than stall invisible.
+                if let Some(token) = self.acquire_foreground_clock() {
+                    self.menu_effects.fade = Some(effects::PageFade {
+                        closing: false,
+                        start_us: self.ui_clock_us.0,
+                        duration_us: enter.fade_us.0,
+                    });
+                    self.menu_effects_clock = Some(token);
+                }
+            }
+        }
+        if let Some(music) = &effects.music {
+            self.start_menu_music(music);
+        }
+    }
+
+    /// Starts the finite close transaction. Returns true when the exit was
+    /// deferred behind the close fade; the caller must then consume the input.
+    pub(super) fn begin_menu_close(
+        &mut self,
+        kind: DeferredExitKind,
+        interaction: u32,
+        sequence: u32,
+    ) -> bool {
+        if self.menu_effects.closing.is_some() {
+            return true;
+        }
+        let close = self
+            .active_menu_effects()
+            .and_then(|effects| effects.close);
+        let Some(close) = close else { return false };
+        if let Some(sound) = &close.sound {
+            self.play_ui_sound(sound);
+        }
+        if close.fade_us.0 > 0 && !self.preferences.reduced_motion {
+            let Some(token) = self.acquire_foreground_clock() else {
+                return false;
+            };
+            self.menu_effects.fade = Some(effects::PageFade {
+                closing: true,
+                start_us: self.ui_clock_us.0,
+                duration_us: close.fade_us.0,
+            });
+            self.menu_effects.closing = Some(effects::DeferredExit {
+                kind,
+                interaction,
+                sequence,
+            });
+            self.menu_effects_clock = Some(token);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn commit_close(&mut self, cancelled_slot_restore: bool) -> Result<()> {
+        self.cancel_menu_preparation();
+        self.screen = self.return_screen;
+        self.pauses.remove("menu");
+        self.status.clear();
+        if cancelled_slot_restore && self.screen == Screen::Story && self.prepare.is_none() {
+            if let Some(pending) = &self.core.state().pending {
+                let cue = pending.cue.clone();
+                let id = pending.id;
+                let assets = self.validated.cue_assets(&cue);
+                self.begin_prepare(Purpose::Activation, id, assets)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_reading_close(&mut self, mode: MenuReadingMode) -> Result<UiAction> {
+        self.cancel_menu_preparation();
+        self.screen = Screen::Story;
+        self.pauses.remove("menu");
+        self.status.clear();
+        Ok(match mode {
+            MenuReadingMode::Auto => {
+                self.auto = false;
+                UiAction::ToggleAuto
+            }
+            MenuReadingMode::SkipRead => {
+                self.skip = false;
+                UiAction::ToggleSkip
+            }
+            MenuReadingMode::PeekStory => unreachable!("peeled off before deferral"),
+        })
+    }
+
+    fn run_deferred_exit(&mut self, exit: effects::DeferredExit, budget: &mut u32) -> Result<()> {
+        let effects::DeferredExit {
+            kind,
+            interaction,
+            sequence,
+        } = exit;
+        match kind {
+            DeferredExitKind::CloseScreen {
+                cancelled_slot_restore,
+            } => self.commit_close(cancelled_slot_restore)?,
+            DeferredExitKind::ReadingClose { mode } => {
+                let toggle = self.commit_reading_close(mode)?;
+                self.action(toggle, interaction, sequence, budget)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Advances menu page effects: fades follow the foreground clock, a
+    /// finished close fade runs its deferred exit, prepared pages fire their
+    /// enter effects once, and leaving the menu surfaces stops page music.
+    pub(super) fn update_menu_effects(&mut self, budget: &mut u32) -> Result<()> {
+        if self.menu_effects.session != self.generation.session {
+            // The host resets both audio domains with the session; every
+            // effect voice died with it and a deferred exit now references
+            // state that no longer exists.
+            self.menu_effects = MenuEffectsState::new(self.generation.session);
+            self.menu_effects_clock = None;
+        }
+        let exit = self.menu_effects.take_finished_close(self.ui_clock_us.0);
+        if exit.is_some() || self.menu_effects.fade.is_none() {
+            self.menu_effects_clock = None;
+        }
+        self.menu_effects.settle_enter(self.ui_clock_us.0);
+        if self.menu_effects.fade.is_none() {
+            self.menu_effects_clock = None;
+        }
+        if let Some(exit) = exit {
+            self.run_deferred_exit(exit, budget)?;
+        }
+        let page = if matches!(self.screen, Screen::Title | Screen::Menu) {
+            self.active_menu_id().map(str::to_owned)
+        } else {
+            None
+        };
+        let identity = page.map(|id| (id, self.menu_session.instance));
+        if self.menu_effects.entered.is_some() && self.menu_effects.entered != identity {
+            // The page changed, or the surfaces were left through a path that
+            // owed no close fade; page effects never outlive their page.
+            self.stop_menu_music();
+            self.menu_effects.retire_page();
+        }
+        if let Some((id, instance)) = identity {
+            if self.menu_effects.closing.is_none()
+                && self.menu_effects.entered.is_none()
+                && self.menu_page_ready(&id)
+            {
+                self.fire_menu_enter(&id, instance);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1076,11 +1325,11 @@ mod tests {
         p.core = Core::restore(p.validated.clone(), empty, "r").unwrap();
         let (instance, revision) = (p.menu_session.instance, p.menu_session.revision);
         assert!(p
-            .resolve_menu_control(instance, revision, "child")
+            .resolve_menu_control(instance, revision, "child", 0, 1)
             .unwrap()
             .is_none());
         assert!(p
-            .resolve_menu_control(instance, revision, "select")
+            .resolve_menu_control(instance, revision, "select", 0, 1)
             .unwrap()
             .is_none());
         p.sync_menu_state().unwrap();
@@ -1568,7 +1817,7 @@ mod tests {
         p.core = Core::restore(p.validated.clone(), changed, "r").unwrap();
         let (instance, revision) = (p.menu_session.instance, p.menu_session.revision);
         assert!(p
-            .resolve_menu_control(instance, revision, "auto")
+            .resolve_menu_control(instance, revision, "auto", 0, 1)
             .unwrap()
             .is_none());
         assert_eq!(p.screen, Screen::Menu);
@@ -2915,5 +3164,398 @@ mod tests {
             }
             assert!(Player::new(p, "release".into(), "Test".into()).is_err());
         }
+    }
+
+    // ---- ui.menu-effects.v1: page effect transactions ------------------
+    fn ui_audio(commands: &[AppCommand]) -> Vec<(u32, &str, AudioBus, bool, f32)> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                AppCommand::AudioStart {
+                    domain: TimeDomain::ForegroundUi,
+                    task,
+                    asset,
+                    bus,
+                    looped,
+                    gain,
+                    ..
+                } => Some((*task, asset.as_str(), *bus, *looped, *gain)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn ui_stops(commands: &[AppCommand]) -> Vec<u32> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                AppCommand::AudioStop {
+                    domain: TimeDomain::ForegroundUi,
+                    task,
+                    ..
+                } => Some(*task),
+                _ => None,
+            })
+            .collect()
+    }
+    fn effects_program() -> Program {
+        let mut p = service_program();
+        p.requires.push("ui.menu-effects.v1".into());
+        for (id, asset) in [("system", "audio.bgm"), ("system.child", "audio.voice")] {
+            let menu = p.theme.image_menus.get_mut(id).unwrap();
+            menu.effects = Some(
+                serde_json::from_value(serde_json::json!({
+                    "enter": {"sound": "audio.bell", "fade_us": "400000"},
+                    "close": {"sound": "audio.bell", "fade_us": "300000"},
+                    "click": "audio.bell",
+                    "music": {"asset": asset, "bus": "voice", "gain": 0.5}
+                }))
+                .unwrap(),
+            );
+        }
+        p.theme.image_menus.get_mut("other").unwrap().effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "enter": {"sound": "audio.bell"},
+                "music": {"asset": "audio.voice"}
+            }))
+            .unwrap(),
+        );
+        p.theme.image_menus.get_mut("title").unwrap().effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "enter": {"sound": "audio.bell", "fade_us": "400000"},
+                "music": {"asset": "audio.bgm"}
+            }))
+            .unwrap(),
+        );
+        p
+    }
+    #[test]
+    fn effects_require_their_capability() {
+        let mut p = effects_program();
+        p.requires.retain(|c| c != "ui.menu-effects.v1");
+        assert_eq!(
+            Player::new(p, "r".into(), "t".into()).err().unwrap().code,
+            "E_CAPABILITY"
+        );
+    }
+    #[test]
+    fn enter_effects_wait_for_preparation_fire_once_and_music_follows_pages() {
+        let mut p = Player::new(effects_program(), "r".into(), "t".into()).unwrap();
+        // The Preparing gap is silent: boot preparation has not completed.
+        let commands = p.pump(vec![], 1000);
+        assert!(ui_audio(&commands).is_empty());
+        let fired = settle(&mut p, commands);
+        let starts = ui_audio(&fired);
+        assert_eq!(starts.len(), 2, "one enter sound plus one music voice");
+        let (_, _, bus, looped, gain) = starts
+            .iter()
+            .find(|(_, asset, ..)| *asset == "audio.bgm")
+            .unwrap();
+        assert_eq!((*bus, *looped, *gain), (AudioBus::Bgm, true, 1.));
+        let (_, _, bus, looped, _) = starts
+            .iter()
+            .find(|(_, asset, ..)| *asset == "audio.bell")
+            .unwrap();
+        assert_eq!((*bus, *looped), (AudioBus::Sfx, false));
+        let instance = p.menu_session.instance;
+        assert_eq!(
+            p.menu_effects.entered,
+            Some(("title".into(), instance)),
+            "ownership recorded"
+        );
+        // Ownership is stable: no re-fire, no stop, until the page changes.
+        let again = p.pump(vec![], 1000);
+        assert!(ui_audio(&again).is_empty());
+        assert!(ui_stops(&again).is_empty());
+        // The enter fade follows the foreground clock and releases its lease.
+        assert_eq!(p.model().menu_opacity, 0.);
+        assert!(p.menu_effects_clock.is_some());
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 200_000,
+            }],
+            1000,
+        );
+        assert!((p.model().menu_opacity - 0.5).abs() < 1e-3);
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 200_000,
+            }],
+            1000,
+        );
+        assert_eq!(p.model().menu_opacity, 1.);
+        assert!(p.menu_effects.fade.is_none());
+        assert!(p.menu_effects_clock.is_none());
+        // A new title page stops the old music and plays its own enter.
+        let title_music = p.menu_effects.music.unwrap().task;
+        let navigate = control(&p, "other");
+        let commands = pump_action(&mut p, navigate);
+        assert!(ui_stops(&commands).contains(&title_music));
+        let starts = ui_audio(&commands);
+        assert_eq!(starts.len(), 2);
+        assert!(starts.iter().any(|(_, asset, ..)| *asset == "audio.voice"));
+        assert_eq!(
+            p.menu_effects.entered,
+            Some(("other".into(), instance + 1)),
+            "a new page instance owns new voices"
+        );
+    }
+    #[test]
+    fn failed_boot_preparation_keeps_the_title_silent() {
+        let mut p = Player::new(effects_program(), "r".into(), "t".into()).unwrap();
+        let commands = p.pump(vec![], 1000);
+        let request = commands
+            .iter()
+            .find_map(|c| {
+                if let AppCommand::GetAssets { request, .. } = c {
+                    Some(*request)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        p.pump(
+            vec![AppEvent::AssetFailed {
+                request,
+                message: "fixture boot failure".into(),
+            }],
+            1000,
+        );
+        let commands = p.pump(vec![], 1000);
+        assert!(p.menu_effects.entered.is_none());
+        assert!(ui_audio(&commands).is_empty());
+    }
+    /// Returns the player with the overlay open and prepared, plus the task
+    /// ids of its enter sound and looping page music.
+    fn effects_player_at_overlay() -> (Player, u32, u32) {
+        let mut p = Player::new(effects_program(), "r".into(), "t".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        // The overlay Preparing gap is silent.
+        assert!(ui_audio(&c).is_empty());
+        let fired = settle(&mut p, c);
+        let bell = ui_audio(&fired)
+            .iter()
+            .find(|(_, asset, ..)| *asset == "audio.bell")
+            .unwrap()
+            .0;
+        let music = p.menu_effects.music.unwrap().task;
+        (p, bell, music)
+    }
+    #[test]
+    fn close_plays_its_sound_locks_input_and_defers_the_exit() {
+        let (mut p, _, music) = effects_player_at_overlay();
+        let commands = pump_action(&mut p, UiAction::Close);
+        // Acceptance feedback first; the page itself is still up.
+        let starts = ui_audio(&commands);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].1, "audio.bell");
+        assert_eq!(p.screen, Screen::Menu);
+        assert!(p.menu_effects.closing.is_some());
+        assert!(p.paused());
+        // Old input is locked while the close fade runs: the repeat Close is
+        // swallowed (beyond telemetry) and changes nothing.
+        let locked = pump_action(&mut p, UiAction::Close);
+        assert!(locked.iter().all(|c| matches!(c, AppCommand::Observation { .. })));
+        assert_eq!(p.screen, Screen::Menu);
+        assert!(p.menu_effects.closing.is_some());
+        assert_eq!(p.screen, Screen::Menu);
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 150_000,
+            }],
+            1000,
+        );
+        assert_eq!(p.screen, Screen::Menu);
+        assert!((p.model().menu_opacity - 0.5).abs() < 1e-3);
+        // Projection agrees: the authored page itself is half faded, not just
+        // the model scalar.
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        let quad = packet
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("menu.only"))
+            .unwrap();
+        assert!((quad.color[3] - 0.5).abs() < 1e-3);
+        // The deferred exit commits exactly when the fade completes, and the
+        // looping page music stops with the page.
+        let commands = p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 150_000,
+            }],
+            1000,
+        );
+        assert_eq!(p.screen, Screen::Story);
+        assert!(!p.paused());
+        assert!(p.menu_effects.closing.is_none());
+        assert!(p.menu_effects_clock.is_none());
+        assert!(ui_stops(&commands).contains(&music));
+        assert_eq!(p.model().menu_opacity, 1., "story is never faded");
+    }
+    #[test]
+    fn click_sounds_only_on_accepted_control_commits() {
+        let (mut p, _, _) = effects_player_at_overlay();
+        let revision = p.menu_session.revision;
+        let accepted = control(&p, "increase");
+        let commands = pump_action(&mut p, accepted);
+        assert!(ui_audio(&commands)
+            .iter()
+            .any(|(_, asset, ..)| *asset == "audio.bell"));
+        let sounds = p.menu_effects.sounds.clone();
+        // The commit and the preference it changed each advance identity, so
+        // the captured revision is now stale in either case.
+        let current = p.menu_session.revision;
+        assert!(current > revision);
+        let stale = UiAction::MenuControl {
+            instance: p.menu_session.instance,
+            revision,
+            control: "increase".into(),
+        };
+        let commands = pump_action(&mut p, stale);
+        assert!(ui_audio(&commands).is_empty());
+        assert_eq!(p.menu_session.revision, current);
+        assert_eq!(p.menu_effects.sounds, sounds);
+    }
+    #[test]
+    fn reduced_motion_suppresses_fades_but_not_sounds() {
+        let mut p = Player::new(effects_program(), "r".into(), "t".into()).unwrap();
+        p.preferences.reduced_motion = true;
+        let c = p.pump(vec![], 1000);
+        let fired = settle(&mut p, c);
+        assert_eq!(ui_audio(&fired).len(), 2, "enter sound and music still play");
+        assert!(p.menu_effects.fade.is_none());
+        assert!(p.menu_effects_clock.is_none());
+        assert_eq!(p.model().menu_opacity, 1.);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        let fired = settle(&mut p, c);
+        assert_eq!(ui_audio(&fired).len(), 2);
+        assert_eq!(p.model().menu_opacity, 1.);
+        // No fade means no deferral: the close sound plays and the exit is
+        // immediate, with no clock lease ever taken.
+        let commands = pump_action(&mut p, UiAction::Close);
+        assert_eq!(ui_audio(&commands).len(), 1);
+        assert_eq!(p.screen, Screen::Story);
+        assert!(p.menu_effects.closing.is_none());
+    }
+    #[test]
+    fn ui_sound_events_are_accepted_by_task_and_session_and_reset_with_sessions() {
+        let (mut p, bell, music) = effects_player_at_overlay();
+        assert!(
+            !p.menu_effects.sounds.contains_key(&music),
+            "looping music is never awaited"
+        );
+        // A stale-session end event cannot retire a live voice.
+        p.pump(
+            vec![AppEvent::AudioEnded {
+                domain: TimeDomain::ForegroundUi,
+                task: bell,
+                session: p.generation.session + 1,
+            }],
+            1000,
+        );
+        assert!(p.menu_effects.sounds.contains_key(&bell));
+        p.pump(
+            vec![AppEvent::AudioEnded {
+                domain: TimeDomain::ForegroundUi,
+                task: bell,
+                session: p.generation.session,
+            }],
+            1000,
+        );
+        assert!(!p.menu_effects.sounds.contains_key(&bell));
+        assert!(p.menu_effects.music.is_some());
+        // An unknown failing task is not a fault of this session's effects.
+        p.pump(
+            vec![AppEvent::AudioFailed {
+                domain: TimeDomain::ForegroundUi,
+                task: music + 100,
+                session: p.generation.session,
+                message: "fixture ui audio failure".into(),
+            }],
+            1000,
+        );
+        assert!(p.error.is_none());
+        // A new session resets the whole voice table; the host reset both
+        // audio domains with it, and the rebooted title owns fresh voices.
+        let c = pump_action(&mut p, UiAction::Title);
+        assert_eq!(p.menu_effects.session, p.generation.session);
+        assert!(p.menu_effects.entered.is_none(), "boot is still preparing");
+        let fired = settle(&mut p, c);
+        assert!(ui_audio(&fired).iter().any(
+            |(_, asset, bus, looped, _)| *asset == "audio.bgm"
+                && *bus == AudioBus::Bgm
+                && *looped
+        ));
+        assert_eq!(
+            p.menu_effects.entered,
+            Some(("title".into(), p.menu_session.instance))
+        );
+        assert_eq!(
+            p.menu_effects.music.unwrap().session,
+            p.generation.session
+        );
+    }
+    #[test]
+    fn reading_close_defers_the_toggle_behind_the_shared_close_fade() {
+        let mut program = reading_program();
+        program.requires.push("ui.menu-effects.v1".into());
+        program
+            .theme
+            .image_menus
+            .get_mut("system")
+            .unwrap()
+            .effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "close": {"sound": "audio.bell", "fade_us": "300000"},
+                "click": "audio.bell"
+            }))
+            .unwrap(),
+        );
+        let mut p = Player::new(program, "r".into(), "t".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        assert!(p.core.dialogue().is_some());
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        let interaction = p.current_interaction();
+        let resume = control(&p, "auto");
+        let commands = pump_action(&mut p, resume);
+        // Acceptance click, then the close sound; the toggle itself waits.
+        assert_eq!(
+            ui_audio(&commands)
+                .iter()
+                .map(|(_, asset, ..)| *asset)
+                .collect::<Vec<_>>(),
+            vec!["audio.bell", "audio.bell"]
+        );
+        assert_eq!(p.screen, Screen::Menu);
+        assert!(p.menu_effects.closing.is_some());
+        assert!(!p.auto);
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 300_000,
+            }],
+            1000,
+        );
+        assert_eq!(p.screen, Screen::Story);
+        assert!(p.auto, "the deferred reading action resumed exactly once");
+        assert_eq!(p.current_interaction(), interaction);
+        assert!(!p.paused());
     }
 }

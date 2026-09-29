@@ -5,8 +5,9 @@ mod menu;
 mod transition;
 mod tween;
 pub use menu::{
-    MenuCondition, MenuContent, MenuElement, MenuImageStates, MenuLocal, MenuPreference,
-    MenuRangeBinding, MenuSlot, MenuToggleBinding, MenuValue, MenuValueInput, MAX_MENU_PARENTS,
+    MenuCondition, MenuContent, MenuEffects, MenuElement, MenuImageStates, MenuLocal, MenuMusic,
+    MenuPreference, MenuRangeBinding, MenuSlot, MenuToggleBinding, MenuTransition, MenuValue,
+    MenuValueInput, MAX_MENU_PARENTS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-history-flow.v1",
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
+    "ui.menu-effects.v1",
     "media.webp.v1",
     "media.mp3.v1",
 ];
@@ -1017,9 +1019,10 @@ pub fn valid_audio_gain(value: f32) -> bool {
     value.is_finite() && (0.0..=4.0).contains(&value)
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioBus {
+    #[default]
     Bgm,
     Voice,
     Sfx,
@@ -1253,6 +1256,9 @@ pub struct ImageMenu {
     pub elements: Vec<MenuElement>,
     pub background: String,
     pub buttons: Vec<ImageButton>,
+    /// Finite page presentation effects; absent keeps legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<MenuEffects>,
 }
 fn builtin_navigation_default() -> bool {
     true

@@ -1823,6 +1823,13 @@ fn validate_image_menus(
         }
     }
     for menu in theme.image_menus.values() {
+        for id in menu.effect_assets() {
+            if asset(&id) != Some(AssetKind::Audio) {
+                return Err(err("E_THEME_ASSET", &id, "menu effects require an audio asset"));
+            }
+        }
+    }
+    for menu in theme.image_menus.values() {
         for (_, action, _) in menu.controls() {
             if let ImageMenuAction::Entry { function: id } = action {
                 if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
@@ -1839,6 +1846,19 @@ fn validate_image_menus(
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_effects)
+        && !root.requires.iter().any(|c| c == "ui.menu-effects.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-effects.v1",
+        ));
+    }
     if (root.theme.menu_overlay.is_some()
         || root
             .theme
@@ -3182,6 +3202,15 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
     }
     for menu in p.theme.image_menus.values() {
         menu.validate_story_exports(&p.variables)?;
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_effects)
+        && !p.requires.iter().any(|c| c == "ui.menu-effects.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-effects.v1",
+        ));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_reading)
         && !p.requires.iter().any(|c| c == "ui.menu-reading.v1")

@@ -407,6 +407,17 @@ fn asset_consumers(
             .or_default()
             .insert("bootstrap".into());
     }
+    for asset in program
+        .theme
+        .image_menus
+        .values()
+        .flat_map(nir_format::ImageMenu::effect_assets)
+    {
+        consumers
+            .entry(asset)
+            .or_default()
+            .insert("menu-effects".into());
+    }
     let title_nodes = program
         .title_scene
         .as_ref()

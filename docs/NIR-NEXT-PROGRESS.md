@@ -558,3 +558,16 @@ SDK 已重建，Schema 已更新；独立发行验证与浏览器整套 33 项�
 - 独立 Pillow GAL 解码器逐像素验证 11 张状态 PNG 与完整平铺 RGBA 边框一致。最终实际生成工程从主线积累 30 条历史后，验证原几何、96 像素滚轮、40 像素箭头、361 像素轨道翻页、滑块持续拖动和首尾夹取；截图文字随滚动变化。立即 Home、两端原箭头、Escape／右键返回父页、新实例与旧父／子／布局请求拒绝全部通过。菜单操作期间观测的 Core 位置、tick、交互、变量、对白、选择及历史数保持不变，无页面异常；返回父页后继续暂停，根页 Close 返回同一剧情。
 
 本批第四个根菜单动作已完成自动转换链路及实际播放验收，历史仍为明确不完整草稿：NIR 字体与有界记录替代来源格式器；scenario-page 间隔、按格式器页数保留、字体阴影／描边、动态样式、箭头按住重复及精确轨道拉伸尚未等价迁移。原可执行文件对照和 Windows 设备待验收，完整 P0–P6 计划未完成；未提交或推送。最终证据：本地忽略目录 source-history-rust-verified.log、source-history-clippy-verified.log、source-history-windows-verified.log、source-history-sdk-verified.log、source-history-sdk-verify-verified.log、source-history-browser-verified.log、source-history-convert-verified.log、source-history-source-verified.log、source-history-pixel-evidence.json 与 source-history-page-browser-evidence.json。此前失败记录保留；契约见 MENU-HISTORY-FLOW-SEMANTICS.md、MENU-SERVICES-SEMANTICS.md 与 IMPORT.md。
+
+## 批次 48：菜单页面效果（P4.1）
+
+- 新增 `ui.menu-effects.v1`：页面边界声明式效果——进入/关闭 MenuTransition（可选一次性音效 + ≤2 秒渐隐）、接受提交点击音效、前台域循环页面音乐（可配总线和 0–4 增益）。`deny_unknown_fields` 与 `E_VIEW_EFFECTS` 校验；编译器按实际声明保留能力并连带菜单服务。
+- 所有权与静默准备：进入效果属主为 `(页面 ID, 菜单实例)`，覆盖页只在自身 prepared stamp 完整后触发，标题闭包页随启动准备就绪；换页/离开面立即停旧页音乐并退休旧页效果，revision 变化不重播。点击音效只在通过实例/版本/守卫校验的提交上播放，过期请求与恢复投影不触发。
+- 关闭事务：声明关闭效果时退出变为有限事务——关闭音效立即播放、旧输入锁定、渐隐保持页面与暂停，淡出完成才提交退出（含阅读模式以原始交互身份重放开关、取消的槽位恢复重启激活准备）；故障/紧急路径可立即退出，进入故障保持标题静默。
+- 时间与音频域：效果状态属前台域，渐隐先取 ForegroundClockToken（MAX_TASKS 上限，完成/取消释放；令牌不可得时进入全不透明立即呈现、关闭立即提交，不产生隐形死页）。一次性音效与音乐走 `foreground_ui` 域 `(域, 会话, 任务)` 寻址；会话重置随宿主 AudioReset 终止全部效果声音，循环音乐从不进入等待集合，未知前台音频失败不构成故障。`reduced_motion` 保留声音、跳过全部渐隐。
+- 设计缺口修复：效果音频资产并入页面准备闭包——新增 `ImageMenu::prepared_assets`（图片 ∪ 效果资产），标题闭包准备、覆盖页 `prepare_active_menu`、准备完成 stamp 子集检查与菜单留存全部改用；否则宿主 `playVoice` 只能播已解码缓冲、留存修剪会立即删掉刚准备的音频（浏览器实测 E_AUDIO_BUFFER 全静默）。
+- 呈现与状态：UiModel.menu_opacity 全页绘制透明度乘数（作者菜单分支），engine state() 暴露 `menu_opacity`；MenuEffectsState 会话瞬态，不入故事快照。
+- Rust 契约覆盖：标题/覆盖静默准备空窗、每 (id,instance) 单次进入、音乐随页（换页停旧起新）、关闭声音/锁输入/延迟退出/音乐停止、点击仅在受提交、reduced_motion（有声无渐隐无令牌）、ForegroundUi AudioEnded 按 (task,session)、未知失败不故障、会话重置全清、进入故障标题静默。最终 `cargo xtask test` 33 套件通过（batch-48-xtask-test.log）。
+- SDK 重构后浏览器验收通过（batch-48-browser-menu-effects.log）：标题进入恰一次（1 音效 + 1 循环音乐），200ms 稳定后不再重播；Start 后会话重置终止 UI 域声音、Story 域 BGM 起；覆盖页就绪后进入（累计 4 起）且稳定；过期 data-action 不增点击音效、真实提交恰 +1；Escape 关闭立即响铃、渐隐中保持 Menu 与音乐停止数不变、完成后才切 Story 并停音乐，透明度全程 0→1 可观测。无页面错误。
+
+P4.1 完成；Replay 事务（P4.2）开始。证据：reports/nir-next/batch-48-xtask-test.log、batch-48-xtask-sdk.log、batch-48-browser-menu-effects.log。契约见 MENU-EFFECTS-SEMANTICS.md、CAPABILITIES.md 与 TIME-DOMAINS.md。完整 P0–P6 计划未完成；未提交或推送。

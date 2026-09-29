@@ -1130,6 +1130,7 @@ impl Adapter {
                 elements: buttons.into_iter().map(menu_element).collect(),
                 background,
                 buttons: vec![],
+                effects: None,
             },
         );
         let (background, _) = self.image("グラフィック/menu/menu2.gal")?;
@@ -1170,6 +1171,7 @@ impl Adapter {
                 elements: buttons.into_iter().map(menu_element).collect(),
                 background,
                 buttons: vec![],
+                effects: None,
             },
         );
         self.warnings.insert("Replay thumbnails retain original grid coordinates. Locked thumbnails preserve alpha with black RGB; a NIR return button and system-menu access remain available for touch/keyboard navigation.".into());

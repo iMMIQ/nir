@@ -963,6 +963,7 @@ impl Engine {
         state["history_error"] = serde_json::json!(self.reading.history_error());
         state["interface_hidden"] = serde_json::json!(self.player.interface_hidden());
         state["foreground_clock_us"] = serde_json::json!(self.player.foreground_clock());
+        state["menu_opacity"] = serde_json::json!(self.player.menu_opacity());
         state["foreground_paused"] =
             serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));
         state["dialogue_appearance"] = serde_json::json!(c.sample_dialogue_appearance());

@@ -328,6 +328,32 @@ navigation_project=build("browser-menu-navigation",lambda c:history_lines(c,6),s
 navigation_server=ThreadingHTTPServer(("127.0.0.1",4219),partial(SimpleHTTPRequestHandler,directory=str(navigation_project)))
 Thread(target=navigation_server.serve_forever,daemon=True).start()
 
+def menu_effects_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.title]",1)[0]
+    # Title: enter sound plus looping page music. Overlay: the full set --
+    # enter/close fades, click feedback and different looping music -- so the
+    # page-change, close-transaction and accepted-commit boundaries all fire.
+    source += '\n[image_menus.title]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.title.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
+    source += '\n[image_menus.title.effects.music]\nasset = "audio.bgm"\n'
+    source += '\n[[image_menus.title.elements]]\nid = "start"\nrect = [80,100,400,80]\ncontent = { type = "button", label = "Start", asset = "menu.blue", action = {type = "new_game"} }\n'
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.system.effects]\nclick = "audio.bell"\n'
+    source += '\n[image_menus.system.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
+    source += '\n[image_menus.system.effects.close]\nsound = "audio.bell"\nfade_us = "700000"\n'
+    source += '\n[image_menus.system.effects.music]\nasset = "audio.voice"\nbus = "voice"\ngain = 0.5\n'
+    source += '\n[[image_menus.system.elements]]\nid = "increase"\nrect = [80,180,300,70]\ncontent = { type = "button", label = "Increase speed", asset = "menu.blue", action = {type = "adjust_preference", field = "text_speed", delta = 0.25 } }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,320,300,70]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+effects_menu_project=build("browser-menu-effects",lambda c:None,setup=menu_effects_assets)
+effects_menu_server=ThreadingHTTPServer(("127.0.0.1",4220),partial(SimpleHTTPRequestHandler,directory=str(effects_menu_project)))
+Thread(target=effects_menu_server.serve_forever,daemon=True).start()
+
+wipe_project=build("browser-wipe-project",wipe)
+
 wipe_project=build("browser-wipe-project",wipe)
 wipe_server=ThreadingHTTPServer(("127.0.0.1",4201),partial(SimpleHTTPRequestHandler,directory=str(wipe_project)))
 Thread(target=wipe_server.serve_forever,daemon=True).start()

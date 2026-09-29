@@ -921,6 +921,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .theme
         .image_menus
         .values()
+        .any(nir_format::ImageMenu::uses_effects)
+    {
+        program.requires.retain(|c| c != "ui.menu-effects.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
         .any(nir_format::ImageMenu::uses_history_scrollbar)
     {
         program
@@ -1034,6 +1042,12 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
 pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
     roots.extend(p.theme.image_assets());
+    roots.extend(
+        p.theme
+            .image_menus
+            .values()
+            .flat_map(nir_format::ImageMenu::effect_assets),
+    );
     // Every scene declaration is shipped in one module Static package, so its
     // media identity must be in the root index even when the scene is not the
     // current title scene. Media bytes remain lazy at runtime.
