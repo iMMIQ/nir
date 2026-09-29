@@ -7,7 +7,7 @@
 | 逻辑 | Bool/I32/String、局部槽、纯表达式、checked 算术、函数/返回、Branch/Switch/Goto | 无浮点剧情变量、脚本扩展或任意 JS |
 | 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、DialogueVisibility、ProfileMerge | Profile 为布尔事实的单调集合 |
 | 终结 | Call/Return、Activate/Await/Interact、End/Fault | 单剧情流；跨模块通过具名导出调用 |
-| 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All | 无 Runtime Worker |
+| 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All、Sequence/ParallelAll 有限组合 | 无 Runtime Worker |
 | 模块 | 多模块命名空间、导出链接、共享变量、函数体/正文哈希分包、执行与恢复前准备 | 静态目录与媒体按需准备、有界预取、租约保护及驱逐；无 Edition 或跨发行存档转换 |
 | 图像 | Group/Sprite、层次顺序、裁切、cut/dissolve、方向擦除/Alpha 阈值遮罩、x/y/scale/opacity 动画 | 来源 PNG，打包默认转有损 WebP（质量 92，alpha 通道无损保留）；无旋转、滤镜、视频和独立 Group 混合模式 |
 | 正文 | 注册字体、样式强调、参数隔离、换行、字素簇揭示、span Marker/Gate、已揭示长文翻阅 | 无 Ruby、NVL、富网页标记 |
@@ -98,6 +98,10 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 `ui.menu-chrome.v1` 允许页面关闭自动添加的导航按钮，保留作者控件、Escape／右键和失败出口。默认开启，旧页面行为不变；转换器可在原页面只使用键盘返回时自动生成该声明，见 [菜单服务](MENU-SERVICES-SEMANTICS.md)。
 
 `ui.menu-navigation.v1` 提供最多八层父页的 push_menu／back，保存有界局部值、逐层 Close 和返回后的新输入实例；旧 menu 替换行为保持兼容。资源、服务与布局状态的边界见 [菜单子页导航](MENU-NAVIGATION-SEMANTICS.md)。
+
+### task.compose.v1
+
+Cue 内可声明 `sequence` / `parallel_all` 有限组合：组合是一个自主任务，主 VM 停驻于等待、选项或内容屏障时链仍自行前进；子项经与顶层效果完全相同的派生路径获得作用域继承、所有权检查与启动时刻属性捕获。结果归并失败 > 取消 > 完成，已完成副作用不回滚，零时长链逐派生计入执行预算且无限循环不可表达。子项不得为 StagePresent/Dialogue，不得被故事按名等待或控制（Await/TaskControl 只认顶层效果 ID），嵌套深度 ≤ 8、单 Cue 叶子数 ≤ 256；能力裁剪、媒体根与激活配方遍历全树。链中途存读档/回退只续播不重播。见 [有限任务组合](COMPOSE-SEMANTICS.md)。不含剧情副作用、条件子项或来源动画序列自动映射。
 
 ### media.webp.v1 / media.mp3.v1
 

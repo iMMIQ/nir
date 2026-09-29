@@ -382,6 +382,24 @@ replay_project=build("browser-replay",replay_function,setup=replay_assets)
 replay_server=ThreadingHTTPServer(("127.0.0.1",4221),partial(SimpleHTTPRequestHandler,directory=str(replay_project)))
 Thread(target=replay_server.serve_forever,daemon=True).start()
 
+def compose(content):
+    # The sample Activate/Await cannot compile: while the VM waits on the
+    # dialogue, a chain first fades the panel and then the text on its own.
+    content["cues"]["intro"]["effects"][0]["effect"]["reveal_us"]="200000"
+    content["cues"]["intro"]["effects"].append({"id":"chain","scope":"session",
+        "effect":{"type":"sequence","children":[
+            {"id":"panel-fade","scope":"session",
+             "effect":{"type":"tween","target":{"type":"dialogue_root","property":"background_opacity"},
+                        "to":0.2,"duration_us":"1500000"}},
+            {"id":"text-fade","scope":"session",
+             "effect":{"type":"tween","target":{"type":"dialogue_root","property":"text_opacity"},
+                        "to":0.35,"duration_us":"1500000"}},
+        ]}})
+
+compose_project=build("browser-compose",compose)
+compose_server=ThreadingHTTPServer(("127.0.0.1",4222),partial(SimpleHTTPRequestHandler,directory=str(compose_project)))
+Thread(target=compose_server.serve_forever,daemon=True).start()
+
 wipe_project=build("browser-wipe-project",wipe)
 
 wipe_project=build("browser-wipe-project",wipe)

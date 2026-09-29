@@ -205,6 +205,9 @@ impl RuntimeProgramView {
                     Effect::Audio { asset, .. } => {
                         set.insert(asset.clone());
                     }
+                    Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                        effect.effect.collect_audio_assets(&mut set);
+                    }
                     _ => {}
                 }
             }
@@ -345,6 +348,9 @@ impl RuntimeProgramView {
                         }
                         Effect::Audio { asset, .. } => {
                             assets.insert(asset.clone());
+                        }
+                        Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                            effect.effect.collect_audio_assets(&mut assets);
                         }
                         _ => {}
                     }
@@ -2658,6 +2664,23 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
         if stages > 1 || dialogues > 1 {
             return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
         }
+        validate_composition(
+            id,
+            cue,
+            &view.requires,
+            &mut names,
+            |asset| view.asset_kind(asset),
+            |target| {
+                root.task_owners.get(target) == Some(&package.module)
+                    && view.task_definitions.get(target).is_some_and(|defs| {
+                        !defs.is_empty()
+                            && defs
+                                .iter()
+                                .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                    })
+            },
+            err,
+        )?;
         let recipe = &package.activation_recipes[id];
         if recipe.iter().any(|asset| {
             view.asset_kind(asset)
@@ -2680,6 +2703,20 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                         id,
                         "audio asset missing from activation recipe",
                     ));
+                }
+            }
+            if effect.effect.uses_compose() {
+                let mut child_audio = BTreeSet::new();
+                effect.effect.collect_audio_assets(&mut child_audio);
+                for asset in child_audio {
+                    if !recipe.contains(&asset) {
+                        return Err(err(
+                            "E_RECIPE",
+                            id,
+                            "audio asset missing from activation recipe",
+                        ));
+                    }
+                    expected.insert(asset);
                 }
             }
             if let Effect::StagePresent {
@@ -3080,6 +3117,224 @@ fn err(code: &str, at: &str, message: &str) -> Diagnostic {
     Diagnostic::new(code, at, message)
 }
 const MAX_CONTENT_BATCH_ITEMS: usize = 128;
+/// Composition nesting cap; the task graph stays reviewable and the runtime
+/// chase loop stays bounded without trusting author intent.
+const MAX_COMPOSE_DEPTH: usize = 8;
+
+/// Every property address a def subtree writes.
+fn subtree_writers(def: &EffectDef) -> BTreeSet<TweenTarget> {
+    let mut set = BTreeSet::new();
+    if let Some((address, _, _)) = def.effect.scalar_track(0., 0.) {
+        set.insert(address);
+    }
+    for child in def.effect.compose_children().unwrap_or(&[]) {
+        set.extend(subtree_writers(child));
+    }
+    set
+}
+
+/// Writers may never overlap between effects that can run at the same
+/// instant: the def against `ambient`, then recursively. Sequence positions
+/// run alone, so a chain may rewrite the address an earlier position wrote;
+/// parallel siblings and everything outside the chain may not.
+fn check_writer_tree(
+    at: &str,
+    def: &EffectDef,
+    ambient: &BTreeSet<TweenTarget>,
+    err: &impl Fn(&str, &str, &str) -> Diagnostic,
+) -> Result<()> {
+    let own = subtree_writers(def);
+    if !ambient.is_disjoint(&own) {
+        return Err(err(
+            "E_OWNERSHIP",
+            at,
+            "concurrent effects write the same property",
+        ));
+    }
+    if let Effect::ParallelAll { children } = &def.effect {
+        let sets: Vec<_> = children.iter().map(subtree_writers).collect();
+        for (index, child) in children.iter().enumerate() {
+            let mut inner = ambient.clone();
+            for (other, set) in sets.iter().enumerate() {
+                if other != index {
+                    inner.extend(set.iter().cloned());
+                }
+            }
+            check_writer_tree(at, child, &inner, err)?;
+        }
+    }
+    if let Effect::Sequence { children } = &def.effect {
+        for child in children {
+            check_writer_tree(at, child, ambient, err)?;
+        }
+    }
+    Ok(())
+}
+
+/// One composition child: scope inheritance, forbidden kinds, capabilities,
+/// assets and stop targets, exactly like a top-level effect.
+fn check_compose_child<'a>(
+    at: &str,
+    def: &'a EffectDef,
+    parent_scope: Scope,
+    depth: usize,
+    names: &mut BTreeSet<&'a String>,
+    requires: &[String],
+    asset_kind: &impl Fn(&str) -> Option<AssetKind>,
+    audio_task: &impl Fn(&str) -> bool,
+    err: &impl Fn(&str, &str, &str) -> Diagnostic,
+) -> Result<()> {
+    if !names.insert(&def.id) {
+        return Err(err("E_DUPLICATE", at, &def.id));
+    }
+    if def.scope != parent_scope {
+        return Err(err("E_SCOPE", at, &def.id));
+    }
+    if depth > MAX_COMPOSE_DEPTH {
+        return Err(err("E_LIMIT", at, "composition nesting"));
+    }
+    if matches!(
+        def.effect,
+        Effect::StagePresent { .. } | Effect::Dialogue { .. }
+    ) {
+        return Err(err(
+            "E_COMPOSE",
+            at,
+            "composition children cannot present stages or dialogue",
+        ));
+    }
+    if matches!(def.effect, Effect::Tween { .. }) && !requires.iter().any(|c| c == "tween.target.v1")
+    {
+        return Err(err("E_CAPABILITY", at, "tween.target.v1"));
+    }
+    match &def.effect {
+        Effect::Audio { gain, .. } if *gain != 1.0 && !requires.iter().any(|c| c == "audio.gain.v1") => {
+            return Err(err("E_CAPABILITY", at, "audio.gain.v1"));
+        }
+        Effect::Audio { gain, .. } if !valid_audio_gain(*gain) => {
+            return Err(err(
+                "E_AUDIO_GAIN",
+                at,
+                "event gain must be finite and within 0..4",
+            ));
+        }
+        Effect::Audio { asset, .. } if asset_kind(asset) != Some(AssetKind::Audio) => {
+            return Err(err("E_ASSET_TYPE", at, asset));
+        }
+        Effect::AudioStop {
+            target,
+            duration_us,
+        } => {
+            if !requires.iter().any(|cap| cap == "audio.stop.v1") {
+                return Err(err("E_CAPABILITY", at, "audio.stop.v1"));
+            }
+            if duration_us.0 > 60_000_000
+                || target == &def.id
+                || !audio_task(target)
+            {
+                return Err(err(
+                    "E_AUDIO_STOP",
+                    at,
+                    "stop requires an audio target and duration within 0..60s",
+                ));
+            }
+        }
+        _ => {}
+    }
+    if def
+        .effect
+        .scalar_track(0., 0.)
+        .is_some_and(|(address, track, _)| !address.accepts(track.to))
+    {
+        return Err(err("E_VISUAL", at, "invalid target value"));
+    }
+    for child in def.effect.compose_children().unwrap_or(&[]) {
+        check_compose_child(
+            at,
+            child,
+            def.scope,
+            depth + 1,
+            names,
+            requires,
+            asset_kind,
+            audio_task,
+            err,
+        )?;
+    }
+    Ok(())
+}
+
+/// Composition cue rules shared by source and package validation. Runs after
+/// the top-level loop; `names` carries the cue's task ids so children cannot
+/// shadow them.
+fn validate_composition<'a>(
+    id: &str,
+    cue: &'a Cue,
+    requires: &[String],
+    names: &mut BTreeSet<&'a String>,
+    asset_kind: impl Fn(&str) -> Option<AssetKind>,
+    audio_task: impl Fn(&str) -> bool,
+    err: impl Fn(&str, &str, &str) -> Diagnostic,
+) -> Result<()> {
+    if !cue.effects.iter().any(|def| def.effect.uses_compose()) {
+        return Ok(());
+    }
+    if !requires.iter().any(|c| c == "task.compose.v1") {
+        return Err(err("E_CAPABILITY", id, "task.compose.v1"));
+    }
+    let total: usize = cue.effects.iter().map(|def| def.effect.compose_leaves()).sum();
+    if total > MAX_TASKS {
+        return Err(err("E_LIMIT", id, "invalid cue size"));
+    }
+    for def in &cue.effects {
+        if def.effect.compose_children().is_none() {
+            continue;
+        }
+        if def.effect.compose_depth() > MAX_COMPOSE_DEPTH {
+            return Err(err("E_LIMIT", id, "composition nesting"));
+        }
+        let ambient: BTreeSet<_> = cue
+            .effects
+            .iter()
+            .filter(|other| other.id != def.id)
+            .flat_map(subtree_writers)
+            .collect();
+        match &def.effect {
+            Effect::Sequence { children } => {
+                for child in children {
+                    check_writer_tree(id, child, &ambient, &err)?;
+                }
+            }
+            Effect::ParallelAll { children } => {
+                let sets: Vec<_> = children.iter().map(subtree_writers).collect();
+                for (index, child) in children.iter().enumerate() {
+                    let mut inner = ambient.clone();
+                    for (other, set) in sets.iter().enumerate() {
+                        if other != index {
+                            inner.extend(set.iter().cloned());
+                        }
+                    }
+                    check_writer_tree(id, child, &inner, &err)?;
+                }
+            }
+            _ => {}
+        }
+        for child in def.effect.compose_children().unwrap_or(&[]) {
+            check_compose_child(
+                id,
+                child,
+                def.scope,
+                1,
+                names,
+                requires,
+                &asset_kind,
+                &audio_task,
+                &err,
+            )?;
+        }
+    }
+    Ok(())
+}
 pub fn expr_type(e: &Expr, vars: &BTreeMap<String, ValueType>, at: &str) -> Result<ValueType> {
     use BinaryOp::*;
     match e {
@@ -3684,6 +3939,22 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         if stage_count > 1 || dialogue_count > 1 {
             return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
         }
+        validate_composition(
+            id,
+            cue,
+            &p.requires,
+            &mut names,
+            |asset| p.assets.get(asset).map(|a| a.kind),
+            |target| {
+                p.task_definitions.get(target).is_some_and(|defs| {
+                    !defs.is_empty()
+                        && defs
+                            .iter()
+                            .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                })
+            },
+            err,
+        )?;
     }
     for (id, c) in p.choices.iter() {
         let mut ids = BTreeSet::new();

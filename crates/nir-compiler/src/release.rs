@@ -358,6 +358,9 @@ fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
                 Effect::Audio { asset, .. } => {
                     assets.insert(asset.clone());
                 }
+                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                    definition.effect.collect_audio_assets(&mut assets);
+                }
                 _ => {}
             }
         }
@@ -397,6 +400,16 @@ fn asset_consumers(
                         .entry(asset.clone())
                         .or_default()
                         .insert(format!("module:{module}"));
+                }
+                if effect.effect.uses_compose() {
+                    let mut child_audio = BTreeSet::new();
+                    effect.effect.collect_audio_assets(&mut child_audio);
+                    for asset in child_audio {
+                        consumers
+                            .entry(asset)
+                            .or_default()
+                            .insert(format!("module:{module}"));
+                    }
                 }
             }
         }

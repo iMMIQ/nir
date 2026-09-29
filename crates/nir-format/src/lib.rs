@@ -61,6 +61,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-values.v1",
     "ui.menu-effects.v1",
     "ui.replay.v1",
+    "task.compose.v1",
     "media.webp.v1",
     "media.mp3.v1",
 ];
@@ -917,6 +918,73 @@ pub enum Effect {
     Delay {
         duration_us: Micros,
     },
+    /// Children run one after another: the next child starts only after the
+    /// previous one completed, capturing the current property values at its
+    /// own start. The composition is itself a task; children are tasks with
+    /// the composition's scope.
+    Sequence {
+        children: Vec<EffectDef>,
+    },
+    /// Children all start together; the composition finishes when every child
+    /// finished, and fails or cancels as soon as any child does.
+    ParallelAll {
+        children: Vec<EffectDef>,
+    },
+}
+impl Effect {
+    /// Children of a composition, for tree walks shared by validation,
+    /// compilation and the runtime.
+    pub fn compose_children(&self) -> Option<&[EffectDef]> {
+        match self {
+            Self::Sequence { children } | Self::ParallelAll { children } => Some(children),
+            _ => None,
+        }
+    }
+    /// Whether this subtree contains any composition node. Children exist
+    /// only inside compositions, so the root being one is the whole answer.
+    pub fn uses_compose(&self) -> bool {
+        self.compose_children().is_some()
+    }
+    /// Total effect definitions in this subtree, including composites.
+    pub fn compose_leaves(&self) -> usize {
+        1 + self
+            .compose_children()
+            .map(|children| children.iter().map(|def| def.effect.compose_leaves()).sum())
+            .unwrap_or(0)
+    }
+    /// Composition nesting depth; a leaf has depth 0.
+    pub fn compose_depth(&self) -> usize {
+        self.compose_children()
+            .map(|children| {
+                1 + children
+                    .iter()
+                    .map(|def| def.effect.compose_depth())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+    /// Depth-first test over this effect and every composition child; cue
+    /// walkers that gate capabilities or media on effect kind must see the
+    /// whole tree, not only top-level definitions.
+    pub fn effect_tree_any(&self, predicate: &impl Fn(&Self) -> bool) -> bool {
+        predicate(self)
+            || self
+                .compose_children()
+                .is_some_and(|children| {
+                    children.iter().any(|def| def.effect.effect_tree_any(predicate))
+                })
+    }
+    /// Every audio asset this effect subtree starts, compositions included.
+    /// Stage present transitions are handled by the caller (scene nodes).
+    pub fn collect_audio_assets(&self, out: &mut BTreeSet<String>) {
+        if let Self::Audio { asset, .. } = self {
+            out.insert(asset.clone());
+        }
+        for def in self.compose_children().unwrap_or(&[]) {
+            def.effect.collect_audio_assets(out);
+        }
+    }
 }
 /// Typed property addresses. UI-owned objects are deliberately not addressable by Story.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

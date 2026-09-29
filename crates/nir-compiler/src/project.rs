@@ -739,29 +739,31 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     {
         program.requires.retain(|c| c != "ui.menu-chrome.v1");
     }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::Audio { gain, .. } if gain != 1.0))
-    {
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::Audio { gain, .. } if *gain != 1.0))
+    }) {
         program.requires.retain(|cap| cap != "audio.gain.v1");
     }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::AudioStop { .. }))
-    {
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::AudioStop { .. }))
+    }) {
         program.requires.retain(|cap| cap != "audio.stop.v1");
+    }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::Tween { .. }))
+    }) {
+        program.requires.retain(|cap| cap != "tween.target.v1");
     }
     if !program
         .cues
         .values()
         .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::Tween { .. }))
+        .any(|def| def.effect.uses_compose())
     {
-        program.requires.retain(|cap| cap != "tween.target.v1");
+        program.requires.retain(|cap| cap != "task.compose.v1");
     }
     if !program
         .functions
@@ -1067,9 +1069,7 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
             if let Effect::StagePresent { transition, .. } = &effect.effect {
                 roots.extend(transition.asset().map(str::to_owned));
             }
-            if let Effect::Audio { asset, .. } = &effect.effect {
-                roots.insert(asset.clone());
-            }
+            effect.effect.collect_audio_assets(&mut roots);
         }
     }
     // Font plans are locale consumers. They do not belong to every activation

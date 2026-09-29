@@ -583,3 +583,15 @@ P4.1 完成；Replay 事务（P4.2）开始。证据：reports/nir-next/batch-48
 - 浏览器验收（端口 4221，`replay.spec.js` 2 项 + 整套 36 项全过，batch-49-browser-replay.log / batch-49-browser-full.log）：锁定控件禁用且伪造当前授权动作同样死亡；IndexedDB 播种 "seen" 解锁；同一 data-action 双投递仅一次进入，entering 期间冻结页保持屏幕；active 后回想正文与冻结正文不同、覆盖层仅提供退出；outcome 后返回原页原正文、控制件恢复可用而冻结前点击不再起效；手动 `Exit replay` 经覆盖控件完整返回。无页面错误。
 
 P4.2 完成；P5（Sequence/ParallelAll 组合）待实施。证据：reports/nir-next/batch-49-xtask-test.log、batch-49-xtask-sdk.log、batch-49-browser-replay.log、batch-49-browser-full.log。契约见 REPLAY-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 50：Sequence/ParallelAll 有限组合（P5.1）
+
+- 新增 `task.compose.v1` 与 `Effect::Sequence`/`Effect::ParallelAll`：组合是一个自主任务，主 VM 停驻于等待、选项或内容屏障时链仍自行前进——以“主 VM 等对白时，另一条先位移再淡出链仍前进”的样例证明仅靠 Activate/Await（单一等待槽）不可编译。子项经与 Cue 提交共用的 `commit_effect` 路径派生：作用域继承、所有权检查、AudioStart 意图与句柄注册完全一致，但派生发生在子项自己开始的时刻，序列后项捕获前项结束后的当前值。
+- 执行语义：结果归并失败 > 取消 > 完成（ParallelAll 取消仍在运行的兄弟）；已完成副作用不回滚；链被 Finish 控制时运行中子项按各自 FinishPolicy 落终值、未派生子项永不执行；`end`/作用域退出照常级联。零时长子项在同一提交的追赶轮内连锁完成，每次派生消耗一个执行预算单位（预算耗尽跨步续跑、work_used 可见），追赶不收敛显式 E_LIMIT 故障，无限零时长循环不可表达。
+- 校验（源与 Runtime 根共用）：子项作用域必须继承组合 scope、禁用 StagePresent/Dialogue 子项、全树 ID 唯一、并发写冲突（序列位置可改写前项地址，Parallel 兄弟及链外并发效果不可）、嵌套深度 ≤ 8、单 Cue 叶子 ≤ MAX_TASKS 256、停止子项只指向同模块顶层音频任务。子项 ID 不进入故事名字索引：Await/TaskControl/DialogueVoice 按子项名寻址直接 E_TASK，组合只能作为整体被等待或控制。
+- 快照与恢复：children/cursor 恒等、已派生子项逐项匹配声明、序列至多一个运行中子项、Finished 链无待办；损坏即拒绝。链中途存档读档/回退后已完成音频不重启、运行中音频只按保存的故事偏移重发一次 AudioStart（续播非重播）、Tween 的 elapsed/captured 原样恢复。
+- 编译器盲区修复：能力裁剪（audio.gain.v1/audio.stop.v1/tween.target.v1）此前只扫描 Cue 顶层效果，嵌套子项会被误裁——新增 `Effect::effect_tree_any` 全树判定；`runtime_roots` 与激活配方 `cue_assets` 改用 `collect_audio_assets` 遍历子项音频资产，否则嵌套音频不进准备闭包。端到端由浏览器夹具构建失败（E_CAPABILITY tween.target.v1）发现并验证。
+- Core 契约 8 项（compose_contract.rs）：VM 等对白时链自主前进且对白正常收束、零时长连锁与预算可见、子项失败保留已完成副作用、ParallelAll 归并与兄弟取消、Finish/Cancel 整链、链中途快照恢复零重播、源校验八类拒绝、恢复校验拒绝损坏组合。Player 协调 2 项：并行链中途本地变量（affection=5）改变后存读档、链中途检查点回退，均断言恰好一次携带故事偏移的 AudioStart、冻结 Tween 值保留、链恰完成一次、结局到达（batch-50-core.log、batch-50-player.log）。
+- 浏览器验收（端口 4222，compose.spec.js 1 项 + 整套通过）：真实 Web 播放器中主 VM 等待对白揭示时，先淡面板（background_opacity→0.2）再淡正文（text_opacity→0.35）的序列链自行按序走完两段，无页面错误（batch-50-browser-compose.log）。SDK 已用修复后的编译器重建。
+
+P5.1 完成；P5.2（故事交互与类型化结果）待实施。证据：reports/nir-next/batch-50-xtask-test.log、batch-50-xtask-sdk.log、batch-50-core.log、batch-50-player.log、batch-50-browser-compose.log。契约见 COMPOSE-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。

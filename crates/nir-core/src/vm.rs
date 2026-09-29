@@ -134,6 +134,16 @@ pub struct Task {
     pub dialogue: Option<Dialogue>,
     pub source: Vec<Node>,
     pub target: Vec<Node>,
+    /// Spawned child task ids, in order, for a composition effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<u32>,
+    /// How many of the composition's children have been spawned; always
+    /// equals `children.len()`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cursor: u32,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -854,6 +864,9 @@ impl Core {
         Ok(())
     }
     fn run(&mut self) -> Result<()> {
+        // Compositions advance even while the VM itself is parked on a wait,
+        // a choice or a content barrier: the chain is autonomous.
+        self.advance_compositions()?;
         if self
             .intents
             .iter()
@@ -862,6 +875,7 @@ impl Core {
             return Ok(());
         }
         while self.work_remaining > 0 {
+            self.advance_compositions()?;
             if self.state.pending.is_some()
                 || self.state.choice.is_some()
                 || self.state.outcome.is_some()
@@ -1351,214 +1365,24 @@ impl Core {
     }
     fn commit_inner(&mut self) -> Result<()> {
         let p = self.state.pending.take().unwrap();
+        let planned: usize = p
+            .effects
+            .iter()
+            .map(|def| def.effect.compose_leaves())
+            .sum();
         if self
             .state
             .tasks
             .values()
             .filter(|t| t.state == TaskState::Running)
             .count()
-            + p.effects.len()
+            + planned
             > MAX_TASKS
         {
             return Err(self.error("E_LIMIT", "active tasks"));
         }
-        for def in p.effects {
-            let mut source = vec![];
-            let mut target = vec![];
-            let mut captured = 0.;
-            let mut base = 0.;
-            let mut target_task = None;
-            match &def.effect {
-                Effect::AudioStop { target, .. } => {
-                    let target_id = *self
-                        .state
-                        .handles
-                        .get(target)
-                        .ok_or_else(|| self.error("E_TASK", target))?;
-                    let audio = &self.state.tasks[&target_id];
-                    if !matches!(audio.effect, Effect::Audio { .. }) {
-                        return Err(
-                            self.error("E_TASK_TYPE", "audio stop requires an audio instance")
-                        );
-                    }
-                    if self.state.tasks.values().any(|task| {
-                        task.state == TaskState::Running && task.target_task == Some(target_id)
-                    }) {
-                        return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
-                    }
-                    target_task = Some(target_id);
-                    captured = audio.audio_envelope;
-                }
-                Effect::StagePresent { scene, .. } => {
-                    if self.state.tasks.values().any(|t| {
-                        t.state == TaskState::Running
-                            && matches!(t.effect, Effect::StagePresent { .. })
-                    }) {
-                        return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
-                    }
-                    source = self.sample_scene();
-                    target = if !self.state.draft.is_empty() {
-                        std::mem::take(&mut self.state.draft)
-                    } else {
-                        self.program().scenes[scene].clone()
-                    };
-                    let ids: Vec<_> = self
-                        .state
-                        .tasks
-                        .values()
-                        .filter(|t| t.scope == Scope::Scene && t.state == TaskState::Running)
-                        .map(|t| t.id)
-                        .collect();
-                    for id in ids {
-                        self.end_task(id, TaskEndReason::ScopeExited)?;
-                    }
-                    self.state.scene = target.clone();
-                    self.state.scene_generation = self
-                        .state
-                        .scene_generation
-                        .checked_add(1)
-                        .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
-                }
-                Effect::Dialogue { .. } => {
-                    let old: Vec<_> = self
-                        .state
-                        .tasks
-                        .values()
-                        .filter(|t| {
-                            t.state == TaskState::Running
-                                && (t.dialogue.is_some() || t.scope == Scope::Interaction)
-                        })
-                        .map(|t| t.id)
-                        .collect();
-                    for id in old {
-                        self.end_task(id, TaskEndReason::Replaced)?;
-                    }
-                }
-                _ => {}
-            }
-            if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
-                match &address {
-                    TweenTarget::SceneNode { node, property } => {
-                        if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
-                            return Err(self.error("E_OWNERSHIP", "transition owns root"));
-                        }
-                        captured = self
-                            .sample_scene()
-                            .iter()
-                            .find(|n| &n.id == node)
-                            .ok_or_else(|| self.error("E_NODE", node))?
-                            .get(*property);
-                        base = self
-                            .state
-                            .scene
-                            .iter()
-                            .find(|n| &n.id == node)
-                            .ok_or_else(|| self.error("E_NODE", node))?
-                            .get(*property);
-                    }
-                    TweenTarget::DialogueRoot { property } => {
-                        captured = self.sample_dialogue_appearance().get(*property);
-                        base = self.state.dialogue_appearance.get(*property);
-                    }
-                }
-                let old: Vec<_> = self
-                    .state
-                    .tasks
-                    .values()
-                    .filter(|t| {
-                        t.state == TaskState::Running
-                            && self.track_is_current(t, &address)
-                            && t.effect
-                                .scalar_track(0., 0.)
-                                .is_some_and(|(a, _, _)| a == address)
-                    })
-                    .map(|t| t.id)
-                    .collect();
-                if !old.is_empty() && !replace {
-                    return Err(self.error("E_OWNERSHIP", format!("{address:?}")));
-                }
-                for id in old {
-                    self.end_task(id, TaskEndReason::Replaced)?;
-                }
-            }
-            let id = self.id()?;
-            if let Effect::AudioStop { duration_us, .. } = &def.effect {
-                let target = target_task.expect("resolved audio stop target");
-                if self.state.tasks[&target].state == TaskState::Running {
-                    self.intents.push(CoreIntent::AudioEnvelope {
-                        owner: Some(id),
-                        elapsed_us: Micros(0),
-                        task: target,
-                        from: captured,
-                        to: 0.,
-                        duration_us: *duration_us,
-                    });
-                }
-            }
-            let dialogue = p.dialogues.get(&def.id).cloned();
-            if let Some(d) = &dialogue {
-                self.state.history.push(HistoryEntry {
-                    text_id: d.text_id.clone(),
-                    meaning_revision: d.meaning_revision,
-                    source_revision: d.source_revision,
-                    contract_digest: d.contract_digest.clone(),
-                    locale: d.locale.clone(),
-                    font_plan_digest: d.font_plan_digest.clone(),
-                    speaker: d.speaker.clone(),
-                    text: d.full_text(),
-                });
-                while self.state.history.len() > 1000
-                    || self
-                        .state
-                        .history
-                        .iter()
-                        .map(|h| h.text.len() + h.speaker.len())
-                        .sum::<usize>()
-                        > 4 * 1024 * 1024
-                {
-                    self.state.history.remove(0);
-                }
-            }
-            if let Effect::Audio {
-                asset,
-                bus,
-                looped,
-                gain,
-            } = &def.effect
-            {
-                self.intents.push(CoreIntent::AudioStart {
-                    task: id,
-                    asset: asset.clone(),
-                    bus: *bus,
-                    looped: *looped,
-                    gain: *gain,
-                    position_us: Micros(0),
-                });
-            }
-            let task = Task {
-                id,
-                name: def.id.clone(),
-                frame: self.frame().id,
-                scene_generation: self.state.scene_generation,
-                scope: def.scope,
-                effect: def.effect,
-                state: TaskState::Running,
-                end_reason: None,
-                target_task,
-                audio_envelope: 1.,
-                audio_position_us: None,
-                audio_device_elapsed_us: None,
-                started_us: self.state.tick_us,
-                elapsed_us: Micros(0),
-                milestones: BTreeSet::from([Milestone::Started]),
-                captured,
-                base,
-                dialogue,
-                source,
-                target,
-            };
-            self.state.handles.insert(def.id, id);
-            self.state.tasks.insert(id, task);
+        for def in &p.effects {
+            self.commit_effect(def, &p.dialogues)?;
         }
         self.jump(p.next);
         self.trace(format!("activate:{}", p.cue));
@@ -1582,6 +1406,7 @@ impl Core {
         for id in ended_stops {
             self.finish_task(id, TaskState::Finished)?;
         }
+        self.advance_compositions()?;
         let keep: BTreeSet<_> = self
             .state
             .handles
@@ -1610,6 +1435,356 @@ impl Core {
             .tasks
             .retain(|id, t| t.state == TaskState::Running || keep.contains(id));
         Ok(())
+    }
+    /// Spawn one effect definition as a task: ownership checks, property
+    /// capture at start, side-effect intents, handle registration. Cue
+    /// commits and composition child spawns share this path so a child gets
+    /// exactly the semantics a top-level effect gets; children arrive with
+    /// an empty dialogue map because composition validation forbids
+    /// dialogue children.
+    fn commit_effect(
+        &mut self,
+        def: &EffectDef,
+        dialogues: &BTreeMap<String, Dialogue>,
+    ) -> Result<u32> {
+        let mut source = vec![];
+        let mut target = vec![];
+        let mut captured = 0.;
+        let mut base = 0.;
+        let mut target_task = None;
+        match &def.effect {
+            Effect::AudioStop { target, .. } => {
+                let target_id = *self
+                    .state
+                    .handles
+                    .get(target)
+                    .ok_or_else(|| self.error("E_TASK", target))?;
+                let audio = &self.state.tasks[&target_id];
+                if !matches!(audio.effect, Effect::Audio { .. }) {
+                    return Err(self.error("E_TASK_TYPE", "audio stop requires an audio instance"));
+                }
+                if self.state.tasks.values().any(|task| {
+                    task.state == TaskState::Running && task.target_task == Some(target_id)
+                }) {
+                    return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
+                }
+                target_task = Some(target_id);
+                captured = audio.audio_envelope;
+            }
+            Effect::StagePresent { scene, .. } => {
+                if self.state.tasks.values().any(|t| {
+                    t.state == TaskState::Running
+                        && matches!(t.effect, Effect::StagePresent { .. })
+                }) {
+                    return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
+                }
+                source = self.sample_scene();
+                target = if !self.state.draft.is_empty() {
+                    std::mem::take(&mut self.state.draft)
+                } else {
+                    self.program().scenes[scene].clone()
+                };
+                let ids: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|t| t.scope == Scope::Scene && t.state == TaskState::Running)
+                    .map(|t| t.id)
+                    .collect();
+                for id in ids {
+                    self.end_task(id, TaskEndReason::ScopeExited)?;
+                }
+                self.state.scene = target.clone();
+                self.state.scene_generation = self
+                    .state
+                    .scene_generation
+                    .checked_add(1)
+                    .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
+            }
+            Effect::Dialogue { .. } => {
+                let old: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.state == TaskState::Running
+                            && (t.dialogue.is_some() || t.scope == Scope::Interaction)
+                    })
+                    .map(|t| t.id)
+                    .collect();
+                for id in old {
+                    self.end_task(id, TaskEndReason::Replaced)?;
+                }
+            }
+            // Compositions spawn their children through advance_compositions
+            // so each child captures the properties current at its own start.
+            Effect::Sequence { .. } | Effect::ParallelAll { .. } => {}
+            _ => {}
+        }
+        if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
+            match &address {
+                TweenTarget::SceneNode { node, property } => {
+                    if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
+                        return Err(self.error("E_OWNERSHIP", "transition owns root"));
+                    }
+                    captured = self
+                        .sample_scene()
+                        .iter()
+                        .find(|n| &n.id == node)
+                        .ok_or_else(|| self.error("E_NODE", node))?
+                        .get(*property);
+                    base = self
+                        .state
+                        .scene
+                        .iter()
+                        .find(|n| &n.id == node)
+                        .ok_or_else(|| self.error("E_NODE", node))?
+                        .get(*property);
+                }
+                TweenTarget::DialogueRoot { property } => {
+                    captured = self.sample_dialogue_appearance().get(*property);
+                    base = self.state.dialogue_appearance.get(*property);
+                }
+            }
+            let old: Vec<_> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| {
+                    t.state == TaskState::Running
+                        && self.track_is_current(t, &address)
+                        && t.effect
+                            .scalar_track(0., 0.)
+                            .is_some_and(|(a, _, _)| a == address)
+                })
+                .map(|t| t.id)
+                .collect();
+            if !old.is_empty() && !replace {
+                return Err(self.error("E_OWNERSHIP", format!("{address:?}")));
+            }
+            for id in old {
+                self.end_task(id, TaskEndReason::Replaced)?;
+            }
+        }
+        let id = self.id()?;
+        if let Effect::AudioStop { duration_us, .. } = &def.effect {
+            let target = target_task.expect("resolved audio stop target");
+            if self.state.tasks[&target].state == TaskState::Running {
+                self.intents.push(CoreIntent::AudioEnvelope {
+                    owner: Some(id),
+                    elapsed_us: Micros(0),
+                    task: target,
+                    from: captured,
+                    to: 0.,
+                    duration_us: *duration_us,
+                });
+            }
+        }
+        let dialogue = dialogues.get(&def.id).cloned();
+        if let Some(d) = &dialogue {
+            self.state.history.push(HistoryEntry {
+                text_id: d.text_id.clone(),
+                meaning_revision: d.meaning_revision,
+                source_revision: d.source_revision,
+                contract_digest: d.contract_digest.clone(),
+                locale: d.locale.clone(),
+                font_plan_digest: d.font_plan_digest.clone(),
+                speaker: d.speaker.clone(),
+                text: d.full_text(),
+            });
+            while self.state.history.len() > 1000
+                || self
+                    .state
+                    .history
+                    .iter()
+                    .map(|h| h.text.len() + h.speaker.len())
+                    .sum::<usize>()
+                    > 4 * 1024 * 1024
+            {
+                self.state.history.remove(0);
+            }
+        }
+        if let Effect::Audio {
+            asset,
+            bus,
+            looped,
+            gain,
+        } = &def.effect
+        {
+            self.intents.push(CoreIntent::AudioStart {
+                task: id,
+                asset: asset.clone(),
+                bus: *bus,
+                looped: *looped,
+                gain: *gain,
+                position_us: Micros(0),
+            });
+        }
+        let task = Task {
+            id,
+            name: def.id.clone(),
+            frame: self.frame().id,
+            scene_generation: self.state.scene_generation,
+            scope: def.scope,
+            effect: def.effect.clone(),
+            state: TaskState::Running,
+            end_reason: None,
+            target_task,
+            audio_envelope: 1.,
+            audio_position_us: None,
+            audio_device_elapsed_us: None,
+            started_us: self.state.tick_us,
+            elapsed_us: Micros(0),
+            milestones: BTreeSet::from([Milestone::Started]),
+            captured,
+            base,
+            dialogue,
+            source,
+            target,
+            children: vec![],
+            cursor: 0,
+        };
+        self.state.handles.insert(def.id.clone(), id);
+        self.state.tasks.insert(id, task);
+        Ok(id)
+    }
+    /// Advance every composition: spawn due children, merge child results,
+    /// finish completed chains. Each spawn costs one unit of step budget, so
+    /// a finite zero-duration chain still pays for every spawn and spreads
+    /// across steps when the budget runs out; the guard turns a chase that
+    /// refuses to converge into an explicit fault instead of a hang.
+    fn advance_compositions(&mut self) -> Result<()> {
+        let mut guard = 0usize;
+        loop {
+            let composites: Vec<u32> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| t.state == TaskState::Running && t.effect.compose_children().is_some())
+                .map(|t| t.id)
+                .collect();
+            if composites.is_empty() {
+                return Ok(());
+            }
+            guard += 1;
+            if guard > MAX_TASKS * 2 {
+                return Err(self.error("E_LIMIT", "composition did not converge"));
+            }
+            let mut acted = false;
+            for id in composites {
+                acted |= self.advance_composition(id)?;
+            }
+            if !acted {
+                return Ok(());
+            }
+        }
+    }
+    /// One chase round for one composition; true when its state changed.
+    fn advance_composition(&mut self, id: u32) -> Result<bool> {
+        let defs = match self.state.tasks.get(&id) {
+            Some(t) if t.state == TaskState::Running => match &t.effect {
+                Effect::Sequence { children } | Effect::ParallelAll { children } => {
+                    children.clone()
+                }
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        let spawned: Vec<u32> = self.state.tasks[&id].children.clone();
+        let running_child = spawned
+            .iter()
+            .any(|c| self.state.tasks.get(c).is_some_and(|t| t.state == TaskState::Running));
+        if matches!(self.state.tasks[&id].effect, Effect::Sequence { .. }) {
+            if running_child {
+                return Ok(false);
+            }
+            if let Some(last) = spawned.last() {
+                let (state, reason) = {
+                    let child = &self.state.tasks[last];
+                    (child.state, child.end_reason)
+                };
+                if state != TaskState::Finished {
+                    // Failure and cancellation propagate to the chain;
+                    // completed children stay settled because their side
+                    // effects are not rolled back.
+                    self.end_task(id, reason.unwrap_or(TaskEndReason::Failed))?;
+                    return Ok(true);
+                }
+            }
+            if spawned.len() == defs.len() {
+                self.finish_task(id, TaskState::Finished)?;
+                return Ok(true);
+            }
+            self.spawn_child(id, &defs[spawned.len()])
+        } else {
+            while self.state.tasks[&id].children.len() < defs.len() {
+                let next = self.state.tasks[&id].children.len();
+                if !self.spawn_child(id, &defs[next])? {
+                    return Ok(false);
+                }
+            }
+            let kids: Vec<TaskState> = self.state.tasks[&id]
+                .children
+                .iter()
+                .map(|c| self.state.tasks[c].state)
+                .collect();
+            // Failure beats cancellation beats completion, like every All.
+            if let Some(index) = kids.iter().position(|s| *s == TaskState::Failed) {
+                let reason = self.state.tasks[&self.state.tasks[&id].children[index]].end_reason;
+                self.end_task(id, reason.unwrap_or(TaskEndReason::Failed))?;
+                return Ok(true);
+            }
+            if let Some(index) = kids.iter().position(|s| *s == TaskState::Cancelled) {
+                let reason = self.state.tasks[&self.state.tasks[&id].children[index]].end_reason;
+                self.end_task(id, reason.unwrap_or(TaskEndReason::CancelledByControl))?;
+                return Ok(true);
+            }
+            if kids.iter().all(|s| *s == TaskState::Finished) {
+                self.finish_task(id, TaskState::Finished)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+    /// Spawn the next child of a composition; false when the step budget is
+    /// spent and the spawn defers to the next step.
+    fn spawn_child(&mut self, parent: u32, def: &EffectDef) -> Result<bool> {
+        if self.state.tasks.values().filter(|t| t.state == TaskState::Running).count() + 1
+            > MAX_TASKS
+        {
+            return Err(self.error("E_LIMIT", "active tasks"));
+        }
+        if self.work_remaining == 0 {
+            return Ok(false);
+        }
+        self.work_remaining -= 1;
+        let child = self.commit_effect(def, &BTreeMap::new())?;
+        let task = self.state.tasks.get_mut(&parent).unwrap();
+        task.children.push(child);
+        task.cursor += 1;
+        // Zero-duration children complete inside the same chase round, and a
+        // stop whose target already ended completes immediately.
+        let finish_now = match &self.state.tasks[&child].effect {
+            Effect::Clip { duration_us, .. }
+            | Effect::Tween { duration_us, .. }
+            | Effect::Delay { duration_us } => duration_us.0 == 0,
+            Effect::AudioStop {
+                duration_us,
+                target,
+            } => {
+                duration_us.0 == 0
+                    || self
+                        .state
+                        .handles
+                        .get(target)
+                        .is_some_and(|id| self.state.tasks[id].state != TaskState::Running)
+            }
+            _ => false,
+        };
+        if finish_now {
+            self.finish_task(child, TaskState::Finished)?;
+        }
+        Ok(true)
     }
     fn resolve_wait(&mut self) -> Result<bool> {
         let w = self.state.waiting.as_ref().unwrap();
@@ -1659,6 +1834,29 @@ impl Core {
         };
         if t.state != TaskState::Running {
             return Ok(());
+        }
+        // A composition ending takes its children with it: finished children
+        // stay settled (their side effects are not rolled back), running
+        // children end so their own finish/cancel policies apply, and
+        // children never spawned never run. A failing or cancelled chain
+        // stops its running children as cancellations; a finished chain
+        // settles them at their end values.
+        if t.effect.compose_children().is_some() {
+            let reason = if reason == TaskEndReason::Failed {
+                TaskEndReason::CancelledByControl
+            } else {
+                reason
+            };
+            for child in t.children.clone() {
+                if self
+                    .state
+                    .tasks
+                    .get(&child)
+                    .is_some_and(|c| c.state == TaskState::Running)
+                {
+                    self.end_task(child, reason)?;
+                }
+            }
         }
         if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
             let value = track.settle(t.elapsed_us, status == TaskState::Finished);
@@ -2202,6 +2400,44 @@ impl Core {
                     return Err(fail("invalid frozen reveal interval"));
                 }
             }
+            // Composition snapshots: the cursor counts spawned children, each
+            // spawned child matches its declared definition and scope, a
+            // sequence runs at most its last spawned child, and a finished
+            // composition has no pending work left.
+            if let Some(defs) = t.effect.compose_children() {
+                if t.cursor as usize != t.children.len()
+                    || t.children.len() > defs.len()
+                    || t.children.iter().any(|c| !s.tasks.contains_key(c))
+                {
+                    return Err(fail("composition cursor/children"));
+                }
+                for (index, child) in t.children.iter().enumerate() {
+                    let c = &s.tasks[child];
+                    if c.name != defs[index].id
+                        || c.scope != t.scope
+                        || serde_json::to_value(&c.effect).unwrap()
+                            != serde_json::to_value(&defs[index].effect).unwrap()
+                    {
+                        return Err(fail("composition child mismatch"));
+                    }
+                }
+                if matches!(t.effect, Effect::Sequence { .. })
+                    && t.children.len() > 1
+                    && t.children[..t.children.len() - 1]
+                        .iter()
+                        .any(|c| s.tasks[c].state == TaskState::Running)
+                {
+                    return Err(fail("sequence runs more than one child"));
+                }
+                if t.milestones.contains(&Milestone::Finished)
+                    && (t.children.len() != defs.len()
+                        || t.children
+                            .iter()
+                            .any(|c| s.tasks[c].state == TaskState::Running))
+                {
+                    return Err(fail("finished composition has pending children"));
+                }
+            }
             if let Some(d) = &t.dialogue {
                 if !p.locales.contains_key(&d.locale)
                     || p.locale_config
@@ -2557,12 +2793,7 @@ pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView
         .cues
         .values()
         .flat_map(|cue| &cue.effects)
-        .any(|definition| {
-            definition.id == task.name
-                && definition.scope == task.scope
-                && serde_json::to_value(&definition.effect).unwrap()
-                    == serde_json::to_value(&task.effect).unwrap()
-        })
+        .any(|definition| def_matches_task(definition, task))
     {
         return Err(Diagnostic::new(
             "E_SNAPSHOT",
@@ -2571,6 +2802,19 @@ pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView
         ));
     }
     Ok(())
+}
+
+/// A task matches its declaration anywhere in the cue's effect tree,
+/// composition children included.
+fn def_matches_task(def: &EffectDef, task: &Task) -> bool {
+    (def.id == task.name
+        && def.scope == task.scope
+        && serde_json::to_value(&def.effect).unwrap()
+            == serde_json::to_value(&task.effect).unwrap())
+        || def
+            .effect
+            .compose_children()
+            .is_some_and(|children| children.iter().any(|child| def_matches_task(child, task)))
 }
 
 pub(crate) fn validate_dialogue(
