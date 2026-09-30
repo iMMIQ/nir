@@ -937,6 +937,7 @@ impl Player {
                         closing: false,
                         start_us: self.ui_clock_us.0,
                         duration_us: enter.fade_us.0,
+                        style: enter.style.clone(),
                     });
                     self.menu_effects_clock = Some(token);
                 }
@@ -973,6 +974,7 @@ impl Player {
                 closing: true,
                 start_us: self.ui_clock_us.0,
                 duration_us: close.fade_us.0,
+                style: close.style.clone(),
             });
             self.menu_effects.closing = Some(effects::DeferredExit {
                 kind,
@@ -1048,6 +1050,7 @@ impl Player {
             self.menu_effects = MenuEffectsState::new(self.generation.session);
             self.menu_effects_clock = None;
         }
+        let had_fade = self.menu_effects.fade.is_some();
         let exit = self.menu_effects.take_finished_close(self.ui_clock_us.0);
         if exit.is_some() || self.menu_effects.fade.is_none() {
             self.menu_effects_clock = None;
@@ -1055,6 +1058,12 @@ impl Player {
         self.menu_effects.settle_enter(self.ui_clock_us.0);
         if self.menu_effects.fade.is_none() {
             self.menu_effects_clock = None;
+        }
+        if had_fade && self.menu_effects.fade.is_none() {
+            // The divert (or alpha ramp) lifted this tick — a discrete visual
+            // change that a clock-only tick would otherwise leave unprojected
+            // right as the clock token releases and the frame loop stops.
+            self.ui_visual_pulse = true;
         }
         if let Some(exit) = exit {
             self.run_deferred_exit(exit, budget)?;
@@ -3506,6 +3515,335 @@ mod tests {
         assert_eq!(ui_audio(&commands).len(), 1);
         assert_eq!(p.screen, Screen::Story);
         assert!(p.menu_effects.closing.is_none());
+    }
+    // ---- ui.menu-transition.v1: spatial page-root reveals -----------------
+    fn spatial_program() -> Program {
+        let mut p = effects_program();
+        p.requires.push("ui.menu-transition.v1".into());
+        // A mask must ride the image closure, so give it an image asset.
+        let image = p.assets["bg.station"].clone();
+        p.assets.insert("menu.mask".into(), image);
+        for id in ["system", "system.child"] {
+            p.theme.image_menus.get_mut(id).unwrap().effects = Some(
+                serde_json::from_value(serde_json::json!({
+                    "enter": {"sound": "audio.bell", "fade_us": "400000",
+                        "style": {"type": "wipe", "direction": "left_to_right", "softness": 0.2}},
+                    "close": {"sound": "audio.bell", "fade_us": "300000",
+                        "style": {"type": "wipe", "direction": "right_to_left", "softness": 0.2}},
+                    "click": "audio.bell",
+                    "music": {"asset": "audio.voice", "bus": "voice", "gain": 0.5}
+                }))
+                .unwrap(),
+            );
+        }
+        p.theme.image_menus.get_mut("title").unwrap().effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "enter": {"sound": "audio.bell", "fade_us": "400000",
+                    "style": {"type": "mask", "asset": "menu.mask", "channel": "alpha", "softness": 0.2}},
+                "music": {"asset": "audio.bgm"}
+            }))
+            .unwrap(),
+        );
+        p
+    }
+    #[test]
+    fn spatial_styles_require_their_capability() {
+        let mut p = spatial_program();
+        p.requires.retain(|c| c != "ui.menu-transition.v1");
+        assert_eq!(
+            Player::new(p, "r".into(), "t".into()).err().unwrap().code,
+            "E_CAPABILITY"
+        );
+    }
+    #[test]
+    fn spatial_enter_diverts_the_page_root_and_follows_the_foreground_clock() {
+        let mut p = Player::new(spatial_program(), "r".into(), "t".into()).unwrap();
+        let commands = p.pump(vec![], 1000);
+        // The mask joins the boot preparation closure as a page image.
+        assert!(commands.iter().any(|c| match c {
+            AppCommand::GetAssets { assets, .. } => assets.contains(&"menu.mask".into()),
+            _ => false,
+        }));
+        let fired = settle(&mut p, commands);
+        assert_eq!(ui_audio(&fired).len(), 2, "sound and music still fire");
+        // The reveal owns visibility: no alpha ramp rides on top of it.
+        assert_eq!(p.model().menu_opacity, 1.);
+        let (style, to_visible, progress) = p.menu_transition().expect("reveal in flight");
+        assert_eq!(
+            style,
+            StageTransition::Mask {
+                asset: "menu.mask".into(),
+                channel: MaskChannel::Alpha,
+                invert: false,
+                softness: 0.2,
+            }
+        );
+        assert!(to_visible);
+        assert_eq!(progress, 0.);
+        assert!(p.menu_effects_clock.is_some());
+        // Projection diverts exactly the page: the sentinel sits at the page's
+        // z-position and the page quads live in their own root.
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        let layers = packet.menu_layers.as_ref().expect("page diverted");
+        let sentinel = &packet.quads[layers.position];
+        assert_eq!(sentinel.asset.as_deref(), Some("@menu"));
+        assert_eq!(sentinel.rect, [0., 0., 1280., 720.]);
+        let background = p.model().theme.image_menus["title"].background.clone();
+        assert_eq!(layers.quads[0].asset.as_deref(), Some(background.as_str()));
+        assert!(packet.quads[..layers.position]
+            .iter()
+            .chain(&packet.quads[layers.position + 1..])
+            .all(|q| q.asset.as_deref() != Some(background.as_str())),
+            "the underlying frame keeps no page quad"
+        );
+        assert!(packet.menu_paint.is_empty());
+        assert!(packet.menu_quad_range.is_none());
+        // The reveal follows the foreground clock, then settles back onto the
+        // shared surface.
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 200_000,
+            }],
+            1000,
+        );
+        let (_, _, progress) = p.menu_transition().expect("reveal still in flight");
+        assert!((progress - 0.5).abs() < 1e-3);
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 200_000,
+            }],
+            1000,
+        );
+        assert!(p.menu_transition().is_none());
+        assert!(p.menu_effects.fade.is_none());
+        assert!(p.menu_effects_clock.is_none());
+        let settled = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(settled.menu_layers.is_none());
+        assert!(settled.menu_quad_range.is_some(), "page returns to the surface");
+    }
+    /// The player with the overlay open and its enter reveal settled.
+    fn spatial_player_at_overlay() -> (Player, u32) {
+        let mut p = Player::new(spatial_program(), "r".into(), "t".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        let music = p.menu_effects.music.unwrap().task;
+        (p, music)
+    }
+    #[test]
+    fn spatial_close_reverses_the_composite_and_defers_the_exit() {
+        let (mut p, music) = spatial_player_at_overlay();
+        // The overlay entered through its own spatial reveal.
+        let (style, to_visible, _) = p.menu_transition().expect("enter reveal in flight");
+        assert_eq!(
+            style,
+            StageTransition::Wipe {
+                direction: WipeDirection::LeftToRight,
+                softness: 0.2,
+            }
+        );
+        assert!(to_visible);
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 400_000,
+            }],
+            1000,
+        );
+        assert!(p.menu_transition().is_none(), "page settled before close");
+        let commands = pump_action(&mut p, UiAction::Close);
+        // Acceptance feedback fires immediately; the exit itself is deferred.
+        assert_eq!(ui_audio(&commands).len(), 1);
+        assert_eq!(p.screen, Screen::Menu);
+        assert!(p.paused());
+        let (_, to_visible, progress) = p.menu_transition().expect("close reveal in flight");
+        assert!(!to_visible, "close erases the page back to the frame");
+        assert_eq!(progress, 0.);
+        assert_eq!(p.model().menu_opacity, 1., "no alpha ramp under the composite");
+        // Halfway: the packet carries the reversed composite, page still up.
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 150_000,
+            }],
+            1000,
+        );
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        let layers = packet.menu_layers.as_ref().expect("page still diverted");
+        assert!(!layers.to_visible);
+        assert!((layers.progress - 0.5).abs() < 1e-3);
+        assert_eq!(
+            layers.style,
+            StageTransition::Wipe {
+                direction: WipeDirection::RightToLeft,
+                softness: 0.2,
+            }
+        );
+        assert_eq!(p.screen, Screen::Menu, "exit stays deferred");
+        let commands = p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 150_000,
+            }],
+            1000,
+        );
+        assert_eq!(p.screen, Screen::Story);
+        assert!(!p.paused());
+        assert!(p.menu_effects.closing.is_none());
+        assert!(p.menu_effects_clock.is_none());
+        assert!(ui_stops(&commands).contains(&music));
+    }
+    #[test]
+    fn a_completed_reveal_pulses_the_view_before_the_clock_token_releases() {
+        let (mut p, _music) = spatial_player_at_overlay();
+        assert!(p.menu_transition().is_some(), "enter reveal in flight");
+        assert!(!p.take_ui_visual_pulse(), "nothing discrete while animating");
+        // A foreground-only tick that keeps the reveal mid-flight is
+        // clock-only from the engine's perspective: no work, no pulse.
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 200_000,
+            }],
+            1000,
+        );
+        assert!(p.menu_transition().is_some(), "halfway tick keeps it in flight");
+        assert!(!p.take_ui_visual_pulse());
+        // The finishing tick settles the page in the foreground domain alone
+        // and releases the clock token in the same breath. The engine's
+        // safety valve never fires once the token is gone, so the settle
+        // itself must mark the view dirty.
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us: 400_000,
+            }],
+            1000,
+        );
+        assert!(p.menu_transition().is_none(), "reveal finished");
+        assert!(p.menu_effects_clock.is_none(), "clock token released");
+        assert!(p.take_ui_visual_pulse(), "the settling tick pulses the view");
+        assert!(!p.take_ui_visual_pulse(), "the pulse is one-shot");
+    }
+    #[test]
+    fn reduced_motion_suppresses_the_reveal_but_not_sounds() {
+        let mut p = Player::new(spatial_program(), "r".into(), "t".into()).unwrap();
+        p.preferences.reduced_motion = true;
+        let c = p.pump(vec![], 1000);
+        let fired = settle(&mut p, c);
+        assert_eq!(ui_audio(&fired).len(), 2, "sound and music still fire");
+        assert!(p.menu_effects.fade.is_none());
+        assert!(p.menu_transition().is_none());
+        assert_eq!(p.model().menu_opacity, 1.);
+        assert!(p.menu_effects_clock.is_none());
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(packet.menu_layers.is_none());
+    }
+    #[test]
+    fn unstyled_fades_stay_on_the_shared_surface() {
+        let mut p = Player::new(effects_program(), "r".into(), "t".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        assert_eq!(p.model().menu_opacity, 0., "legacy fade is running");
+        assert!(p.menu_transition().is_none());
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(packet.menu_layers.is_none());
+        assert!(
+            packet.menu_quad_range.is_some(),
+            "page keeps interleaving on the shared surface"
+        );
+    }
+    #[test]
+    fn a_spatial_reveal_absorbs_the_spliced_history_bar_into_the_page() {
+        use nir_presentation::{ReadingState, TextEngine};
+        let mut program = history_scrollbar_program();
+        program.requires.push("ui.menu-effects.v1".into());
+        program.requires.push("ui.menu-transition.v1".into());
+        program.theme.image_menus.get_mut("system").unwrap().effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "enter": {"fade_us": "400000",
+                    "style": {"type": "wipe", "direction": "left_to_right", "softness": 0.2}}
+            }))
+            .unwrap(),
+        );
+        let mut p = Player::new(program, "r".into(), "Test".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let mut snapshot = p.core.snapshot();
+        snapshot.history = vec![snapshot.history[0].clone(); 1000];
+        p.restore(snapshot).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        assert!(p.menu_transition().is_some(), "enter reveal in flight");
+        let mut reading = ReadingState::default();
+        let mut text = TextEngine::default();
+        text.add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
+        let messages = nir_presentation::Messages::default();
+        let identity = (p.generation.session, p.current_interaction());
+        let mut packet = reading.project(&p.model(), identity, 1280., 720., &messages, &mut text);
+        for _ in 0..100 {
+            if !reading.history_pending() {
+                break;
+            }
+            packet = reading.project(&p.model(), identity, 1280., 720., &messages, &mut text);
+        }
+        let layers = packet.menu_layers.as_ref().expect("page diverted mid-reveal");
+        // The history bar's spliced quads ride the page root with the rest of
+        // the page; the underlying frame keeps none of them.
+        for asset in ["bar.track", "bar.thumb"] {
+            assert!(
+                layers.quads.iter().any(|q| q.asset.as_deref() == Some(asset)),
+                "{asset} belongs to the page root"
+            );
+            assert!(packet.quads[..layers.position]
+                .iter()
+                .chain(&packet.quads[layers.position + 1..])
+                .all(|q| q.asset.as_deref() != Some(asset)),
+                "{asset} must not stay in the underlying frame"
+            );
+        }
+        assert!(
+            !layers.texts.is_empty(),
+            "history rows route to the page root"
+        );
     }
     #[test]
     fn ui_sound_events_are_accepted_by_task_and_session_and_reset_with_sessions() {

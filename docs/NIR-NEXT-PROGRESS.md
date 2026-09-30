@@ -29,9 +29,9 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
-| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 页面根、来源映射与硬件验证仍待完成 |
+| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；UI 页面根上的通用目标与转场仍待实施 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；消息/UI 根上的通用补间目标仍待实施 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
 | P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
@@ -660,3 +660,14 @@ P6 三项（映射账本、完整路线认证、能力发行清单）全部交�
 - 导入器：MESON/MESOFF 非零渐隐毫秒映射为等时长 dissolve 窗口揭示（fade_sites 计数入账本），零渐隐保持立即翻转；账本规则 `livenovel.textbox.fade` 由 approximate 升为 adapted（存在渐隐位点时依赖 text.window-transition.v1），批次 53 记录的近似清单相应收窄为 menu-sfx/text.reveal 两条。发行侧遮罩随窗口揭示进入媒体根（window_transition_masks_join_the_release_roots_and_capability）。文档同步：CAPABILITIES.md（能力段落 + 发行清单行）、STAGE-TRANSITION-SEMANTICS.md（消息根一节）、TWEEN-SEMANTICS.md、IMPORT.md。
 
 P2.4 的消息根半边交付；UI 菜单页根（MenuTransition 样式、ui.menu-transition.v1）与 P1.2 UI/音频通用目标、P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-56-*.log。契约见 STAGE-TRANSITION-SEMANTICS.md（消息根一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 57：菜单页面根空间揭示（P2.4）
+
+- MenuTransition（进入/关闭转场）增加可选 `style`，复用舞台 StageTransition 的 wipe（方向 + 软边）与 mask（图片遮罩 + 通道）；dissolve 或未声明样式保持旧的整层 alpha 渐隐路径（menu_opacity），不需新能力。`MenuEffects::uses_transition()` 判定空间样式使用；mask 的遮罩是 Image 类页面资产，经 `MenuEffects::mask_assets()` 并入 `ImageMenu::image_assets()`（Image 类校验、准备与留存），不从音效闭包取用。nir-format 契约测试覆盖旧文件缺省读取、样式化序列化往返、遮罩闭包与能力语义。
+- 新能力 `ui.menu-transition.v1`：源（nir-core validate）与 runtime（from_runtime）双侧拒绝「使用空间样式而无能力」（E_CAPABILITY），仅声明未使用合法（编译器裁剪，menu_transition_capability_follows_spatial_style_usage）；样式边界时长仍须 0 < fade_us ≤ 2 秒（E_VIEW_EFFECTS），遮罩非 Image 资产以 E_THEME_ASSET 拒绝。契约测试 menu_transition_contract.rs 4 项。
+- Player：空间揭示持有 ForegroundClockToken，期间输入锁定、阅读暂停；进入等页面准备落定后才起播；关闭立即播放音效并锁定，退出延迟至擦除完成提交；reduced_motion 抑制呈现不抑制音效。协调/菜单测试新增 7 项：无能力拒绝、进入分流页根跟随前台时钟（@menu 哨兵、页资产只出现在页根、menu_paint 清空、进度推进与收尾复位）、关闭反向合成与延迟退出、reduced_motion、无样式停留共享面、连续历史滚动条拼接随页面吸收进页根。
+- Presentation/Renderer：`divert_menu_page()` 后置通道把页面四边形与页面文本分流到离屏页根（历史拼接吸收在 menu_page_range.to + 4），页面在共享菜单面清空；渲染器双根合成复用舞台转场混合路径（进入 bind(底层,页面)、关闭 bind(页面,底层)），期间 menu_opacity 恒为 1。
+- 引擎状态桥 `state.menu_transition` 暴露进度（null 或 0..1），与 `state.window` 同型。浏览器规格 tests/nir-next/menu-wipe.spec.js 在固体红剧情场景 + 黑色菜单背景 fixture（4224 端口）上采样：进入中途左侧为页面、右侧为冻结帧，完成覆盖全帧；关闭中途反向（页面保留在左、帧回归在右），延迟退出期间 screen 保持 Menu 且 paused，完成后回 Story 且 paused=false；全程 menu_opacity=1。文档同步：CAPABILITIES.md（能力段落 + 发行清单行）、MENU-EFFECTS-SEMANTICS.md、TIME-DOMAINS.md。
+- 转场完成脉冲（产品缺陷修复）：页面渐隐的收尾发生在纯时钟 tick 内（clock-only，无工作即不置脏），且同一刻 ForegroundClockToken 释放、宿主帧循环停摆，16 帧安全阀不再触发——落定帧可能永不重投影（批次 48 的 alpha 渐隐即已潜伏，空间揭示使其可见）。修复：Player 以 `ui_visual_pulse` 标记「本 tick 渐隐由有到无」的离散视觉变化（`take_ui_visual_pulse()` 取走），Engine 在 `pump()` 末尾将其并入 `state_dirty`；回归测试 a_completed_reveal_pulses_the_view_before_the_clock_token_releases 断言中途 tick 无脉冲、收尾 tick 恰好一次脉冲。浏览器规格连过 4 次后全量 43 项绿。
+
+P2.4 的菜单页根半边交付；P1.2 UI/音频通用目标与 P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-57-*.log。契约见 MENU-EFFECTS-SEMANTICS.md（空间揭示样式一节）。完整 P0–P6 计划未完成；未提交或推送。

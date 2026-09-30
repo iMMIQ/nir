@@ -11,6 +11,10 @@ pub(super) struct PageFade {
     pub closing: bool,
     pub start_us: u64,
     pub duration_us: u64,
+    /// Authored transition style. A spatial style (wipe/mask) diverts the page
+    /// into the offscreen page root for the same duration; dissolve or no
+    /// style keeps the legacy whole-layer alpha fade.
+    pub style: Option<nir_format::StageTransition>,
 }
 impl PageFade {
     fn sample(&self, now_us: u64) -> f32 {
@@ -26,8 +30,23 @@ impl PageFade {
             progress
         }
     }
+    /// Raw reveal ramp 0 -> 1; the direction is the composite flip, so unlike
+    /// `sample` it never inverts for a closing page.
+    fn progress(&self, now_us: u64) -> f32 {
+        let elapsed = now_us.saturating_sub(self.start_us) as f32;
+        if self.duration_us == 0 {
+            1.
+        } else {
+            (elapsed / self.duration_us as f32).clamp(0., 1.)
+        }
+    }
     fn finished(&self, now_us: u64) -> bool {
         now_us.saturating_sub(self.start_us) >= self.duration_us
+    }
+    /// Whether this fade diverts the page into the page root. Dissolve is the
+    /// legacy fade and needs no reveal machinery.
+    fn spatial(&self) -> bool {
+        self.style.as_ref().is_some_and(|s| !s.is_default())
     }
 }
 
@@ -90,11 +109,32 @@ impl MenuEffectsState {
                     } else {
                         1.
                     }
+                } else if fade.spatial() {
+                    // The page-root reveal owns visibility; folding an alpha
+                    // ramp on top would double-fade the revealed page.
+                    1.
                 } else {
                     fade.sample(now_us)
                 }
             }
         }
+    }
+    /// The in-flight page-root reveal: (style, to_visible, progress). Only
+    /// spatial styles divert; dissolve and unstyled fades return `None`.
+    pub fn transition(
+        &self,
+        now_us: u64,
+        reduced_motion: bool,
+    ) -> Option<(nir_format::StageTransition, bool, f32)> {
+        let fade = self.fade.as_ref()?;
+        if reduced_motion || !fade.spatial() {
+            return None;
+        }
+        Some((
+            fade.style.clone().unwrap(),
+            !fade.closing,
+            fade.progress(now_us),
+        ))
     }
     /// Takes the deferred exit when its close fade has fully elapsed.
     pub fn take_finished_close(&mut self, now_us: u64) -> Option<DeferredExit> {

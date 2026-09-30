@@ -125,6 +125,9 @@ pub struct Renderer {
     /// Offscreen surface-sized root for the diverted message window; text
     /// alignment pins it to the swapchain extent, not the stage size.
     window_root: Option<(Texture, u32, u32)>,
+    /// Offscreen surface-sized roots for a diverted menu page: A holds the
+    /// underlying frame without the page, B the page itself.
+    menu_roots: Option<(Texture, Texture, u32, u32)>,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: BTreeMap<String, Texture>,
@@ -137,6 +140,7 @@ pub struct Renderer {
     text_renderer: TextRenderer,
     menu_text_renderers: Vec<(usize, TextRenderer)>,
     window_text_renderers: Vec<(usize, TextRenderer)>,
+    page_text_renderers: Vec<(usize, TextRenderer)>,
     viewport: Viewport,
     swash: SwashCache,
     pub submitted: u64,
@@ -465,6 +469,7 @@ impl Renderer {
             mix_pipeline,
             scratch: None,
             window_root: None,
+            menu_roots: None,
             layout,
             sampler,
             textures: BTreeMap::new(),
@@ -477,6 +482,7 @@ impl Renderer {
             text_renderer,
             menu_text_renderers: vec![],
             window_text_renderers: vec![],
+            page_text_renderers: vec![],
             viewport,
             swash: SwashCache::new(),
             submitted: 0,
@@ -799,6 +805,27 @@ impl Renderer {
             .iter()
             .flat_map(|layers| layers.texts.iter().copied())
             .collect();
+        let page_indices: Vec<usize> = p
+            .menu_layers
+            .iter()
+            .flat_map(|layers| layers.texts.iter().copied())
+            .collect();
+        self.page_text_renderers.truncate(page_indices.len());
+        for (batch, index) in page_indices.iter().enumerate() {
+            if batch == self.page_text_renderers.len() {
+                self.page_text_renderers.push((
+                    *index,
+                    TextRenderer::new(
+                        &mut self.atlas,
+                        &self.device,
+                        wgpu::MultisampleState::default(),
+                        None,
+                    ),
+                ));
+            } else {
+                self.page_text_renderers[batch].0 = *index;
+            }
+        }
         self.window_text_renderers.truncate(window_indices.len());
         for (batch, index) in window_indices.iter().enumerate() {
             if batch == self.window_text_renderers.len() {
@@ -838,8 +865,14 @@ impl Renderer {
         let mut areas = vec![];
         let mut menu_areas: Vec<Vec<TextArea<'_>>> = menu_indices.iter().map(|_| vec![]).collect();
         let mut window_areas: Vec<Vec<TextArea<'_>>> = window_indices.iter().map(|_| vec![]).collect();
+        let mut page_areas: Vec<Vec<TextArea<'_>>> = page_indices.iter().map(|_| vec![]).collect();
         for (run_index, r) in paint_runs.iter().enumerate() {
-            let areas = if let Some(batch) = window_indices
+            let areas = if let Some(batch) = page_indices
+                .iter()
+                .position(|i| *i == owners[run_index])
+            {
+                &mut page_areas[batch]
+            } else if let Some(batch) = window_indices
                 .iter()
                 .position(|i| *i == owners[run_index])
             {
@@ -957,6 +990,19 @@ impl Renderer {
                 )
                 .map_err(|e| error(e.to_string()))?;
         }
+        for ((_, renderer), areas) in self.page_text_renderers.iter_mut().zip(page_areas) {
+            renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.fonts,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash,
+                )
+                .map_err(|e| error(e.to_string()))?;
+        }
         self.profile_end("prepare.glyphs", glyphs_start);
         Ok(())
     }
@@ -1060,6 +1106,31 @@ impl Renderer {
                     .get(layers.style.asset().unwrap_or(""))
                     .ok_or_else(|| error("window mask missing"))?;
                 pass.set_bind_group(2, &mask.bind, &[]);
+            } else if id == "@menu" {
+                let layers = p
+                    .menu_layers
+                    .as_ref()
+                    .ok_or_else(|| error("menu layers missing"))?;
+                let (underlying, page, _, _) = self
+                    .menu_roots
+                    .as_ref()
+                    .ok_or_else(|| error("menu roots missing"))?;
+                pass.set_pipeline(&self.mix_pipeline);
+                // mix(source, target, coverage): an entering page is revealed
+                // over the frozen underlying frame; a closing page is erased
+                // back to it.
+                if layers.to_visible {
+                    pass.set_bind_group(0, &underlying.bind, &[]);
+                    pass.set_bind_group(1, &page.bind, &[]);
+                } else {
+                    pass.set_bind_group(0, &page.bind, &[]);
+                    pass.set_bind_group(1, &underlying.bind, &[]);
+                }
+                let mask = self
+                    .textures
+                    .get(layers.style.asset().unwrap_or(""))
+                    .ok_or_else(|| error("menu mask missing"))?;
+                pass.set_bind_group(2, &mask.bind, &[]);
             } else {
                 pass.set_pipeline(&self.pipeline);
                 let texture = self
@@ -1098,7 +1169,7 @@ impl Renderer {
         }
         self.prepare(p, dpr, false)?;
         let vertex_start = self.profile_start();
-        let vertex_result = (|| -> Result<(usize, usize, usize)> {
+        let vertex_result = (|| -> Result<(usize, usize, usize, usize, usize, usize)> {
             let mut verts = vec![];
             let append = |verts: &mut Vec<Vertex>, quads: &[nir_presentation::Quad]| {
                 for q in quads {
@@ -1107,6 +1178,8 @@ impl Renderer {
                         p.transition_layers.as_ref().unwrap().2
                     } else if q.asset.as_deref() == Some("@window") {
                         p.window_layers.as_ref().unwrap().progress
+                    } else if q.asset.as_deref() == Some("@menu") {
+                        p.menu_layers.as_ref().unwrap().progress
                     } else {
                         q.color[3]
                     };
@@ -1114,6 +1187,8 @@ impl Renderer {
                         p.transition_style.parameters(a)
                     } else if q.asset.as_deref() == Some("@window") {
                         p.window_layers.as_ref().unwrap().style.parameters(a)
+                    } else if q.asset.as_deref() == Some("@menu") {
+                        p.menu_layers.as_ref().unwrap().style.parameters(a)
                     } else {
                         [
                             linear(q.color[0]) * a,
@@ -1173,15 +1248,43 @@ impl Renderer {
                     self.window_root = Some((self.offscreen(w, h), w, h));
                 }
             }
+            // Root A holds the frame without the page (the quads around the
+            // sentinel, contiguously); root B holds the diverted page.
+            let menu_under_start = verts.len();
+            let mut menu_after_start = menu_under_start;
+            let mut menu_page_start = menu_under_start;
+            if let Some(layers) = &p.menu_layers {
+                append(&mut verts, &p.quads[..layers.position]);
+                menu_after_start = verts.len();
+                append(&mut verts, &p.quads[layers.position + 1..]);
+                menu_page_start = verts.len();
+                append(&mut verts, &layers.quads);
+                let (w, h) = (self.config.width, self.config.height);
+                if !self
+                    .menu_roots
+                    .as_ref()
+                    .is_some_and(|(_, _, x, y)| *x == w && *y == h)
+                {
+                    self.menu_roots = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
+                }
+            }
             if verts.len() > self.capacity {
                 return Err(error("quad capacity exceeded"));
             }
             self.queue
                 .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
-            Ok((source_start, target_start, window_start))
+            Ok((
+                source_start,
+                target_start,
+                window_start,
+                menu_under_start,
+                menu_after_start,
+                menu_page_start,
+            ))
         })();
         self.profile_end("vertex.build_write", vertex_start);
-        let (source_start, target_start, window_start) = vertex_result?;
+        let (source_start, target_start, window_start, menu_under_start, menu_after_start, menu_page_start) =
+            vertex_result?;
 
         let acquire_start = self.profile_start();
         let frame_result = self.acquire_frame();
@@ -1247,6 +1350,66 @@ impl Renderer {
                     renderer
                         .render(&self.atlas, &self.viewport, &mut pass)
                         .map_err(|e| error(e.to_string()))?;
+                }
+            }
+            if let Some(layers) = &p.menu_layers {
+                let (underlying, page, w, h) = self.menu_roots.as_ref().unwrap();
+                {
+                    // Root A: the underlying frame — every quad except the
+                    // diverted page and its sentinel — plus the shared texts.
+                    let view = underlying._texture.create_view(&Default::default());
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("menu underlying root"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.paint(&mut pass, &p.quads[..layers.position], menu_under_start, p, [*w, *h])?;
+                    self.paint(
+                        &mut pass,
+                        &p.quads[layers.position + 1..],
+                        menu_after_start,
+                        p,
+                        [*w, *h],
+                    )?;
+                    pass.set_scissor_rect(0, 0, *w, *h);
+                    self.text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|e| error(e.to_string()))?;
+                }
+                {
+                    // Root B: the page quads and its own texts, re-rendered
+                    // every frame so live state stays visible under coverage.
+                    let view = page._texture.create_view(&Default::default());
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("menu page root"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.paint(&mut pass, &layers.quads, menu_page_start, p, [*w, *h])?;
+                    pass.set_scissor_rect(0, 0, *w, *h);
+                    for (_, renderer) in &self.page_text_renderers {
+                        renderer
+                            .render(&self.atlas, &self.viewport, &mut pass)
+                            .map_err(|e| error(e.to_string()))?;
+                    }
                 }
             }
             {

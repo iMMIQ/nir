@@ -230,6 +230,11 @@ impl ReadingState {
         }
         p.quads.splice(end..end, quads);
         p.menu_quad_range = Some((start, end + 4));
+        // The spliced bar quads belong to the authored page; a later page-root
+        // divert must absorb them.
+        if let Some((from, to)) = p.menu_page_range {
+            p.menu_page_range = Some((from, to + 4));
+        }
         let added = if p
             .history_flow
             .as_ref()

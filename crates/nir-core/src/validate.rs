@@ -1885,6 +1885,19 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "ui.menu-effects.v1",
         ));
     }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_transition))
+        && !root.requires.iter().any(|c| c == "ui.menu-transition.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-transition.v1",
+        ));
+    }
     if (root.theme.menu_overlay.is_some()
         || root
             .theme
@@ -3558,6 +3571,18 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             "E_CAPABILITY",
             "theme.image_menus",
             "ui.menu-effects.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_transition))
+        && !p.requires.iter().any(|c| c == "ui.menu-transition.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-transition.v1",
         ));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_replay)

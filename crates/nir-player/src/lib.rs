@@ -369,6 +369,11 @@ pub struct Player {
     ui_clock_demand: ForegroundClockDemand,
     menu_effects: MenuEffectsState,
     menu_effects_clock: Option<ForegroundClockToken>,
+    /// A foreground-owned visual state changed discretely (a menu page fade
+    /// completed). Clock-only ticks must still re-project for it: the clock
+    /// token releases at completion and can stop the frame loop before the
+    /// engine's safety valve would have refreshed the view.
+    ui_visual_pulse: bool,
     /// One mask fetch per in-flight window reveal, keyed by its start.
     window_mask_attempt: Option<(Micros, String)>,
     audio_paused: BTreeMap<TimeDomain, bool>,
@@ -513,6 +518,7 @@ impl Player {
             ui_clock_demand: ForegroundClockDemand::default(),
             menu_effects: MenuEffectsState::new(1),
             menu_effects_clock: None,
+            ui_visual_pulse: false,
             window_mask_attempt: None,
             audio_paused: BTreeMap::from([
                 (TimeDomain::Story, true),
@@ -559,6 +565,11 @@ impl Player {
     }
     pub fn work_used(&self) -> u32 {
         self.work_used
+    }
+    /// Takes whether a foreground-owned visual state changed discretely since
+    /// the last check; the engine re-projects on the next draw when set.
+    pub fn take_ui_visual_pulse(&mut self) -> bool {
+        std::mem::take(&mut self.ui_visual_pulse)
     }
     pub fn pending_events(&self) -> usize {
         self.inbox.len()
@@ -875,6 +886,12 @@ impl Player {
     pub fn menu_opacity(&self) -> f32 {
         self.menu_effects
             .opacity(self.ui_clock_us.0, self.preferences.reduced_motion)
+    }
+    /// The in-flight spatial page reveal: (style, to_visible, progress).
+    /// `None` when no reveal runs (no style, dissolve, or reduced motion).
+    pub fn menu_transition(&self) -> Option<(StageTransition, bool, f32)> {
+        self.menu_effects
+            .transition(self.ui_clock_us.0, self.preferences.reduced_motion)
     }
     pub fn acquire_foreground_clock(&self) -> Option<ForegroundClockToken> {
         self.ui_clock_demand.acquire()
@@ -3464,6 +3481,10 @@ impl Player {
                 && c.dialogue().is_some()
                 && window_transition.is_none(),
             window_transition,
+            menu_transition: self.menu_effects.transition(
+                self.ui_clock_us.0,
+                self.preferences.reduced_motion,
+            ),
             dialogue: c
                 .dialogue()
                 .filter(|_| !c.state().dialogue_hidden || window_reveal_live)

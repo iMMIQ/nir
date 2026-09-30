@@ -88,6 +88,10 @@ pub struct UiModel {
     /// In-flight message-window reveal; `None` (including under reduced
     /// motion) keeps the committed hidden/visible state with no interpolation.
     pub window_transition: Option<WindowTransition>,
+    /// In-flight spatial menu-page reveal. Dissolve coverage (and no style at
+    /// all) rides the legacy `menu_opacity` ramp instead; `None` keeps the
+    /// page on the shared surface.
+    pub menu_transition: Option<(StageTransition, bool, f32)>,
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
     pub choices: Vec<ChoiceView>,
@@ -246,6 +250,19 @@ pub struct WindowLayers {
     pub to_visible: bool,
     pub progress: f32,
 }
+/// The diverted menu page root. `position` is the `@menu` sentinel's index in
+/// `DrawPacket::quads` — the underlying frame keeps every quad around it;
+/// `texts` index `DrawPacket::texts` (kept in the packet for layout) whose
+/// glyph areas route to the page pass instead of the shared renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuLayers {
+    pub quads: Vec<Quad>,
+    pub texts: Vec<usize>,
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+    pub position: usize,
+}
 #[derive(Debug, Default)]
 pub struct DrawPacket {
     pub(crate) history_flow: Option<reading::HistoryFlowView>,
@@ -255,6 +272,8 @@ pub struct DrawPacket {
     pub menu_paint: Vec<MenuPaint>,
     pub menu_controls: std::collections::BTreeMap<u32, String>,
     pub menu_quad_range: Option<(usize, usize)>,
+    pub(crate) menu_page_range: Option<(usize, usize)>,
+    pub(crate) menu_page_texts: Option<(usize, usize)>,
     pub quads: Vec<Quad>,
     pub texts: Vec<TextRun>,
     pub semantics: Vec<SemanticNode>,
@@ -268,6 +287,7 @@ pub struct DrawPacket {
     pub stage_size: [u32; 2],
     pub transition_layers: Option<(Vec<Quad>, Vec<Quad>, f32)>,
     pub window_layers: Option<WindowLayers>,
+    pub menu_layers: Option<MenuLayers>,
     pub scrolls: Vec<ScrollView>,
     pub(crate) dialogue_hint: Option<usize>,
     pub(crate) dialogue_hint_quad: Option<usize>,
@@ -399,6 +419,7 @@ impl DrawPacket {
             && self.transition_layers == other.transition_layers
             && self.transition_style == other.transition_style
             && self.window_layers == other.window_layers
+            && self.menu_layers == other.menu_layers
     }
 
     fn rect(&mut self, r: [f32; 4], c: [f32; 4]) {
@@ -1090,7 +1111,68 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
 }
 
 pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> DrawPacket {
-    project_measured(m, width, height, messages, &[], 0., 0.)
+    let mut p = project_measured(m, width, height, messages, &[], 0., 0.);
+    divert_menu_page(&mut p, m);
+    p
+}
+
+/// Diverts the authored menu page into the offscreen page root while a
+/// spatial reveal is in flight. Must run after history flow/bar projection:
+/// the bar splices four quads inside the page span, so splitting earlier
+/// would invalidate its index fixups.
+pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
+    let Some((style, to_visible, progress)) = m.menu_transition.as_ref() else {
+        return;
+    };
+    let Some((start, end)) = p.menu_page_range else {
+        return;
+    };
+    // Page texts are the branch's own runs plus every page-marked text
+    // appended after it (history flow rows).
+    let mut texts: Vec<usize> = p
+        .menu_page_texts
+        .map(|(from, to)| from..to)
+        .into_iter()
+        .flatten()
+        .collect();
+    texts.extend(
+        p.menu_paint
+            .iter()
+            .filter_map(|paint| match paint {
+                MenuPaint::Text(i) => Some(*i),
+                _ => None,
+            }),
+    );
+    let tail = p.quads.split_off(end);
+    let quads = p.quads.split_off(start);
+    p.quads.push(Quad {
+        rect: [0., 0., p.width, p.height],
+        color: [1., 1., 1., 1.],
+        asset: Some("@menu".into()),
+        clip: None,
+    });
+    let position = p.quads.len() - 1;
+    p.quads.extend(tail);
+    // Quads after the page shift down by the page length minus the sentinel.
+    let shift = end - start - 1;
+    if let Some(index) = &mut p.dialogue_hint_quad {
+        if *index >= end {
+            *index -= shift;
+        }
+    }
+    // Interleaving is moot while the page lives in its own root.
+    p.menu_paint.clear();
+    p.menu_quad_range = None;
+    p.menu_page_range = None;
+    p.menu_page_texts = None;
+    p.menu_layers = Some(MenuLayers {
+        quads,
+        texts,
+        style: style.clone(),
+        to_visible: *to_visible,
+        progress: *progress,
+        position,
+    });
 }
 fn project_measured(
     m: &UiModel,
@@ -1248,6 +1330,10 @@ fn project_measured(
                     t,
                 );
             }
+            // The page owns everything this branch paints, including builtin
+            // navigation; a spatial reveal diverts exactly this span.
+            p.menu_page_range = Some((fade_quads, p.quads.len()));
+            p.menu_page_texts = Some((fade_texts, p.texts.len()));
             let opacity = m.menu_opacity.clamp(0., 1.);
             if opacity < 1. {
                 for quad in &mut p.quads[fade_quads..] {
@@ -2193,6 +2279,9 @@ fn project_measured(
         p.menu_paint.clear();
         p.menu_controls.clear();
         p.menu_quad_range = None;
+        p.menu_page_range = None;
+        p.menu_page_texts = None;
+        p.menu_layers = None;
         p.transition_layers = None;
         p.rect([0., 0., width, height], t.background);
         let w = (width - 2. * margin).min(520.);

@@ -1,6 +1,6 @@
 # 场景方向擦除
 
-StagePresent 保留唯一任务、资源准备及前后场景所有权，增加可选 transition。缺省与旧文件仍为 dissolve；非默认 wipe 要求 `stage.wipe.v1`，编译器按实际使用推导。纹理阈值遮罩使用下节的独立能力；消息窗口作为转场根见文末一节，UI 根与动态输入继续作为计划后续增量。
+StagePresent 保留唯一任务、资源准备及前后场景所有权，增加可选 transition。缺省与旧文件仍为 dissolve；非默认 wipe 要求 `stage.wipe.v1`，编译器按实际使用推导。纹理阈值遮罩使用下节的独立能力；消息窗口与菜单页面作为转场根见文末一节，其余 UI 根与动态输入继续作为计划后续增量。
 
 ```json
 {"type":"stage_present","scene":"next","duration_us":"600000",
@@ -49,5 +49,5 @@ asset 必须是已声明的 Image；channel 当前只允许 alpha，其他值拒
 
 反向同款操作以打断时刻的覆盖度为新起点（from_coverage）；与已提交状态一致的同款操作立即提交；旧两字段立即翻转会中断在飞的揭示。快照捕获飞行中的样式、方向、起点覆盖与起止时刻，恢复做结构校验，样式或遮罩与发行定义不一致时拒绝（invalid window reveal / invalid window reveal mask）。遮罩资产必须是已声明的 Image，与状态资产一起进入准备闭包与 TopUp 需求，整段揭示期间只取一次；减少动态效果跳过动画、在截止时刻直接提交。
 
-来源映射：LiveNovel 的 MESON/MESOFF 渐隐毫秒数大于零时映射为 dissolve 揭示（duration_us = 毫秒×1000），为零时保持立即翻转；导入账本据此把 `livenovel.textbox.fade` 从 approximate 升为 adapted（仅当确有渐隐位点，见 [导入](IMPORT.md)）。UI 菜单页根仍待后续交付；硬件 WebGPU 和 Windows 实机仍需单独认证。
+来源映射：LiveNovel 的 MESON/MESOFF 渐隐毫秒数大于零时映射为 dissolve 揭示（duration_us = 毫秒×1000），为零时保持立即翻转；导入账本据此把 `livenovel.textbox.fade` 从 approximate 升为 adapted（仅当确有渐隐位点，见 [导入](IMPORT.md)）。菜单页面根已按 `ui.menu-transition.v1` 复用同一组样式与混合路径（见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md) 的空间揭示样式一节）；其余 UI 根、硬件 WebGPU 和 Windows 实机仍需单独认证。
 

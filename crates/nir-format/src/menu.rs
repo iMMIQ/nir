@@ -497,15 +497,20 @@ pub struct MenuEffects {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music: Option<MenuMusic>,
 }
-/// One page boundary: an optional one-shot sound plus a bounded fade.
+/// One page boundary: an optional one-shot sound plus a bounded fade. A
+/// spatial `style` (wipe/mask) turns the fade duration into a page-root
+/// reveal over the frozen underlying frame; dissolve or no style keeps the
+/// legacy whole-layer alpha fade.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MenuTransition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<String>,
     #[serde(default)]
     pub fade_us: Micros,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<StageTransition>,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,6 +550,8 @@ impl MenuEffects {
         for transition in [&self.enter, &self.close].into_iter().flatten() {
             if transition.fade_us.0 > 2_000_000
                 || transition.sound.as_deref().is_some_and(|s| !asset(s))
+                || transition.style.as_ref().is_some_and(|s| !s.valid())
+                || (transition.style.is_some() && transition.fade_us.is_zero())
             {
                 return Err(fail());
             }
@@ -561,6 +568,25 @@ impl MenuEffects {
             }
         }
         Ok(())
+    }
+}
+impl MenuEffects {
+    /// Transition mask assets. They are page images, not effect audio, so
+    /// they join the image closure and its Image-kind validation.
+    pub fn mask_assets(&self) -> Vec<&str> {
+        [&self.enter, &self.close]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.style.as_ref().and_then(StageTransition::asset))
+            .collect()
+    }
+    /// Whether any page boundary requires the page-root reveal machinery.
+    /// Dissolve is the legacy fade and needs no capability.
+    pub fn uses_transition(&self) -> bool {
+        [&self.enter, &self.close]
+            .into_iter()
+            .flatten()
+            .any(|t| t.style.as_ref().is_some_and(|s| !s.is_default()))
     }
 }
 impl ImageMenu {
@@ -967,6 +993,11 @@ impl ImageMenu {
                     .iter()
                     .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
             )
+            .chain(
+                self.effects
+                    .iter()
+                    .flat_map(|e| e.mask_assets().into_iter().map(str::to_owned)),
+            )
             .collect()
     }
     /// Assets a page needs resident before it may present and play its page
@@ -1280,5 +1311,112 @@ impl ImageMenu {
         self.controls().any(|(_, a, _)| {
             matches!(a, ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transitions_round_trip_styles_and_keep_legacy_deserialization() {
+        // Legacy documents predate styles entirely: no field deserializes to
+        // the legacy alpha fade and serializes back without one.
+        let legacy: MenuTransition =
+            serde_json::from_str(r#"{"sound":"audio.bell","fade_us":"400000"}"#).unwrap();
+        assert!(legacy.style.is_none());
+        assert!(serde_json::to_string(&legacy).unwrap().contains(r#""fade_us":"400000""#));
+        let styled: MenuTransition = serde_json::from_value(serde_json::json!({
+            "sound": "audio.bell", "fade_us": "400000",
+            "style": {"type": "wipe", "direction": "left_to_right", "softness": 0.2}
+        }))
+        .unwrap();
+        assert_eq!(
+            styled.style,
+            Some(StageTransition::Wipe {
+                direction: WipeDirection::LeftToRight,
+                softness: 0.2,
+            })
+        );
+        let round: MenuTransition =
+            serde_json::from_str(&serde_json::to_string(&styled).unwrap()).unwrap();
+        assert_eq!(round, styled);
+        // Unknown style fields stay denied.
+        assert!(serde_json::from_value::<MenuTransition>(serde_json::json!({
+            "fade_us": "400000",
+            "style": {"type": "wipe", "direction": "sideways"}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn only_spatial_styles_claim_the_reveal_and_mask_closure() {
+        let effects = |enter, close| MenuEffects {
+            enter,
+            close,
+            click: None,
+            music: None,
+        };
+        let transition = |style| MenuTransition {
+            sound: None,
+            fade_us: Micros(400_000),
+            style,
+        };
+        let none = effects(None, None);
+        let dissolve = effects(
+            Some(transition(Some(StageTransition::Dissolve))),
+            Some(transition(None)),
+        );
+        assert!(!none.uses_transition());
+        assert!(!dissolve.uses_transition(), "dissolve is the legacy fade");
+        assert!(dissolve.mask_assets().is_empty());
+        let spatial = effects(
+            Some(transition(Some(StageTransition::Dissolve))),
+            Some(transition(Some(StageTransition::Wipe {
+                direction: WipeDirection::TopToBottom,
+                softness: 0.,
+            }))),
+        );
+        assert!(spatial.uses_transition());
+        assert!(spatial.mask_assets().is_empty(), "wipe needs no asset");
+        let mask = effects(
+            Some(transition(Some(StageTransition::Mask {
+                asset: "menu.mask".into(),
+                channel: MaskChannel::Alpha,
+                invert: false,
+                softness: 0.2,
+            }))),
+            None,
+        );
+        assert!(mask.uses_transition());
+        assert_eq!(mask.mask_assets(), vec!["menu.mask"]);
+        // Masks are page images, never effect audio.
+        assert!(!mask.assets().contains(&"menu.mask"));
+    }
+
+    #[test]
+    fn image_closures_carry_masks_through_the_theme() {
+        let menu: ImageMenu = serde_json::from_value(serde_json::json!({
+            "background": "menu.only", "buttons": [],
+            "effects": {
+                "enter": {"fade_us": "400000",
+                    "style": {"type": "mask", "asset": "menu.mask", "channel": "alpha"}},
+                "close": {"sound": "audio.bell", "fade_us": "300000",
+                    "style": {"type": "wipe", "direction": "left_to_right"}},
+                "click": "audio.bell",
+                "music": {"asset": "audio.voice"}
+            }
+        }))
+        .unwrap();
+        let mut theme = Theme::default();
+        theme.image_menus.insert("system".into(), menu);
+        assert!(theme.image_assets().contains("menu.mask"));
+        assert_eq!(
+            theme.image_menus["system"].prepared_assets(),
+            ["audio.bell", "audio.voice", "menu.mask", "menu.only"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
     }
 }

@@ -377,6 +377,31 @@ effects_menu_project=build("browser-menu-effects",lambda c:None,setup=menu_effec
 effects_menu_server=ThreadingHTTPServer(("127.0.0.1",4220),partial(SimpleHTTPRequestHandler,directory=str(effects_menu_project)))
 Thread(target=effects_menu_server.serve_forever,daemon=True).start()
 
+def menu_wipe(content):
+    # The story parks on a solid red station scene so the page reveal can be
+    # sampled against a known underlying frame.
+    content["scenes"]["station"]=[{"id":"solid","x":0,"y":0,"width":1280,"height":720,"color":[1.,0.,0.,1.]}]
+
+def menu_wipe_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # Both pages wipe in over the underlying frame; the overlay wipes out
+    # again. Styled boundaries cap at 2 s (E_VIEW_EFFECTS), so the spec cannot
+    # lean on the stage fixtures' long durations: it freezes both time domains
+    # on the crossing frame and samples the frozen composite's pure page and
+    # frame columns.
+    source += '\n[image_menus.title.effects.enter]\nfade_us = "1200000"\nstyle = {type = "wipe", direction = "left_to_right", softness = 0.2}\n'
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.system.effects.enter]\nfade_us = "2000000"\nstyle = {type = "wipe", direction = "left_to_right", softness = 0.1}\n'
+    source += '\n[image_menus.system.effects.close]\nsound = "audio.bell"\nfade_us = "2000000"\nstyle = {type = "wipe", direction = "right_to_left", softness = 0.1}\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [490,320,300,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+wipe_menu_project=build("browser-menu-wipe",menu_wipe,setup=menu_wipe_assets)
+wipe_menu_server=ThreadingHTTPServer(("127.0.0.1",4224),partial(SimpleHTTPRequestHandler,directory=str(wipe_menu_project)))
+Thread(target=wipe_menu_server.serve_forever,daemon=True).start()
+
 def replay_assets(project):
     menu_service_assets(project)
     theme=project/"themes/rain/theme.toml"

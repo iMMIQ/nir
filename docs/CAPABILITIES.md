@@ -95,6 +95,8 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 `ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画、效果等待或来源系统菜单的自动效果映射。
 
+`ui.menu-transition.v1` 允许菜单页面边界的转场声明空间样式（wipe/mask，复用舞台 StageTransition 的方向、软边、遮罩通道语义）：呈现层把页面整体分流到离屏页根，以遮罩合成覆盖在冻结的底层帧上，替代旧的整层 alpha 渐隐；遮罩是 Image 类页面资产，随页面图片进入准备与留存。dissolve 或未声明样式保持旧 alpha 渐隐路径，不需本能力；飞行中持有前台时钟租约、锁定输入并暂停阅读，关闭延迟退出至擦除完成，reduced_motion 只抑制呈现不抑制音效。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。
+
 `ui.replay.v1` 提供显式声明的回想事务：`replay` 控件动作冻结原会话（快照、检查点、菜单页与局部值、auto/skip），候选 Core 在屏障外独自准备后切换为唯一活动会话，结束（outcome 或手动 `exit_replay`）时冻结会话作为恢复候选重新验证并原样接回。活动期间 Profile 写入、保存/导出、读取/导入隔离，嵌套入口与存储动作在派发点复查即拒绝；入口媒体与冻结会话联合准入，重叠资产不重复计费；准入失败整事务作废且不提供 Retry。旧 `entry` 动作行为不变。见 [Replay 事务](REPLAY-SEMANTICS.md)。不含共享变量写回、sleep/awake 语义或来源系统的自动回想映射。
 
 `ui.menu-chrome.v1` 允许页面关闭自动添加的导航按钮，保留作者控件、Escape／右键和失败出口。默认开启，旧页面行为不变；转换器可在原页面只使用键盘返回时自动生成该声明，见 [菜单服务](MENU-SERVICES-SEMANTICS.md)。
@@ -158,6 +160,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | ui.menu-history-scrollbar.v1 | crates/nir-player/src/menu.rs（拖动状态/输入权威/裁切序） | 无运行态（仅校验）：拖动瞬态，位置归流程窗口版本 | tests/nir-next/history-scrollbar.spec.js | 待验证 | 批次 45 |
 | ui.menu-values.v1 | crates/nir-player/src/menu.rs（单次提交/过期拒绝/边界校验） | crates/nir-player/src/replay.rs（绑定局部值冻结恢复） | tests/nir-next/menu-values.spec.js | 待验证 | 语义见 MENU-VALUES-SEMANTICS.md |
 | ui.menu-effects.v1 | crates/nir-player/src/menu.rs（进入效果等待准备、关闭延迟退出） | 无运行态（不入故事快照）：会话重置终止（同文件） | tests/nir-next/menu-effects.spec.js | 待验证 | 批次 48；瞬态不入快照 |
+| ui.menu-transition.v1 | crates/nir-player/src/menu.rs（空间揭示飞行与关闭延迟退出）；crates/nir-core/tests/menu_transition_contract.rs（能力/界限/遮罩资产门） | 无运行态（不入故事快照）：会话重置终止（crates/nir-player/src/menu.rs） | tests/nir-next/menu-wipe.spec.js | 待验证 | 批次 57；dissolve 走旧 alpha 渐隐不需能力 |
 | ui.replay.v1 | crates/nir-player/src/replay.rs（冻结/嵌套拒绝/准入失败整事务作废） | 同文件（outcome/手动退出恢复冻结会话、设备丢失续备） | tests/nir-next/replay.spec.js | 待验证 | 批次 49；实包全路线见批次 54 认证 |
 | task.compose.v1 | crates/nir-core/tests/compose_contract.rs（VM 等待时链前进、All 失败优先） | 同文件（链中途存读档只续播）；crates/nir-player/tests/coordination.rs（链中途回退不重播） | tests/nir-next/compose.spec.js | 待验证 | 批次 50；parallel_all 无浏览器直接断言 |
 | story.typed-result.v1 | crates/nir-core/tests/typed_result_contract.rs（写声明值后分支/超时 default/取消不写） | 同文件（游标快照恢复、篡改拒绝）；crates/nir-player/tests/coordination.rs（存读档/回退） | tests/nir-next/typed-result.spec.js | 待验证 | 批次 51；批次 52 LiveNovel 复用同核心 |

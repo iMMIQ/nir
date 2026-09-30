@@ -61,6 +61,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
     "ui.menu-effects.v1",
+    "ui.menu-transition.v1",
     "ui.replay.v1",
     "task.compose.v1",
     "story.typed-result.v1",
@@ -1445,17 +1446,7 @@ impl Theme {
             assets.insert(asset.clone());
         }
         for menu in self.image_menus.values() {
-            assets.extend(
-                menu.elements
-                    .iter()
-                    .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
-            );
-            assets.insert(menu.background.clone());
-            for button in &menu.buttons {
-                assets.insert(button.asset.clone());
-                assets.extend(button.hover_asset.clone());
-                assets.extend(button.locked_asset.clone());
-            }
+            assets.extend(menu.image_assets());
         }
         assets
     }

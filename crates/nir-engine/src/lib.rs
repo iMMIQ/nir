@@ -999,6 +999,8 @@ impl Engine {
         state["interface_hidden"] = serde_json::json!(self.player.interface_hidden());
         state["foreground_clock_us"] = serde_json::json!(self.player.foreground_clock());
         state["menu_opacity"] = serde_json::json!(self.player.menu_opacity());
+        state["menu_transition"] =
+            serde_json::json!(self.player.menu_transition().map(|(_, _, p)| p));
         state["replay"] = serde_json::json!(self.player.replay_phase());
         state["foreground_paused"] =
             serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));
@@ -1232,6 +1234,10 @@ impl Engine {
             self.work_remaining -= used;
         }
         self.state_dirty |= !clock_only || work > admitted;
+        // Foreground-owned visuals (menu page fades) complete inside
+        // clock-only ticks and release their clock token at that instant;
+        // without this the settled frame may never be projected.
+        self.state_dirty |= self.player.take_ui_visual_pulse();
         Ok(())
     }
 
