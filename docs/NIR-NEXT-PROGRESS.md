@@ -33,7 +33,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
 | P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息/UI 根上的通用目标与遮罩转场仍待实施 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
-| P6 兼容认证与困难案例 | ImportReport 映射级别与证据类已实现（批次 53，报告格式 2 + 显式近似接受门禁）；完整路线认证已实现（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）；能力发行清单仍待实施 |
+| P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
 Windows 宿主已同步修改，但 Linux 上的公共 Rust 测试不覆盖 cfg(windows) 原生运行路径；不得据此声明 Windows 实机验收通过。实际测试日志保留在本地 `reports/nir-next/`。
 
@@ -641,3 +641,12 @@ P6.1 完成；P6 余下完整路线认证与能力发行清单，P4 遗留（消
 - 本批触及 Player 运行时 → 按先例恢复浏览器整套验收（先 cargo xtask sdk 重建 dist/novelc）。nir-compiler 测试 dev-dependencies 加入 nir-player/nir-presentation。
 
 P6.2 完成；P6 余下能力发行清单，P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）待后续批次。证据：reports/nir-next/batch-54-corpus-certify.log、batch-54-xtask-test.log、batch-54-xtask-sdk.log、batch-54-verify-sdk.log、batch-54-clippy.log、batch-54-architecture.log、batch-54-browser.log。契约见 IMPORT.md（完整 Player 级路线认证一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 55：能力发行清单（P6.3）
+
+- docs/CAPABILITIES.md 新增「能力发行清单」：代码 `CAPABILITIES` 全部 43 项逐一登记执行证据（Rust 测试）、恢复证据（快照/存读档/回退，或「无运行态（仅校验）」并给出校验测试）、Web 后端（浏览器 E2E 规格的实际执行）与 Windows 原生状态。Windows 原生全部如实记为「待验证」——公共 Rust 测试不覆盖 cfg(windows) 原生路径，不据此声明实机通过。个别能力的浏览器覆盖为间接，备注如实标注而不当作直接断言：ui.menu-chrome.v1 的 builtin_navigation=false 页实际运行但无按钮缺失直接断言；media.webp.v1/media.mp3.v1 经 fixture 产物实际解码播放，无容器级直接断言；task.compose.v1 浏览器仅直接覆盖 sequence，parallel_all 经 Rust 组合/协调测试。
+- 新增 scripts/verify_capabilities.py 并接入 `cargo xtask test`（check_architecture.py 之后）：代码能力表与清单必须一一对应（缺行、幽灵行分别点名），引用的 .rs/.js 证据路径必须存在，Windows 列只允许「待验证/✓」。负例已验证：缺行报 "advertised in code but no ledger row"、非法 Windows 值报 "Windows column must be 待验证 or ✓"、幽灵行报 "ledger row for unknown capability"。
+- 能力→证据映射由两路独立检索汇总（Rust 测试侧与浏览器规格侧），引用路径全部经文件存在性核对；基线能力（v0.1.0）与 NIR-NEXT 批次交付在备注中区分，批次号取自实施进度文档。
+- 本批只改文档/脚本/xtask 测试挂接，不触及 Player/格式/编译器运行时；dist/novelc 自批次 54 门禁后未变，按批次 53 先例不重复浏览器整套验收。
+
+P6 三项（映射账本、完整路线认证、能力发行清单）全部交付；P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）与 P0 三个完整示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-55-xtask-test.log、batch-55-xtask-sdk.log、batch-55-verify-sdk.log、batch-55-clippy.log、batch-55-architecture.log。契约见 docs/CAPABILITIES.md（能力发行清单一节）。完整 P0–P6 计划未完成；未提交或推送。
