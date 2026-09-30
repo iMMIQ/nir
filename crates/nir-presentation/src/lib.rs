@@ -85,6 +85,9 @@ pub struct UiModel {
     pub stage: [f32; 2],
     pub dialogue: Option<DialogueView>,
     pub hidden_dialogue: bool,
+    /// In-flight message-window reveal; `None` (including under reduced
+    /// motion) keeps the committed hidden/visible state with no interpolation.
+    pub window_transition: Option<WindowTransition>,
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
     pub choices: Vec<ChoiceView>,
@@ -223,6 +226,26 @@ pub enum MenuPaint {
     Quad(usize),
     Text(usize),
 }
+/// In-flight message-window reveal as seen by projection. Dissolve folds into
+/// the existing per-item opacity multiply; wipe/mask divert the window into
+/// the offscreen root and return through the `@window` sentinel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowTransition {
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+}
+/// The diverted window root: quads render into the offscreen root texture;
+/// `texts` indexes `DrawPacket::texts` (kept in the packet for layout) whose
+/// glyph areas route to the window pass instead of the shared text renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowLayers {
+    pub quads: Vec<Quad>,
+    pub texts: Vec<usize>,
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+}
 #[derive(Debug, Default)]
 pub struct DrawPacket {
     pub(crate) history_flow: Option<reading::HistoryFlowView>,
@@ -244,6 +267,7 @@ pub struct DrawPacket {
     pub height: f32,
     pub stage_size: [u32; 2],
     pub transition_layers: Option<(Vec<Quad>, Vec<Quad>, f32)>,
+    pub window_layers: Option<WindowLayers>,
     pub scrolls: Vec<ScrollView>,
     pub(crate) dialogue_hint: Option<usize>,
     pub(crate) dialogue_hint_quad: Option<usize>,
@@ -374,6 +398,7 @@ impl DrawPacket {
             && self.stage_size == other.stage_size
             && self.transition_layers == other.transition_layers
             && self.transition_style == other.transition_style
+            && self.window_layers == other.window_layers
     }
 
     fn rect(&mut self, r: [f32; 4], c: [f32; 4]) {
@@ -1476,6 +1501,46 @@ fn project_measured(
                 }
                 for text in &mut p.texts[first_text..] {
                     text.color[3] *= appearance.opacity * appearance.text_opacity;
+                }
+                match m.window_transition.as_ref() {
+                    // Uniform coverage is the dissolve ramp: fold it into the
+                    // existing per-item opacity multiply.
+                    Some(w) if matches!(w.style, StageTransition::Dissolve) => {
+                        let coverage = if w.to_visible {
+                            w.progress
+                        } else {
+                            1. - w.progress
+                        };
+                        for quad in &mut p.quads[first_quad..] {
+                            quad.color[3] *= coverage;
+                        }
+                        for text in &mut p.texts[first_text..] {
+                            text.color[3] *= coverage;
+                        }
+                    }
+                    // Spatial coverage composites through the mix pass: divert
+                    // the window quads into the offscreen root, leave a
+                    // full-surface sentinel at their z-position. Window texts
+                    // stay in the packet for layout; their glyph areas route
+                    // to the window pass instead of the shared renderer.
+                    Some(w) => {
+                        let quads = p.quads.split_off(first_quad);
+                        p.dialogue_hint_quad = None;
+                        p.quads.push(Quad {
+                            rect: [0., 0., width, height],
+                            color: [1., 1., 1., 1.],
+                            asset: Some("@window".into()),
+                            clip: None,
+                        });
+                        p.window_layers = Some(WindowLayers {
+                            quads,
+                            texts: (first_text..p.texts.len()).collect(),
+                            style: w.style.clone(),
+                            to_visible: w.to_visible,
+                            progress: w.progress,
+                        });
+                    }
+                    None => {}
                 }
                 p.semantics.push(SemanticNode {
                     value: None,

@@ -29,9 +29,9 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
-| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息/UI 目标、来源映射与硬件验证仍待完成 |
+| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 页面根、来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息/UI 根上的通用目标与遮罩转场仍待实施 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；UI 页面根上的通用目标与转场仍待实施 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
 | P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
@@ -650,3 +650,13 @@ P6.2 完成；P6 余下能力发行清单，P4 遗留（P2.4 消息/UI 根遮罩
 - 本批只改文档/脚本/xtask 测试挂接，不触及 Player/格式/编译器运行时；dist/novelc 自批次 54 门禁后未变，按批次 53 先例不重复浏览器整套验收。
 
 P6 三项（映射账本、完整路线认证、能力发行清单）全部交付；P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）与 P0 三个完整示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-55-xtask-test.log、batch-55-xtask-sdk.log、batch-55-verify-sdk.log、batch-55-clippy.log、batch-55-architecture.log。契约见 docs/CAPABILITIES.md（能力发行清单一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 56：消息根窗口转场（P2.4）
+
+- `dialogue_visibility` 增加可选 `transition` 与 `duration_us`（0 < duration_us ≤ 60 秒），缺省与旧两字段操作仍是立即翻转；样式化操作要求 `text.window-transition.v1`，源校验（nir-core validate：能力、样式、时长门）与 runtime 加载双侧执行，nir-format 契约测试覆盖旧文件缺省读取与样式化序列化往返。
+- Core：`WindowReveal { style, to_visible, from_coverage, started_us, duration_us }` 跟随 Story 时钟并加入 needs_clock；提交的 `dialogue_hidden` 只在截止时刻翻转，反向同款操作以打断时刻覆盖度为新起点，与已提交状态一致的同款操作立即提交，旧立即翻转会中断在飞揭示；恢复对样式/遮罩做结构校验（invalid window reveal / invalid window reveal mask），遮罩必须是 Image 类并进入准备闭包与恢复资产。契约测试 window_reveal_contract.rs 5 项（截止提交、打断捕获、冗余立即提交、立即翻转中断、校验/恢复门）。
+- Player/Presentation/Renderer：dissolve 把覆盖度乘进消息框背景与文字透明度（HUD 不参与）；擦除/遮罩把消息框项剥离为窗口根并在原位留下覆盖全表面的哨兵四边形（@window），复用舞台转场的双输入混合路径——隐藏方向把已渲染窗口放在 source 侧由覆盖度擦除，窗口根本身每帧重绘以保持正文揭示与外观动画。协调测试 76 项含：投影跟随时钟并截止提交、reduced_motion 跳过动画直接提交、飞行中存读档续播、遮罩只取一次并钉住时钟、dissolve 仅折叠窗口项、wipe 哨兵几何与前后绘制序不变。TopUp 遮罩请求会并入状态资产，宿主须喂满整个扣留请求。
+- 引擎状态桥 `state.window` 暴露进度（null 或 0..1）。浏览器规格 tests/nir-next/window.spec.js 在固体红开场场景 + 1×1 绿色窗口背景 fixture（4216 端口）上采样：领先侧擦除为场景色、尾侧保持纯绿、软边覆盖度与进度一致；暂停冻结、飞行中存读档恢复同进度、恢复后继续清空。fixture 修正过一处：复用 wipe() 场景改写会连带注入舞台擦除转场，导致背景本身处于蓝红擦除中途——改为仅改写 `station` 场景，开场静态呈纯红。
+- 导入器：MESON/MESOFF 非零渐隐毫秒映射为等时长 dissolve 窗口揭示（fade_sites 计数入账本），零渐隐保持立即翻转；账本规则 `livenovel.textbox.fade` 由 approximate 升为 adapted（存在渐隐位点时依赖 text.window-transition.v1），批次 53 记录的近似清单相应收窄为 menu-sfx/text.reveal 两条。发行侧遮罩随窗口揭示进入媒体根（window_transition_masks_join_the_release_roots_and_capability）。文档同步：CAPABILITIES.md（能力段落 + 发行清单行）、STAGE-TRANSITION-SEMANTICS.md（消息根一节）、TWEEN-SEMANTICS.md、IMPORT.md。
+
+P2.4 的消息根半边交付；UI 菜单页根（MenuTransition 样式、ui.menu-transition.v1）与 P1.2 UI/音频通用目标、P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-56-*.log。契约见 STAGE-TRANSITION-SEMANTICS.md（消息根一节）。完整 P0–P6 计划未完成；未提交或推送。

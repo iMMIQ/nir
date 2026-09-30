@@ -814,6 +814,25 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     {
         program.requires.retain(|cap| cap != "text.voice-timer.v1");
     }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| {
+            matches!(
+                op.operation,
+                Operation::DialogueVisibility {
+                    transition: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "text.window-transition.v1");
+    }
     if program.player.auto_delay_policy == nir_format::AutoDelayPolicy::LengthScaled {
         program
             .requires
@@ -1091,6 +1110,22 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
                 roots.extend(transition.asset().map(str::to_owned));
             }
             effect.effect.collect_audio_assets(&mut roots);
+        }
+    }
+    // Window reveal masks are committed by mid-block operations, not cue
+    // effects, so no activation recipe can pin them; the root index keeps
+    // their identity addressable for the story-context admission set.
+    for function in p.functions.values() {
+        for block in function.blocks.values() {
+            for op in &block.ops {
+                if let Operation::DialogueVisibility {
+                    transition: Some(transition),
+                    ..
+                } = &op.operation
+                {
+                    roots.extend(transition.asset().map(str::to_owned));
+                }
+            }
         }
     }
     // Font plans are locale consumers. They do not belong to every activation

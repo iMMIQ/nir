@@ -3,7 +3,7 @@
 use nir_assets::{BudgetLedger, Generation, PrepareJob, Reservation};
 use nir_core::*;
 use nir_format::*;
-use nir_presentation::{ChoiceView, DialogueView, Screen, SlotView, UiModel};
+use nir_presentation::{ChoiceView, DialogueView, Screen, SlotView, UiModel, WindowTransition};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod clock;
@@ -299,6 +299,9 @@ enum Purpose {
     /// Isolated replay entry: the frozen session stays live until this
     /// candidate prepares.
     Replay,
+    /// Mid-story media top-up (an operation-committed reveal mask): swaps the
+    /// active lease only, never advances the VM.
+    TopUp,
 }
 struct Preparation {
     request: u32,
@@ -366,6 +369,8 @@ pub struct Player {
     ui_clock_demand: ForegroundClockDemand,
     menu_effects: MenuEffectsState,
     menu_effects_clock: Option<ForegroundClockToken>,
+    /// One mask fetch per in-flight window reveal, keyed by its start.
+    window_mask_attempt: Option<(Micros, String)>,
     audio_paused: BTreeMap<TimeDomain, bool>,
     inbox: VecDeque<(u32, AppEvent)>,
     work_used: u32,
@@ -452,9 +457,12 @@ impl Player {
         let ledger = BudgetLedger::new(MEMORY_LEDGER_LIMIT);
         let _surface_budget = ledger.reserve(&BTreeMap::from([(
             "@render-surfaces".into(),
-            validated.program().stage.width as u64 * validated.program().stage.height as u64 * 8
+            // Two stage-sized freeze targets plus the window root at typical
+            // stage cost; the root actually tracks the swapchain extent, so
+            // the slack covers surfaces up to 4K.
+            validated.program().stage.width as u64 * validated.program().stage.height as u64 * 12
                 + 8 * 1024 * 1024
-                + 32 * 1024 * 1024,
+                + 48 * 1024 * 1024,
         )]))?;
         let menu_session =
             MenuSession::new(core.program().theme.image_menus.get("title"), &preferences);
@@ -505,6 +513,7 @@ impl Player {
             ui_clock_demand: ForegroundClockDemand::default(),
             menu_effects: MenuEffectsState::new(1),
             menu_effects_clock: None,
+            window_mask_attempt: None,
             audio_paused: BTreeMap::from([
                 (TimeDomain::Story, true),
                 (TimeDomain::ForegroundUi, true),
@@ -943,6 +952,9 @@ impl Player {
                 a.insert(asset.clone());
             }
         }
+        if let Some(reveal) = &s.window_reveal {
+            a.extend(reveal.style.asset().map(str::to_owned));
+        }
         if let Some(pending) = &s.pending {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
@@ -958,6 +970,9 @@ impl Player {
             }
         }
         a.extend(core.program().theme.dialogue.background.iter().cloned());
+        // Operation-committed masks belong to no cue recipe; the loaded-body
+        // set keeps authored reveals from stalling on their first encounter.
+        a.extend(self.validated.window_transition_assets());
         a.extend(self.font_assets(&self.effective_ui_locale, &self.effective_text_locale));
         let config = &core.program().locale_config;
         for locale in s
@@ -1509,6 +1524,33 @@ impl Player {
         }
         Ok(())
     }
+    /// A reveal committed by a mid-block operation owns no cue recipe, so its
+    /// mask may sit outside every admitted set when it spawns. One top-up per
+    /// reveal fetches it; the story clock holds at the prepare pause until the
+    /// media lands, so the reveal never runs half-masked.
+    fn maybe_prepare_window_mask(&mut self) -> Result<()> {
+        let Some(reveal) = self.core.state().window_reveal.clone() else {
+            self.window_mask_attempt = None;
+            return Ok(());
+        };
+        let Some(asset) = reveal.style.asset().map(str::to_owned) else {
+            self.window_mask_attempt = None;
+            return Ok(());
+        };
+        if self.window_mask_attempt == Some((reveal.started_us, asset.clone())) {
+            return Ok(());
+        }
+        self.window_mask_attempt = Some((reveal.started_us, asset.clone()));
+        if self.screen == Screen::Story
+            && self.prepare.is_none()
+            && self.candidate.is_none()
+            && self.restore_work.is_none()
+            && !self.replay_live()
+        {
+            self.begin_prepare(Purpose::TopUp, 0, BTreeSet::from([asset]))?;
+        }
+        Ok(())
+    }
     fn cancel_prefetch_content(&mut self) -> bool {
         let requests: Vec<_> = self
             .content
@@ -1690,6 +1732,9 @@ impl Player {
             self.report(e, true);
         }
         if let Err(e) = self.prepare_active_menu() {
+            self.report(e, true);
+        }
+        if let Err(e) = self.maybe_prepare_window_mask() {
             self.report(e, true);
         }
         self.maybe_prefetch_content();
@@ -2297,7 +2342,7 @@ impl Player {
         let commit_generation = self.generation;
         self.observe("commit_started", Some(request));
         match purpose {
-            Purpose::Boot | Purpose::Menu => {}
+            Purpose::Boot | Purpose::Menu | Purpose::TopUp => {}
             Purpose::Activation => self.step(
                 CoreInput::Prepared {
                     activation: lease.activation,
@@ -3375,6 +3420,17 @@ impl Player {
                     screen,
                     Screen::Menu | Screen::Settings | Screen::Saves | Screen::History
                 ));
+        // While a reveal is in flight the window stays projectable in either
+        // direction: the committed hidden flag only lands at its deadline.
+        let window_transition = c
+            .window_reveal()
+            .filter(|_| !self.preferences.reduced_motion)
+            .map(|(style, to_visible, progress)| WindowTransition {
+                style: style.clone(),
+                to_visible,
+                progress,
+            });
+        let window_reveal_live = window_transition.is_some();
         UiModel {
             transition_style: c.transition_style(),
             image_menu: self.active_menu_id().unwrap_or(&self.image_menu).to_owned(),
@@ -3404,10 +3460,13 @@ impl Player {
             ],
             dialogue_appearance: c.sample_dialogue_appearance(),
             interface_hidden: self.interface_hidden && screen == Screen::Story,
-            hidden_dialogue: c.state().dialogue_hidden && c.dialogue().is_some(),
+            hidden_dialogue: c.state().dialogue_hidden
+                && c.dialogue().is_some()
+                && window_transition.is_none(),
+            window_transition,
             dialogue: c
                 .dialogue()
-                .filter(|_| !c.state().dialogue_hidden)
+                .filter(|_| !c.state().dialogue_hidden || window_reveal_live)
                 .map(|(_, d)| DialogueView {
                     full_text: d.full_text(),
                     visible_text: d.visible_text(),

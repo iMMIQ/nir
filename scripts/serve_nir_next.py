@@ -80,6 +80,31 @@ def mask(content,invert=False):
     content["cues"]["intro"]["effects"][0]["effect"]["transition"]={"type":"mask","asset":"mask.pattern","channel":"alpha","invert":invert,"softness":0.2}
     content["functions"]["main"]["blocks"]["wait_intro"]["ops"].append({"id":"hide-mask-text","operation":{"type":"dialogue_visibility","visible":False}})
 
+def window_assets(project):
+    # A 1x1 opaque green backdrop: over the solid red scene the message
+    # window reads as pure green wherever the wipe has not erased it.
+    def chunk(kind,data):
+        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",zlib.crc32(kind+data)&0xffffffff)
+    rgba=bytes([0,0,255,0,255])
+    png=b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",1,1,8,6,0,0,0))+chunk(b"IDAT",zlib.compress(rgba))+chunk(b"IEND",b"")
+    (project/"assets/source/window.png").write_bytes(png)
+    with (project/"assets/catalog.toml").open("a") as f:
+        f.write('\n[[assets]]\nid = "window.green"\nkind = "image"\nsource = "source/window.png"\nrights = "CC0-1.0"\nexpected_size = [1, 1]\n')
+    theme=project/"themes/rain/theme.toml"
+    theme.write_text(theme.read_text().replace(
+        "[dialogue]", '[dialogue]\nrect = [20.0, 450.0, 1240.0, 220.0]\nbackground = "window.green"\n'))
+
+
+def window_reveal(content):
+    # A mid-block styled hide over a solid red opening scene (the `opening`
+    # cue presents `station` with no stage transition): while the reader parks
+    # on the intro line the window wipes away left-to-right over 10s.
+    content["scenes"]["station"]=[{"id":"solid","x":0,"y":0,"width":1280,"height":720,"color":[1.,0.,0.,1.]}]
+    content["functions"]["main"]["blocks"]["wait_intro"]["ops"].append(
+        {"id":"hide-window","operation":{"type":"dialogue_visibility","visible":False,
+         "transition":{"type":"wipe","direction":"left_to_right","softness":0.2},
+         "duration_us":"10000000"}})
+
 def menu_assets(project):
     def png(name, rgba):
         def chunk(kind,data):
@@ -426,7 +451,9 @@ typed_project=build("browser-typed-result",typed_result)
 typed_server=ThreadingHTTPServer(("127.0.0.1",4223),partial(SimpleHTTPRequestHandler,directory=str(typed_project)))
 Thread(target=typed_server.serve_forever,daemon=True).start()
 
-wipe_project=build("browser-wipe-project",wipe)
+window_project=build("browser-window-reveal",window_reveal,setup=window_assets)
+window_server=ThreadingHTTPServer(("127.0.0.1",4216),partial(SimpleHTTPRequestHandler,directory=str(window_project)))
+Thread(target=window_server.serve_forever,daemon=True).start()
 
 wipe_project=build("browser-wipe-project",wipe)
 wipe_server=ThreadingHTTPServer(("127.0.0.1",4201),partial(SimpleHTTPRequestHandler,directory=str(wipe_project)))

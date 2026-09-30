@@ -1530,6 +1530,317 @@ fn dialogue_opacity_multiplies_author_colors_without_fading_scene() {
     }
 }
 
+/// A story whose entry block commits a styled window reveal and then parks on
+/// the intro dialogue, so the reveal runs while the reader holds input.
+fn reveal_player(style: StageTransition, duration_us: u64, reduced_motion: bool) -> Player {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.requires.push("text.window-transition.v1".into());
+    let f = program.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({
+            "ops":[{"id":"reveal","operation":{
+                "type":"dialogue_visibility","visible":false,
+                "transition":serde_json::to_value(&style).unwrap(),
+                "duration_us":duration_us.to_string()}}],
+            "terminator":{"type":"activate","cue":"intro","next":"hold"}
+        }))
+        .unwrap(),
+    );
+    for (block, body) in [
+        (
+            "hold",
+            serde_json::json!({"terminator":{
+                "type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"done","on_cancelled":"done","on_failed":"done"}}),
+        ),
+        (
+            "done",
+            serde_json::json!({"terminator":{"type":"end","outcome":"done"}}),
+        ),
+    ] {
+        f.blocks
+            .insert(block.into(), serde_json::from_value(body).unwrap());
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    p.preferences.reduced_motion = reduced_motion;
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    p
+}
+
+#[test]
+fn window_reveal_projection_follows_the_story_clock_and_commits_at_the_deadline() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, false);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    let w = m.window_transition.as_ref().expect("reveal live in the model");
+    assert_eq!(w.style, StageTransition::Dissolve);
+    assert!(!w.to_visible);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    assert!(!m.hidden_dialogue, "the committed flag lands at the deadline");
+    assert!(m.dialogue.is_some(), "the view stays projectable while live");
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 600_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    assert!(m.window_transition.is_none());
+    assert!(m.hidden_dialogue);
+    assert!(m.dialogue.is_none());
+}
+
+#[test]
+fn reduced_motion_suppresses_the_reveal_and_jumps_at_the_deadline() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, true);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    assert!(m.window_transition.is_none());
+    assert!(
+        !m.hidden_dialogue,
+        "committed flag still deferred under reduced motion"
+    );
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 600_000 }], 1000);
+    ready(&mut p, commands);
+    assert!(p.model().hidden_dialogue);
+}
+
+#[test]
+fn mid_reveal_save_and_load_restores_the_flight() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, false);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let envelope = slot_envelope(&p, 0);
+    let commands = p.pump(vec![AppEvent::Loaded { envelope }], 1000);
+    ready(&mut p, commands);
+    assert!(p.paused());
+    action(&mut p, UiAction::Continue);
+    let m = p.model();
+    let w = m.window_transition.expect("reveal restored mid-flight");
+    assert_eq!(w.style, StageTransition::Dissolve);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    assert!(!m.hidden_dialogue);
+}
+
+#[test]
+fn window_mask_reveals_fetch_their_mask_once_and_hold_the_story_clock() {
+    let style = StageTransition::Mask {
+        asset: "bg.river".into(),
+        channel: MaskChannel::Alpha,
+        invert: false,
+        softness: 0.2,
+    };
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.requires.push("text.window-transition.v1".into());
+    let f = program.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({
+            "ops":[{"id":"reveal","operation":{
+                "type":"dialogue_visibility","visible":false,
+                "transition":serde_json::to_value(&style).unwrap(),
+                "duration_us":"1000000"}}],
+            "terminator":{"type":"activate","cue":"intro","next":"hold"}
+        }))
+        .unwrap(),
+    );
+    for (block, body) in [
+        (
+            "hold",
+            serde_json::json!({"terminator":{
+                "type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"done","on_cancelled":"done","on_failed":"done"}}),
+        ),
+        (
+            "done",
+            serde_json::json!({"terminator":{"type":"end","outcome":"done"}}),
+        ),
+    ] {
+        f.blocks
+            .insert(block.into(), serde_json::from_value(body).unwrap());
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    // Drive the new session but withhold the mask top-up request once it
+    // appears: the reveal must not run while its media is outstanding.
+    let mut queue = action(&mut p, UiAction::NewGame);
+    let mut mask_request: Option<(u32, Vec<String>)> = None;
+    for _ in 0..40 {
+        let mut next = vec![];
+        for c in queue {
+            match c {
+                AppCommand::GetAssets { request, assets, .. } => {
+                    if assets.iter().any(|a| a == "bg.river") {
+                        assert!(mask_request.replace((request, assets)).is_none(),
+                            "the mask is fetched by exactly one top-up");
+                    } else {
+                        for asset in assets {
+                            next.extend(
+                                p.pump(vec![AppEvent::AssetReady { request, asset }], 1000)
+                            );
+                        }
+                    }
+                }
+                AppCommand::PreparePresentation { request } => next
+                    .extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000)),
+                AppCommand::PrepareLocale { request, .. } => {
+                    next.extend(p.pump(vec![AppEvent::LocaleReady { request }], 1000))
+                }
+                _ => {}
+            }
+        }
+        queue = next;
+        if queue.is_empty() {
+            break;
+        }
+    }
+    let (request, withheld) =
+        mask_request.expect("the reveal mask is fetched by a top-up");
+    assert!(
+        p.paused(),
+        "the story clock holds while the mask is outstanding"
+    );
+    let before = p.core().state().tick_us;
+    p.pump(vec![AppEvent::Tick { delta_us: 5_000_000 }], 1000);
+    assert_eq!(
+        p.core().state().tick_us, before,
+        "no story time passes before the media lands"
+    );
+    let commands = p.pump(
+        withheld
+            .into_iter()
+            .map(|asset| AppEvent::AssetReady { request, asset })
+            .collect(),
+        1000,
+    );
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    assert!(p.retained_assets().contains("bg.river"));
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    let w = m.window_transition
+        .as_ref()
+        .expect("reveal resumed after the fetch");
+    assert_eq!(w.style, style);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    // One top-up per reveal: the completed fetch is not re-issued.
+    let later = p.pump(vec![], 1000);
+    assert!(!later.iter().any(|c| match c {
+        AppCommand::GetAssets { assets, .. } => assets.contains(&"bg.river".to_owned()),
+        _ => false,
+    }));
+}
+
+#[test]
+fn window_reveal_dissolve_folds_coverage_into_window_items_only() {
+    use nir_presentation::{project, Messages, WindowTransition};
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.loading = false;
+    model.paused = false;
+    let messages = Messages::default();
+    let before = project(&model, 1280., 800., &messages);
+    assert!(model.dialogue.is_some());
+    model.window_transition = Some(WindowTransition {
+        style: StageTransition::Dissolve,
+        to_visible: false,
+        progress: 0.25,
+    });
+    let after = project(&model, 1280., 800., &messages);
+    assert_eq!(before.quads.len(), after.quads.len());
+    assert_eq!(before.texts.len(), after.texts.len());
+    assert!(after.window_layers.is_none(), "dissolve needs no diversion");
+    // The window items (box, accent, window texts) take the coverage; the
+    // backdrop quad and the HUD controls outside the range keep their color.
+    let mut faded_quads = 0;
+    for (a, b) in before.quads.iter().zip(&after.quads) {
+        assert_eq!(b.asset, a.asset);
+        if a.color != b.color {
+            faded_quads += 1;
+            assert!((b.color[3] - a.color[3] * 0.75).abs() < 0.00001);
+        }
+    }
+    assert!(faded_quads > 0, "the window box must fade");
+    assert!(faded_quads < before.quads.len(), "HUD quads keep their color");
+    let mut faded_texts = 0;
+    for (a, b) in before.texts.iter().zip(&after.texts) {
+        assert_eq!(b.text, a.text);
+        if a.color != b.color {
+            faded_texts += 1;
+            assert!((b.color[3] - a.color[3] * 0.75).abs() < 0.00001);
+        }
+    }
+    assert!(faded_texts > 0, "the window text must fade");
+    assert!(
+        faded_texts < before.texts.len(),
+        "HUD button labels keep their color"
+    );
+}
+
+#[test]
+fn window_reveal_wipe_diverts_window_layers_behind_a_sentinel() {
+    use nir_presentation::{project, Messages, WindowTransition};
+    let wipe = StageTransition::Wipe {
+        direction: WipeDirection::LeftToRight,
+        softness: 0.,
+    };
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.loading = false;
+    model.paused = false;
+    let messages = Messages::default();
+    let before = project(&model, 1280., 800., &messages);
+    model.window_transition = Some(WindowTransition {
+        style: wipe.clone(),
+        to_visible: true,
+        progress: 0.5,
+    });
+    let after = project(&model, 1280., 800., &messages);
+    let layers = after.window_layers.as_ref().expect("spatial styles divert");
+    assert_eq!(layers.style, wipe);
+    assert!(layers.to_visible);
+    assert_eq!(layers.progress, 0.5);
+    // The diverted window run left the main list exactly once, replaced in
+    // place by a full-surface sentinel at the window's z-position.
+    let at = after
+        .quads
+        .iter()
+        .position(|q| q.asset.as_deref() == Some("@window"))
+        .expect("a sentinel quad marks the window");
+    let sentinel = &after.quads[at];
+    assert_eq!(sentinel.rect, [0., 0., 1280., 800.]);
+    let diverted = layers.quads.len();
+    assert!(diverted > 0);
+    assert_eq!(&before.quads[..at], &after.quads[..at]);
+    assert_eq!(&layers.quads, &before.quads[at..at + diverted]);
+    assert_eq!(&after.quads[at + 1..], &before.quads[at + diverted..]);
+    assert_eq!(
+        after.quads.len(),
+        before.quads.len() - diverted + 1
+    );
+    // Window texts stay in the packet for layout, routed to the window pass.
+    assert_eq!(after.texts, before.texts);
+    assert!(!layers.texts.is_empty());
+    assert!(layers
+        .texts
+        .windows(2)
+        .all(|pair| pair[0] + 1 == pair[1]));
+    assert!(layers.texts.iter().any(|&i| before.texts[i].region.is_some()));
+    assert!(after
+        .semantics
+        .iter()
+        .any(|s| s.action == UiAction::Advance));
+}
+
 #[test]
 fn foreground_and_story_pause_owners_and_clocks_are_independent() {
     let mut p = playing();
@@ -2119,7 +2430,11 @@ fn interface_player(policy: HidePolicy, script_hidden: bool) -> Player {
             .ops
             .push(Op {
                 id: "script-hidden".into(),
-                operation: Operation::DialogueVisibility { visible: false },
+                operation: Operation::DialogueVisibility {
+                    visible: false,
+                    transition: None,
+                    duration_us: Micros(0),
+                },
             });
     }
     let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();

@@ -42,4 +42,4 @@ Source/runtime/content 版本不因这项可声明的新增能力整体升级。
 
 Core 契约测试覆盖独立通道、零时长、完成/取消、替换捕获、跨场景作用域、坏快照及能力/属性错误；旧 Clip 与 typed scene_node 使用两条公共路线对比 trace。Player 测试检查实际绘制 packet 的颜色相乘和场景不受影响。浏览器测试入口为 `playwright.nir-next.config.js`，包含画面像素变化及菜单暂停检查，实际运行结果记录在实施进展中。
 
-LiveNovel 的 MESON/MESOFF 仍使用旧立即显隐映射；源命令的等待/中断规则尚未认证，不能仅依据参数名称宣称已精确映射。Windows 真机与硬件 WebGPU 尚待实测。消息文字阴影、遮罩、动画指示器和 UI View 目标仍属后续交付。
+LiveNovel 的 MESON/MESOFF 非零渐隐现映射为等时长的 dissolve 窗口揭示（`text.window-transition.v1`，见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)），零渐隐保持立即翻转；源命令的等待/中断规则尚未认证，不能仅依据参数名称宣称已精确映射。Windows 真机与硬件 WebGPU 尚待实测。消息文字阴影、遮罩、动画指示器和 UI View 目标仍属后续交付。

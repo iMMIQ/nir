@@ -336,6 +336,7 @@ struct Adapter {
     choices: BTreeMap<String, Value>,
     variables: BTreeMap<String, Value>,
     choice_sites: usize,
+    fade_sites: usize,
     source_map: BTreeMap<String, SourceLocation>,
     warnings: BTreeSet<String>,
     counter: usize,
@@ -422,7 +423,7 @@ type DispatchOption = (String, usize);
 /// scripts (this corpus) or the documented LSB/GAL/LPM formats; none claims
 /// original-runtime or cross-backend verification, which stays an open item
 /// recorded through the fidelity warnings.
-pub(super) fn mapping_ledger(choice_sites: usize) -> Vec<ImportMapping> {
+pub(super) fn mapping_ledger(choice_sites: usize, fade_sites: usize) -> Vec<ImportMapping> {
     let entry = |rule: &str,
                  level: &str,
                  evidence: &str,
@@ -486,12 +487,18 @@ pub(super) fn mapping_ledger(choice_sites: usize) -> Vec<ImportMapping> {
         ),
         entry(
             "livenovel.textbox.fade",
-            "approximate",
+            "adapted",
             "decoded-source",
             "LSB116",
-            "Message-box show/hide fades are represented by immediate visibility changes.",
-            &[],
-            Some("MESON/MESOFF fade durations are dropped; fade timing is not certified against the original runtime."),
+            &format!(
+                "MESON/MESOFF lower to dialogue-visibility operations; {fade_sites} fade duration(s) map to dissolve window reveals of the original millisecond timing, zero-duration toggles commit immediately."
+            ),
+            if fade_sites > 0 {
+                &["text.window-transition.v1"]
+            } else {
+                &[] as &[&str]
+            },
+            None,
         ),
         entry(
             "livenovel.stage.wipe",
@@ -633,6 +640,7 @@ impl Adapter {
             choices: BTreeMap::new(),
             variables: BTreeMap::new(),
             choice_sites: 0,
+            fade_sites: 0,
             source_map: BTreeMap::new(),
             warnings: BTreeSet::new(),
             counter: 0,
@@ -798,12 +806,24 @@ impl Adapter {
         match name {
             "" | "MENUENABLED" | "MESEND" => {}
             "MESON" | "MESOFF" => {
-                self.op(
-                    blocks,
-                    json!({"type":"dialogue_visibility","visible":name=="MESON"}),
-                );
-                if number(0)? > 0 {
-                    self.warnings.insert("Message-box fade is represented by immediate visibility; text layout and original box image are preserved.".into());
+                // The first argument is the box fade duration in ms; a zero
+                // duration is the source's own immediate toggle.
+                let fade_ms = number(0)?;
+                if fade_ms > 0 {
+                    self.fade_sites += 1;
+                    self.op(
+                        blocks,
+                        json!({
+                            "type":"dialogue_visibility","visible":name=="MESON",
+                            "transition":{"type":"dissolve"},
+                            "duration_us":(fade_ms*1000).to_string()
+                        }),
+                    );
+                } else {
+                    self.op(
+                        blocks,
+                        json!({"type":"dialogue_visibility","visible":name=="MESON"}),
+                    );
                 }
             }
             "WAIT" => {
@@ -1669,7 +1689,7 @@ pub(super) fn convert(
     } else {
         "Linear LiveNovel route,".into()
     };
-    let mappings = mapping_ledger(adapter.choice_sites);
+    let mappings = mapping_ledger(adapter.choice_sites, adapter.fade_sites);
     let mut report=ImportReport{format:2,engine:"livemaker-livenovel116".into(),status:ImportReport::status_from_mappings(&mappings).into(),written:false,errors:0,approximate:mappings.iter().filter(|m|m.approximate()).count(),text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings and per-rule mappings.",route_shape,adapter.assets.len()),mappings,diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
     report.diagnostics.extend(ui.diagnostics());
     let staging = tempfile::Builder::new()

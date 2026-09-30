@@ -195,6 +195,20 @@ pub struct Waiting {
     pub on_cancelled: String,
     pub on_failed: String,
 }
+/// In-flight message-window reveal. Coverage interpolates linearly from the
+/// captured `from_coverage` toward the hidden/visible endpoint so a reversing
+/// op (show mid-hide) continues from the visual state it interrupted. Not a
+/// task: it is committed by a `DialogueVisibility` operation, joins the
+/// Story clock's deadline set, and is validated structurally on restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowReveal {
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub from_coverage: f32,
+    pub started_us: Micros,
+    pub duration_us: Micros,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
@@ -227,6 +241,10 @@ pub struct Snapshot {
     pub choice: Option<OfferedChoice>,
     #[serde(default)]
     pub dialogue_hidden: bool,
+    /// Deferred visibility flip: while set, `dialogue_hidden` still holds the
+    /// pre-op value and the window's committed state lands at the deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_reveal: Option<WindowReveal>,
     #[serde(default)]
     pub dialogue_appearance: DialogueAppearance,
     pub history: Vec<HistoryEntry>,
@@ -392,6 +410,7 @@ impl Core {
             waiting: None,
             choice: None,
             dialogue_hidden: false,
+            window_reveal: None,
             dialogue_appearance: DialogueAppearance::default(),
             history: vec![],
             locale,
@@ -1108,7 +1127,40 @@ impl Core {
                     .ok_or_else(|| Diagnostic::new("E_NODE", at, node))?;
                 n.set(*property, *value);
             }
-            Operation::DialogueVisibility { visible } => self.state.dialogue_hidden = !visible,
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                // An instant flip commits directly. A styled flip defers the
+                // committed value to the reveal deadline; the window keeps its
+                // old committed state while presentation interpolates coverage
+                // from the captured start (so a reversing op continues from
+                // the visual state it interrupted).
+                let reveal = transition
+                    .clone()
+                    .filter(|style| duration_us.0 > 0 && style.valid())
+                    .filter(|_| {
+                        self.state.window_reveal.is_some()
+                            || self.state.dialogue_hidden == *visible
+                    });
+                match reveal {
+                    Some(style) => {
+                        let from_coverage = self.window_coverage();
+                        self.state.window_reveal = Some(WindowReveal {
+                            style,
+                            to_visible: *visible,
+                            from_coverage,
+                            started_us: self.state.tick_us,
+                            duration_us: *duration_us,
+                        });
+                    }
+                    None => {
+                        self.state.dialogue_hidden = !visible;
+                        self.state.window_reveal = None;
+                    }
+                }
+            }
             Operation::ProfileMerge { key } => self
                 .intents
                 .push(CoreIntent::ProfileMerge { key: key.clone() }),
@@ -2172,6 +2224,14 @@ impl Core {
             if let Some(deadline) = self.state.choice.as_ref().and_then(|c| c.deadline_us) {
                 next = next.min(deadline.0.max(now.saturating_add(1)));
             }
+            if let Some(reveal) = &self.state.window_reveal {
+                let due = reveal
+                    .started_us
+                    .0
+                    .saturating_add(reveal.duration_us.0)
+                    .max(now.saturating_add(1));
+                next = next.min(due);
+            }
             self.state.tick_us = Micros(next);
             for t in self
                 .state
@@ -2211,6 +2271,12 @@ impl Core {
                         self.reveal(id, false)?
                     }
                     _ => {}
+                }
+            }
+            if let Some(reveal) = self.state.window_reveal.clone() {
+                if next >= reveal.started_us.0.saturating_add(reveal.duration_us.0) {
+                    self.state.window_reveal = None;
+                    self.state.dialogue_hidden = !reveal.to_visible;
                 }
             }
             if let Some(c) = self.state.choice.clone() {
@@ -2315,6 +2381,34 @@ impl Core {
             }
         })
     }
+    /// In-flight message-window reveal: (style, direction, linear progress).
+    /// The committed `dialogue_hidden` still holds the pre-op value; coverage
+    /// blends from `from_coverage` so reversals stay continuous.
+    pub fn window_reveal(&self) -> Option<(&StageTransition, bool, f32)> {
+        let reveal = self.state.window_reveal.as_ref()?;
+        let progress = (self.state.tick_us.0.saturating_sub(reveal.started_us.0) as f64
+            / reveal.duration_us.0 as f64)
+            .min(1.) as f32;
+        Some((&reveal.style, reveal.to_visible, progress))
+    }
+    fn window_coverage(&self) -> f32 {
+        match &self.state.window_reveal {
+            Some(reveal) => {
+                let progress = (self.state.tick_us.0.saturating_sub(reveal.started_us.0) as f64
+                    / reveal.duration_us.0 as f64)
+                    .clamp(0., 1.) as f32;
+                let target = if reveal.to_visible { 1. } else { 0. };
+                reveal.from_coverage + (target - reveal.from_coverage) * progress
+            }
+            None => {
+                if self.state.dialogue_hidden {
+                    0.
+                } else {
+                    1.
+                }
+            }
+        }
+    }
     /// Observations never execute story code or change task time/milestones.
     pub fn observe_audio_positions(&mut self, positions: &[AudioPosition]) -> Result<()> {
         if positions.len() > MAX_TASKS
@@ -2390,6 +2484,9 @@ impl Core {
             .choice
             .as_ref()
             .is_some_and(|c| c.deadline_us.is_some())
+            // A reveal in flight must reach its deadline even when the VM is
+            // otherwise parked at an input barrier.
+            || self.state.window_reveal.is_some()
             || self.state.tasks.values().any(|t| {
                 t.state == TaskState::Running
                     && match t.effect {
@@ -2731,6 +2828,24 @@ impl Core {
         }
         if !s.dialogue_appearance.valid() {
             return Err(fail("invalid dialogue appearance"));
+        }
+        if let Some(reveal) = &s.window_reveal {
+            // Structural only: the reveal is operation-committed, so unlike
+            // tasks it has no cue declaration to match against.
+            if !p.requires.iter().any(|c| c == "text.window-transition.v1")
+                || !reveal.style.valid()
+                || reveal.duration_us.0 == 0
+                || !reveal.from_coverage.is_finite()
+                || !(0. ..=1.).contains(&reveal.from_coverage)
+                || reveal.started_us.0.saturating_add(reveal.duration_us.0) <= s.tick_us.0
+            {
+                return Err(fail("invalid window reveal"));
+            }
+            if reveal.style.asset().is_some_and(|asset| {
+                p.asset(asset).is_none_or(|a| a.kind != AssetKind::Image)
+            }) {
+                return Err(fail("invalid window reveal mask"));
+            }
         }
         let mut property_owners = BTreeSet::new();
         let mut envelope_owners = BTreeSet::new();

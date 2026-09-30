@@ -442,6 +442,42 @@ fn runtime_rejects_missing_or_rewritten_index_and_recipe() {
 }
 
 #[test]
+fn window_transition_masks_join_the_release_roots_and_capability() {
+    // A mid-block mask reveal belongs to no cue recipe: its identity must
+    // still ship in the release root index, and the capability stays declared
+    // only while an op actually uses a styled reveal.
+    let d = project();
+    let catalog = d.path().join("assets/catalog.toml");
+    let mut s = fs::read_to_string(&catalog).unwrap();
+    s.push_str("\n[[assets]]\nid = \"mask.pattern\"\nkind = \"image\"\nsource = \"source/station.png\"\nrights = \"CC0-1.0\"\nexpected_size = [1280, 720]\n");
+    fs::write(&catalog, s).unwrap();
+    let path = d.path().join("content/ch01/story.nir.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["functions"]["main"]["blocks"]["intro"]["ops"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id":"window.reveal","operation":{
+            "type":"dialogue_visibility","visible":false,
+            "transition":{"type":"mask","asset":"mask.pattern","channel":"alpha"},
+            "duration_us":"500000"}}));
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let p = load_project(d.path()).unwrap();
+    assert!(p
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "text.window-transition.v1"));
+    assert!(runtime_roots(&p.program).contains("mask.pattern"));
+
+    let base = load_project(&source()).unwrap();
+    assert!(!base
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "text.window-transition.v1"));
+    assert!(!runtime_roots(&base.program).contains("mask.pattern"));
+}
+#[test]
 fn source_diagnostic_locates_reference_without_changing_program_identity() {
     let d = project();
     let path = d.path().join("content/ch01/story.nir.json");

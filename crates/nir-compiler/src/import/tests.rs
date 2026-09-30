@@ -22,7 +22,6 @@ pub(super) fn options(source: &Path, out: &Path) -> ImportOptions {
 pub(super) const APPROXIMATE_RULES: &[&str] = &[
     "livenovel.menu-sfx",
     "livenovel.text.reveal",
-    "livenovel.textbox.fade",
 ];
 pub(super) fn sdk() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -352,8 +351,8 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    for sites in [0, 2] {
-        let ledger = livenovel::mapping_ledger(sites);
+    for (sites, fade_sites) in [(0, 0), (2, 0), (2, 3)] {
+        let ledger = livenovel::mapping_ledger(sites, fade_sites);
         assert!(ledger.len() >= 12);
         let mut rules = std::collections::BTreeSet::new();
         for m in &ledger {
@@ -395,6 +394,17 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
                 .iter()
                 .any(|c| c == "story.typed-result.v1"));
         }
+        let fade = ledger
+            .iter()
+            .find(|m| m.rule == "livenovel.textbox.fade")
+            .unwrap();
+        assert_eq!(fade.level, "adapted");
+        assert_eq!(fade.approximation, None);
+        assert_eq!(
+            fade.capabilities.iter().any(|c| c == "text.window-transition.v1"),
+            fade_sites > 0,
+            "the window-transition capability follows actual fade sites"
+        );
         let approximate: Vec<&str> = ledger
             .iter()
             .filter(|m| m.approximate())
@@ -415,7 +425,7 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         opts.accept_approximate.clear();
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
         assert!(denied.to_string().contains("E_IMPORT_APPROXIMATE"), "{denied}");
-        opts.accept_approximate = vec!["livenovel.menu-sfx".into(), "livenovel.textbox.fade".into()];
+        opts.accept_approximate = vec!["livenovel.menu-sfx".into()];
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
         assert!(
             denied.to_string().contains("livenovel.text.reveal"),
@@ -447,7 +457,7 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         "converted"
     );
     assert_eq!(
-        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0)[..2]),
+        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0, 0)[..2]),
         "converted_with_adaptations"
     );
 }

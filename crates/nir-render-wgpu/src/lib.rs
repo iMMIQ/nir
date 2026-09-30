@@ -122,6 +122,9 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     mix_pipeline: wgpu::RenderPipeline,
     scratch: Option<(Texture, Texture, u32, u32)>,
+    /// Offscreen surface-sized root for the diverted message window; text
+    /// alignment pins it to the swapchain extent, not the stage size.
+    window_root: Option<(Texture, u32, u32)>,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: BTreeMap<String, Texture>,
@@ -133,6 +136,7 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     menu_text_renderers: Vec<(usize, TextRenderer)>,
+    window_text_renderers: Vec<(usize, TextRenderer)>,
     viewport: Viewport,
     swash: SwashCache,
     pub submitted: u64,
@@ -460,6 +464,7 @@ impl Renderer {
             pipeline,
             mix_pipeline,
             scratch: None,
+            window_root: None,
             layout,
             sampler,
             textures: BTreeMap::new(),
@@ -471,6 +476,7 @@ impl Renderer {
             atlas,
             text_renderer,
             menu_text_renderers: vec![],
+            window_text_renderers: vec![],
             viewport,
             swash: SwashCache::new(),
             submitted: 0,
@@ -481,6 +487,9 @@ impl Renderer {
             profile: ProfileCollector::default(),
         };
         r.upload_rgba("", 1, 1, &[255; 4]);
+        // Neutral inputs for the two-input compositor: an opaque white mask
+        // stand-in and a transparent source/target side.
+        r.upload_rgba("@transparent", 1, 1, &[0, 0, 0, 0]);
         if let Some(e) = r.device.pop_error_scope().await {
             return Err(error(e.to_string()));
         }
@@ -734,8 +743,9 @@ impl Renderer {
     }
     pub fn retain(&mut self, ids: &BTreeSet<String>) {
         self.uploads.retain(|id, _| ids.contains(id));
-        self.textures
-            .retain(|id, _| id.is_empty() || ids.contains(id));
+        self.textures.retain(|id, _| {
+            id.is_empty() || id == "@transparent" || ids.contains(id)
+        });
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
         let layout_start = self.profile_start();
@@ -784,6 +794,27 @@ impl Renderer {
                 self.menu_text_renderers[batch].0 = *index;
             }
         }
+        let window_indices: Vec<usize> = p
+            .window_layers
+            .iter()
+            .flat_map(|layers| layers.texts.iter().copied())
+            .collect();
+        self.window_text_renderers.truncate(window_indices.len());
+        for (batch, index) in window_indices.iter().enumerate() {
+            if batch == self.window_text_renderers.len() {
+                self.window_text_renderers.push((
+                    *index,
+                    TextRenderer::new(
+                        &mut self.atlas,
+                        &self.device,
+                        wgpu::MultisampleState::default(),
+                        None,
+                    ),
+                ));
+            } else {
+                self.window_text_renderers[batch].0 = *index;
+            }
+        }
         self.text.layout_texts(&paint_runs);
         self.profile_end("prepare.layout", layout_start);
         if let Some(error) = self.text.missing_font.take() {
@@ -806,13 +837,18 @@ impl Renderer {
         );
         let mut areas = vec![];
         let mut menu_areas: Vec<Vec<TextArea<'_>>> = menu_indices.iter().map(|_| vec![]).collect();
+        let mut window_areas: Vec<Vec<TextArea<'_>>> = window_indices.iter().map(|_| vec![]).collect();
         for (run_index, r) in paint_runs.iter().enumerate() {
-            let areas =
-                if let Some(batch) = menu_indices.iter().position(|i| *i == owners[run_index]) {
-                    &mut menu_areas[batch]
-                } else {
-                    &mut areas
-                };
+            let areas = if let Some(batch) = window_indices
+                .iter()
+                .position(|i| *i == owners[run_index])
+            {
+                &mut window_areas[batch]
+            } else if let Some(batch) = menu_indices.iter().position(|i| *i == owners[run_index]) {
+                &mut menu_areas[batch]
+            } else {
+                &mut areas
+            };
             if r.preflight_only {
                 continue;
             }
@@ -908,6 +944,19 @@ impl Renderer {
                 )
                 .map_err(|e| error(e.to_string()))?;
         }
+        for ((_, renderer), areas) in self.window_text_renderers.iter_mut().zip(window_areas) {
+            renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.fonts,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash,
+                )
+                .map_err(|e| error(e.to_string()))?;
+        }
         self.profile_end("prepare.glyphs", glyphs_start);
         Ok(())
     }
@@ -981,6 +1030,36 @@ impl Renderer {
                     .get(p.transition_style.asset().unwrap_or(""))
                     .ok_or_else(|| error("transition mask missing"))?;
                 pass.set_bind_group(2, &mask.bind, &[]);
+            } else if id == "@window" {
+                let layers = p
+                    .window_layers
+                    .as_ref()
+                    .ok_or_else(|| error("window layers missing"))?;
+                let root = self
+                    .window_root
+                    .as_ref()
+                    .map(|(texture, _, _)| texture)
+                    .ok_or_else(|| error("window root missing"))?;
+                let transparent = self
+                    .textures
+                    .get("@transparent")
+                    .ok_or_else(|| error("transparent placeholder missing"))?;
+                pass.set_pipeline(&self.mix_pipeline);
+                // mix(source, target, coverage): a hiding reveal keeps the
+                // rendered window as the source so coverage erases it; a
+                // showing reveal puts it on the target side.
+                if layers.to_visible {
+                    pass.set_bind_group(0, &transparent.bind, &[]);
+                    pass.set_bind_group(1, &root.bind, &[]);
+                } else {
+                    pass.set_bind_group(0, &root.bind, &[]);
+                    pass.set_bind_group(1, &transparent.bind, &[]);
+                }
+                let mask = self
+                    .textures
+                    .get(layers.style.asset().unwrap_or(""))
+                    .ok_or_else(|| error("window mask missing"))?;
+                pass.set_bind_group(2, &mask.bind, &[]);
             } else {
                 pass.set_pipeline(&self.pipeline);
                 let texture = self
@@ -1019,18 +1098,22 @@ impl Renderer {
         }
         self.prepare(p, dpr, false)?;
         let vertex_start = self.profile_start();
-        let vertex_result = (|| -> Result<(usize, usize)> {
+        let vertex_result = (|| -> Result<(usize, usize, usize)> {
             let mut verts = vec![];
             let append = |verts: &mut Vec<Vertex>, quads: &[nir_presentation::Quad]| {
                 for q in quads {
                     let [x, y, w, h] = q.rect;
                     let a = if q.asset.as_deref() == Some("@transition") {
                         p.transition_layers.as_ref().unwrap().2
+                    } else if q.asset.as_deref() == Some("@window") {
+                        p.window_layers.as_ref().unwrap().progress
                     } else {
                         q.color[3]
                     };
                     let color = if q.asset.as_deref() == Some("@transition") {
                         p.transition_style.parameters(a)
+                    } else if q.asset.as_deref() == Some("@window") {
+                        p.window_layers.as_ref().unwrap().style.parameters(a)
                     } else {
                         [
                             linear(q.color[0]) * a,
@@ -1078,15 +1161,27 @@ impl Renderer {
                     self.scratch = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
                 }
             }
+            let window_start = verts.len();
+            if let Some(layers) = &p.window_layers {
+                append(&mut verts, &layers.quads);
+                let (w, h) = (self.config.width, self.config.height);
+                if !self
+                    .window_root
+                    .as_ref()
+                    .is_some_and(|(_, x, y)| *x == w && *y == h)
+                {
+                    self.window_root = Some((self.offscreen(w, h), w, h));
+                }
+            }
             if verts.len() > self.capacity {
                 return Err(error("quad capacity exceeded"));
             }
             self.queue
                 .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
-            Ok((source_start, target_start))
+            Ok((source_start, target_start, window_start))
         })();
         self.profile_end("vertex.build_write", vertex_start);
-        let (source_start, target_start) = vertex_result?;
+        let (source_start, target_start, window_start) = vertex_result?;
 
         let acquire_start = self.profile_start();
         let frame_result = self.acquire_frame();
@@ -1125,6 +1220,33 @@ impl Renderer {
                         occlusion_query_set: None,
                     });
                     self.paint(&mut pass, quads, start, p, [*w, *h])?;
+                }
+            }
+            if let Some(layers) = &p.window_layers {
+                // The window root re-renders every frame: text reveal and
+                // appearance stay live underneath the spatial coverage.
+                let (root, w, h) = self.window_root.as_ref().unwrap();
+                let view = root._texture.create_view(&Default::default());
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("window root"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.paint(&mut pass, &layers.quads, window_start, p, [*w, *h])?;
+                pass.set_scissor_rect(0, 0, *w, *h);
+                for (_, renderer) in &self.window_text_renderers {
+                    renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|e| error(e.to_string()))?;
                 }
             }
             {

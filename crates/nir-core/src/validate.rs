@@ -1810,6 +1810,24 @@ impl ValidatedProgram {
     pub fn cue_assets(&self, cue: &str) -> BTreeSet<String> {
         self.program.cue_assets(cue)
     }
+    /// Mask identities referenced by `DialogueVisibility` reveal styles in
+    /// every loaded function body. Runtime roots only see admitted modules;
+    /// the in-flight reveal carries its own mask for the first encounter.
+    pub fn window_transition_assets(&self) -> BTreeSet<String> {
+        self.program
+            .functions
+            .values()
+            .flat_map(|function| function.blocks.values())
+            .flat_map(|block| block.ops.iter())
+            .filter_map(|op| match &op.operation {
+                Operation::DialogueVisibility {
+                    transition: Some(style),
+                    ..
+                } => style.asset().map(str::to_owned),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn bad_runtime(at: &str, message: &str) -> Diagnostic {
@@ -2900,6 +2918,36 @@ fn validate_runtime_function(
                         &op.id,
                         "expected local dialogue and non-looping Voice task",
                     ));
+                }
+                if let Operation::DialogueVisibility {
+                    transition: Some(style),
+                    duration_us,
+                    ..
+                } = &op.operation
+                {
+                    if !view
+                        .requires
+                        .iter()
+                        .any(|c| c == "text.window-transition.v1")
+                    {
+                        return Err(err("E_CAPABILITY", &op.id, "text.window-transition.v1"));
+                    }
+                    if !style.valid() {
+                        return Err(err("E_TRANSITION", &op.id, "invalid window reveal style"));
+                    }
+                    if duration_us.0 == 0 || duration_us.0 > 60_000_000 {
+                        return Err(err(
+                            "E_TIME",
+                            &op.id,
+                            "window reveal requires a duration within 0..60s",
+                        ));
+                    }
+                    if style
+                        .asset()
+                        .is_some_and(|asset| view.asset_kind(asset) != Some(AssetKind::Image))
+                    {
+                        return Err(err("E_ASSET", &op.id, "mask must reference an image"));
+                    }
                 }
             }
             match &op.operation {
@@ -4079,6 +4127,31 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                             &op.id,
                             "expected dialogue and non-looping Voice task",
                         ));
+                    }
+                }
+                if let Operation::DialogueVisibility {
+                    transition: Some(style),
+                    duration_us,
+                    ..
+                } = &op.operation
+                {
+                    if !p.requires.iter().any(|c| c == "text.window-transition.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "text.window-transition.v1"));
+                    }
+                    if !style.valid() {
+                        return Err(err("E_TRANSITION", &op.id, "invalid window reveal style"));
+                    }
+                    if duration_us.0 == 0 || duration_us.0 > 60_000_000 {
+                        return Err(err(
+                            "E_TIME",
+                            &op.id,
+                            "window reveal requires a duration within 0..60s",
+                        ));
+                    }
+                    if style.asset().is_some_and(|asset| {
+                        p.assets.get(asset).is_none_or(|a| a.kind != AssetKind::Image)
+                    }) {
+                        return Err(err("E_ASSET", &op.id, "mask must reference an image"));
                     }
                 }
                 match &op.operation {

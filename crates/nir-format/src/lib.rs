@@ -37,6 +37,7 @@ pub const CAPABILITIES: &[&str] = &[
     "audio.stop.v1",
     "ui.image-menu.v1",
     "text.visibility.v1",
+    "text.window-transition.v1",
     "text.voice-binding.v1",
     "text.voice-timer.v1",
     "player.hide-policy.v1",
@@ -116,6 +117,11 @@ impl TryFrom<String> for Micros {
 impl From<Micros> for String {
     fn from(v: Micros) -> Self {
         v.0.to_string()
+    }
+}
+impl Micros {
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -715,6 +721,11 @@ pub struct Op {
 pub enum Operation {
     DialogueVisibility {
         visible: bool,
+        /// Styled reveal; absent or zero-duration commits flip instantly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transition: Option<StageTransition>,
+        #[serde(default, skip_serializing_if = "Micros::is_zero")]
+        duration_us: Micros,
     },
     Assign {
         target: String,
@@ -2212,4 +2223,61 @@ pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// text.window-transition.v1: the styled reveal fields are optional and
+    /// omit cleanly; the legacy two-field op still deserializes unchanged.
+    #[test]
+    fn dialogue_visibility_transition_fields_roundtrip_and_default_away() {
+        let legacy: Operation = serde_json::from_value(serde_json::json!({
+            "type":"dialogue_visibility","visible":false
+        }))
+        .unwrap();
+        match &legacy {
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                assert!(!*visible);
+                assert_eq!(transition, &None);
+                assert_eq!(*duration_us, Micros(0));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({"type":"dialogue_visibility","visible":false})
+        );
+        let styled: Operation = serde_json::from_value(serde_json::json!({
+            "type":"dialogue_visibility","visible":true,
+            "transition":{"type":"dissolve"},
+            "duration_us":"1000000"
+        }))
+        .unwrap();
+        match &styled {
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                assert!(*visible);
+                assert_eq!(transition, &Some(StageTransition::Dissolve));
+                assert_eq!(*duration_us, Micros(1_000_000));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(
+            serde_json::to_value(&styled).unwrap(),
+            serde_json::json!({
+                "type":"dialogue_visibility","visible":true,
+                "transition":{"type":"dissolve"},
+                "duration_us":"1000000"
+            })
+        );
+    }
 }

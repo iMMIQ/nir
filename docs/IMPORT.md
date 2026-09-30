@@ -58,10 +58,10 @@ GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引
 ```sh
 ./novelc import livemaker "/path/to/extracted-game" --out imported-story \
   --game-id org.example.story --title "My Story" \
-  --accept-approximate livenovel.menu-sfx,livenovel.text.reveal,livenovel.textbox.fade
+  --accept-approximate livenovel.menu-sfx,livenovel.text.reveal
 ```
 
-拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-sfx`（菜单音效／动画光标不复现）、`livenovel.text.reveal`（字体样式与字速单位未映射）、`livenovel.textbox.fade`（消息框渐变以立即显隐替代）。`--draft` 保持自己的不完整契约，不走该门禁。
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-sfx`（菜单音效／动画光标不复现）、`livenovel.text.reveal`（字体样式与字速单位未映射）。`livenovel.textbox.fade` 已升为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 

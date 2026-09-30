@@ -51,9 +51,11 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 对白正文可选 `text.shadow.v1` 单层有限偏移阴影，跟随正文揭示、裁切、透明度和玩家隐藏；详见 [阴影语义](TEXT-SHADOW-SEMANTICS.md)。不含模糊、多层或来源样式自动推断。
 
-`stage.wipe.v1` 提供四方向、有限软边的场景擦除，保留旧 StagePresent 生命周期与恢复，见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)。纹理阈值遮罩见下一项；消息/UI 根仍待实现。
+`stage.wipe.v1` 提供四方向、有限软边的场景擦除，保留旧 StagePresent 生命周期与恢复，见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)。纹理阈值遮罩见下一项；消息根见 `text.window-transition.v1`，UI 根仍待实现。
 
-`stage.mask.v1` 提供 Alpha 纹理阈值遮罩、反向极性及有限软边，使用最近邻/clamp 数据采样并进入准备、预算与恢复闭包。RGB 灰度来源须转换为 Alpha 数据，目前没有自动来源映射；消息/UI 根与 live 输入仍待实现。
+`stage.mask.v1` 提供 Alpha 纹理阈值遮罩、反向极性及有限软边，使用最近邻/clamp 数据采样并进入准备、预算与恢复闭包。RGB 灰度来源须转换为 Alpha 数据，目前没有自动来源映射；消息根见 `text.window-transition.v1`，UI 根与 live 输入仍待实现。
+
+`text.window-transition.v1` 让 `dialogue_visibility` 携带舞台转场样式与有限时长（0 < duration_us ≤ 60 秒）：dissolve 把覆盖度乘进消息框背景与文字的透明度；擦除/遮罩等空间样式把消息框项从主绘制序剥离为独立窗口根，经与舞台转场相同的合成路径呈现，HUD 按钮不参与。揭示跟随 Story 时钟并加入 needs_clock：暂停冻结进度，截止时刻才翻转提交的 `dialogue_hidden`；反向同款操作以打断时刻的覆盖度为新起点，即时翻转会中断在飞的揭示。存档捕获飞行中的样式、方向与起止时刻，恢复做结构校验并拒绝伪造（invalid window reveal）；遮罩资产必须是 Image 类并进入准备闭包与 TopUp 需求，只取一次；减少动态效果跳过动画、截止时刻直接提交。见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md) 的消息根一节。不含 UI 菜单页根与来源样式的自动推断（LiveNovel 消息框渐变经导入账本映射为 dissolve，见 [导入](IMPORT.md)）。
 
 `ui.menu-elements.v1` 增量支持有序图片/文字、分组变换与裁切、图片按钮和透明命中区，沿用旧菜单动作与 Profile guard，见 [有限菜单元素语义](MENU-ELEMENTS-SEMANTICS.md)。局部状态、值控件及服务绑定见下列能力；通用集合仍待实施。
 
@@ -132,6 +134,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | audio.stop.v1 | crates/nir-core/tests/audio_contract.rs（淡出停止后取消、剩余段恢复） | 同文件（拒绝无效目标/伪造所有权） | tests/nir-next/audio.spec.js（跨存读档停止包络） | 待验证 | 淡出走故事时钟 |
 | ui.image-menu.v1 | crates/nir-player/src/lib.rs（media_tests 缩放/悬停/回想解锁门） | crates/nir-player/src/replay.rs（冻结菜单页随回想恢复） | tests/nir-next/menu-elements.spec.js；menu-* 规格均经图片菜单页 | 待验证 | v0.1.0 基线 |
 | text.visibility.v1 | crates/nir-player/tests/coordination.rs（临时隐藏不推进、不覆写脚本可见性） | 同测试（隐藏跨恢复/回退保持） | tests/nir-next/interface-hide.spec.js、tests/nir-next/reading.spec.js | 待验证 | 与 player.hide-policy.v1 分开声明 |
+| text.window-transition.v1 | crates/nir-core/tests/window_reveal_contract.rs（样式/时长门、截止提交、打断捕获覆盖度）；crates/nir-player/tests/coordination.rs（时钟冻结、遮罩只取一次、dissolve 只折叠窗口项、空间样式剥离窗口根） | crates/nir-core/tests/window_reveal_contract.rs（结构校验、伪造被拒）；crates/nir-player/tests/coordination.rs（飞行中存读档续播） | tests/nir-next/window.spec.js（边缘像素、暂停冻结、存读档进度） | 待验证 | 消息根复用舞台转场样式；HUD 不参与 |
 | text.voice-binding.v1 | crates/nir-core/tests/reading_contract.rs（绑定校验、失败关闭） | 同文件（未提交对白不能恢复伪造绑定） | tests/nir-next/sampled-reading.spec.js、tests/nir-next/reading.spec.js（并行语音等待） | 待验证 | 页首及页内 Gate 后绑定 |
 | text.voice-timer.v1 | crates/nir-player/tests/coordination.rs（采样余量/静音冻结）；crates/nir-core/tests/reading_contract.rs（已知时长门） | crates/nir-core/tests/reading_contract.rs（恢复保策略、不能绕过能力检查） | tests/nir-next/sampled-reading.spec.js（Auto 等于采样余量+固定延迟） | 待验证 | 批次 29 |
 | player.hide-policy.v1 | crates/nir-player/tests/coordination.rs（显式暂停只释放自己的 owner） | 同文件（策略须能力、遮罩不跨新会话） | tests/nir-next/interface-hide.spec.js（音频设备挂起对比默认政策） | 待验证 | 默认政策仅隐藏呈现 |
