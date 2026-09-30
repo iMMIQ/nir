@@ -24,6 +24,9 @@ use pause::Pauses;
 
 pub const EVENT_CAPACITY: usize = 256;
 const INPUT_CAPACITY: usize = 128;
+/// Ceiling for the sum of all decoded-asset leases (stage media, fonts,
+/// audio); the render-surface reservation is carved out of the same ledger.
+const MEMORY_LEDGER_LIMIT: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -441,7 +444,12 @@ impl Player {
         let locale = preferences.text_locale.clone();
         let ui_locale = preferences.ui_locale.clone();
         let core = Core::new(validated.clone(), release.clone(), locale.clone())?;
-        let ledger = BudgetLedger::new(128 * 1024 * 1024);
+        // The decoded-asset ledger bounds worst-case residency, not a target.
+        // A real image-heavy route legitimately peaks past 128 MiB once scene
+        // crossfades admit the outgoing and incoming cue together with the
+        // always-resident fonts (certified against a full LiveNovel import);
+        // 256 MiB keeps that headroom while still bounding runaway leases.
+        let ledger = BudgetLedger::new(MEMORY_LEDGER_LIMIT);
         let _surface_budget = ledger.reserve(&BTreeMap::from([(
             "@render-surfaces".into(),
             validated.program().stage.width as u64 * validated.program().stage.height as u64 * 8
@@ -3560,7 +3568,7 @@ impl Player {
 #[cfg(test)]
 mod media_tests {
     use super::*;
-    const LIMIT: u64 = 128 * 1024 * 1024;
+    const LIMIT: u64 = super::MEMORY_LEDGER_LIMIT;
 
     #[test]
     fn imported_japanese_story_settings_only_offer_configured_languages() {

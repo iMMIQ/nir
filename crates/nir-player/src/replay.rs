@@ -265,7 +265,7 @@ impl Player {
 mod replay_tests {
     use super::*;
 
-    const LIMIT: u64 = 128 * 1024 * 1024;
+    const LIMIT: u64 = crate::MEMORY_LEDGER_LIMIT;
 
     /// rain.json plus a locked system-overlay Replay control and a one-line
     /// replay function that merges a profile key and ends with an outcome.

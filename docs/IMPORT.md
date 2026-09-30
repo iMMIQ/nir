@@ -130,6 +130,16 @@ cargo test -p nir-compiler real_livenovel_conversion_and_all_routes -- --ignored
 
 该测试导入实际包，自动推进主线和所有回想入口，检查故障、结束、解锁和快照恢复。正常测试使用自行生成的中性 LSB、GAL、WAV 样本与菜单配置，覆盖格式边界、透明度、块引用、声道转换、菜单缩放和锁定入口。
 
+完整的 Player 级路线认证（阅读/界面/存读档/回想事务走共享播放器，而非 VM 直驱）：
+
+```sh
+NIR_IMPORT_SOURCE="/path/to/extracted-game" \
+NIR_IMPORT_OUT="/path/to/new-project" \
+cargo test -p nir-compiler real_livenovel_player_certifies -- --ignored --nocapture
+```
+
+认证内容：Auto 自动阅读走完主线并集齐回想解锁；未解锁档案下回想入口经真实菜单控件分发时被拒绝，不切换会话也不离开菜单；经作者菜单控件进入全部回想入口，读完经 return-to-title 结果返回回想菜单；已读主线在按住快进下整线快进；隐藏（默认继续政策）与恢复不推进；菜单暂停/关闭恢复同页；演出中保存→前进→回退→槽位读档恢复保存页后走完全程。
+
 新导入的 LiveNovel 页首及页内 Gate 事件后会绑定具体非循环 Voice 实例，Auto 不再被无关语音阻塞；逻辑页、视口翻页和并行等待的边界见 [阅读语义](READING-SEMANTICS.md)。
 
 

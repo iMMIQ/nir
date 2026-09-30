@@ -1,7 +1,7 @@
 use super::lsb::tests::{command, dialogue, literal, script, string, u32b};
 use super::*;
 
-fn options(source: &Path, out: &Path) -> ImportOptions {
+pub(super) fn options(source: &Path, out: &Path) -> ImportOptions {
     ImportOptions {
         source: source.into(),
         out: out.into(),
@@ -24,7 +24,7 @@ pub(super) const APPROXIMATE_RULES: &[&str] = &[
     "livenovel.text.reveal",
     "livenovel.textbox.fade",
 ];
-fn sdk() -> PathBuf {
+pub(super) fn sdk() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 fn exit(line: u32) -> Vec<u8> {

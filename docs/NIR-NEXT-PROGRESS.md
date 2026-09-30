@@ -33,7 +33,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
 | P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息/UI 根上的通用目标与遮罩转场仍待实施 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
-| P6 兼容认证与困难案例 | ImportReport 映射级别与证据类已实现（批次 53，报告格式 2 + 显式近似接受门禁）；完整路线认证（Auto/held skip/隐藏/菜单切换/演出中保存的实包全路线）、能力发行清单仍待实施 |
+| P6 兼容认证与困难案例 | ImportReport 映射级别与证据类已实现（批次 53，报告格式 2 + 显式近似接受门禁）；完整路线认证已实现（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）；能力发行清单仍待实施 |
 
 Windows 宿主已同步修改，但 Linux 上的公共 Rust 测试不覆盖 cfg(windows) 原生运行路径；不得据此声明 Windows 实机验收通过。实际测试日志保留在本地 `reports/nir-next/`。
 
@@ -631,3 +631,13 @@ P5 收口；P4 遗留（消息/UI 根遮罩与通用目标）与 P6（映射级�
 - 本批只改离线导入器/CLI 与报告格式，不触及 Player/运行时；按批次 37/38/42 先例不重复浏览器整套验收。真实语料回归（RJ061378）经 ignored 测试（其 options 预接受三条规则）与独立 CLI 双向验证：不带门禁标志转换在发布后以 E_IMPORT_APPROXIMATE 退出并列出三规则，带 `--accept-approximate` 全列表成功且 1357 页/17 函数不变。
 
 P6.1 完成；P6 余下完整路线认证与能力发行清单，P4 遗留（消息/UI 根遮罩与通用目标）待后续批次。证据：reports/nir-next/batch-53-xtask-test.log、batch-53-clippy.log、batch-53-architecture.log、batch-53-xtask-sdk.log、batch-53-verify-sdk.log、batch-53-corpus.log、batch-53-corpus-gate.log。契约见 IMPORT.md（映射级别、证据与近似接受一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 54：完整路线认证（P6.2）
+
+- 新增 Player 级实包认证 `real_livenovel_player_certifies_full_routes`（import/certify.rs，ignored，需 NIR_IMPORT_SOURCE/NIR_IMPORT_OUT；tests.rs 的 options/sdk 提升为 pub(super) 供其复用）。与既有 VM 直驱回归不同，全部路线经共享 Player 的输入路由、阅读策略、菜单控件解析与存档事务。四个场景：A）Auto 自动阅读走完主线至结果，解锁集与导入器在菜单控件上声明的 lm.replay.* 完全一致，read: 标记落盘，结果清除自动阅读。B0）全新档案经真实 MenuControl 分发带锁回想入口被拒——不切换会话、不离开标题、停留在原菜单。B）经作者菜单控件（标题菜单 Menu 控件 → 回想菜单 Entry 控件）进入全部回想入口，每条读完经 return-to-title 结果回到回想菜单且无故障。C）已读主线在按住快进下整线快进至结果；无 auto/skip 时 tick 不推进。D）隐藏（默认继续政策）剧情时钟继续、恢复不推进；菜单暂停/关闭恢复同页；演出中保存 → 前进 → 回退（Continue 释放 restored 暂停）→ 槽位读档精确恢复保存页与阅读位置（text_id、span/cluster、gate/awaiting 位逐一相等）→ 走完全程。
+- 认证 harness 承担宿主的音频结束职责：每次 tick 前对全部 Running 非循环 Audio 任务注入 AudioEnded（宿主契约同 coordination.rs）。缺了它，语音 WAV 作为 Running 任务永久钉住解码资产，内存账本必然耗尽——属 harness 缺陷而非产品缺陷，在本测试内修复。
+- 读档断言认证页面与阅读位置的精确往返（text_id、span/cluster 揭示进度、gate/awaiting 位在菜单暂停下随存档冻结、读档后逐一相等），不比对 interaction 令牌：Core 快照恢复按设计为恢复中的对白/选择重铸交互身份（vm.rs restore："restored interactions receive fresh identities, in addition to the host epoch change"），陈旧输入拒绝由会话纪元承担；比对保存时的令牌值是错误断言（全语料首两轮运行先后在 15≠17 与揭示位上误报）。
+- 产品修复：MEMORY_LEDGER_LIMIT 128→256 MiB（nir-player 常量 + 注释）。全语料多次运行在 episode7/b000680 确定性达到 ~130 MiB 峰值（105.76 MiB 已钉 + 24.16 MiB 待入：场景交叉淡入需新旧 cue 同驻，加常驻字体），admission 剪枝正确、无泄漏——是上限过紧而非泄漏。256 MiB 仍为硬上界，防失控租约；replay.rs 与 media_tests 的测试常量改为引用同一常量（其 admission 测试压到零余量，必须与真实上限一致）。
+- 本批触及 Player 运行时 → 按先例恢复浏览器整套验收（先 cargo xtask sdk 重建 dist/novelc）。nir-compiler 测试 dev-dependencies 加入 nir-player/nir-presentation。
+
+P6.2 完成；P6 余下能力发行清单，P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）待后续批次。证据：reports/nir-next/batch-54-corpus-certify.log、batch-54-xtask-test.log、batch-54-xtask-sdk.log、batch-54-verify-sdk.log、batch-54-clippy.log、batch-54-architecture.log、batch-54-browser.log。契约见 IMPORT.md（完整 Player 级路线认证一节）。完整 P0–P6 计划未完成；未提交或推送。

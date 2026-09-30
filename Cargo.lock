@@ -2343,6 +2343,8 @@ dependencies = [
  "nir-content",
  "nir-core",
  "nir-format",
+ "nir-player",
+ "nir-presentation",
  "rustybuzz",
  "schemars",
  "serde",

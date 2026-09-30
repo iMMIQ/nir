@@ -452,4 +452,6 @@ fn export(
 }
 
 #[cfg(test)]
+mod certify;
+#[cfg(test)]
 mod tests;
