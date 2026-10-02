@@ -22,7 +22,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 
 | 计划 | 状态 |
 | --- | --- |
-| P0 来源基线、三例、完整版本/限额矩阵 | 大部分完成：N01–N10/R01–R06 账本、中性样例 A/B/C 与 P0.2 版本/限额矩阵（docs/NIR-NEXT-VERSION-LIMITS.md）已交付（批次 61–62，docs/NIR-NEXT-P0-BASELINE.md）；KAG 第二来源认证待批次 63 |
+| P0 来源基线、三例、完整版本/限额矩阵 | 已交付：N01–N10/R01–R06 账本、中性样例 A/B/C 与 P0.2 版本/限额矩阵（批次 61–62，docs/NIR-NEXT-P0-BASELINE.md、docs/NIR-NEXT-VERSION-LIMITS.md）；KAG 第二来源规格认证（批次 63，docs/NIR-NEXT-SECOND-SOURCE-KAG.md，原版运行对照与导入器按计划标待认证/未交付）；Windows 原生各项待验证 |
 | P1.1 播放实例和终态原因 | 已有实例协议上补原因及验证；跨设备实测继续验收 |
 | P1.2 类型化目标 | 计划所列四个域均已接入共享求值：场景节点与消息根（Core 故事轨道），AudioInstance 实例增益补间（`audio.gain-tween.v1`，Core 轨道）与 ViewElement 菜单元素动画（`ui.menu-element-tween.v1`，Player 瞬态）于批次 58 交付；跨设备实测继续验收 |
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
@@ -723,3 +723,12 @@ P0.1 大部分交付；样例 C（页签设置/存档/历史，player 级验证�
 - 门禁：`cargo test -p nir-compiler` 137 项通过（5 项私有来源忽略，p0_examples 5 项）；样例 C `novelc resolve → check --locked → test → build --locked` 全通过；`cargo xtask test`（依赖架构 18 包 PASS、能力发行清单 47 项一一对应 PASS）；`cargo clippy --workspace --all-targets --locked` 通过（19 处现存警告容忍，与本批文件无关）。本批不触及 Player/Presentation 运行时代码（仅作 nir-compiler dev-dep 引用），按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点仍随批次 58 整套成立。
 
 P0.1/P0.2 收口；KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-62-compiler-test.log、batch-62-p0-final.log、batch-62-novelc-pipeline.log、batch-62-xtask-test.log、batch-62-clippy.log（本地保留）。契约见 docs/NIR-NEXT-P0-BASELINE.md、docs/NIR-NEXT-VERSION-LIMITS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 63：KAG 第二来源规格认证（P0 收口）
+
+- 认证记录 docs/NIR-NEXT-SECOND-SOURCE-KAG.md：引擎家族 KiriKiri2＋KAG3，精确版本与提交逐项登记——KAG 版本串 `3.32 stable rev. 2`（krkrz/kag3 data/system/Initialize.tjs:5 @ `1f3ab309106d210e3169bbbe0fb4e066ae463b42`，2017-12-24）；场景解析器 krkrz/KAGParser @ `c2269b26b390bd09aa1f2b39d7d779cb79c26f2e`（2024-09-17）；引擎稳定线 KiriKiri2 2.32 stable rev.2 = krkrz/krkr2 `kirikiri2/branches/2.32stable` 头部 `9c892a7fa773b66077369bb85fc9637906a71907`（2010-10-26T08:28:03Z，提交信息「2.32stable2コミット」，与 kr2_232r2.zip 发布同日）；主镜像 master `dec49af9…`（GPL-2.0）。许可边界记录在案：仓库不复制其源码/素材，只登记身份与语义。
+- 小型固定子集规格冻结（正文与 `;` 注释/`[[` 转义、[l] 行等待、[p] 页等待、`*标签|页名`、[jump]、[if]/[elsif]/[else]/[endif]、[link]…[endlink]、[s] 终止），语义逐项锚定公开源码行号：执行期标签在 kag3 系统层处理器字典（MainWindow.tjs [l]:4977、[p]:4983、[s]:5116、[link]:4888 → MessageLayer.tjs beginHyperLink:1640 参数字典、endHyperLink:1664、onMouseDown:2163 → findLink → processLink:1991 经 window.process(storage,target,countPage) 跳转），解析期在 KAGParser.cpp（`;`:1105、`*标签|页名`:1108-1120、`[[`:1491/1539、特殊标签分发表含 if/else/elsif/endif/jump:1583-1616）；分层结构事实 Conductor.tjs:13 `class BaseConductor extends KAGParser`。子集仅用方括号标签形式（`@` 形式不进入子集）。
+- 证据方式：documented（公开源码精确提交＋官方文档镜像 krkrz.github.io/krkr2doc/kag3doc/），不涉及解码私有二进制；原版运行对照与 KAG 导入器如实标注「待认证/未交付」（计划 §1 不运行未知原版可执行文件；第二来源不要求先行交付导入器）。映射笔记（非交付承诺）记录与 NIR 概念对应：[p]≈源页边界、[l]≈页内等待细分、[s]≈终态、[link] 区间≈Interact 选项——与 LiveNovel 選択値 约定同构，均可降级 story.typed-result.v1 同一核心（P5「第二来源复用相同核心」在 KAG 侧的对应面）。
+- 本批仅文档：认证记录 + 基线账本 N10/§5/§6 与进度 P0 行同步。门禁 `cargo xtask test`（依赖架构 18 包、能力发行清单 47 项一一对应）与 `cargo clippy --workspace --all-targets --locked`（19 处现存警告容忍，均与本批无关）通过；按批次 53/55/59/62 先例不跑浏览器套件。
+
+P0（P0.1 账本/回归/三样例 + P0.2 矩阵 + 第二来源认证）按计划自身判据收口。遗留：LiveNovel 导入器侧来源映射（批次 57/58 能力的菜单转场/元素动画映射、menu-hover/text.font 显式近似）、nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-63-xtask-test.log、batch-63-clippy.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。

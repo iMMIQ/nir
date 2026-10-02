@@ -19,7 +19,7 @@
 | N07 | 音频事件：事件 gain、带时长停止、实例增益补间、总线乘算（P2.1） | 已交付 | AUDIO-SEMANTICS.md；audio-gain-tween.spec.js；fixture A（BGM 0.7 + 50 ms 语音淡出停止）；Windows 原生待验证 |
 | N08 | 有限页面组合与系统服务：stack 菜单、值控件（Range/Toggle）、有界历史窗口、存档槽与确认令牌（P3） | 已交付（批次 62 收口） | MENU-*.md 系列语义文档；批次 36–47 协调与浏览器测试；fixture C（夜航日志，player 级驱动） |
 | N09 | 页面效果与隔离回想：进入/关闭边界效果、页面音乐、元素进入动画、Replay 冻结-切换-返回事务与 Profile 守卫（P4） | 已交付（批次 48–49/56–58） | MENU-EFFECTS-SEMANTICS.md / REPLAY-SEMANTICS.md；fixture B（锁定回想 + 页面效果/转场/元素动画）；Windows 原生待验证 |
-| N10 | 兼容迁移与发行：类型化结果复用、映射级别账本与显式近似门禁、完整路线认证、能力发行清单（P5/P6） | 已交付（批次 50–55）；第二来源认证待批次 63 | IMPORT.md / CAPABILITIES.md；import-report 格式 2；verify_capabilities.py 门禁；真实语料全路线（本地报告）；KAG 待认证 |
+| N10 | 兼容迁移与发行：类型化结果复用、映射级别账本与显式近似门禁、完整路线认证、能力发行清单（P5/P6） | 已交付（批次 50–55；KAG 第二来源规格认证批次 63） | IMPORT.md / CAPABILITIES.md；import-report 格式 2；verify_capabilities.py 门禁；真实语料全路线（本地报告）；KAG 规格认证见 [NIR-NEXT-SECOND-SOURCE-KAG.md](NIR-NEXT-SECOND-SOURCE-KAG.md)（原版运行对照与导入器待认证） |
 
 计划 §12 的 P0.2（实例/结果/时钟/版本矩阵与数量上限冻结）已于批次 62 交付，见 [NIR-NEXT-VERSION-LIMITS.md](NIR-NEXT-VERSION-LIMITS.md)。
 
@@ -64,10 +64,11 @@
 ## 5. 版本/限额矩阵与第二来源（指针）
 
 - **P0.2 版本/上限矩阵**：已交付（批次 62），见 [NIR-NEXT-VERSION-LIMITS.md](NIR-NEXT-VERSION-LIMITS.md)——目标身份、任务结果原因、时间域、源页边界、输入消费、页面动作白名单、Replay 策略状态表、数量上限（View 元素/局部数据、表达式深度、计划深度/叶子、可见集合、并发 UI 音频、文本长度等）与 source/runtime/content/snapshot/preferences/schema/host protocol 逐项影响，数值逐一锚定代码常量。
-- **KAG 第二来源**：计划 §4 P0.1 要求「至少两个引擎家族……记录精确版本/源码提交/参数/证据方式；无原版运行证据时标待认证」。LiveNovel 侧已有真实语料的映射账本与全路线认证（批次 53/54/59/60，证据保留本地 reports/）；KAG 小型固定子集的版本、来源提交与参数认证待批次 63，在此之前一切 KAG 支持声明均为「待认证」，不写入仓库声明。
+- **KAG 第二来源**：规格级认证已交付（批次 63）——精确版本（KAG 3.32 stable rev.2 / KiriKiri2 2.32 stable rev.2）、源码提交（krkrz/kag3、krkrz/KAGParser、krkr2 `kirikiri2/branches/2.32stable` 头部）、小型固定子集参数与逐项源码锚点见 [NIR-NEXT-SECOND-SOURCE-KAG.md](NIR-NEXT-SECOND-SOURCE-KAG.md)。原版运行对照与 KAG 导入器保持「待认证/未交付」；在导入器交付并验收前，任何 KAG 支持声明不写入仓库其他文档。LiveNovel 侧真实语料的映射账本与全路线认证见批次 53/54/59/60（证据保留本地 reports/）。
 
 ## 6. 基线测试记录
 
 - 2026-10-03，批次 61：`cargo test -p nir-compiler`（含 p0_examples 3 项）、`cargo xtask test`（含 verify_capabilities.py 47 项能力一一对应）、`cargo clippy --workspace --all-targets --locked` 通过（19 处现存警告容忍，nir-core 6 处 -D warnings 失败为批次 58 遗留，与本批无关）；两样例 `novelc resolve → check --locked → test → build --locked` 全通过。证据日志：reports/nir-next/batch-61-*.log（本地保留）。
 - 2026-10-03，批次 62：`cargo test -p nir-compiler` 137 项通过（含 p0_examples 5 项：样例 A/B 原三项 + 样例 C 能力断言与 player 级全流程驱动；5 项私有来源测试忽略）；`cargo xtask test`、`cargo clippy --workspace --all-targets --locked`（19 处现存警告容忍）、样例 C `novelc resolve → check --locked → test → build --locked` 全通过。本批触及 nir-compiler 测试与生成脚本/文档，Player/Presentation 仅作 dev-dep 引用且未改动，按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点仍随批次 58 整套成立。证据日志：reports/nir-next/batch-62-*.log（本地保留）。
+- 2026-10-03，批次 63：KAG 第二来源规格认证（docs/NIR-NEXT-SECOND-SOURCE-KAG.md）。仅文档批次（认证记录 + 本账本与进度同步），未触及代码与样例；`cargo xtask test`（依赖架构、能力发行清单）与 `cargo clippy --workspace --all-targets --locked` 通过。证据日志：reports/nir-next/batch-63-*.log（本地保留）。
 - 本批不触及 Player/格式/编译器运行时代码，按批次 53/55 先例不重跑浏览器整套；R01–R06 的浏览器锚点随最近一次整套运行（批次 58，44 项全绿）成立。
