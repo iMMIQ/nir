@@ -1,0 +1,84 @@
+format = 1
+
+[[assets]]
+id = "bg.title"
+kind = "image"
+source = "source/title.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "bg.deck"
+kind = "image"
+source = "source/deck.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.panel"
+kind = "image"
+source = "source/panel.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.begin"
+kind = "image"
+source = "source/begin.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.begin.hover"
+kind = "image"
+source = "source/begin.hover.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.system"
+kind = "image"
+source = "source/system.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.system.hover"
+kind = "image"
+source = "source/system.hover.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.back"
+kind = "image"
+source = "source/back.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.save"
+kind = "image"
+source = "source/save.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.load"
+kind = "image"
+source = "source/load.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.older"
+kind = "image"
+source = "source/older.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.newer"
+kind = "image"
+source = "source/newer.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "font.reader"
+kind = "font"
+source = "source/reader.otf"
+rights = "OFL-1.1"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/Noto-OFL.txt"

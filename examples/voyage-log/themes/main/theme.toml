@@ -1,0 +1,288 @@
+format = 1
+id = "theme.log"
+base = "builtin.reader"
+tokens = "tokens.json"
+return_to_title = true
+menu_overlay = "system"
+
+[slots]
+"dialogue.main" = "builtin.dialogue"
+"choice.main" = "builtin.choice"
+
+[dialogue]
+height = 240.0
+padding = 24.0
+font_size = 23.0
+
+[choice]
+width = 520.0
+item_height = 58.0
+
+[image_menus.title]
+background = "bg.title"
+builtin_navigation = true
+buttons = []
+
+[[image_menus.title.elements]]
+id = "begin"
+rect = [520.0, 280.0, 240.0, 64.0]
+content = { type = "button", label = "开始航行", asset = "ui.begin", hover_asset = "ui.begin.hover", action = { type = "new_game" } }
+
+[[image_menus.title.elements]]
+id = "system"
+rect = [520.0, 376.0, 240.0, 64.0]
+content = { type = "button", label = "手账面板", asset = "ui.system", hover_asset = "ui.system.hover", action = { type = "push_menu", menu = "system" } }
+
+[image_menus.system]
+background = "ui.panel"
+builtin_navigation = true
+buttons = []
+
+[image_menus.system.locals.tab]
+type = "enum"
+initial = "设置"
+values = ["设置", "存档", "历史"]
+
+[image_menus.system.locals.slot]
+type = "int"
+initial = 0
+min = 0
+max = 2
+
+[image_menus.system.locals.offset]
+type = "int"
+initial = 0
+min = 0
+max = 999
+
+[image_menus.system.locals.lamp]
+type = "bool"
+initial = true
+
+[image_menus.system.locals.glow]
+type = "int"
+initial = 80
+min = 0
+max = 100
+
+[[image_menus.system.elements]]
+id = "tab-settings"
+rect = [60.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "设置页签", action = { type = "set_local", local = "tab", value = "设置" } }
+
+[[image_menus.system.elements]]
+id = "tab-saves"
+rect = [250.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "存档页签", action = { type = "set_local", local = "tab", value = "存档" } }
+
+[[image_menus.system.elements]]
+id = "tab-history"
+rect = [440.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "历史页签", action = { type = "set_local", local = "tab", value = "历史" } }
+
+[[image_menus.system.elements]]
+id = "tab-caption"
+rect = [900.0, 60.0, 320.0, 56.0]
+text_local = "tab"
+content = { type = "text", text = "设置", size = 34.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "back"
+rect = [990.0, 630.0, 230.0, 56.0]
+content = { type = "button", label = "返回", asset = "ui.back", action = { type = "close" } }
+
+[[image_menus.system.elements]]
+id = "page-settings"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "设置" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "rows"
+parent = "page-settings"
+rect = [60.0, 20.0, 900.0, 440.0]
+content = { type = "stack", gap = 14.0 }
+
+[[image_menus.system.elements]]
+id = "row-speed"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-speed-label"
+parent = "row-speed"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "字速", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "speed"
+parent = "row-speed"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "字速滑条", binding = { type = "preference", field = "text_speed" }, min = 0.25, max = 4.0, step = 0.25 }
+
+[[image_menus.system.elements]]
+id = "speed-caption"
+parent = "row-speed"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_preference = "text_speed"
+content = { type = "text", text = "1.00", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "row-bgm"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-bgm-label"
+parent = "row-bgm"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "音乐音量", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "volume"
+parent = "row-bgm"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "音乐音量滑条", binding = { type = "preference", field = "bgm_volume" }, min = 0.0, max = 1.0, step = 0.1 }
+
+[[image_menus.system.elements]]
+id = "volume-caption"
+parent = "row-bgm"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_preference = "bgm_volume"
+content = { type = "text", text = "0.40", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "row-motion"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-motion-label"
+parent = "row-motion"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "动画减弱", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "motion"
+parent = "row-motion"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "toggle", label = "动画减弱开关", binding = { type = "reduced_motion" } }
+
+[[image_menus.system.elements]]
+id = "row-lamp"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-lamp-label"
+parent = "row-lamp"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "舱灯提示", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "lamp"
+parent = "row-lamp"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "toggle", label = "舱灯提示开关", binding = { type = "local", name = "lamp" } }
+
+[[image_menus.system.elements]]
+id = "row-glow"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-glow-label"
+parent = "row-glow"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "面板亮度", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "glow"
+parent = "row-glow"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "面板亮度滑条", binding = { type = "local", name = "glow" }, min = 0.0, max = 100.0, step = 10.0 }
+
+[[image_menus.system.elements]]
+id = "glow-caption"
+parent = "row-glow"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_local = "glow"
+content = { type = "text", text = "80", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "page-saves"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "存档" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "slot-caption"
+parent = "page-saves"
+rect = [60.0, 40.0, 600.0, 48.0]
+text_slot = { type = "local", name = "slot" }
+content = { type = "text", text = "0", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "slot-0"
+parent = "page-saves"
+rect = [60.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位一", action = { type = "set_local", local = "slot", value = 0 } }
+
+[[image_menus.system.elements]]
+id = "slot-1"
+parent = "page-saves"
+rect = [260.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位二", action = { type = "set_local", local = "slot", value = 1 } }
+
+[[image_menus.system.elements]]
+id = "slot-2"
+parent = "page-saves"
+rect = [460.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位三", action = { type = "set_local", local = "slot", value = 2 } }
+
+[[image_menus.system.elements]]
+id = "save"
+parent = "page-saves"
+rect = [60.0, 220.0, 300.0, 64.0]
+content = { type = "button", label = "保存到当前槽位", asset = "ui.save", action = { type = "save_slot", slot = { type = "local", name = "slot" } } }
+
+[[image_menus.system.elements]]
+id = "load"
+parent = "page-saves"
+rect = [400.0, 220.0, 300.0, 64.0]
+content = { type = "button", label = "读取当前槽位", asset = "ui.load", action = { type = "load_slot", slot = { type = "local", name = "slot" } } }
+
+[[image_menus.system.elements]]
+id = "saves-note"
+parent = "page-saves"
+rect = [60.0, 320.0, 900.0, 48.0]
+content = { type = "text", text = "页签与槽位都保存在手账里；离开页面即失效。", size = 24.0, color = [0.58, 0.62, 0.6, 1.0] }
+
+[[image_menus.system.elements]]
+id = "page-history"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "历史" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "records"
+parent = "page-history"
+rect = [60.0, 20.0, 1160.0, 220.0]
+content = { type = "history_window", offset_local = "offset", limit = 2, row_height = 92.0, size = 28.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "older"
+parent = "page-history"
+rect = [60.0, 260.0, 300.0, 56.0]
+content = { type = "button", label = "更早", asset = "ui.older", action = { type = "history_page", window = "records", delta = 1 } }
+
+[[image_menus.system.elements]]
+id = "newer"
+parent = "page-history"
+rect = [400.0, 260.0, 300.0, 56.0]
+content = { type = "button", label = "更近", asset = "ui.newer", action = { type = "history_page", window = "records", delta = -1 } }

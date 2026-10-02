@@ -1,0 +1,61 @@
+{
+  "format": 1,
+  "source_locale": "zh-Hans",
+  "texts": {
+    "log1": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "96e071a061b43c37f0d01d914708f971ef9268fbba8a7954e9680f29806bac60",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "24b6da67b99e01233ab0b922e1b57a88433c2b2c8d7a1e91c3bad6d49526c3f3"
+      }
+    },
+    "log2": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "da1be833925690735fb12b42e9377688737c508989f869fc678f7a8bfcd2073c",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "38d5e31d15d2f33097a5bf8e1e455f7c32048e933022411bdc7a685d43387f05"
+      }
+    },
+    "log3": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "760246c07b66e69a7aa002c7d8777bf30a60c98bd0e09093edaf7e2cc580dfa6",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "437258e4221501217ced70d111c6c130dacfea20404cf5b8eb030cfa63f3e2c2"
+      }
+    },
+    "log4": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "ba099209158eb244202fdba51872043812735be09cec0dedcd069dd0981228ed",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "79d6d686137b8f73165e081ab4cbf6670812363503f6a00a3340f45b43567b18"
+      }
+    },
+    "log5": {
+      "source_revision": 1,
+      "contract_revision": 1,
+      "meaning_revision": 1,
+      "source_digest": "6705ff6cc587ca05bb4ed258e2a96f8ad57894020d987b0c86578bef12d42858",
+      "contract_digest": "a176ab9ea508f3924f40afef0042e048f867f3618ecf7c3e634fb8a46359793d",
+      "shape_digest": "7a38905296006c575d7d45d1d881690a3ee87361ed67ce64642e2504482da818",
+      "reviewed": {
+        "en": "b0778749894a15d43a6ed1018be70235253e434169036a25bc28ede9e455c70b"
+      }
+    }
+  }
+}

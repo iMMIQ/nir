@@ -921,6 +921,493 @@ novelc build --locked
     return out
 
 
+# --- fixture C: voyage-log -----------------------------------------------------
+
+def build_voyage_log():
+    out = ROOT / "examples/voyage-log"
+    lines = {
+        "log1": (
+            "暮色里船离了岸。你在掌灯前坐下，翻开这本空白的夜航日志。",
+            "The boat leaves the shore at dusk. You sit before the lamp and open the blank logbook.",
+        ),
+        "log2": ("第一行先记风：东南，二级，浪不高。", "The first line records the wind: southeast, force two, low swells."),
+        "log3": ("灯芯偶尔一跳，把你的影子钉在舱壁上。", "Now and then the filament jumps, pinning your shadow to the cabin wall."),
+        "log4": ("过半程的时候，岸上的灯火只剩下三粒。", "Past the halfway mark, only three grains of shore light remain."),
+        "log5": ("天将亮未亮。你合上日志，靠岸的方向已经有雾。", "The night is almost over. You close the log; mist already waits toward the shore."),
+    }
+    contracts = {
+        k: {"source_revision": 1, "contract_revision": 1, "meaning_revision": 1, "gates": [], "params": {}}
+        for k in lines
+    }
+
+    def docs(loc):
+        i = 0 if loc == "zh-Hans" else 1
+        return {
+            k: {
+                "source_revision": 1,
+                "contract_revision": 1,
+                "spans": [{"type": "text", "id": "body", "text": v[i], "emphasis": False}],
+            }
+            for k, v in lines.items()
+        }
+
+    scenes = {
+        "deck": [node("background", "bg.deck", 0, 0, 1280, 720)],
+        # The title screen is the image menu's own background; the scene graph
+        # still needs the named scene to exist (same convention as imports).
+        "title": [],
+    }
+    cues = {
+        "open": {"effects": [effect("stage", "stage_present", scene="deck", duration_us="0")]},
+        **{
+            f"log{i}": {
+                "effects": [
+                    effect("line", "dialogue", scope="interaction", text=k, speaker="", reveal_us="36000")
+                ]
+            }
+            for i, k in enumerate(lines, 1)
+        },
+    }
+    blocks = {"start": block(activate("open", "page1"))}
+    for i in range(1, len(lines) + 1):
+        blocks[f"page{i}"] = block(activate(f"log{i}", f"wait{i}"))
+        nxt = f"page{i + 1}" if i < len(lines) else "done"
+        blocks[f"wait{i}"] = block(wait("line", nxt))
+    blocks["done"] = block(end("completed"))
+    blocks.update(faults())
+    fragment = {
+        "fragment_format": 1,
+        "variables": {},
+        "functions": {"main": {"entry": "start", "blocks": blocks}},
+        "scenes": scenes,
+        "cues": cues,
+        "choices": {},
+    }
+    dump(out / "content/ch01/story.nir.json", fragment)
+    theme = '''format = 1
+id = "theme.log"
+base = "builtin.reader"
+tokens = "tokens.json"
+return_to_title = true
+menu_overlay = "system"
+
+[slots]
+"dialogue.main" = "builtin.dialogue"
+"choice.main" = "builtin.choice"
+
+[dialogue]
+height = 240.0
+padding = 24.0
+font_size = 23.0
+
+[choice]
+width = 520.0
+item_height = 58.0
+
+[image_menus.title]
+background = "bg.title"
+builtin_navigation = true
+buttons = []
+
+[[image_menus.title.elements]]
+id = "begin"
+rect = [520.0, 280.0, 240.0, 64.0]
+content = { type = "button", label = "开始航行", asset = "ui.begin", hover_asset = "ui.begin.hover", action = { type = "new_game" } }
+
+[[image_menus.title.elements]]
+id = "system"
+rect = [520.0, 376.0, 240.0, 64.0]
+content = { type = "button", label = "手账面板", asset = "ui.system", hover_asset = "ui.system.hover", action = { type = "push_menu", menu = "system" } }
+
+[image_menus.system]
+background = "ui.panel"
+builtin_navigation = true
+buttons = []
+
+[image_menus.system.locals.tab]
+type = "enum"
+initial = "设置"
+values = ["设置", "存档", "历史"]
+
+[image_menus.system.locals.slot]
+type = "int"
+initial = 0
+min = 0
+max = 2
+
+[image_menus.system.locals.offset]
+type = "int"
+initial = 0
+min = 0
+max = 999
+
+[image_menus.system.locals.lamp]
+type = "bool"
+initial = true
+
+[image_menus.system.locals.glow]
+type = "int"
+initial = 80
+min = 0
+max = 100
+
+[[image_menus.system.elements]]
+id = "tab-settings"
+rect = [60.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "设置页签", action = { type = "set_local", local = "tab", value = "设置" } }
+
+[[image_menus.system.elements]]
+id = "tab-saves"
+rect = [250.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "存档页签", action = { type = "set_local", local = "tab", value = "存档" } }
+
+[[image_menus.system.elements]]
+id = "tab-history"
+rect = [440.0, 60.0, 180.0, 56.0]
+content = { type = "hit_region", label = "历史页签", action = { type = "set_local", local = "tab", value = "历史" } }
+
+[[image_menus.system.elements]]
+id = "tab-caption"
+rect = [900.0, 60.0, 320.0, 56.0]
+text_local = "tab"
+content = { type = "text", text = "设置", size = 34.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "back"
+rect = [990.0, 630.0, 230.0, 56.0]
+content = { type = "button", label = "返回", asset = "ui.back", action = { type = "close" } }
+
+[[image_menus.system.elements]]
+id = "page-settings"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "设置" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "rows"
+parent = "page-settings"
+rect = [60.0, 20.0, 900.0, 440.0]
+content = { type = "stack", gap = 14.0 }
+
+[[image_menus.system.elements]]
+id = "row-speed"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-speed-label"
+parent = "row-speed"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "字速", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "speed"
+parent = "row-speed"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "字速滑条", binding = { type = "preference", field = "text_speed" }, min = 0.25, max = 4.0, step = 0.25 }
+
+[[image_menus.system.elements]]
+id = "speed-caption"
+parent = "row-speed"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_preference = "text_speed"
+content = { type = "text", text = "1.00", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "row-bgm"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-bgm-label"
+parent = "row-bgm"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "音乐音量", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "volume"
+parent = "row-bgm"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "音乐音量滑条", binding = { type = "preference", field = "bgm_volume" }, min = 0.0, max = 1.0, step = 0.1 }
+
+[[image_menus.system.elements]]
+id = "volume-caption"
+parent = "row-bgm"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_preference = "bgm_volume"
+content = { type = "text", text = "0.40", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "row-motion"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-motion-label"
+parent = "row-motion"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "动画减弱", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "motion"
+parent = "row-motion"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "toggle", label = "动画减弱开关", binding = { type = "reduced_motion" } }
+
+[[image_menus.system.elements]]
+id = "row-lamp"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-lamp-label"
+parent = "row-lamp"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "舱灯提示", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "lamp"
+parent = "row-lamp"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "toggle", label = "舱灯提示开关", binding = { type = "local", name = "lamp" } }
+
+[[image_menus.system.elements]]
+id = "row-glow"
+parent = "rows"
+rect = [0.0, 0.0, 900.0, 74.0]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "row-glow-label"
+parent = "row-glow"
+rect = [0.0, 12.0, 240.0, 48.0]
+content = { type = "text", text = "面板亮度", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "glow"
+parent = "row-glow"
+rect = [260.0, 8.0, 420.0, 56.0]
+content = { type = "range", label = "面板亮度滑条", binding = { type = "local", name = "glow" }, min = 0.0, max = 100.0, step = 10.0 }
+
+[[image_menus.system.elements]]
+id = "glow-caption"
+parent = "row-glow"
+rect = [720.0, 12.0, 160.0, 48.0]
+text_local = "glow"
+content = { type = "text", text = "80", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "page-saves"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "存档" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "slot-caption"
+parent = "page-saves"
+rect = [60.0, 40.0, 600.0, 48.0]
+text_slot = { type = "local", name = "slot" }
+content = { type = "text", text = "0", size = 30.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "slot-0"
+parent = "page-saves"
+rect = [60.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位一", action = { type = "set_local", local = "slot", value = 0 } }
+
+[[image_menus.system.elements]]
+id = "slot-1"
+parent = "page-saves"
+rect = [260.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位二", action = { type = "set_local", local = "slot", value = 1 } }
+
+[[image_menus.system.elements]]
+id = "slot-2"
+parent = "page-saves"
+rect = [460.0, 110.0, 180.0, 56.0]
+content = { type = "hit_region", label = "选择槽位三", action = { type = "set_local", local = "slot", value = 2 } }
+
+[[image_menus.system.elements]]
+id = "save"
+parent = "page-saves"
+rect = [60.0, 220.0, 300.0, 64.0]
+content = { type = "button", label = "保存到当前槽位", asset = "ui.save", action = { type = "save_slot", slot = { type = "local", name = "slot" } } }
+
+[[image_menus.system.elements]]
+id = "load"
+parent = "page-saves"
+rect = [400.0, 220.0, 300.0, 64.0]
+content = { type = "button", label = "读取当前槽位", asset = "ui.load", action = { type = "load_slot", slot = { type = "local", name = "slot" } } }
+
+[[image_menus.system.elements]]
+id = "saves-note"
+parent = "page-saves"
+rect = [60.0, 320.0, 900.0, 48.0]
+content = { type = "text", text = "页签与槽位都保存在手账里；离开页面即失效。", size = 24.0, color = [0.58, 0.62, 0.6, 1.0] }
+
+[[image_menus.system.elements]]
+id = "page-history"
+rect = [0.0, 140.0, 1280.0, 470.0]
+visible_when = [{ type = "local", name = "tab", equals = "历史" }]
+content = { type = "group" }
+
+[[image_menus.system.elements]]
+id = "records"
+parent = "page-history"
+rect = [60.0, 20.0, 1160.0, 220.0]
+content = { type = "history_window", offset_local = "offset", limit = 2, row_height = 92.0, size = 28.0, color = [0.94, 0.95, 0.92, 1.0] }
+
+[[image_menus.system.elements]]
+id = "older"
+parent = "page-history"
+rect = [60.0, 260.0, 300.0, 56.0]
+content = { type = "button", label = "更早", asset = "ui.older", action = { type = "history_page", window = "records", delta = 1 } }
+
+[[image_menus.system.elements]]
+id = "newer"
+parent = "page-history"
+rect = [400.0, 260.0, 300.0, 56.0]
+content = { type = "button", label = "更近", asset = "ui.newer", action = { type = "history_page", window = "records", delta = -1 } }
+'''
+    player = '''format = 1
+
+[defaults]
+font_scale = 1.0
+bgm_volume = 0.4
+voice_volume = 0.9
+sfx_volume = 0.6
+reduced_motion = false
+prefetch_content = true
+prefetch_media = true
+'''
+    tokens = {
+        "background": [0.05, 0.055, 0.08, 1],
+        "panel": [0.1, 0.11, 0.14, 0.97],
+        "accent": [0.56, 0.66, 0.8, 1],
+        "text": [0.94, 0.95, 0.92, 1],
+        "muted": [0.58, 0.62, 0.6, 1],
+    }
+    (out / "tests/scenarios/tour.toml").parent.mkdir(parents=True, exist_ok=True)
+    (out / "tests/scenarios/tour.toml").write_text(
+        '''format = 1
+id = "tour"
+entry = "main"
+text_locale = "zh-Hans"
+steps = []
+
+[expect]
+outcome = "completed"
+'''
+    )
+    base_tree(
+        out,
+        "org.nir.voyage-log",
+        "voyage-log",
+        "夜航日志 · Voyage Log",
+        "title",
+        ["tests/scenarios/tour.toml"],
+        theme,
+        tokens,
+        player,
+        docs,
+        lines,
+        contracts,
+        [],
+    )
+    credits(out, "背景与按钮")
+    # artwork: a night crossing under a low moon, then the cabin panel
+    title = Gradient((14, 20, 34), (30, 38, 56), 1280, 720)
+    title.glow(1010, 170, 150, 130, (214, 216, 210))
+    title.glow(220, 300, 320, 240, (52, 66, 84))
+    title.rect((0, 560, 1280, 720), (18, 26, 40))
+    for i in range(9):
+        title.rect((60 + i * 130, 590 + (i % 3) * 12, 96, 4), (44, 58, 76))
+    title.rect((760, 120, 1060, 400), (10, 14, 24))
+    png(out / "assets/source/title.png", (1280, 720), title)
+    deck = Gradient((22, 26, 34), (14, 16, 22), 1280, 720)
+    deck.glow(250, 250, 300, 260, (188, 148, 92))
+    deck.rect((0, 620, 1280, 720), (40, 34, 28))
+    deck.rect((120, 540, 420, 600), (54, 44, 36))
+    png(out / "assets/source/deck.png", (1280, 720), deck)
+    panel = Gradient((22, 26, 34), (16, 18, 24), 1280, 720)
+    panel.rect((0, 0, 1280, 5), (70, 84, 100, 255))
+    panel.rect((0, 715, 1280, 720), (70, 84, 100, 255))
+    png(out / "assets/source/panel.png", (1280, 720), panel)
+    plate(out / "assets/source/begin.png", 240, 64, (48, 56, 70), (140, 158, 178))
+    plate(out / "assets/source/begin.hover.png", 240, 64, (48, 56, 70), (188, 204, 218), hover=True)
+    plate(out / "assets/source/system.png", 240, 64, (48, 56, 70), (140, 158, 178))
+    plate(out / "assets/source/system.hover.png", 240, 64, (48, 56, 70), (188, 204, 218), hover=True)
+    plate(out / "assets/source/back.png", 230, 56, (44, 50, 62), (128, 144, 162))
+    plate(out / "assets/source/save.png", 300, 64, (52, 62, 60), (128, 168, 150))
+    plate(out / "assets/source/load.png", 300, 64, (60, 56, 72), (150, 140, 178))
+    plate(out / "assets/source/older.png", 300, 56, (46, 52, 60), (128, 144, 162))
+    plate(out / "assets/source/newer.png", 300, 56, (46, 52, 60), (128, 144, 162))
+    assets = []
+    for i, (id, kind, source, rights) in enumerate(
+        [
+            ("bg.title", "image", "title.png", "CC0-1.0"),
+            ("bg.deck", "image", "deck.png", "CC0-1.0"),
+            ("ui.panel", "image", "panel.png", "CC0-1.0"),
+            ("ui.begin", "image", "begin.png", "CC0-1.0"),
+            ("ui.begin.hover", "image", "begin.hover.png", "CC0-1.0"),
+            ("ui.system", "image", "system.png", "CC0-1.0"),
+            ("ui.system.hover", "image", "system.hover.png", "CC0-1.0"),
+            ("ui.back", "image", "back.png", "CC0-1.0"),
+            ("ui.save", "image", "save.png", "CC0-1.0"),
+            ("ui.load", "image", "load.png", "CC0-1.0"),
+            ("ui.older", "image", "older.png", "CC0-1.0"),
+            ("ui.newer", "image", "newer.png", "CC0-1.0"),
+        ]
+    ):
+        assets.append(f'[[assets]]\nid = "{id}"\nkind = "{kind}"\nsource = "source/{source}"\nrights = "{rights}"\n')
+    assets.append(
+        '''[[assets]]
+id = "font.reader"
+kind = "font"
+source = "source/reader.otf"
+rights = "OFL-1.1"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/Noto-OFL.txt"
+'''
+    )
+    (out / "assets/catalog.toml").write_text("format = 1\n\n" + "\n".join(assets))
+    (out / "README.md").write_text(
+        """# P0 验收样例：夜航日志 · Voyage Log
+
+NIR-NEXT P0 验收样例之三（页签设置/存档/历史页面）。完整原创中性内容；覆盖：
+
+- 单页三页签（设置/存档/历史）的局部状态页：enum/int/bool 局部值与 `set_local` 切换，
+  `visible_when` 条件页，`text_local`/`text_preference`/`text_slot` 三种动态文字；
+- 值控件：偏好滑条（字速/音乐音量）、`reduced_motion` 开关、局部 bool 开关与局部有界
+  int 滑条（面板亮度），内置绘制，无图片依赖；
+- 设置行以 `stack` 容器紧凑纵向排列（`ui.menu-stack.v1`）；
+- 存档槽：局部槽位选择 + `save_slot`/`load_slot`（局部槽位解析，3 槽上限）；
+- 历史页：`history_window` 分页窗口 + `history_page` 更早/更近；
+- 标题页 `push_menu` 进入面板（`ui.menu-navigation.v1`），`menu_overlay` 使剧情内
+  菜单键直达同一面板（`ui.menu-services.v1`）。
+
+```sh
+novelc check --locked
+novelc test
+novelc build --locked
+```
+
+剧情路线 tour 对应 `tests/scenarios/`；player 级驱动（页签、值提交、历史分页）见仓库
+集成测试。素材与字体由 `scripts/make_p0_examples.py` 重建；验收映射见 `docs/NIR-NEXT-P0-BASELINE.md`。
+"""
+    )
+    labels = "开始航行手账面板设置存档历史页签返回字速音乐音量滑条动画减弱开关舱灯提示面板亮度选择槽位一二三保存到当前读取更早更近与都保存在手账里离开页面即失效"
+    write_chars(out, "夜航日志" + "".join(zh + en for zh, en in lines.values()) + labels)
+    return out
+
+
 if __name__ == "__main__":
     import sys
 
@@ -929,4 +1416,6 @@ if __name__ == "__main__":
         build_reading_lamp()
     if fixture in ("all", "replay-atlas"):
         build_replay_atlas()
+    if fixture in ("all", "voyage-log"):
+        build_voyage_log()
     print("regenerated:", fixture)

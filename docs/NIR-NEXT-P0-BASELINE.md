@@ -17,11 +17,11 @@
 | N05 | 消息窗口与文字目标：样式化显隐（dissolve/wipe）、阴影、FontPlan 映射、来源字速单位（P2.3） | 已交付（来源字速批次 60） | 批次 56 窗口揭示契约；fixture A 窗口显隐；来源字体面保持显式近似（livenovel.text.font） |
 | N06 | 遮罩转场：舞台场景根、消息窗口根、菜单页根的方向 wipe 与图片 mask（P2.4） | 已交付（批次 56/57） | STAGE-TRANSITION-SEMANTICS.md / MENU-EFFECTS-SEMANTICS.md；window.spec.js、menu-wipe.spec.js；fixtures A/B 使用侧；硬件 WebGPU 未认证 |
 | N07 | 音频事件：事件 gain、带时长停止、实例增益补间、总线乘算（P2.1） | 已交付 | AUDIO-SEMANTICS.md；audio-gain-tween.spec.js；fixture A（BGM 0.7 + 50 ms 语音淡出停止）；Windows 原生待验证 |
-| N08 | 有限页面组合与系统服务：stack 菜单、值控件（Range/Toggle）、有界历史窗口、存档槽与确认令牌（P3） | 已交付；player 级验收样例待批次 62 | MENU-*.md 系列语义文档；批次 36–47 协调与浏览器测试；fixture C（页签设置/存档/历史）待批次 62 |
+| N08 | 有限页面组合与系统服务：stack 菜单、值控件（Range/Toggle）、有界历史窗口、存档槽与确认令牌（P3） | 已交付（批次 62 收口） | MENU-*.md 系列语义文档；批次 36–47 协调与浏览器测试；fixture C（夜航日志，player 级驱动） |
 | N09 | 页面效果与隔离回想：进入/关闭边界效果、页面音乐、元素进入动画、Replay 冻结-切换-返回事务与 Profile 守卫（P4） | 已交付（批次 48–49/56–58） | MENU-EFFECTS-SEMANTICS.md / REPLAY-SEMANTICS.md；fixture B（锁定回想 + 页面效果/转场/元素动画）；Windows 原生待验证 |
 | N10 | 兼容迁移与发行：类型化结果复用、映射级别账本与显式近似门禁、完整路线认证、能力发行清单（P5/P6） | 已交付（批次 50–55）；第二来源认证待批次 63 | IMPORT.md / CAPABILITIES.md；import-report 格式 2；verify_capabilities.py 门禁；真实语料全路线（本地报告）；KAG 待认证 |
 
-计划 §12 的 P0.2（实例/结果/时钟/版本矩阵与数量上限冻结）作为独立账本待批次 62 交付；本表先指针化，不提前声明。
+计划 §12 的 P0.2（实例/结果/时钟/版本矩阵与数量上限冻结）已于批次 62 交付，见 [NIR-NEXT-VERSION-LIMITS.md](NIR-NEXT-VERSION-LIMITS.md)。
 
 ## 2. 回归账本 R01–R06
 
@@ -46,7 +46,7 @@
 | --- | --- | --- | --- |
 | A 夜灯书页 · Reading Lamp | examples/reading-lamp | N01（Await 链）、N04（页内 Gate×2 后继续同一对白、固定 Auto 策略）、N05（wipe 揭示/dissolve 隐藏消息窗口）、N06（场景转场）、N07（BGM gain 0.7、显式语音绑定 sampled_remaining、50 ms 语音淡出停止）、N10（类型化选择结果写入 `kept`） | 场景 sunrise/rest（typed 变量断言）；crates/nir-compiler/tests/p0_examples.rs（能力推导 + VoiceWaitPolicy 断言） |
 | B 回想图集 · Replay Atlas | examples/replay-atlas | N06（菜单页进入/关闭转场）、N08（图片菜单组合）、N09（Profile 守卫的锁定回想、Replay 动作以 replay_completed 返回、点击音/页面音乐/元素进入动画）、N10（ui.replay.v1 等能力推导） | 场景 tour；p0_examples.rs（锁定不变量：atlas.north 授予/atlas.south 恒锁；三个入口函数驱动至终态） |
-| C 页签设置/存档/历史 | 待批次 62 | N08（stack 菜单、Range/Toggle、存档槽、历史窗口） | player 级验证 + 场景；未实现片段以行为期望描述，不伪装为可编译格式 |
+| C 夜航日志 · Voyage Log | examples/voyage-log | N08（单页三页签局部状态、stack 设置行、Range/Toggle 偏好与局部绑定、0–2 槽存读档事务、固定行历史窗口分页、push_menu 导航与 menu_overlay 覆盖页）、N10（ui.menu-state/values/services/storage/history/navigation/stack 七项能力按使用推导） | 场景 tour；crates/nir-compiler/tests/p0_examples.rs 两项——能力/结构断言（locals 5 项、uses_stack、menu_overlay）与 player 级全流程驱动（标题 push/back、Story 覆盖页、值提交写偏好与局部滑条步进吸附、槽位选择→Save 事务→Saved 回执、历史偏移分页与钳制边界禁用、关闭恢复同页不暂停） |
 
 样例 A/B 的 `game.lock` 随仓库提交；`.nir/`、`dist/` 产物按既有 gitignore 规则排除。
 
@@ -54,7 +54,7 @@
 
 全部素材可从仓库确定性重建，无外部下载：
 
-1. `python3 scripts/make_p0_examples.py [all|reading-lamp|replay-atlas]`——纯标准库重写两棵样例树：PNG（自带 IHDR/IDAT 编码器，渐变+矩形+辉光合成）、WAV（24 kHz 单声道 PCM16 合成音）、TOML/JSON 配置与文本账本（digest 算法与 `nir-format` 的 sha256 紧凑 JSON 一致）。
+1. `python3 scripts/make_p0_examples.py [all|reading-lamp|replay-atlas|voyage-log]`——纯标准库重写三棵样例树：PNG（自带 IHDR/IDAT 编码器，渐变+矩形+辉光合成）、WAV（24 kHz 单声道 PCM16 合成音）、TOML/JSON 配置与文本账本（digest 算法与 `nir-format` 的 sha256 紧凑 JSON 一致）。样例 C 无音频素材（值控件与内置绘制，无图片依赖）。
 2. 字体子集不由该脚本生成。母本为仓库 SDK 模板 `templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf`（Noto Sans CJK SC 2.004，SIL OFL 1.1，静态 CFF1——编译器 `face()` 拒绝可变字体，nix-store 的 CFF2 可变版本不可用）。子集 `assets/source/reader.otf` 由编译器自身的 `fonts::prepare()`（vendored hb-subset，keep_everything + remove_unrecognized_tables + retain_legacy_names + unicode_set）从 `assets/source/reader.chars.txt` 生成：临时在 fonts.rs 挂一个 ignored 测试调用 `prepare()`，完成后撤销；缓存落在样例目录 `.nir/cache/fonts`（gitignore）。
 3. 不变量：`reader.chars.txt` = nir-presentation 全部 `.ftl`+`src/**/*.rs` UI 副本闭包 + ASCII 32–127 + 标点 + 样例全部正文 + 游戏标题（标题经 collect_strings 进入每个字体计划，遗漏即 E_FONT_COVERAGE）。新增文字后必须同步扩充字符表并重建子集。
 4. 内容变更后重新 `novelc resolve` 更新 `game.lock`。
@@ -63,10 +63,11 @@
 
 ## 5. 版本/限额矩阵与第二来源（指针）
 
-- **P0.2 版本/上限矩阵**：目标身份、任务结果原因、时间域、页面动作白名单、Replay 策略状态表与数量上限（View 元素/局部数据、表达式深度、计划深度/叶子、可见集合、并发 UI 音频、文本长度）——待批次 62，作为独立账本文档交付；在此之前以 CAPABILITIES.md 与各语义文档为现行记录。
+- **P0.2 版本/上限矩阵**：已交付（批次 62），见 [NIR-NEXT-VERSION-LIMITS.md](NIR-NEXT-VERSION-LIMITS.md)——目标身份、任务结果原因、时间域、源页边界、输入消费、页面动作白名单、Replay 策略状态表、数量上限（View 元素/局部数据、表达式深度、计划深度/叶子、可见集合、并发 UI 音频、文本长度等）与 source/runtime/content/snapshot/preferences/schema/host protocol 逐项影响，数值逐一锚定代码常量。
 - **KAG 第二来源**：计划 §4 P0.1 要求「至少两个引擎家族……记录精确版本/源码提交/参数/证据方式；无原版运行证据时标待认证」。LiveNovel 侧已有真实语料的映射账本与全路线认证（批次 53/54/59/60，证据保留本地 reports/）；KAG 小型固定子集的版本、来源提交与参数认证待批次 63，在此之前一切 KAG 支持声明均为「待认证」，不写入仓库声明。
 
 ## 6. 基线测试记录
 
 - 2026-10-03，批次 61：`cargo test -p nir-compiler`（含 p0_examples 3 项）、`cargo xtask test`（含 verify_capabilities.py 47 项能力一一对应）、`cargo clippy --workspace --all-targets --locked` 通过（19 处现存警告容忍，nir-core 6 处 -D warnings 失败为批次 58 遗留，与本批无关）；两样例 `novelc resolve → check --locked → test → build --locked` 全通过。证据日志：reports/nir-next/batch-61-*.log（本地保留）。
+- 2026-10-03，批次 62：`cargo test -p nir-compiler` 137 项通过（含 p0_examples 5 项：样例 A/B 原三项 + 样例 C 能力断言与 player 级全流程驱动；5 项私有来源测试忽略）；`cargo xtask test`、`cargo clippy --workspace --all-targets --locked`（19 处现存警告容忍）、样例 C `novelc resolve → check --locked → test → build --locked` 全通过。本批触及 nir-compiler 测试与生成脚本/文档，Player/Presentation 仅作 dev-dep 引用且未改动，按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点仍随批次 58 整套成立。证据日志：reports/nir-next/batch-62-*.log（本地保留）。
 - 本批不触及 Player/格式/编译器运行时代码，按批次 53/55 先例不重跑浏览器整套；R01–R06 的浏览器锚点随最近一次整套运行（批次 58，44 项全绿）成立。

@@ -1,0 +1,19 @@
+format = 1
+engine_api = "nir-player/0.1"
+capability_profile = "web-v1"
+sdk_digest = "0d2f1a8e57b6d307d3117483264c2ab453f6b110a638afc4ba4d9580e6dc48cd"
+
+[sdk]
+format = 1
+compiler_version = "0.1.1"
+
+[sdk.files]
+"THIRD-PARTY.txt" = "f08a6f3fb0a3467ea451c4fd7918d164052a909afc84c68256d0a611983c0d98"
+"android/lib/arm64-v8a/libplayer.so" = "50d1daddbea4e7eb50140a228919c2167a84d09738eeb4a6eec0d5c4ef945b5a"
+"bootstrap.js" = "0389a4eb7010cd66511ce3bbfa35ae34fccff1e4e0bfc21ff8d3c9739909beac"
+"compiler.sha256" = "b6943fe4496fb394b2d19b293df9590db3d52a5fd7a790f8f88f1cc890ecb42f"
+"host.js" = "781e7976e844801a704d8e0a867546a8a2ebce5bc0d937941154084d4ff2edac"
+"index.html" = "61d4c8349194f8a3c47ce1480f8d4d84c5fc089a0aac95102910479ec1b50c7b"
+"linux/player-linux" = "1de659fb1b13ceaea1f9adc841b3fe3c95dff93b785fea18013dc79ea4df4883"
+"player_web.js" = "5a105c7a35a993deb71372921a24b9a3b0dbf304a9a3816e89af35642c49b51a"
+"player_web_bg.wasm" = "9ae3b0b36cc1e4d74863f11370f1174948f9f955a0873884d34e47a7f4276a98"

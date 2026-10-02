@@ -22,7 +22,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 
 | 计划 | 状态 |
 | --- | --- |
-| P0 来源基线、三例、完整版本/限额矩阵 | 大部分完成：N01–N10/R01–R06 账本与中性样例 A（夜灯书页）/B（回想图集）已交付（批次 61，docs/NIR-NEXT-P0-BASELINE.md）；样例 C（页签设置/存档/历史）、P0.2 完整版本/限额矩阵待批次 62，KAG 第二来源认证待批次 63 |
+| P0 来源基线、三例、完整版本/限额矩阵 | 大部分完成：N01–N10/R01–R06 账本、中性样例 A/B/C 与 P0.2 版本/限额矩阵（docs/NIR-NEXT-VERSION-LIMITS.md）已交付（批次 61–62，docs/NIR-NEXT-P0-BASELINE.md）；KAG 第二来源认证待批次 63 |
 | P1.1 播放实例和终态原因 | 已有实例协议上补原因及验证；跨设备实测继续验收 |
 | P1.2 类型化目标 | 计划所列四个域均已接入共享求值：场景节点与消息根（Core 故事轨道），AudioInstance 实例增益补间（`audio.gain-tween.v1`，Core 轨道）与 ViewElement 菜单元素动画（`ui.menu-element-tween.v1`，Player 瞬态）于批次 58 交付；跨设备实测继续验收 |
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
@@ -713,3 +713,13 @@ P2.3 的字速半边交付；来源字体面保持显式近似，P0 三示例与
 - 门禁：cargo test -p nir-compiler 135 项全绿（batch-61-compiler-test.log）、cargo xtask test（47 项能力一一对应核对，batch-61-xtask-test.log）、Clippy 全目标通过（batch-61-clippy.log，现存警告容忍）。本批不触及 Player/格式/编译器运行时代码，按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点随批次 58 整套（44 项全绿）成立。
 
 P0.1 大部分交付；样例 C（页签设置/存档/历史，player 级验证）与 P0.2 完整版本/限额矩阵待批次 62，KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-61-*.log。契约见 docs/NIR-NEXT-P0-BASELINE.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 62：中性样例 C 与 P0.2 版本/限额矩阵（P0.1/P0.2 收口）
+
+- 样例 C examples/voyage-log（夜航日志）：单页三页签（设置/存档/历史）系统页。enum/int/bool 局部值与 set_local 页签切换、visible_when 条件页、text_local/text_preference/text_slot 三种动态文字；设置行以 stack 容器纵向排列；值控件覆盖偏好滑条（字速/音乐音量）、reduced_motion 开关、局部 bool 开关与局部有界 int 滑条（无图片依赖）；存档页 0–2 槽位局部选择 + save_slot/load_slot 局部槽位解析；历史页固定行窗口（limit 2）+ history_page 更早/更近分页；标题页 push_menu 进入面板，menu_overlay 使剧情内菜单键直达同一页。七项能力（ui.menu-state/values/services/storage/history/navigation/stack.v1）全部由编译器按实际使用推导，样例走完整作者管线（1 函数 6 cues 两 locale，24 objects/17,357,528 bytes）。
+- player 级验收（p0_examples.rs 扩至 5 项）：新测试以与 nir-player 套件同契约的驱动 harness（action/settle/hit/tap/commit_value/advance_pages）走完——标题 push 保持 Title 屏仅加深层（push_menu 只换活动页不改屏幕）、设置页签交互性与隐藏页命中排除、back 恢复；NewGame 后推进 4 页（历史含正在揭示页共 5 行）；覆盖页以 Menu 屏深度 0 打开并暂停剧情；值提交写偏好与局部（局部 glow 滑条 44→40 按 step 10 向下吸附）；存档页槽位局部 Int(2) 解析进 Save 事务（slot 2/expected_revision 0/job）并经 Saved 回执收尾；历史页偏移分页至最旧端钳制（钳制位按钮经 menu_service_enabled 禁用、hit 返回 None，以禁用检测断言边界而非期待空点击）再翻回 0；关闭恢复 Story 同页、解除暂停、无 outcome。开发期四轮失败日志（借用检查/屏幕断言/凭据重放/历史钳制）保留为 batch-62-p0-*-run.log。
+- P0.2 交付 docs/NIR-NEXT-VERSION-LIMITS.md：版本矩阵（source 1 / runtime 2 / 内容包 2 / 快照 2（v1 拒绝）/ 各 TOML format 1 / 导入报告 2（UI 报告 3）/ 字体工具链串 / 宿主协议 nir-player/0.1 + web-v1 / LSB116·LPB116·LPM106·Gale105-106 / preferences 无版本号补默认）；语义状态表（任务终态原因、目标身份四域、时间域与前台令牌、源页边界三分、输入消费四元身份 + 菜单 (instance, revision, control) 凭据、ImageMenuAction 18 变体白名单、Replay 三相状态表、存档 CAS 事务）；数量上限矩阵逐项锚定代码常量（MAX_TASKS 256、快照任务 512、帧 64、节点 1024、输入 16 MiB、内存账本 256 MiB、组合深度 8/叶子 256、菜单元素 256/文字承载 64/层级 8/导航父页 8/局部 32/枚举 32/条件 16、几何 8192/Stack gap 0–1024 累计 8192、历史 1000 条/窗口行 1–16/偏移 0–999/翻页 |δ|≤16、fade ≤2 s/元素轨道 128 (0,2 s]、gain 0–4/补间与停止 ≤60 s（零时长合法）/窗口揭示 (0,60 s]、导入表达式 64 指令/256 节点/16 KiB、转换媒体 ≤1 GiB、来源字速 0..=640 ms、偏好钳制域），未设独立上限项（函数/块/页数/正文长度/快照字节）如实标注间接约束；source/runtime/content/snapshot/preferences/schema/host protocol 逐项影响表与「只有实际变化才升级、旧文件缺省行为不改」承诺。
+- 文档同步：P0-BASELINE N08 行收口、样例 C 行落地（覆盖需求与两项测试载体）、§4 重建程序纳入 voyage-log、§5 P0.2 指针改为已交付、§6 追加批次 62 基线记录；PROGRESS P0 行更新。
+- 门禁：`cargo test -p nir-compiler` 137 项通过（5 项私有来源忽略，p0_examples 5 项）；样例 C `novelc resolve → check --locked → test → build --locked` 全通过；`cargo xtask test`（依赖架构 18 包 PASS、能力发行清单 47 项一一对应 PASS）；`cargo clippy --workspace --all-targets --locked` 通过（19 处现存警告容忍，与本批文件无关）。本批不触及 Player/Presentation 运行时代码（仅作 nir-compiler dev-dep 引用），按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点仍随批次 58 整套成立。
+
+P0.1/P0.2 收口；KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-62-compiler-test.log、batch-62-p0-final.log、batch-62-novelc-pipeline.log、batch-62-xtask-test.log、batch-62-clippy.log（本地保留）。契约见 docs/NIR-NEXT-P0-BASELINE.md、docs/NIR-NEXT-VERSION-LIMITS.md。完整 P0–P6 计划未完成；未提交或推送。

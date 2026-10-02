@@ -1,0 +1,8 @@
+format = 1
+id = "tour"
+entry = "main"
+text_locale = "zh-Hans"
+steps = []
+
+[expect]
+outcome = "completed"
