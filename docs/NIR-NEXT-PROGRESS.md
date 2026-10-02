@@ -22,7 +22,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 
 | 计划 | 状态 |
 | --- | --- |
-| P0 来源基线、三例、完整版本/限额矩阵 | 部分：已有代码盘点和回归基线；第二来源认证与三个完整新样例未完成 |
+| P0 来源基线、三例、完整版本/限额矩阵 | 大部分完成：N01–N10/R01–R06 账本与中性样例 A（夜灯书页）/B（回想图集）已交付（批次 61，docs/NIR-NEXT-P0-BASELINE.md）；样例 C（页签设置/存档/历史）、P0.2 完整版本/限额矩阵待批次 62，KAG 第二来源认证待批次 63 |
 | P1.1 播放实例和终态原因 | 已有实例协议上补原因及验证；跨设备实测继续验收 |
 | P1.2 类型化目标 | 计划所列四个域均已接入共享求值：场景节点与消息根（Core 故事轨道），AudioInstance 实例增益补间（`audio.gain-tween.v1`，Core 轨道）与 ViewElement 菜单元素动画（`ui.menu-element-tween.v1`，Player 瞬态）于批次 58 交付；跨设备实测继续验收 |
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
@@ -702,3 +702,14 @@ P4 的来源效果映射半边交付；悬停音效/动画光标保持显式近�
 - 文档同步：IMPORT.md（对白映射句、近似规则清单、import-defaults 字段说明）、READING-SEMANTICS.md（LiveNovel 配置映射一节）。
 
 P2.3 的字速半边交付；来源字体面保持显式近似，P0 三示例与版本上限矩阵、来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-60-*.log。契约见 IMPORT.md、READING-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 61：P0 基线账本与中性样例 A/B（P0.1）
+
+- 新增 docs/NIR-NEXT-P0-BASELINE.md：需求账本 N01–N10（对应计划 §3 阶段表与 §5–§9 验收条款，逐项状态/批次/常设证据载体，Windows 原生一律待验证）；回归账本 R01–R06（计划 P0.1「已修复六项回归」，锚定仍在本仓库运行的常设测试：8c44ace 三项 player 资源生命周期/预约/准入重试 + 次要指针输入路由、e9612c2 预览连接风暴、32e36d8 Web 设备丢失；95cbf6e Windows 构建支持脚注不计运行时回归）；验收样例清单与素材/字体重建程序；P0.2 版本/限额矩阵与 KAG 第二来源认证指针化为待批次 62/63。
+- 新增生成器 scripts/make_p0_examples.py（纯标准库，确定性原创内容）：自带 PNG/WAV 编码器、UI 副本字符闭包扫描（nir-presentation .ftl + src + ASCII + 标点 + 正文 + 标题）、与 nir-format 逐字节一致的文本账本 digest 算法。样例 A examples/reading-lamp（夜灯书页）：页内 Gate×2（chime/rest marker）后继续同一对白、显式语音绑定 sampled_remaining、页尾 50 ms 语音淡出停止、wipe/dissolve 消息窗口显隐、舞台转场、BGM gain 0.7、固定 Auto 策略、类型化选择结果写入 kept 变量（sunrise/rest 两场景含 typed 断言）。样例 B examples/replay-atlas（回想图集）：标题图片菜单 + 回想图集子菜单（profile 守卫：atlas.north 剧情授予、atlas.south 恒锁）、Replay 动作入口函数以 replay_completed 返回、页面点击音/循环页面音乐/进入关闭转场/逐元素进入动画。
+- 字体子集：母本 templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf（静态 CFF1，OFL-1.1），经编译器自身 fonts::prepare()（vendored hb-subset）按 assets/source/reader.chars.txt 生成两份 reader.otf 子集随仓库提交（152,972/141,340 字节）；OFL 全文与 credits/README.md（中文来源声明+重建指引）随样例提交。标题字符经 collect_strings 进入字体计划，须列入字符表（E_FONT_COVERAGE 教训）。
+- 新增常设集成测试 crates/nir-compiler/tests/p0_examples.rs（3 项）：A/B 加载+编译+validate+场景运行与能力推导精确断言（A：voice-binding/voice-timer/window-transition/audio.gain/audio.stop/typed-result/auto-delay-policy；B：ui.replay/menu-effects/menu-transition/menu-element-tween）；B 的锁定不变量（授予集恰为 atlas.north）与 gallery 守卫双向断言；三个入口函数经 Core 驱动至 replay_completed/completed 终态。nir-core 已是 nir-compiler 常规依赖，无需新增 dev-dep。
+- 两样例走完整作者管线：novelc resolve → check --locked → test → build --locked 全通过（A 1 函数/10 cues，B 3 函数/8 cues，两 locale）；game.lock 随仓库提交，.nir/ 与 dist 产物按既有 gitignore 排除。开发期教训：ImageMenu.buttons 无 serde 缺省必须显式空数组；title_scene 须指向存在的场景（空场景即导入器惯例）；op id 同函数内须唯一；Expect 仅 outcome/affection/variables 三字段（typed 断言入 [expect.variables]）；ui.replay.v1 仅由 Replay/ExitReplay 动作推导（Entry 动作不推导——语义上Entry销毁启动会话，Replay才是隔离回想）。
+- 门禁：cargo test -p nir-compiler 135 项全绿（batch-61-compiler-test.log）、cargo xtask test（47 项能力一一对应核对，batch-61-xtask-test.log）、Clippy 全目标通过（batch-61-clippy.log，现存警告容忍）。本批不触及 Player/格式/编译器运行时代码，按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点随批次 58 整套（44 项全绿）成立。
+
+P0.1 大部分交付；样例 C（页签设置/存档/历史，player 级验证）与 P0.2 完整版本/限额矩阵待批次 62，KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-61-*.log。契约见 docs/NIR-NEXT-P0-BASELINE.md。完整 P0–P6 计划未完成；未提交或推送。

@@ -1,0 +1,11 @@
+format = 1
+
+[defaults]
+font_scale = 1.0
+bgm_volume = 0.4
+voice_volume = 0.9
+sfx_volume = 0.6
+reduced_motion = false
+auto_delay_us = "1200000"
+prefetch_content = true
+prefetch_media = true

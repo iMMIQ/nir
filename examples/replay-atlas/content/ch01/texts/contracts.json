@@ -1,0 +1,37 @@
+{
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "grant": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "rn1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "rn2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "rs1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  }
+}

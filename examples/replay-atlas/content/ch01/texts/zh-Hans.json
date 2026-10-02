@@ -1,0 +1,62 @@
+{
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "长廊尽头的画框还蒙着布。你在第一幅前停下脚步。",
+        "emphasis": false
+      }
+    ]
+  },
+  "grant": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "布被揭开，北岸的芦苇在画里弯下腰。它进入了你的回想。",
+        "emphasis": false
+      }
+    ]
+  },
+  "rn1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "北岸的风把画里的芦苇吹弯了。",
+        "emphasis": false
+      }
+    ]
+  },
+  "rn2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "你记得那天，水鸟贴着浪飞。",
+        "emphasis": false
+      }
+    ]
+  },
+  "rs1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "南径的岔路口，石阶还留着雨色。",
+        "emphasis": false
+      }
+    ]
+  }
+}

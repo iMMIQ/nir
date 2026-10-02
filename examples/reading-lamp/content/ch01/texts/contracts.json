@@ -1,0 +1,69 @@
+{
+  "speaker.lamp": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "note": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [
+      "chime"
+    ],
+    "params": {}
+  },
+  "spoken": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [
+      "rest"
+    ],
+    "params": {}
+  },
+  "ask": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "opt.bright": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "opt.dim": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "bright_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "dim_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  }
+}

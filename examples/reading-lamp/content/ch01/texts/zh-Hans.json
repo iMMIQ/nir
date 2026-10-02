@@ -1,0 +1,130 @@
+{
+  "speaker.lamp": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "灯",
+        "emphasis": false
+      }
+    ]
+  },
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "台灯亮起来的时候，房间退成一小圈暖色。你翻开摊在桌上的笔记。",
+        "emphasis": false
+      }
+    ]
+  },
+  "note": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "风从窗缝里挤进来，纸页轻轻响了一声。",
+        "emphasis": false
+      },
+      {
+        "type": "gate",
+        "id": "chime"
+      },
+      {
+        "type": "text",
+        "id": "tail",
+        "text": "你伸手压住那一页，继续读下去。",
+        "emphasis": false
+      }
+    ]
+  },
+  "spoken": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "灯芯轻轻一跳：「这页记的，是起风的那天。」",
+        "emphasis": false
+      },
+      {
+        "type": "gate",
+        "id": "rest"
+      },
+      {
+        "type": "text",
+        "id": "tail",
+        "text": "「再往后读，天就要亮了。」",
+        "emphasis": false
+      }
+    ]
+  },
+  "ask": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "天色将明未明。要把这盏灯留到日出吗？",
+        "emphasis": false
+      }
+    ]
+  },
+  "opt.bright": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "让灯亮到日出",
+        "emphasis": false
+      }
+    ]
+  },
+  "opt.dim": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "现在熄灯安睡",
+        "emphasis": false
+      }
+    ]
+  },
+  "bright_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "灯光落在最后一行字上，像一句没有说完的晚安。",
+        "emphasis": false
+      }
+    ]
+  },
+  "dim_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "你合上笔记。黑暗温柔地接管了房间。",
+        "emphasis": false
+      }
+    ]
+  }
+}

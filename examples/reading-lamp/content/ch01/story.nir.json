@@ -1,0 +1,608 @@
+{
+  "fragment_format": 1,
+  "variables": {
+    "kept": {
+      "type": "string",
+      "value": ""
+    }
+  },
+  "functions": {
+    "main": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [
+            {
+              "id": "window.open",
+              "operation": {
+                "type": "dialogue_visibility",
+                "visible": true,
+                "transition": {
+                  "type": "wipe",
+                  "direction": "bottom_to_top"
+                },
+                "duration_us": "400000"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "activate",
+            "cue": "open",
+            "next": "show"
+          }
+        },
+        "show": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "intro",
+            "next": "wait_intro"
+          }
+        },
+        "wait_intro": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "evening",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "evening": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "evening",
+            "next": "wait_evening"
+          }
+        },
+        "wait_evening": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "stage",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "note_page",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "note_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "note",
+            "next": "gate_chime"
+          }
+        },
+        "gate_chime": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "marker",
+                  "id": "chime"
+                }
+              }
+            ],
+            "next": "chime_page",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "chime_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "chime",
+            "next": "wait_chime"
+          }
+        },
+        "wait_chime": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "chime",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "note_resume",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "note_resume": {
+          "ops": [
+            {
+              "id": "note.continue",
+              "operation": {
+                "type": "dialogue_continue",
+                "task": "line"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "spoken_page",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "spoken_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "spoken",
+            "next": "bind_voice"
+          }
+        },
+        "bind_voice": {
+          "ops": [
+            {
+              "id": "voice.bind",
+              "operation": {
+                "type": "dialogue_voice",
+                "task": "line",
+                "voice": "voice",
+                "wait": "sampled_remaining"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "goto",
+            "target": "gate_rest"
+          }
+        },
+        "gate_rest": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "marker",
+                  "id": "rest"
+                }
+              }
+            ],
+            "next": "rest_hide",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "rest_hide": {
+          "ops": [
+            {
+              "id": "window.hide",
+              "operation": {
+                "type": "dialogue_visibility",
+                "visible": false,
+                "transition": {
+                  "type": "dissolve"
+                },
+                "duration_us": "300000"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "goto",
+            "target": "rest_show"
+          }
+        },
+        "rest_show": {
+          "ops": [
+            {
+              "id": "window.reopen",
+              "operation": {
+                "type": "dialogue_visibility",
+                "visible": true,
+                "transition": {
+                  "type": "wipe",
+                  "direction": "bottom_to_top"
+                },
+                "duration_us": "350000"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "goto",
+            "target": "spoken_resume"
+          }
+        },
+        "spoken_resume": {
+          "ops": [
+            {
+              "id": "spoken.continue",
+              "operation": {
+                "type": "dialogue_continue",
+                "task": "line"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "voice_out",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "voice_out": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "voice_stop",
+            "next": "ask_page"
+          }
+        },
+        "ask_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "ask",
+            "next": "wait_ask"
+          }
+        },
+        "wait_ask": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "choose",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "choose": {
+          "ops": [],
+          "terminator": {
+            "type": "interact",
+            "choice": "keep",
+            "branches": {
+              "bright": "bright_page",
+              "dim": "dim_page"
+            },
+            "on_empty": "failed",
+            "result": "kept"
+          }
+        },
+        "bright_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "bright_line",
+            "next": "wait_bright"
+          }
+        },
+        "wait_bright": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "bright_end",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "bright_end": {
+          "ops": [
+            {
+              "id": "unlock.sunrise",
+              "operation": {
+                "type": "profile_merge",
+                "key": "lamp.sunrise"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "end",
+            "outcome": "lamp_lit"
+          }
+        },
+        "dim_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "dim_line",
+            "next": "wait_dim"
+          }
+        },
+        "wait_dim": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "dim_end",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "dim_end": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "lamp_dimmed"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    }
+  },
+  "scenes": {
+    "desk": [
+      {
+        "id": "background",
+        "asset": "bg.desk",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "window": [
+      {
+        "id": "background",
+        "asset": "bg.window",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ]
+  },
+  "cues": {
+    "open": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "desk",
+            "duration_us": "0"
+          }
+        },
+        {
+          "id": "music",
+          "scope": "session",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.bgm",
+            "bus": "bgm",
+            "looped": true,
+            "gain": 0.7
+          }
+        }
+      ]
+    },
+    "evening": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "window",
+            "duration_us": "900000"
+          }
+        }
+      ]
+    },
+    "intro": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "intro",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "note": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "note",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "chime": {
+      "effects": [
+        {
+          "id": "chime",
+          "scope": "interaction",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.chime",
+            "bus": "sfx",
+            "looped": false
+          }
+        }
+      ]
+    },
+    "spoken": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "spoken",
+            "speaker": "speaker.lamp",
+            "reveal_us": "40000"
+          }
+        },
+        {
+          "id": "voice",
+          "scope": "interaction",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.voice",
+            "bus": "voice",
+            "looped": false
+          }
+        }
+      ]
+    },
+    "voice_stop": {
+      "effects": [
+        {
+          "id": "voice_stop",
+          "scope": "session",
+          "effect": {
+            "type": "audio_stop",
+            "target": "voice",
+            "duration_us": "50000"
+          }
+        }
+      ]
+    },
+    "ask": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "ask",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "bright_line": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "bright_line",
+            "speaker": "speaker.lamp",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "dim_line": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "dim_line",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    }
+  },
+  "choices": {
+    "keep": {
+      "options": [
+        {
+          "id": "bright",
+          "text": "opt.bright",
+          "value": {
+            "type": "string",
+            "value": "sunrise"
+          }
+        },
+        {
+          "id": "dim",
+          "text": "opt.dim",
+          "value": {
+            "type": "string",
+            "value": "rest"
+          }
+        }
+      ]
+    }
+  }
+}

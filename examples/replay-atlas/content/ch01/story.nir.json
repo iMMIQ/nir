@@ -1,0 +1,437 @@
+{
+  "fragment_format": 1,
+  "variables": {},
+  "functions": {
+    "main": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "open",
+            "next": "intro_page"
+          }
+        },
+        "intro_page": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "intro",
+            "next": "wait_intro"
+          }
+        },
+        "wait_intro": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "grant_page",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "grant_page": {
+          "ops": [
+            {
+              "id": "unlock.north",
+              "operation": {
+                "type": "profile_merge",
+                "key": "atlas.north"
+              }
+            }
+          ],
+          "terminator": {
+            "type": "activate",
+            "cue": "grant",
+            "next": "wait_grant"
+          }
+        },
+        "wait_grant": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "done",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "done": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "completed"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    },
+    "replay_north": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "rn_open",
+            "next": "wait_open"
+          }
+        },
+        "wait_open": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "stage",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page1",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page1": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "rn1",
+            "next": "wait1"
+          }
+        },
+        "wait1": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page2",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page2": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "rn2",
+            "next": "wait2"
+          }
+        },
+        "wait2": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "done",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "done": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "replay_completed"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    },
+    "replay_south": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "rs_open",
+            "next": "wait_open"
+          }
+        },
+        "wait_open": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "stage",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page1",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page1": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "rs1",
+            "next": "wait1"
+          }
+        },
+        "wait1": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "done",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "done": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "replay_completed"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    }
+  },
+  "scenes": {
+    "hall": [
+      {
+        "id": "background",
+        "asset": "bg.hall",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "north": [
+      {
+        "id": "background",
+        "asset": "bg.north",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "south": [
+      {
+        "id": "background",
+        "asset": "bg.south",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "title": []
+  },
+  "cues": {
+    "open": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "hall",
+            "duration_us": "0"
+          }
+        },
+        {
+          "id": "music",
+          "scope": "session",
+          "effect": {
+            "type": "audio",
+            "asset": "audio.bgm",
+            "bus": "bgm",
+            "looped": true,
+            "gain": 0.9
+          }
+        }
+      ]
+    },
+    "intro": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "intro",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "grant": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "grant",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "rn_open": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "north",
+            "duration_us": "600000"
+          }
+        }
+      ]
+    },
+    "rn1": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "rn1",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "rn2": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "rn2",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "rs_open": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "south",
+            "duration_us": "600000"
+          }
+        }
+      ]
+    },
+    "rs1": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "rs1",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    }
+  },
+  "choices": {}
+}

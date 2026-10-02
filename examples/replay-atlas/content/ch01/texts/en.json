@@ -1,0 +1,62 @@
+{
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The frames at the end of the corridor are still veiled. You stop before the first one.",
+        "emphasis": false
+      }
+    ]
+  },
+  "grant": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The cloth lifts; reeds on the north shore bend inside the picture. It joins your memories.",
+        "emphasis": false
+      }
+    ]
+  },
+  "rn1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The north wind bends the painted reeds.",
+        "emphasis": false
+      }
+    ]
+  },
+  "rn2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "You remember seabirds skimming the waves that day.",
+        "emphasis": false
+      }
+    ]
+  },
+  "rs1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "At the south fork, the stone steps still hold the rain.",
+        "emphasis": false
+      }
+    ]
+  }
+}
