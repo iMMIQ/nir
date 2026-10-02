@@ -43,7 +43,7 @@
 
 GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引用、透明度、调色板、图层合成与尾部矩形列表。动画 GAL、LCM 视频和归档解包尚未支持；本配置不会导入未引用的动画光标。解码由 Rust 在同一个 `novelc` 内完成，没有外部媒体进程。
 
-**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。原 wipe、声音／消息框渐变、回想菜单音乐、菜单音效、动画光标、逐字符原字体样式尚未完整复刻。报告逐项列出这些差异；不是无差异转换认证。
+**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。标题／回想选择音与回想 BGM、消息框渐变和 wipe 以有界 NIR 机制映射（账本记为 adapted）；悬停音效、动画光标和逐字符原字体样式尚未复刻。报告逐项列出这些差异；不是无差异转换认证。
 
 ### 映射级别、证据与近似接受（报告格式 2）
 
@@ -58,10 +58,10 @@ GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引
 ```sh
 ./novelc import livemaker "/path/to/extracted-game" --out imported-story \
   --game-id org.example.story --title "My Story" \
-  --accept-approximate livenovel.menu-sfx,livenovel.text.reveal
+  --accept-approximate livenovel.menu-hover,livenovel.text.reveal
 ```
 
-拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-sfx`（菜单音效／动画光标不复现）、`livenovel.text.reveal`（字体样式与字速单位未映射）。`livenovel.textbox.fade` 已升为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.reveal`（字体样式与字速单位未映射）。`livenovel.menu-sfx` 已升为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 

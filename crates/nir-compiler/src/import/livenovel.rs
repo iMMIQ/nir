@@ -6,7 +6,10 @@ use super::{
     SourceLocation,
 };
 use anyhow::{bail, ensure, Context, Result};
-use nir_format::{ImageButton, ImageMenu, ImageMenuAction, MenuContent, MenuElement, Node, Span};
+use nir_format::{
+    AudioBus, ImageButton, ImageMenu, ImageMenuAction, MenuContent, MenuEffects, MenuElement,
+    MenuMusic, Node, Span,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -337,6 +340,7 @@ struct Adapter {
     variables: BTreeMap<String, Value>,
     choice_sites: usize,
     fade_sites: usize,
+    menu_sounds: usize,
     source_map: BTreeMap<String, SourceLocation>,
     warnings: BTreeSet<String>,
     counter: usize,
@@ -412,9 +416,124 @@ fn selection_dispatch(e: &Expression) -> Option<&str> {
 /// call parameters, parks until the player picks an option, and leaves the
 /// result in the 選択値 variable.
 const CHOICE_EXECUTOR: &str = "ノベルシステム/選択メニュー/■選択実行.lsb";
+/// The preview-menu variant of the choice executor arms the LPM title menu;
+/// its call parameters carry the menu's sound effects — hover at index 4,
+/// select at index 5 (decoded-source evidence in both executor pages).
+const PREVIEW_EXECUTOR: &str = "プレビューメニュー\\■選択実行.lsb";
 /// The stock selection result variable (engine convention, like
 /// __メッセージ終了).
 const CHOICE_RESULT: &str = "選択値";
+/// The title menu's select sound: the preview choice-executor call plays it
+/// when a title button is accepted. Only the select parameter has a NIR
+/// counterpart — the page's click effect; the hover parameter stays an
+/// accepted approximation in the ledger.
+fn title_select_sound(script: &Script) -> Result<Option<String>> {
+    let mut found: Option<Option<String>> = None;
+    for c in &script.commands {
+        let Body::Call { target, params, .. } = &c.body else {
+            continue;
+        };
+        if !target.page.ends_with(PREVIEW_EXECUTOR) {
+            continue;
+        }
+        ensure!(
+            found.is_none(),
+            "E_IMPORT_LIVENOVEL: ambiguous title menu call"
+        );
+        let parameter = params
+            .get(5)
+            .context("E_IMPORT_LIVENOVEL: title menu select sound parameter missing")?;
+        let Literal::String(file) = parameter
+            .literal
+            .as_ref()
+            .context("E_IMPORT_LIVENOVEL: title menu select sound not a literal")?
+        else {
+            bail!("E_IMPORT_LIVENOVEL: title menu select sound not a string");
+        };
+        found = Some((!file.is_empty()).then(|| file.replace('\\', "/")));
+    }
+    Ok(found.flatten())
+}
+/// The replay grid's select sound: the thumbnail mouse handler creates one
+/// "SE" object per labeled section — hover before any label, select under the
+/// 選択 label — and the select sound is what plays when an entry is accepted.
+fn replay_select_sound(script: &Script) -> Result<Option<String>> {
+    let mut label = None;
+    let mut select = None;
+    for c in &script.commands {
+        match &c.body {
+            Body::Label(name) => label = Some(name.as_str()),
+            Body::Object(fields) if c.kind == 42 => {
+                let name = match fields.get(&1).and_then(|e| e.literal.as_ref()) {
+                    Some(Literal::String(s)) => s.as_str(),
+                    _ => continue,
+                };
+                if name != "SE" || label != Some("選択") {
+                    continue;
+                }
+                match fields.get(&3).and_then(|e| e.literal.as_ref()) {
+                    Some(Literal::String(file)) if !file.is_empty() => {
+                        ensure!(
+                            select.is_none(),
+                            "E_IMPORT_LIVENOVEL: ambiguous replay select sound"
+                        );
+                        select = Some(file.replace('\\', "/"));
+                    }
+                    Some(Literal::String(_)) => {}
+                    _ => bail!("E_IMPORT_LIVENOVEL: replay select sound not a literal"),
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(select)
+}
+/// The replay screen's looping menu music: ■開始 loads it through the stock
+/// BGM再生 helper in ■関数.lsb with the sound file as the call's only
+/// parameter. The helper section's line range keeps the match on convention
+/// rather than on any call that happens to carry a string.
+fn replay_bgm(open: &Script, functions: &Script) -> Result<Option<String>> {
+    let mut labels = vec![];
+    for c in &functions.commands {
+        if let Body::Label(name) = &c.body {
+            labels.push((name.clone(), c.line));
+        }
+    }
+    let position = labels
+        .iter()
+        .position(|(name, _)| name == "BGM再生")
+        .context("E_IMPORT_LIVENOVEL: BGM再生 helper missing")?;
+    let start = labels[position].1;
+    let end = labels.get(position + 1).map(|(_, line)| *line);
+    let mut found = None;
+    for c in &open.commands {
+        let Body::Call { target, params, .. } = &c.body else {
+            continue;
+        };
+        if !target.page.ends_with("■関数.lsb")
+            || target.line < start
+            || end.is_some_and(|end| target.line >= end)
+        {
+            continue;
+        }
+        ensure!(
+            params.len() == 1,
+            "E_IMPORT_LIVENOVEL: replay music helper call parameters"
+        );
+        match params[0].literal.as_ref() {
+            Some(Literal::String(file)) if !file.is_empty() => {
+                ensure!(
+                    found.is_none(),
+                    "E_IMPORT_LIVENOVEL: ambiguous replay menu music"
+                );
+                found = Some(file.replace('\\', "/"));
+            }
+            Some(Literal::String(_)) => {}
+            _ => bail!("E_IMPORT_LIVENOVEL: replay menu music not a literal"),
+        }
+    }
+    Ok(found)
+}
 /// One stock dispatch option: its literal text and the label index it jumps to.
 type DispatchOption = (String, usize);
 /// The compatibility ledger for this profile: one entry per mapping rule the
@@ -423,7 +542,11 @@ type DispatchOption = (String, usize);
 /// scripts (this corpus) or the documented LSB/GAL/LPM formats; none claims
 /// original-runtime or cross-backend verification, which stays an open item
 /// recorded through the fidelity warnings.
-pub(super) fn mapping_ledger(choice_sites: usize, fade_sites: usize) -> Vec<ImportMapping> {
+pub(super) fn mapping_ledger(
+    choice_sites: usize,
+    fade_sites: usize,
+    menu_sounds: usize,
+) -> Vec<ImportMapping> {
     let entry = |rule: &str,
                  level: &str,
                  evidence: &str,
@@ -460,12 +583,27 @@ pub(super) fn mapping_ledger(choice_sites: usize, fade_sites: usize) -> Vec<Impo
         ),
         entry(
             "livenovel.menu-sfx",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            &format!(
+                "Title and replay-grid select sounds map to the generated pages' click effect and the replay screen's BGM to looping page music ({menu_sounds} page effect(s)); volumes ride the sfx/bgm bus defaults decoded from live.lpb."
+            ),
+            if menu_sounds > 0 {
+                &["ui.menu-effects.v1"]
+            } else {
+                &[] as &[&str]
+            },
+            None,
+        ),
+        entry(
+            "livenovel.menu-hover",
             "approximate",
             "decoded-source",
             "LSB116",
-            "Menu sound effects and animated cursors are not reproduced.",
+            "Menu hover sounds and animated cursors are not reproduced.",
             &[],
-            Some("Excluded from the compatibility claim; no NIR counterpart is mapped yet."),
+            Some("Excluded from the compatibility claim; NIR menus have no hover-driven audio or custom pointer cursors."),
         ),
         entry(
             "livenovel.title-menu",
@@ -641,6 +779,7 @@ impl Adapter {
             variables: BTreeMap::new(),
             choice_sites: 0,
             fade_sites: 0,
+            menu_sounds: 0,
             source_map: BTreeMap::new(),
             warnings: BTreeSet::new(),
             counter: 0,
@@ -1387,7 +1526,7 @@ impl Adapter {
         let first = first.context("E_IMPORT_LIVENOVEL: missing new-game route")?;
         self.textbox = self.image("グラフィック/立ちポーズ/box.gal")?.0;
         self.warnings.insert("Stock LiveNovel startup, window/system scripts and asynchronous message handshake are replaced by NIR. This profile targets its episode/replay/choice convention, not arbitrary LSB expressions.".into());
-        self.warnings.insert("Save/load, history and settings use NIR UI and save format; LiveMaker save files are not compatible. Menu sound effects and animated cursors are not yet reproduced.".into());
+        self.warnings.insert("Save/load, history and settings use NIR UI and save format; LiveMaker save files are not compatible. Title/replay select sounds and the replay BGM map to page effects; hover sounds and animated cursors are not reproduced.".into());
         self.warnings.insert("Text uses the bundled NIR Japanese font and a 32 ms reveal interval; the source text-speed value is retained in import-defaults.json but its unit and source font/style are not yet mapped.".into());
         self.warnings.insert("Source Auto uses a sampled remaining-voice timer plus fixed delay. The imported policy samples the bound voice duration/position and voice-volume preference once per Auto cycle; original device timing and unsupported simultaneous source voice channels remain outside certification.".into());
         let mut routes = Routes {
@@ -1414,6 +1553,43 @@ impl Adapter {
         // Build replay wrappers from the original dispatcher, preserving its order.
         let (_, replay) = self.source.read("シーン回想.lsb")?;
         let (_, replay_ui) = self.source.read("ノベルシステム/シーン回想/■開始.lsb")?;
+        // The replay page's stock chrome carries its own sounds: the thumbnail
+        // grid's select SE and the screen's looping BGM through the BGM再生
+        // helper. Missing conventions lower to no effects; recognized-but-
+        // malformed ones fail the import.
+        let (_, mouse) =
+            self.source
+                .read("ノベルシステム/シーン回想/サムネイル・マウス処理.lsb")?;
+        let (_, stock) = self.source.read("ノベルシステム/■関数.lsb")?;
+        let replay_click = replay_select_sound(&mouse)?;
+        let replay_music = replay_bgm(&replay_ui, &stock)?;
+        let replay_effects = if replay_click.is_none() && replay_music.is_none() {
+            None
+        } else {
+            let click = replay_click
+                .map(|path| self.sound(&path, 1.))
+                .transpose()?;
+            let music = match replay_music {
+                Some(path) => {
+                    let asset = self.sound(&path, 1.)?;
+                    self.menu_sounds += 1;
+                    Some(MenuMusic {
+                        asset,
+                        bus: AudioBus::Bgm,
+                        gain: 1.,
+                    })
+                }
+                None => None,
+            };
+            self.menu_sounds += usize::from(click.is_some());
+            Some(MenuEffects {
+                enter: None,
+                close: None,
+                click,
+                music,
+                elements: vec![],
+            })
+        };
         let ids = replay_ui
             .commands
             .iter()
@@ -1534,7 +1710,7 @@ impl Adapter {
                 elements: buttons.into_iter().map(menu_element).collect(),
                 background,
                 buttons: vec![],
-                effects: None,
+                effects: replay_effects,
             },
         );
         let (background, _) = self.image("グラフィック/menu/menu2.gal")?;
@@ -1566,6 +1742,22 @@ impl Adapter {
                 requires: None,
             });
         }
+        // The title menu's select sound arms the page's click effect. The
+        // preview executor's hover parameter has no NIR counterpart and stays
+        // in the accepted menu-hover approximation.
+        let title_effects = match title_select_sound(&script)? {
+            Some(path) => {
+                self.menu_sounds += 1;
+                Some(MenuEffects {
+                    enter: None,
+                    close: None,
+                    click: Some(self.sound(&path, 1.)?),
+                    music: None,
+                    elements: vec![],
+                })
+            }
+            None => None,
+        };
         self.menus.insert(
             "title".into(),
             ImageMenu {
@@ -1575,7 +1767,7 @@ impl Adapter {
                 elements: buttons.into_iter().map(menu_element).collect(),
                 background,
                 buttons: vec![],
-                effects: None,
+                effects: title_effects,
             },
         );
         self.warnings.insert("Replay thumbnails retain original grid coordinates. Locked thumbnails preserve alpha with black RGB; a NIR return button and system-menu access remain available for touch/keyboard navigation.".into());
@@ -1689,7 +1881,7 @@ pub(super) fn convert(
     } else {
         "Linear LiveNovel route,".into()
     };
-    let mappings = mapping_ledger(adapter.choice_sites, adapter.fade_sites);
+    let mappings = mapping_ledger(adapter.choice_sites, adapter.fade_sites, adapter.menu_sounds);
     let mut report=ImportReport{format:2,engine:"livemaker-livenovel116".into(),status:ImportReport::status_from_mappings(&mappings).into(),written:false,errors:0,approximate:mappings.iter().filter(|m|m.approximate()).count(),text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings and per-rule mappings.",route_shape,adapter.assets.len()),mappings,diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
     report.diagnostics.extend(ui.diagnostics());
     let staging = tempfile::Builder::new()
@@ -2669,4 +2861,187 @@ mod tests {
         assert!(err.contains("must end with Exit"), "{err}");
     }
 
+    /// The three stock menu-sound extractions: the title select sound from the
+    /// preview executor's sixth parameter, the replay select sound from the
+    /// 選択-labeled SE object, and the replay BGM from a call inside the
+    /// BGM再生 helper's line range. Absent conventions stay absent;
+    /// recognized-but-malformed ones fail instead of guessing.
+    #[test]
+    fn menu_sound_helpers_read_stock_conventions_and_refuse_malformed() {
+        use super::super::lsb::Reference;
+        let text = |v: &str| Expression {
+            literal: Some(Literal::String(v.into())),
+            operations: vec![],
+            functions: BTreeMap::new(),
+        };
+        let bare = || Expression {
+            literal: None,
+            operations: vec![],
+            functions: BTreeMap::new(),
+        };
+        let call = |page: &str, line: u32, params: Vec<Expression>| Body::Call {
+            target: Reference {
+                page: page.into(),
+                line,
+            },
+            condition: route::flag(),
+            has_params: true,
+            params,
+        };
+        let object = |name: &str, file: Expression| {
+            Body::Object(BTreeMap::from([(1, text(name)), (3, file)]))
+        };
+        let label = |name: &str, line: u32| route::command(3, line, Body::Label(name.into()));
+        let preview = "ノベルシステム\\プレビューメニュー\\■選択実行.lsb";
+        // Title: the sixth parameter is the select sound; paths normalize to '/'.
+        let title = route::script(vec![route::command(
+            5,
+            143,
+            call(
+                preview,
+                0,
+                vec![
+                    text("はじめから"),
+                    text("skin"),
+                    text("0"),
+                    text("0"),
+                    text("サウンド\\tm2_switch001.wav"),
+                    text("サウンド\\tm2_switch002.wav"),
+                ],
+            ),
+        )]);
+        assert_eq!(
+            title_select_sound(&title).unwrap().as_deref(),
+            Some("サウンド/tm2_switch002.wav")
+        );
+        // An absent call or an empty parameter means no sound, not a guess.
+        assert_eq!(
+            title_select_sound(&route::script(vec![route::exit(1)])).unwrap(),
+            None
+        );
+        assert_eq!(
+            title_select_sound(&route::script(vec![route::command(
+                5,
+                143,
+                call(preview, 0, vec![text(""); 6]),
+            )]))
+            .unwrap(),
+            None
+        );
+        // The story executor is a different page and never arms the title.
+        assert_eq!(
+            title_select_sound(&route::script(vec![route::choice_call(143)])).unwrap(),
+            None
+        );
+        for bad in [
+            // A preview call without the select parameter is malformed.
+            route::script(vec![route::command(5, 143, call(preview, 0, vec![]))]),
+            // So are non-string and non-literal parameters, and a second call.
+            route::script(vec![route::command(
+                5,
+                143,
+                call(preview, 0, vec![bare(); 6]),
+            )]),
+            route::script(vec![
+                route::command(5, 143, call(preview, 0, vec![text(""); 6])),
+                route::command(5, 150, call("プレビューメニュー\\■選択実行.lsb", 0, vec![text(""); 6])),
+            ]),
+        ] {
+            assert!(title_select_sound(&bad).is_err());
+        }
+        // Replay select: the SE object under the 選択 label, not the unlabeled
+        // hover object before it.
+        let mouse = route::script(vec![
+            route::command(42, 10, object("SE", text("サウンド\\tm2_switch001.wav"))),
+            label("選択", 11),
+            route::command(42, 12, object("SE", text("サウンド\\tm2_switch002.wav"))),
+        ]);
+        assert_eq!(
+            replay_select_sound(&mouse).unwrap().as_deref(),
+            Some("サウンド/tm2_switch002.wav")
+        );
+        assert_eq!(
+            replay_select_sound(&route::script(vec![route::command(
+                42,
+                10,
+                object("SE", text("サウンド\\tm2_switch001.wav")),
+            )]))
+            .unwrap(),
+            None,
+            "hover-only handlers carry no select sound"
+        );
+        assert_eq!(
+            replay_select_sound(&route::script(vec![
+                route::command(42, 9, object("BGM", text("サウンド\\x.ogg"))),
+                label("選択", 11),
+                route::command(42, 12, object("BGM", text("サウンド\\y.ogg"))),
+            ]))
+            .unwrap(),
+            None,
+            "only SE objects are the convention"
+        );
+        assert!(replay_select_sound(&route::script(vec![
+            label("選択", 11),
+            route::command(42, 12, object("SE", bare())),
+        ]))
+        .is_err());
+        // Replay BGM: the call into the BGM再生 section of ■関数.lsb.
+        let functions = route::script(vec![
+            label("BGM再生", 33),
+            route::command(42, 37, object("BGM", text("サウンド\\BGM054mama.ogg"))),
+            label("音量計算", 41),
+        ]);
+        let open = route::script(vec![route::command(
+            5,
+            100,
+            call(
+                "ノベルシステム\\■関数.lsb",
+                37,
+                vec![text("サウンド\\BGM054mama.ogg")],
+            ),
+        )]);
+        assert_eq!(
+            replay_bgm(&open, &functions).unwrap().as_deref(),
+            Some("サウンド/BGM054mama.ogg")
+        );
+        assert_eq!(
+            replay_bgm(
+                &route::script(vec![route::command(
+                    5,
+                    100,
+                    call("ノベルシステム\\■関数.lsb", 41, vec![text("x")]),
+                )]),
+                &functions,
+            )
+            .unwrap(),
+            None,
+            "calls outside the helper section are other helpers"
+        );
+        assert!(replay_bgm(&open, &route::script(vec![route::exit(1)])).is_err());
+        assert!(replay_bgm(
+            &route::script(vec![route::command(
+                5,
+                100,
+                call("ノベルシステム\\■関数.lsb", 37, vec![text("a"), text("b")]),
+            )]),
+            &functions,
+        )
+        .is_err());
+        assert!(replay_bgm(
+            &route::script(vec![
+                route::command(
+                    5,
+                    100,
+                    call("ノベルシステム\\■関数.lsb", 37, vec![text("a")]),
+                ),
+                route::command(
+                    5,
+                    101,
+                    call("ノベルシステム\\■関数.lsb", 39, vec![text("b")]),
+                ),
+            ]),
+            &functions,
+        )
+        .is_err());
+    }
 }

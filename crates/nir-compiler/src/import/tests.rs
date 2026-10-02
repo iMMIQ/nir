@@ -20,7 +20,7 @@ pub(super) fn options(source: &Path, out: &Path) -> ImportOptions {
 /// Every rule the fixtures lower at approximate level; keep in sync with the
 /// importers' mapping ledgers.
 pub(super) const APPROXIMATE_RULES: &[&str] = &[
-    "livenovel.menu-sfx",
+    "livenovel.menu-hover",
     "livenovel.text.reveal",
 ];
 pub(super) fn sdk() -> PathBuf {
@@ -351,8 +351,8 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    for (sites, fade_sites) in [(0, 0), (2, 0), (2, 3)] {
-        let ledger = livenovel::mapping_ledger(sites, fade_sites);
+    for (sites, fade_sites, menu_sounds) in [(0, 0, 0), (2, 0, 0), (2, 3, 0), (2, 3, 3)] {
+        let ledger = livenovel::mapping_ledger(sites, fade_sites, menu_sounds);
         assert!(ledger.len() >= 12);
         let mut rules = std::collections::BTreeSet::new();
         for m in &ledger {
@@ -405,6 +405,23 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
             fade_sites > 0,
             "the window-transition capability follows actual fade sites"
         );
+        let sfx = ledger
+            .iter()
+            .find(|m| m.rule == "livenovel.menu-sfx")
+            .unwrap();
+        assert_eq!(sfx.level, "adapted");
+        assert_eq!(sfx.approximation, None);
+        assert_eq!(
+            sfx.capabilities.iter().any(|c| c == "ui.menu-effects.v1"),
+            menu_sounds > 0,
+            "the menu-effects capability follows actually mapped page effects"
+        );
+        let hover = ledger
+            .iter()
+            .find(|m| m.rule == "livenovel.menu-hover")
+            .unwrap();
+        assert_eq!(hover.level, "approximate");
+        assert!(hover.approximation.as_deref().is_some_and(|s| !s.is_empty()));
         let approximate: Vec<&str> = ledger
             .iter()
             .filter(|m| m.approximate())
@@ -425,7 +442,7 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         opts.accept_approximate.clear();
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
         assert!(denied.to_string().contains("E_IMPORT_APPROXIMATE"), "{denied}");
-        opts.accept_approximate = vec!["livenovel.menu-sfx".into()];
+        opts.accept_approximate = vec!["livenovel.menu-hover".into()];
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
         assert!(
             denied.to_string().contains("livenovel.text.reveal"),
@@ -433,7 +450,10 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         );
         opts.accept_approximate = vec!["livenovel.text.reveal".into(), "typo".into()];
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
-        assert!(denied.to_string().contains("livenovel.menu-sfx"), "{denied}");
+        assert!(
+            denied.to_string().contains("livenovel.menu-hover"),
+            "{denied}"
+        );
         opts.accept_approximate = APPROXIMATE_RULES.iter().map(|s| (*s).into()).collect();
         enforce_acceptance(&ledger, &opts).unwrap();
         opts.accept_approximate.clear();
@@ -457,7 +477,7 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         "converted"
     );
     assert_eq!(
-        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0, 0)[..2]),
+        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0, 0, 0)[..2]),
         "converted_with_adaptations"
     );
 }

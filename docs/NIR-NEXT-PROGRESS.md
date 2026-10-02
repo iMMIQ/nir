@@ -31,7 +31,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
 | P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；来源系统菜单的效果/动画映射仍待完成 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；LiveNovel 来源菜单的效果映射已交付（批次 59，标题/回想选择音与回想 BGM → 页面点击音效/循环页面音乐），悬停音效/动画光标与来源动画映射仍待完成 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
 | P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
@@ -682,3 +682,13 @@ P2.4 的菜单页根半边交付；P1.2 UI/音频通用目标与 P0 三示例/�
 - 门禁：工作区 Rust 测试 49 套全绿、Clippy、依赖架构（18 包）、SDK 重建（batch-58-partb-tests/clippy/arch/sdk.log；Core 契约另见 batch-58-core.log）；浏览器整套 44 项通过后新增两条规格分别单独复跑通过（batch-58-partb-browser.log、batch-58-partb-browser-element.log、batch-58-parta-browser-gain.log）；`cargo xtask test` 常设门禁含 verify_capabilities.py 对 47 项能力的一一对应核对（batch-58-xtask-test.log）。
 
 P1.2 计划所列四个目标域（SceneNode/DialogueRoot/ViewElement/AudioInstance）全部接入共享求值；P4 的通用补间目标随之交付。遗留：P2.4/P4 来源映射（导入器菜单转场与元素动画）、P2.3 来源样式/字体映射、P0 三示例与版本上限矩阵。Windows 原生一律待验证。证据：reports/nir-next/batch-58-*.log。契约见 AUDIO-SEMANTICS.md（实例增益补间）、MENU-EFFECTS-SEMANTICS.md（元素进入动画）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 59：LiveNovel 菜单音效映射（P4 来源映射）
+
+- 导入器新增三个严格按引擎固定约定提取的助手（缺失约定静默为 None，识别但畸形以 E_IMPORT_LIVENOVEL 拒绝）：`title_select_sound` 读引导脚本中对 `プレビューメニュー\■選択実行.lsb` 调用的第 6 参（选择音，空串为无音）；`replay_select_sound` 读 `サムネイル・マウス処理.lsb` 中 `選択` 标签之下的 kind-42 "SE" 对象文件字段；`replay_bgm` 把 `■関数.lsb` 的 `BGM再生` 标签区间解析为行号范围，只接受落在该区间、单参数字面量的调用——匹配约定而非「任意带声音路径的调用」。路径反斜杠统一归一为 `/`，经 `self.sound(path, 1.)` 进入既有音频资产管线（Ogg 经 lewton 转 WAV）。
+- 映射落点：标题页与回想网格页的 `ImageMenu.effects` 各获得 click 一次性音效（Player 侧 `play_ui_sound` 走 Sfx 总线，音量随 live.lpb 的 StatusSEVolume → sfx_volume 默认值），回想页另获得循环页面音乐（`MenuMusic { bus: Bgm, gain: 1 }`，音量随 StatusBGMVolume）；两个页面各自计入 menu_sounds。`ImageMenu::image_assets()`/`MenuEffects::assets()` 已把 click/music 并入页面媒体闭包，编译器按 `uses_effects` 自动保留 `ui.menu-effects.v1`——无需播放器侧改动。
+- 账本拆分：`livenovel.menu-sfx` 由 approximate 升为 adapted（存在映射位点时依赖 ui.menu-effects.v1，行为句记录 {menu_sounds} 与音量语义）；悬停音效与动画光标无 NIR 对应机制，新设近似规则 `livenovel.menu-hover` 显式点名（「NIR 菜单无悬停驱动音频或自定义指针光标」），沿用批次 53 起的原则——近似必须显式接受而非静默警告。近似清单收窄为 menu-hover/text.reveal 两条；`--accept-approximate` 示例与 `APPROXIMATE_RULES` 测试常量同步更新。
+- 实证：真实语料转换（1357 页、main + 8 条回想全路线含快照恢复）通过（batch-59-corpus-test.log）；重建发行 CLI 后，无接受时以 E_IMPORT_APPROXIMATE 点名 [livenovel.menu-hover, livenovel.text.reveal] 退出且工程已写出，带新 ID 接受时成功——theme.toml 中 title.click 与 replay.click/music（bgm 总线）及 import-media.json 中 tm2_switch002.wav/BGM054mama.ogg（gain 1.0）逐项核对（batch-59-cli-gate.log、batch-59-sdk-novelc.log、batch-59-verify-sdk.log）；助手单测覆盖空/缺参/非字面量/二义调用、悬停-only 处理器、非 SE 对象、区间外调用与多参数调用。门禁：`cargo xtask test`（47 项能力）、Clippy、依赖架构（batch-59-xtask-test/clippy/architecture.log）。仅改导入器，按批次 53/55 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（近似规则清单与菜单音效描述、保真边界句）、CAPABILITIES.md（ui.menu-effects.v1 段落与外部引擎导入行）、MENU-EFFECTS-SEMANTICS.md（不包含清单改为指向导入映射）。
+
+P4 的来源效果映射半边交付；悬停音效/动画光标保持显式近似，来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）、P2.3 来源字体样式与字速单位、P0 三示例与版本上限矩阵待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-59-*.log。契约见 MENU-EFFECTS-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
