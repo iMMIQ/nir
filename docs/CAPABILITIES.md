@@ -22,7 +22,7 @@
 | 恢复 | 候选先验证/准备、暂停提交、检查点回退、设备重建 | 无安全热更新 |
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告、打包媒体优化 | 无 PWA、签名/CDN 调度 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
-| 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单（含选择音／回想 BGM 页面效果）、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
+| 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单（含选择音／回想 BGM／系统菜单进出渐隐页面效果）、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
 | 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
 
 资源账本、准备配方和缓存提供首版所需的分层准备与有界准入；已加入函数体与正文的跨模块按需获取；没有实现附件中完整的通用 DAG 调度、任意资源类型与高级缓存策略。静态声明目录已分包按需加载，字体仍为逐语言计划。v0.1.0 的实际测试列在 TEST-REPORT.md，后续有界事件队列、共享预算、独立暂停令牌、取消和分块上传的验证见 [引擎稳定性进展](ENGINE-STABILITY.md)；逐请求终态预留、迟到存读档回执及交错压力测试见 [请求生命周期进展](REQUEST-LIFECYCLE.md)。
@@ -93,7 +93,7 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 `ui.menu-history-availability.v1` 提供只读 `history_available` 条件，查询当前剧情历史是否非空；不冻结正文，不要求历史窗口。共享显隐、布局、命中和提交校验，事实改变使旧 revision 失效，见 [连续历史窗口](MENU-HISTORY-FLOW-SEMANTICS.md)。
 
-`ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画（见 `ui.menu-element-tween.v1`）或效果等待；LiveNovel 标题／回想页的选择音与回想 BGM 经导入账本映射为本能力声明（见 [导入](IMPORT.md)）。
+`ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画（见 `ui.menu-element-tween.v1`）或效果等待；LiveNovel 标题／回想页的选择音与回想 BGM、系统菜单草稿页的进出渐隐（`livenovel.menu-transition`）经导入账本映射为本能力声明（见 [导入](IMPORT.md)）。
 
 `ui.menu-transition.v1` 允许菜单页面边界的转场声明空间样式（wipe/mask，复用舞台 StageTransition 的方向、软边、遮罩通道语义）：呈现层把页面整体分流到离屏页根，以遮罩合成覆盖在冻结的底层帧上，替代旧的整层 alpha 渐隐；遮罩是 Image 类页面资产，随页面图片进入准备与留存。dissolve 或未声明样式保持旧 alpha 渐隐路径，不需本能力；飞行中持有前台时钟租约、锁定输入并暂停阅读，关闭延迟退出至擦除完成，reduced_motion 只抑制呈现不抑制音效。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。
 

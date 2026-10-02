@@ -43,7 +43,7 @@
 
 GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引用、透明度、调色板、图层合成与尾部矩形列表。动画 GAL、LCM 视频和归档解包尚未支持；本配置不会导入未引用的动画光标。解码由 Rust 在同一个 `novelc` 内完成，没有外部媒体进程。
 
-**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。标题／回想选择音与回想 BGM、消息框渐变和 wipe 以有界 NIR 机制映射（账本记为 adapted）；悬停音效、动画光标和逐字符原字体样式尚未复刻。报告逐项列出这些差异；不是无差异转换认证。
+**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。标题／回想选择音与回想 BGM、消息框渐变和 wipe、系统菜单进出渐隐（`--draft` 草稿页）以有界 NIR 机制映射（账本记为 adapted）；悬停音效、动画光标和逐字符原字体样式尚未复刻。报告逐项列出这些差异；不是无差异转换认证。
 
 ### 映射级别、证据与近似接受（报告格式 2）
 
@@ -61,7 +61,7 @@ GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引
   --accept-approximate livenovel.menu-hover,livenovel.text.font
 ```
 
-拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.font`（来源字体为工程外的 Windows 系统字体，无法打包注册，正文以 NIR 内置日文字体渲染）。`livenovel.text.reveal` 已升为 adapted：`StatusTextSpeed`（每字符毫秒，0 瞬时）映射为每字素簇微秒的揭示间隔，单位经固定滑条回调 `@ParamStr[0] × 64` 与官方文档双重认证。`livenovel.menu-sfx` 亦为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.font`（来源字体为工程外的 Windows 系统字体，无法打包注册，正文以 NIR 内置日文字体渲染）。`livenovel.text.reveal` 已升为 adapted：`StatusTextSpeed`（每字符毫秒，0 瞬时）映射为每字素簇微秒的揭示间隔，单位经固定滑条回调 `@ParamStr[0] × 64` 与官方文档双重认证。`livenovel.menu-sfx` 亦为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.menu-transition` 同为 adapted：初始化脚本的进入 Flip 与右クリック处理的关闭 Flip（wipe 3、字面量参数 20/1、菜单背景层）按原毫秒时序映射为 `--draft` 系统菜单草稿页的整层进出渐隐（`ui.menu-effects.v1`），空间 wipe 形状以整层渐隐近似，子页选择、存档截图与游戏退出 Flip 不映射；角色签名不符的 Flip（含动态签名）不认领，角色被识别但钉定参数、目标或时序异常（含超出 NIR 渐隐上限、同向时序二义）时以 `E_IMPORT_MENU_TRANSITION` 拒绝。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 
@@ -147,9 +147,9 @@ cargo test -p nir-compiler real_livenovel_player_certifies -- --ignored --nocapt
 
 ### 原系统菜单草稿
 
-识别上述 LiveNovel 配置时，`--draft` 另生成不完整的系统菜单覆盖页；普通导入暂不启用。标签和顺序来自原名称／动作表，位置、字号、行距与文字颜色来自原 Menu 声明。已校验分派与分支体的 Auto／已读快进／隐藏文字动作绑定阅读服务；历史动作在来源校验后进入生成的子页。绑定依据动作 ID，不依据显示标签；其可用性由播放器再次检查。未映射的项目以灰色静态文字呈现，不携带占位动作。Escape 使用播放器的逐层关闭服务。
+识别上述 LiveNovel 配置时，`--draft` 另生成不完整的系统菜单覆盖页；普通导入暂不启用。标签和顺序来自原名称／动作表，位置、字号、行距与文字颜色来自原 Menu 声明。已校验分派与分支体的 Auto／已读快进／隐藏文字动作绑定阅读服务；历史动作在来源校验后进入生成的子页。绑定依据动作 ID，不依据显示标签；其可用性由播放器再次检查。未映射的项目以灰色静态文字呈现，不携带占位动作。Escape 使用播放器的逐层关闭服务。原初始化进入 Flip 与右クリック关闭 Flip 的毫秒时序映射为该页的整层进出渐隐（账本规则 `livenovel.menu-transition`，缺失约定时不带效果）；空间 wipe 形状、子页选择、存档截图与游戏退出 Flip 不在其中。
 
-该草稿尚未迁移其余原显示条件、子菜单、容器／截图恢复和 200 ms 退出动画；字体替代、字号／行距单位、固定行宽和半透明变暗只是预览近似。`import-menu-preview.json` 格式 2 记录来源哈希、绑定、限制及历史页报告引用；`import-report.json` 状态为 `incomplete_ui_preview`，附错误诊断与 `MIGRATION-INCOMPLETE.txt`，工程验证后写出，命令仍以非零状态退出。它是转换链路的中间验收产物，不是原菜单完整兼容的声明。
+该草稿尚未迁移其余原显示条件、子菜单、容器／截图恢复及进出动画的空间 wipe 形状；字体替代、字号／行距单位、固定行宽和半透明变暗只是预览近似。`import-menu-preview.json` 格式 2 记录来源哈希、绑定、进出渐隐时序（`menu_fades`）、限制及历史页报告引用；`import-report.json` 状态为 `incomplete_ui_preview`，附错误诊断与 `MIGRATION-INCOMPLETE.txt`，工程验证后写出，命令仍以非零状态退出。它是转换链路的中间验收产物，不是原菜单完整兼容的声明。
 
 菜单草稿现也校验已读快进分支的容器恢复、退出参数、三个跳过标记及两项消息框属性，并核对原菜单中的已读／无选择／非回想条件。匹配后绑定 SkipRead 服务：未读、选择期间和回想中隐藏该项。转换器为主线／回想包装入口生成 bool 上下文，使用 `ui.menu-story.v1` 显式只读导出；该字段按现有故事快照保存恢复。尚未证明原菜单初始化的全部控制流、数组全程序不变性及原设备时序，草稿不完整状态保留。
 

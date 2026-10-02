@@ -14,7 +14,7 @@ const SOURCE: &str = "ノベルシステム/システムメニュー/初期化.l
 const ID: &str = "import.menu.preview";
 const REPLAY_VARIABLE: &str = "import.replay_active";
 const BACKDROP: &str = "import.preview.backdrop";
-const LIMITS: &str = "Incomplete source menu preview: remaining source visibility predicates, submenu actions, screenshot/cabinet storage, arbitrary source UI components and 200 ms fades are not lowered. Font substitution, font-height/line-spacing mapping, fixed row widths and dimming are provisional. Unsupported rows are non-interactive text; Escape closes the preview using the player service.";
+const LIMITS: &str = "Incomplete source menu preview: remaining source visibility predicates, submenu actions, screenshot/cabinet storage and arbitrary source UI components are not lowered. Menu enter/close fades map the stock initialization/right-click Flip timings as whole-layer fades; the spatial wipe pattern and the sub-page selection, save-screenshot and game-exit flips are not lowered. Font substitution, font-height/line-spacing mapping, fixed row widths and dimming are provisional. Unsupported rows are non-interactive text; Escape closes the preview using the player service.";
 
 struct Style {
     x: i32,
@@ -271,7 +271,11 @@ fn verify_history_guard(script: &Script) -> Result<()> {
     )
 }
 
-fn menu(style: &Style, items: &[super::ui_items::MenuItem]) -> Result<(ImageMenu, Vec<Value>)> {
+fn menu(
+    style: &Style,
+    items: &[super::ui_items::MenuItem],
+    fades: Option<&super::livenovel::MenuFades>,
+) -> Result<(ImageMenu, Vec<Value>)> {
     let rows: Vec<_> = items
         .iter()
         .filter(|i| !i.action.contains("オプション_") && !i.action.contains("ゲーム終了_"))
@@ -331,9 +335,20 @@ fn menu(style: &Style, items: &[super::ui_items::MenuItem]) -> Result<(ImageMenu
         elements.push(element);
         bindings.push(json!({"source_index":row.index,"label":row.label,"source_action":row.action,"binding":if history {"history.source_page".into()}else{mode.map(|mode|format!("reading.{mode}")).unwrap_or_else(||"unbound_noninteractive".into())}}));
     }
+    // The certified stock fade timings enter as plain whole-layer fades; the
+    // source wipe pattern has no certified NIR direction and stays out of the
+    // claim (see the mapping ledger's menu-transition rule).
+    let effects = fades
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            json!({
+                "enter": f.enter.map(|us| json!({"fade_us": us.to_string()})),
+                "close": f.close.map(|us| json!({"fade_us": us.to_string()})),
+            })
+        });
     Ok((
         serde_json::from_value(
-            json!({"background":BACKDROP,"buttons":[],"story_exports":{"replay":REPLAY_VARIABLE},"elements":elements}),
+            json!({"background":BACKDROP,"buttons":[],"story_exports":{"replay":REPLAY_VARIABLE},"elements":elements,"effects":effects}),
         )?,
         bindings,
     ))
@@ -402,6 +417,7 @@ pub(super) fn prepare_story(story: &mut Value) -> Result<()> {
 pub(super) fn install(
     root: &Path,
     source: &mut Source,
+    fades: Option<&super::livenovel::MenuFades>,
     items: &MenuItems,
     report: &mut ImportReport,
 ) -> Result<()> {
@@ -417,7 +433,7 @@ pub(super) fn install(
     super::ui_history::verify_selection(&selection)?;
     let history = super::ui_history::HistoryPreview::load(source)?;
     let style = style(&script)?;
-    let (menu, bindings) = menu(&style, &items.items)?;
+    let (menu, bindings) = menu(&style, &items.items, fades)?;
     let path = root.join("theme/theme.toml");
     let mut theme: Value = toml::from_str(&fs::read_to_string(&path)?)?;
     theme["image_menus"][ID] = serde_json::to_value(menu)?;
@@ -440,7 +456,7 @@ pub(super) fn install(
     super::ui_history::mark_draft_diagnostics(report);
     super::write_json(
         &root.join("import-menu-preview.json"),
-        &json!({"format":2,"status":"incomplete","menu":ID,"source":SOURCE,"source_sha256":script.source_sha256,"source_version":script.version,"source_font":style.font,"bindings":bindings,"limitations":LIMITS,"history_preview":"import-history-preview.json","history_limitations":super::ui_history::LIMITS}),
+        &json!({"format":2,"status":"incomplete","menu":ID,"source":SOURCE,"source_sha256":script.source_sha256,"source_version":script.version,"source_font":style.font,"bindings":bindings,"menu_fades":fades.map(|f| json!({"enter_us":f.enter,"close_us":f.close})),"limitations":LIMITS,"history_preview":"import-history-preview.json","history_limitations":super::ui_history::LIMITS}),
     )?;
     let mut messages = vec![LIMITS.to_owned(), super::ui_history::LIMITS.to_owned()];
     messages.extend(
@@ -657,7 +673,7 @@ mod tests {
                 action: "prefixオプション_test".into(),
             },
         ];
-        let (menu, bindings) = menu(&style, &items).unwrap();
+        let (menu, bindings) = menu(&style, &items, None).unwrap();
         assert_eq!(bindings.len(), 2);
         assert_eq!(menu.controls().count(), 1);
         assert_eq!(menu.controls().next().unwrap().0, "source.row.0");
@@ -711,6 +727,47 @@ mod tests {
         }
     }
     #[test]
+    fn certified_fades_enter_the_preview_as_whole_layer_effects() {
+        let items = vec![MenuItem {
+            index: 0,
+            label: "Auto".into(),
+            action: "自動テキスト送り".into(),
+        }];
+        let style = style(&script()).unwrap();
+        // Missing convention keeps the page effect-free.
+        let (page, _) = menu(&style, &items, None).unwrap();
+        assert!(page.effects.is_none());
+        // A half convention maps only its direction.
+        let (page, _) = menu(
+            &style,
+            &items,
+            Some(&super::super::livenovel::MenuFades {
+                enter: Some(200_000),
+                close: None,
+            }),
+        )
+        .unwrap();
+        let effects = page.effects.as_ref().unwrap();
+        assert_eq!(effects.enter.as_ref().unwrap().fade_us.0, 200_000);
+        assert!(effects.close.is_none());
+        // The certified stock pair maps both directions as plain fades.
+        let (page, _) = menu(
+            &style,
+            &items,
+            Some(&super::super::livenovel::MenuFades {
+                enter: Some(200_000),
+                close: Some(200_000),
+            }),
+        )
+        .unwrap();
+        let effects = page.effects.as_ref().unwrap();
+        for transition in [&effects.enter, &effects.close].into_iter().flatten() {
+            assert_eq!(transition.fade_us.0, 200_000);
+            assert!(transition.sound.is_none());
+            assert!(transition.style.is_none());
+        }
+    }
+    #[test]
     fn history_binding_uses_source_action_and_both_availability_facts() {
         let items = vec![
             MenuItem {
@@ -724,7 +781,7 @@ mod tests {
                 action: "シナリオ回想".into(),
             },
         ];
-        let (menu, bindings) = menu(&style(&script()).unwrap(), &items).unwrap();
+        let (menu, bindings) = menu(&style(&script()).unwrap(), &items, None).unwrap();
         assert_eq!(menu.controls().count(), 1);
         assert_eq!(bindings[1]["binding"], "history.source_page");
         assert!(

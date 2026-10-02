@@ -383,6 +383,7 @@ struct Adapter {
     choice_sites: usize,
     fade_sites: usize,
     menu_sounds: usize,
+    menu_fades: Option<MenuFades>,
     source_map: BTreeMap<String, SourceLocation>,
     warnings: BTreeSet<String>,
     counter: usize,
@@ -576,6 +577,112 @@ fn replay_bgm(open: &Script, functions: &Script) -> Result<Option<String>> {
     }
     Ok(found)
 }
+/// Certified system-menu fade timings for the generated preview pages, in
+/// microseconds: the initialization script's enter Flip and the right-click
+/// close Flip, both lowered as whole-layer fades of the original timing.
+pub(super) struct MenuFades {
+    pub(super) enter: Option<u64>,
+    pub(super) close: Option<u64>,
+}
+impl MenuFades {
+    pub(super) fn is_empty(&self) -> bool {
+        self.enter.is_none() && self.close.is_none()
+    }
+}
+/// The stock system-menu fade convention: the initialization script's enter
+/// Flip (act 1, no targets) and the close Flip the right-click handler runs on
+/// the menu-background layer (act 0, delete 1, stop event) — both wipe 3 with
+/// the literal parameters 20/1. Flips with another role signature (sub-page
+/// selection enters, the reversed reading-exit close, save-screenshot and
+/// game-exit fades) are not claimed by this mapping and pass through. A
+/// package without any convention Flip lowers to no transition; a Flip whose
+/// role is recognized but whose pinned parameters, target or timing differ
+/// fails the import, and all enter-shaped (resp. close-shaped) Flips must
+/// share one timing so a single menu fade represents them.
+pub(super) fn system_menu_fades(init: &Script, right_click: &Script) -> Result<Option<MenuFades>> {
+    use super::ui_expr::{normalize, Term};
+    let text = |s: &str| Term::String { value: s.into() };
+    let mut enter: Option<i64> = None;
+    let mut close: Option<i64> = None;
+    for script in [init, right_click] {
+        for c in &script.commands {
+            if c.muted || c.not_update || c.kind != 13 {
+                continue;
+            }
+            let Body::Flip {
+                parameters,
+                targets,
+            } = &c.body
+            else {
+                continue;
+            };
+            let param = |name: &str| -> Result<Term> {
+                parameters
+                    .get(name)
+                    .map(normalize)
+                    .transpose()?
+                    .flatten()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("E_IMPORT_MENU_TRANSITION: dynamic {name} parameter")
+                    })
+            };
+            let literal = |name: &str| -> Result<Option<i64>> {
+                Ok(match parameters.get(name).map(normalize).transpose()?.flatten() {
+                    Some(Term::Int { value }) => Some(i64::from(value)),
+                    _ => None,
+                })
+            };
+            // The role signature is the part that identifies the flip as this
+            // convention; anything else (including a dynamic signature) is
+            // another effect we do not claim.
+            let role = match (
+                literal("act")?,
+                literal("delete")?,
+                literal("reverse")?,
+                literal("stop_event")?,
+                targets.len(),
+            ) {
+                (Some(1), Some(0), Some(0), Some(0), 0) => "enter",
+                (Some(0), Some(1), Some(0), Some(1), 1)
+                    if normalize(&targets[0])? == Some(text("メニュー背景")) =>
+                {
+                    "close"
+                }
+                _ => continue,
+            };
+            // With the role recognized the stock shape is pinned exactly.
+            ensure!(
+                param("wipe")? == Term::Int { value: 3 }
+                    && param("parameter_0")? == Term::Int { value: 20 }
+                    && param("parameter_1")? == Term::Int { value: 1 }
+                    && param("source")? == text(""),
+                "E_IMPORT_MENU_TRANSITION: unsupported {role} fade parameters"
+            );
+            let Term::Int { value } = param("time")? else {
+                bail!("E_IMPORT_MENU_TRANSITION: nonconstant {role} fade time");
+            };
+            let time = i64::from(value);
+            ensure!(
+                (1..=2000).contains(&time),
+                "E_IMPORT_MENU_TRANSITION: {role} fade time {time} ms outside the NIR menu fade bound"
+            );
+            let found = if role == "enter" {
+                &mut enter
+            } else {
+                &mut close
+            };
+            ensure!(
+                found.is_none() || *found == Some(time),
+                "E_IMPORT_MENU_TRANSITION: ambiguous {role} fade timing"
+            );
+            *found = Some(time);
+        }
+    }
+    Ok((enter.is_some() || close.is_some()).then(|| MenuFades {
+        enter: enter.map(|ms| ms as u64 * 1000),
+        close: close.map(|ms| ms as u64 * 1000),
+    }))
+}
 /// One stock dispatch option: its literal text and the label index it jumps to.
 type DispatchOption = (String, usize);
 /// The compatibility ledger for this profile: one entry per mapping rule the
@@ -588,6 +695,7 @@ pub(super) fn mapping_ledger(
     choice_sites: usize,
     fade_sites: usize,
     menu_sounds: usize,
+    menu_transitions: usize,
     reveal_us: u64,
 ) -> Vec<ImportMapping> {
     let entry = |rule: &str,
@@ -633,6 +741,21 @@ pub(super) fn mapping_ledger(
                 "Title and replay-grid select sounds map to the generated pages' click effect and the replay screen's BGM to looping page music ({menu_sounds} page effect(s)); volumes ride the sfx/bgm bus defaults decoded from live.lpb."
             ),
             if menu_sounds > 0 {
+                &["ui.menu-effects.v1"]
+            } else {
+                &[] as &[&str]
+            },
+            None,
+        ),
+        entry(
+            "livenovel.menu-transition",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            &format!(
+                "The stock system-menu initialization enter Flip and right-click close Flip (wipe 3, literal parameters 20/1, menu-background layer) map to the generated system-menu preview's whole-layer enter/close fades of the original millisecond timing ({menu_transitions} mapped transition pair); the spatial wipe pattern is approximated by whole-layer fades and sub-page selection, save-screenshot and game-exit flips are not mapped."
+            ),
+            if menu_transitions > 0 {
                 &["ui.menu-effects.v1"]
             } else {
                 &[] as &[&str]
@@ -834,6 +957,7 @@ impl Adapter {
             choice_sites: 0,
             fade_sites: 0,
             menu_sounds: 0,
+            menu_fades: None,
             source_map: BTreeMap::new(),
             warnings: BTreeSet::new(),
             counter: 0,
@@ -1567,6 +1691,13 @@ impl Adapter {
         verify_auto_timer(&mut self.source)?;
         verify_text_speed(&mut self.source)?;
         self.menu_items = Some(super::ui_items::MenuItems::load(&mut self.source)?);
+        // The stock system-menu fade convention (the initialization enter Flip
+        // and the right-click close Flip) feeds the draft preview's page
+        // effects below; the spatial wipe pattern itself is approximated by
+        // whole-layer fades.
+        let (_, menu_init) = self.source.read("ノベルシステム/システムメニュー/初期化.lsb")?;
+        let (_, menu_close) = self.source.read("ノベルシステム/システムメニュー/右クリック時.lsb")?;
+        self.menu_fades = system_menu_fades(&menu_init, &menu_close)?;
         let (_, startup) = self.source.read(entry)?;
         let (_, bootstrap) = self.source.read(&last_jump(&startup)?)?;
         let (page, script) = self.source.read(&last_jump(&bootstrap)?)?;
@@ -1948,6 +2079,7 @@ pub(super) fn convert(
         adapter.choice_sites,
         adapter.fade_sites,
         adapter.menu_sounds,
+        usize::from(options.draft && !adapter.menu_fades.as_ref().is_some_and(MenuFades::is_empty)),
         adapter
             .defaults
             .as_ref()
@@ -1969,6 +2101,7 @@ pub(super) fn convert(
         super::ui_preview::install(
             &project,
             &mut adapter.source,
+            adapter.menu_fades.as_ref(),
             adapter
                 .menu_items
                 .as_ref()
@@ -3208,5 +3341,154 @@ mod tests {
             &functions,
         )
         .is_err());
+    }
+
+    #[test]
+    fn system_menu_fades_match_the_stock_pair_skip_other_roles_and_refuse_malformed() {
+        use super::super::lsb::Command;
+        let expr = |op, name: &str, args| Expression {
+            literal: None,
+            operations: vec![(op, name.into(), args)],
+            functions: BTreeMap::new(),
+        };
+        let int = |n| expr(1, "____arg", vec![Literal::Int(n)]);
+        let text = |s: &str| expr(1, "____arg", vec![Literal::String(s.into())]);
+        // The exact stock Flip shape: an enter/close role signature with the
+        // pinned wipe/parameter/source conventions and a literal millisecond
+        // time (the corpus pair uses 200 ms in both directions).
+        let stock = |act: i32,
+                     delete: i32,
+                     reverse: i32,
+                     stop_event: i32,
+                     time: i32|
+         -> BTreeMap<String, Expression> {
+            [
+                ("act", int(act)),
+                ("delete", int(delete)),
+                ("reverse", int(reverse)),
+                ("stop_event", int(stop_event)),
+                ("wipe", int(3)),
+                ("time", int(time)),
+                ("parameter_0", int(20)),
+                ("parameter_1", int(1)),
+                ("source", text("")),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect()
+        };
+        let flip = |parameters: BTreeMap<String, Expression>,
+                    targets: Vec<Expression>,
+                    indent: u32|
+         -> Command {
+            Command {
+                kind: 13,
+                indent,
+                body: Body::Flip {
+                    parameters,
+                    targets,
+                },
+                muted: false,
+                not_update: false,
+                line: 0,
+                offset: 0,
+            }
+        };
+        let enter = |time: i32| flip(stock(1, 0, 0, 0, time), vec![], 0);
+        let close = |time: i32, indent: u32| {
+            flip(
+                stock(0, 1, 0, 1, time),
+                vec![text("メニュー背景")],
+                indent,
+            )
+        };
+        let empty = || route::script(vec![route::exit(1)]);
+        // The stock pair: an enter Flip and nested close Flip in the
+        // initialization script plus the right-click close Flip.
+        let init = route::script(vec![enter(200), close(200, 1)]);
+        let right_click = route::script(vec![close(200, 0)]);
+        let fades = system_menu_fades(&init, &right_click)
+            .unwrap()
+            .expect("stock pair maps");
+        assert_eq!((fades.enter, fades.close), (Some(200_000), Some(200_000)));
+        // No convention at all stays silent.
+        assert!(system_menu_fades(&empty(), &empty()).unwrap().is_none());
+        // A lone direction maps only its side.
+        let fades = system_menu_fades(&route::script(vec![enter(200)]), &empty())
+            .unwrap()
+            .expect("lone enter maps");
+        assert_eq!((fades.enter, fades.close), (Some(200_000), None));
+        // Other role signatures are not claimed: the sub-page selection enter
+        // (stop_event 1, parameter_0 8, empty parameter_1), the reversed
+        // reading-exit close, a dynamic-act Flip, a muted stock Flip and a
+        // close aimed at another layer all pass through without a claim.
+        let mut sub_page = stock(1, 0, 0, 1, 200);
+        sub_page.insert("parameter_0".into(), int(8));
+        sub_page.insert("parameter_1".into(), Expression::default());
+        let mut reversed = stock(0, 1, 1, 1, 200);
+        reversed.insert("parameter_0".into(), Expression::default());
+        reversed.insert("parameter_1".into(), Expression::default());
+        reversed.insert("source".into(), Expression::default());
+        let mut dynamic_act = stock(1, 0, 0, 0, 200);
+        dynamic_act.insert("act".into(), Expression::default());
+        let mut muted = enter(200);
+        muted.muted = true;
+        let other_layer = flip(stock(0, 1, 0, 1, 200), vec![text("物語")], 0);
+        // A dynamic close target is as uncertifiable as a dynamic signature.
+        let dynamic_target = flip(stock(0, 1, 0, 1, 200), vec![Expression::default()], 0);
+        let mixed = route::script(vec![
+            flip(sub_page, vec![], 0),
+            flip(reversed, vec![text("メニュー背景")], 0),
+            flip(dynamic_act, vec![], 0),
+            muted,
+            other_layer,
+            dynamic_target,
+        ]);
+        assert!(system_menu_fades(&mixed, &empty()).unwrap().is_none());
+        // A recognized role with malformed pinned shape or timing is refused.
+        for (name, parameters, targets) in [
+            ("wipe", {
+                let mut p = stock(1, 0, 0, 0, 200);
+                p.insert("wipe".into(), int(4));
+                p
+            }, vec![] as Vec<Expression>),
+            ("parameter_0", {
+                let mut p = stock(1, 0, 0, 0, 200);
+                p.insert("parameter_0".into(), int(8));
+                p
+            }, vec![]),
+            ("dynamic parameter_1", {
+                let mut p = stock(1, 0, 0, 0, 200);
+                p.insert("parameter_1".into(), Expression::default());
+                p
+            }, vec![]),
+            ("nonempty source", {
+                let mut p = stock(1, 0, 0, 0, 200);
+                p.insert("source".into(), text("風"));
+                p
+            }, vec![]),
+            ("zero time", stock(1, 0, 0, 0, 0), vec![]),
+            ("time beyond the NIR bound", stock(1, 0, 0, 0, 2500), vec![]),
+            ("dynamic time", {
+                let mut p = stock(1, 0, 0, 0, 200);
+                p.insert("time".into(), Expression::default());
+                p
+            }, vec![]),
+        ] {
+            let script = route::script(vec![flip(parameters, targets, 0)]);
+            assert!(
+                system_menu_fades(&script, &empty()).is_err(),
+                "{name} must be refused"
+            );
+        }
+        // All same-role Flips must agree on one timing; a matching repeat is
+        // accepted and carries no extra claim.
+        let both = route::script(vec![enter(200), enter(200)]);
+        let fades = system_menu_fades(&both, &empty())
+            .unwrap()
+            .expect("repeat timing maps");
+        assert_eq!(fades.enter, Some(200_000));
+        let ambiguous = route::script(vec![enter(200), enter(300)]);
+        assert!(system_menu_fades(&ambiguous, &empty()).is_err());
     }
 }

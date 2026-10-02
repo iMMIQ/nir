@@ -29,9 +29,9 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源字速已映射（批次 60），来源字体面与完整源映射仍待完成 |
-| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射与硬件验证仍待完成 |
+| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射的整层进出渐隐已交付（批次 64），空间 wipe 形状以整层渐隐近似；硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；LiveNovel 来源菜单的效果映射已交付（批次 59，标题/回想选择音与回想 BGM → 页面点击音效/循环页面音乐），悬停音效/动画光标与来源动画映射仍待完成 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；LiveNovel 来源菜单的效果映射已交付（批次 59，标题/回想选择音与回想 BGM → 页面点击音效/循环页面音乐；批次 64，系统菜单进入/关闭 Flip → 草稿页整层进出渐隐），悬停音效/动画光标保持显式近似；逐元素进入动画无已认证的来源约定（库存菜单以整层 Flip 呈现），不作映射声明 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
 | P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
@@ -732,3 +732,15 @@ P0.1/P0.2 收口；KAG 第二来源认证待批次 63。证据：reports/nir-nex
 - 本批仅文档：认证记录 + 基线账本 N10/§5/§6 与进度 P0 行同步。门禁 `cargo xtask test`（依赖架构 18 包、能力发行清单 47 项一一对应）与 `cargo clippy --workspace --all-targets --locked`（19 处现存警告容忍，均与本批无关）通过；按批次 53/55/59/62 先例不跑浏览器套件。
 
 P0（P0.1 账本/回归/三样例 + P0.2 矩阵 + 第二来源认证）按计划自身判据收口。遗留：LiveNovel 导入器侧来源映射（批次 57/58 能力的菜单转场/元素动画映射、menu-hover/text.font 显式近似）、nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-63-xtask-test.log、batch-63-clippy.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。
+
+## 批次 64：来源系统菜单进出渐隐映射（P4 来源映射收口）
+
+- 证据先行（真实语料 data_flow 的字面量形状）：`初期化.lsb` 进入 Flip（act 1、delete 0、无目标）与 `右クリック時.lsb` 关闭 Flip（act 0、delete 1、stop_event 1、目标 メニュー背景）同为 wipe 3、字面量参数 20/1、空 source、200 ms；子页选择进入（stop_event 1、parameter_0 8）、存档截图（wipe 1、`__tmpscreen`）、游戏退出与反向阅读退出 Flip 均为不同角色签名，不属本约定。
+- 新增 `system_menu_fades` 严格提取器：按字面量角色签名分类（act/delete/reverse/stop_event/targets），动态或他种签名不认领、直接跳过；角色一旦识别，钉定参数（wipe 3、20/1、空 source）必须精确匹配，time 须为 1..=2000 ms 字面量（超出 NIR 渐隐界拒绝、不钳制），同方向多枚 Flip 必须同一时序否则二义拒绝；enter/close 两方向独立映射为微秒 `MenuFades`，无任何约定 Flip 时为 None。提取在 run() 两种模式都执行，畸形在普通导入同样以 `E_IMPORT_MENU_TRANSITION` 拒绝。
+- 映射落点：`--draft` 系统菜单草稿页的 `ImageMenu.effects` 获得整层 enter/close 渐隐（不声明空间样式，只需 `ui.menu-effects.v1`；空间 wipe 形状以整层渐隐近似，与批次 56 textbox.fade 同口径）；`import-menu-preview.json` 新增 `menu_fades` 字段，LIMITS 限制句同步。
+- 账本：新规则 `livenovel.menu-transition`（adapted／decoded-source／LSB116），`ui.menu-effects.v1` 仅在计数 >0（draft 且确有约定对）时列出；近似清单保持 menu-hover/text.font 两条不变。
+- 测试：提取器单测覆盖库存对、单向、空脚本、他角色跳过（子页进入、反向关闭、动态签名、静音、异层目标、动态目标）与七类畸形拒绝（wipe/parameter_0/动态 parameter_1/非空 source/零与超界时长/动态时长）及同时序重复、二义时序；ui_preview 测试覆盖无约定无效果、半约定单方向、成对整层渐隐（无声音无样式）；mapping_ledger 断言扩 menu_transitions 维度。
+- 门禁与实证：`cargo test -p nir-compiler` 139 项通过；`cargo xtask test`（18 包、47 能力）与工作区 Clippy（19 处现存警告容忍）通过。真实语料非 draft 回归 1357 页、17 函数，main+8 回想全路线含快照恢复通过，报告 15 条映射中 menu-transition 计数 0、无能力、聚合状态不变；重建发行 CLI（xtask sdk + verify_sdk.py）后 `--draft` 实测：theme.toml 草稿页 effects enter/close `fade_us="200000"`、`import-menu-preview.json` `menu_fades` 200000/200000、账本行 adapted + `ui.menu-effects.v1` + 1 mapped transition pair，CLI 按 incomplete 契约非零退出且工程已写出。仅改导入器，按批次 53/55/59/60 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（映射级别一节新规则句、系统菜单草稿段与尚非等价清单）、CAPABILITIES.md（外部引擎导入行、ui.menu-effects.v1 段）、MENU-EFFECTS-SEMANTICS.md（导入指针）、本进度 P2.4/P4 行。
+
+P4 的来源效果映射收口：menu-sfx（批次 59）与 menu-transition（本批）已交付；悬停音效/动画光标与来源字体面保持显式近似；逐元素进入动画无已认证来源约定（库存菜单以整层 Flip 呈现进出），不作映射声明。遗留：nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-64-*.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。

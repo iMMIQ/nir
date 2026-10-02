@@ -347,8 +347,16 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    for (sites, fade_sites, menu_sounds) in [(0, 0, 0), (2, 0, 0), (2, 3, 0), (2, 3, 3)] {
-        let ledger = livenovel::mapping_ledger(sites, fade_sites, menu_sounds, 128_000);
+    for (sites, fade_sites, menu_sounds, menu_transitions) in
+        [(0, 0, 0, 0), (2, 0, 0, 0), (2, 3, 0, 0), (2, 3, 3, 0), (2, 3, 3, 1)]
+    {
+        let ledger = livenovel::mapping_ledger(
+            sites,
+            fade_sites,
+            menu_sounds,
+            menu_transitions,
+            128_000,
+        );
         assert!(ledger.len() >= 12);
         let mut rules = std::collections::BTreeSet::new();
         for m in &ledger {
@@ -411,6 +419,20 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
             sfx.capabilities.iter().any(|c| c == "ui.menu-effects.v1"),
             menu_sounds > 0,
             "the menu-effects capability follows actually mapped page effects"
+        );
+        let transition = ledger
+            .iter()
+            .find(|m| m.rule == "livenovel.menu-transition")
+            .unwrap();
+        assert_eq!(transition.level, "adapted");
+        assert_eq!(transition.approximation, None);
+        assert_eq!(
+            transition
+                .capabilities
+                .iter()
+                .any(|c| c == "ui.menu-effects.v1"),
+            menu_transitions > 0,
+            "the menu-transition capability follows actually mapped fade pairs"
         );
         let hover = ledger
             .iter()
@@ -486,7 +508,9 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         "converted"
     );
     assert_eq!(
-        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0, 0, 0, 128_000)[..2]),
+        ImportReport::status_from_mappings(&livenovel::mapping_ledger(
+            0, 0, 0, 0, 128_000
+        )[..2]),
         "converted_with_adaptations"
     );
 }
