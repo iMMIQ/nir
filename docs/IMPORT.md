@@ -39,7 +39,7 @@
 - 回想：原缩略图与网格坐标、独立入口、Profile 解锁，读完返回回想菜单。锁定项使用保留透明度的黑色替代图并拒绝执行；另保留 NIR 系统菜单和返回按钮，便于触摸访问。
 - 自动阅读：从 LPB 的 StatusAutoTextWait 读取固定等待，语音余量在 Auto 周期开始时采样并冻结，不再使用文本长度附加或并行语音等待。零等待有显式能力声明。
 - 剧情选择：识别标准選択メニュー约定——无条件调用 `ノベルシステム\選択メニュー\■選択実行.lsb`（调用参数与菜单外壳由 NIR 替代），其后紧跟对 `選択値` 变量与单个字符串字面量做相等比较（操作 12）的连续条件跳转分发链，链尾必须是 Exit（字面量恒命中，后继不可达）。每个分发字面量即选项文本，也是回调提交进 `選択値` 的值（選択.lsb 证据：`選択値 = @ParamStr[0]`）。整个调用点降级为一个类型化 Interact：选项声明字符串值、VM 独占写入 `選択値`、分支目标继续各自标签处的路线；合流分支合并为同一续块，回到自身可达路径的分支按路线循环拒绝。条件调用、缺失/单选项链、重复选项文本、链后非 Exit 一律 `E_IMPORT_CHOICE` 报错。菜单皮肤、悬停/选择音效、倒计时与对齐参数不迁移，报告保持 `converted_with_adaptations`。
-- 对白：原消息框图片、位置、透明度、白色文字、32 像素基础字号和 40 像素行高。字体采用随 SDK 提供的字体，揭示间隔为 32 ms。
+- 对白：原消息框图片、位置、透明度、白色文字、32 像素基础字号和 40 像素行高。字体采用随 SDK 提供的字体；揭示间隔映射 live.lpb 的 `StatusTextSpeed`——单位为每字符毫秒（由固定滑条回调 `StatusTextSpeed = @ParamStr[0] × 64` 与官方文档的每字符毫秒语义双重认证，0 表示瞬时），换算为每字素簇微秒。
 
 GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引用、透明度、调色板、图层合成与尾部矩形列表。动画 GAL、LCM 视频和归档解包尚未支持；本配置不会导入未引用的动画光标。解码由 Rust 在同一个 `novelc` 内完成，没有外部媒体进程。
 
@@ -58,10 +58,10 @@ GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引
 ```sh
 ./novelc import livemaker "/path/to/extracted-game" --out imported-story \
   --game-id org.example.story --title "My Story" \
-  --accept-approximate livenovel.menu-hover,livenovel.text.reveal
+  --accept-approximate livenovel.menu-hover,livenovel.text.font
 ```
 
-拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.reveal`（字体样式与字速单位未映射）。`livenovel.menu-sfx` 已升为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.font`（来源字体为工程外的 Windows 系统字体，无法打包注册，正文以 NIR 内置日文字体渲染）。`livenovel.text.reveal` 已升为 adapted：`StatusTextSpeed`（每字符毫秒，0 瞬时）映射为每字素簇微秒的揭示间隔，单位经固定滑条回调 `@ParamStr[0] × 64` 与官方文档双重认证。`livenovel.menu-sfx` 亦为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 
@@ -143,7 +143,7 @@ cargo test -p nir-compiler real_livenovel_player_certifies -- --ignored --nocapt
 新导入的 LiveNovel 页首及页内 Gate 事件后会绑定具体非循环 Voice 实例，Auto 不再被无关语音阻塞；逻辑页、视口翻页和并行等待的边界见 [阅读语义](READING-SEMANTICS.md)。
 
 
-`import-defaults.json` 记录 LPB 输入哈希、选取的音量/等待值及尚未映射的字速原值，不复制作者工程目录、项目标题或全部系统设置。来源未知类型、缺失或越界的必要值会报错，不能无提示地替换成模板默认值。LPB116 后续编辑器数据区保留为未解释部分，不执行、不导出。
+`import-defaults.json` 记录 LPB 输入哈希、选取的音量/等待/字速值（`text_speed_ms`，每字符毫秒），不复制作者工程目录、项目标题或全部系统设置。来源未知类型、缺失或越界的必要值会报错，不能无提示地替换成模板默认值。LPB116 后续编辑器数据区保留为未解释部分，不执行、不导出。
 
 ### 原系统菜单草稿
 

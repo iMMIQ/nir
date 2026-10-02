@@ -37,8 +37,10 @@ struct ImportedDefaults {
     voice_volume: f32,
     sfx_volume: f32,
     auto_wait_ms: u32,
-    // Preserved as evidence only: the source reveal unit is not yet certified.
-    text_speed_raw: i32,
+    // Milliseconds per character (0 = instant): certified by the stock slider
+    // callback `StatusTextSpeed = @ParamStr[0] × 64` over the authored 0..10
+    // slider, and by the documented per-character ms unit.
+    text_speed_ms: i32,
 }
 impl ImportedDefaults {
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -59,7 +61,7 @@ impl ImportedDefaults {
             voice_volume: integer("StatusVoiceVolume", 1000)? as f32 / 1000.,
             sfx_volume: integer("StatusSEVolume", 1000)? as f32 / 1000.,
             auto_wait_ms: integer("StatusAutoTextWait", 30_000)? as u32,
-            text_speed_raw: integer("StatusTextSpeed", i32::MAX)?,
+            text_speed_ms: integer("StatusTextSpeed", 640)?,
         })
     }
 }
@@ -95,6 +97,13 @@ pub(super) fn verify_auto_timer(source: &mut Source) -> Result<()> {
         );
     }
     Ok(())
+}
+pub(super) fn verify_text_speed(source: &mut Source) -> Result<()> {
+    // The stock slider callback certifies the unit of the persisted setting:
+    // one slider step is 64 milliseconds per character, 0 meaning instant.
+    let (_, callback) = source
+        .read("ノベルシステム/システムメニュー/オプションテキスト速度スライダー変化時.lsb")?;
+    verify_text_speed_callback(&callback)
 }
 // Certify only the stock Auto branch body. This does not prove the enclosing
 // dispatch, source menu guards, cabinet contents, or equivalent UI fade timing.
@@ -307,6 +316,39 @@ fn verify_auto_wait_callback(script: &Script) -> Result<()> {
     ensure!(
         super::ui_expr::normalize(value)? == Some(expected),
         "E_IMPORT_AUTO_POLICY: unknown auto-wait caption units"
+    );
+    Ok(())
+}
+fn verify_text_speed_callback(script: &Script) -> Result<()> {
+    use super::ui_expr::{assignment, Op, Term};
+    let commands: Vec<_> = script.commands.iter().filter(|c| !c.muted).collect();
+    ensure!(
+        commands.len() == 1 && commands[0].indent == 0 && !commands[0].not_update,
+        "E_IMPORT_TEXT_SPEED: unknown text-speed callback control flow"
+    );
+    let Body::Calc(expression) = &commands[0].body else {
+        bail!("E_IMPORT_TEXT_SPEED: missing text-speed assignment");
+    };
+    let (target, value) =
+        assignment(expression).context("E_IMPORT_TEXT_SPEED: invalid text-speed assignment")?;
+    let expected = Term::Apply {
+        op: Op::Multiply,
+        args: vec![
+            Term::Apply {
+                op: Op::Index,
+                args: vec![
+                    Term::Read {
+                        name: "@ParamStr".into(),
+                    },
+                    Term::Int { value: 0 },
+                ],
+            },
+            Term::Int { value: 64 },
+        ],
+    };
+    ensure!(
+        target == "StatusTextSpeed" && value == expected,
+        "E_IMPORT_TEXT_SPEED: unsupported text-speed setting units"
     );
     Ok(())
 }
@@ -546,6 +588,7 @@ pub(super) fn mapping_ledger(
     choice_sites: usize,
     fade_sites: usize,
     menu_sounds: usize,
+    reveal_us: u64,
 ) -> Vec<ImportMapping> {
     let entry = |rule: &str,
                  level: &str,
@@ -615,13 +658,24 @@ pub(super) fn mapping_ledger(
             None,
         ),
         entry(
-            "livenovel.text.reveal",
+            "livenovel.text.font",
             "approximate",
             "decoded-source",
-            "LSB116",
-            "Dialogue uses the bundled NIR Japanese font with a 32 ms reveal interval; source box image, position, opacity, 32 px base size and 40 px line height are preserved.",
+            "LPB116",
+            "Dialogue renders in the bundled NIR Japanese font at the preserved base size and line height; the source font-face setting is retained as evidence only.",
             &[],
-            Some("Source font/style and the StatusTextSpeed unit are not mapped (raw value retained in import-defaults.json); original-runtime comparison pending."),
+            Some("Excluded from the compatibility claim; the persisted StatusFontName is a Windows system font outside the project, so it cannot be bundled or registered as NIR content."),
+        ),
+        entry(
+            "livenovel.text.reveal",
+            "adapted",
+            "decoded-source",
+            "LSB116",
+            &format!(
+                "Dialogue reveal interval maps the persisted StatusTextSpeed — milliseconds per character, certified by the stock slider callback `@ParamStr[0] × 64`, 0 meaning instant — to microseconds per grapheme cluster ({reveal_us} µs at the source default); source box image, position, opacity, 32 px base size and 40 px line height are preserved."
+            ),
+            &[],
+            None,
         ),
         entry(
             "livenovel.textbox.fade",
@@ -1161,11 +1215,19 @@ impl Adapter {
                 spans,
             },
         );
+        // StatusTextSpeed is milliseconds per character; NIR wants microseconds
+        // per grapheme cluster, and 0 keeps the instant-reveal meaning.
+        let reveal_us = (self
+            .defaults
+            .as_ref()
+            .context("E_IMPORT_SETTINGS: source defaults not loaded")?
+            .text_speed_ms as u64)
+            * 1000;
         self.effect(
             blocks,
             "line",
             "interaction",
-            json!({"type":"dialogue","text":tid,"speaker":"","reveal_us":"32000"}),
+            json!({"type":"dialogue","text":tid,"speaker":"","reveal_us":reveal_us.to_string()}),
             false,
         );
         self.bind_page_voice(blocks);
@@ -1503,6 +1565,7 @@ impl Adapter {
             &self.source.path("live.lpb")?,
         )?)?);
         verify_auto_timer(&mut self.source)?;
+        verify_text_speed(&mut self.source)?;
         self.menu_items = Some(super::ui_items::MenuItems::load(&mut self.source)?);
         let (_, startup) = self.source.read(entry)?;
         let (_, bootstrap) = self.source.read(&last_jump(&startup)?)?;
@@ -1527,7 +1590,7 @@ impl Adapter {
         self.textbox = self.image("グラフィック/立ちポーズ/box.gal")?.0;
         self.warnings.insert("Stock LiveNovel startup, window/system scripts and asynchronous message handshake are replaced by NIR. This profile targets its episode/replay/choice convention, not arbitrary LSB expressions.".into());
         self.warnings.insert("Save/load, history and settings use NIR UI and save format; LiveMaker save files are not compatible. Title/replay select sounds and the replay BGM map to page effects; hover sounds and animated cursors are not reproduced.".into());
-        self.warnings.insert("Text uses the bundled NIR Japanese font and a 32 ms reveal interval; the source text-speed value is retained in import-defaults.json but its unit and source font/style are not yet mapped.".into());
+        self.warnings.insert("Text speed maps the persisted StatusTextSpeed (milliseconds per character, 0 meaning instant) to the reveal interval; text renders in the bundled NIR Japanese font because the source font-face setting names a system font that cannot be bundled.".into());
         self.warnings.insert("Source Auto uses a sampled remaining-voice timer plus fixed delay. The imported policy samples the bound voice duration/position and voice-volume preference once per Auto cycle; original device timing and unsupported simultaneous source voice channels remain outside certification.".into());
         let mut routes = Routes {
             episodes: vec![],
@@ -1881,7 +1944,17 @@ pub(super) fn convert(
     } else {
         "Linear LiveNovel route,".into()
     };
-    let mappings = mapping_ledger(adapter.choice_sites, adapter.fade_sites, adapter.menu_sounds);
+    let mappings = mapping_ledger(
+        adapter.choice_sites,
+        adapter.fade_sites,
+        adapter.menu_sounds,
+        adapter
+            .defaults
+            .as_ref()
+            .context("E_IMPORT_SETTINGS: source defaults not loaded")?
+            .text_speed_ms as u64
+            * 1000,
+    );
     let mut report=ImportReport{format:2,engine:"livemaker-livenovel116".into(),status:ImportReport::status_from_mappings(&mappings).into(),written:false,errors:0,approximate:mappings.iter().filter(|m|m.approximate()).count(),text_pages:adapter.texts.len(),functions:adapter.functions.len(),coverage:format!("{} replay dispatch and title image menu. {} referenced media assets converted. Native system scripts are replaced; see fidelity warnings and per-rule mappings.",route_shape,adapter.assets.len()),mappings,diagnostics:adapter.warnings.iter().map(|message|ImportDiagnostic{severity:"warning".into(),source:entry.into(),index:0,line:0,byte:0,command:"LiveNovelProfile".into(),message:message.clone()}).collect(),source_map:adapter.source_map.clone()};
     report.diagnostics.extend(ui.diagnostics());
     let staging = tempfile::Builder::new()
@@ -2243,9 +2316,94 @@ mod tests {
     }
 
     #[test]
+    fn text_speed_profile_checks_slider_write_units() {
+        use super::super::lsb::Command;
+        let var = |name: &str| Literal::Variable(name.into());
+        let expression = |ops| Expression {
+            literal: None,
+            operations: ops,
+            functions: BTreeMap::new(),
+        };
+        let write = expression(vec![
+            (
+                10,
+                "____d_0".into(),
+                vec![var("@ParamStr"), Literal::Int(0)],
+            ),
+            (4, "____1".into(), vec![var("____d_0"), Literal::Int(64)]),
+            (1, "StatusTextSpeed".into(), vec![var("____1")]),
+        ]);
+        let command = |kind, body| Command {
+            kind,
+            body,
+            indent: 0,
+            muted: false,
+            not_update: false,
+            line: 0,
+            offset: 0,
+        };
+        let mut script = Script {
+            source_sha256: String::new(),
+            version: 116,
+            commands: vec![command(14, Body::Calc(write))],
+        };
+        verify_text_speed_callback(&script).unwrap();
+        if let Body::Calc(e) = &mut script.commands[0].body {
+            e.operations[1].2[1] = Literal::Int(100);
+        }
+        assert!(verify_text_speed_callback(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("units"));
+        if let Body::Calc(e) = &mut script.commands[0].body {
+            e.operations[1] = (5, "____1".into(), vec![var("____d_0"), Literal::Int(64)]);
+        }
+        assert!(verify_text_speed_callback(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("units"));
+        if let Body::Calc(e) = &mut script.commands[0].body {
+            e.operations[1] = (4, "____1".into(), vec![var("____d_0"), Literal::Int(64)]);
+            e.operations[2] = (1, "StatusAutoTextWait".into(), vec![var("____1")]);
+        }
+        assert!(verify_text_speed_callback(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("units"));
+        if let Body::Calc(e) = &mut script.commands[0].body {
+            e.operations[2] = (1, "StatusTextSpeed".into(), vec![var("____1")]);
+        }
+        script
+            .commands
+            .push(command(14, Body::Calc(Expression::default())));
+        assert!(verify_text_speed_callback(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("control flow"));
+        script.commands.pop();
+        script.commands[0].not_update = true;
+        assert!(verify_text_speed_callback(&script)
+            .unwrap_err()
+            .to_string()
+            .contains("control flow"));
+    }
+
+    fn stock_defaults() -> ImportedDefaults {
+        ImportedDefaults {
+            source_sha256: String::new(),
+            bgm_volume: 1.,
+            voice_volume: 1.,
+            sfx_volume: 1.,
+            auto_wait_ms: 3000,
+            text_speed_ms: 128,
+        }
+    }
+
+    #[test]
     fn mid_page_event_waits_for_text_marker_then_resumes_same_dialogue() {
         let temp = tempfile::tempdir().unwrap();
         let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+        adapter.defaults = Some(stock_defaults());
         let mut blocks = vec![];
         adapter
             .page(
@@ -2264,6 +2422,10 @@ mod tests {
             .unwrap();
         let doc = adapter.texts.values().next().unwrap();
         assert!(matches!(&doc.spans[1],Span::Gate{id} if id=="s1"));
+        assert!(adapter
+            .cues
+            .values()
+            .any(|cue| cue["effects"][0]["effect"]["reveal_us"] == "128000"));
         assert_eq!(
             blocks[2]["terminator"]["conditions"][0]["milestone"],
             json!({"type":"marker","id":"s1"})
@@ -2288,6 +2450,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("サウンド")).unwrap();
         std::fs::write(temp.path().join("サウンド/tone.wav"), b"fixture").unwrap();
         let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+        adapter.defaults = Some(stock_defaults());
         let event = || {
             Glyph::Event(
                 ["PLAYSND", "tone.wav", "VOICE", "NORMAL", "1000", "0"]
@@ -2383,6 +2546,7 @@ mod tests {
     fn page_completion_cancels_non_looping_voice_only() {
         let temp = tempfile::tempdir().unwrap();
         let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+        adapter.defaults = Some(stock_defaults());
         adapter
             .audio
             .insert("bgm".into(), json!({"type":"audio","looped":true}));
@@ -2453,12 +2617,12 @@ mod tests {
         assert_eq!(defaults.bgm_volume, 0.75);
         assert_eq!(defaults.voice_volume, 1.);
         assert_eq!(defaults.sfx_volume, 0.);
-        assert_eq!(defaults.text_speed_raw, 128);
+        assert_eq!(defaults.text_speed_ms, 128);
         assert_eq!(defaults.source_sha256, nir_content::digest(&bytes));
         assert!(!serde_json::to_string(&defaults)
             .unwrap()
             .contains("author-project-directory"));
-        for (index, value) in [(0, -1), (0, 30_001), (1, 1001), (2, -1)] {
+        for (index, value) in [(0, -1), (0, 30_001), (1, 1001), (2, -1), (4, -1), (4, 641)] {
             let mut broken = settings;
             broken[index].1 = value;
             assert!(ImportedDefaults::parse(&settings_file(&broken)).is_err());
@@ -2654,7 +2818,8 @@ mod tests {
         }
         pub(super) fn adapter() -> (tempfile::TempDir, Adapter) {
             let temp = tempfile::tempdir().unwrap();
-            let adapter = Adapter::new(Source::new(temp.path()).unwrap());
+            let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+            adapter.defaults = Some(super::stock_defaults());
             (temp, adapter)
         }
         pub(super) fn walk(adapter: &mut Adapter, script: &Script) -> Result<Routes> {

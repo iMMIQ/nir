@@ -28,7 +28,7 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
-| P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
+| P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源字速已映射（批次 60），来源字体面与完整源映射仍待完成 |
 | P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
 | P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；LiveNovel 来源菜单的效果映射已交付（批次 59，标题/回想选择音与回想 BGM → 页面点击音效/循环页面音乐），悬停音效/动画光标与来源动画映射仍待完成 |
@@ -692,3 +692,13 @@ P1.2 计划所列四个目标域（SceneNode/DialogueRoot/ViewElement/AudioInsta
 - 文档同步：IMPORT.md（近似规则清单与菜单音效描述、保真边界句）、CAPABILITIES.md（ui.menu-effects.v1 段落与外部引擎导入行）、MENU-EFFECTS-SEMANTICS.md（不包含清单改为指向导入映射）。
 
 P4 的来源效果映射半边交付；悬停音效/动画光标保持显式近似，来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）、P2.3 来源字体样式与字速单位、P0 三示例与版本上限矩阵待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-59-*.log。契约见 MENU-EFFECTS-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 60：来源字速映射（P2.3）
+
+- 单位认证（证据先行）：LiveNovel 官方帮助（pylivemaker 镜像）明确「テキスト速度変更／１文字の表示時間」按毫秒指定（標準 50ms／ノーウエイト 0ms／スロー 300ms）；固定滑条回调 `ノベルシステム/システムメニュー/オプションテキスト速度スライダー変化時.lsb` 仅一条 Calc：`StatusTextSpeed = @ParamStr[0] × 64`（操作码 10=索引、4=乘、1=赋值；操作 4=乘经等待滑条字幕证据 `StatusAutoTextWait ÷ 1000 + "秒"` 与 `× 1000` 写回对称定型）。创作侧滑条 0..10 步 1 → StatusTextSpeed ∈ {0,…,640} ms/字符，live.lpb 默认 128；0 为瞬时（既読跳过路径写 0，经消息框 SetProperty 属性 82 消费）。
+- 映射：新增 `verify_text_speed_callback` 严格校验回调形状——唯一非静音、缩进 0、非 NotUpdate 的 Calc，目标与 `Index[@ParamStr,0] × 64` 表达式完全匹配，畸形以 `E_IMPORT_TEXT_SPEED` 拒绝；在 run() 中紧随 verify_auto_timer 执行。`ImportedDefaults.text_speed_raw` 更名 `text_speed_ms` 并按认证范围 0..=640 校验（import-defaults.json 字段随更名）。page() 的对白揭示间隔由固定 32 ms 改为 `StatusTextSpeed × 1000` 微秒/字素簇；0 保持瞬时语义，玩家字速偏好继续在 Core 侧作为除数生效。通用 LSB 路径（非 LiveNovel 配置）不受影响，其固定间隔与既有「替代揭示速度」警告保持。
+- 账本拆分：`livenovel.text.reveal` 升为 adapted（行为句记录单位认证、×1000 换算与默认值），`mapping_ledger` 增加 reveal_us 参数记录实际映射值；字体面拆分为新近似规则 `livenovel.text.font`——live.lpb 的 StatusFontName 是工程外的 Windows 系统字体，无法打包注册为 NIR 内容，正文以内置日文字体渲染、字号/行高保留。近似清单收窄为 menu-hover/text.font 两条；`--accept-approximate` 示例与 `APPROXIMATE_RULES` 测试常量、账本门禁断言同步更新。
+- 实证：真实语料转换 1357 页、main + 8 条回想全路线含快照恢复通过（batch-60-corpus-test.log），1357 条对白 cue 全部 `reveal_us=128000`、import-defaults.json `text_speed_ms=128`；重建发行 CLI 后，无接受时以 E_IMPORT_APPROXIMATE 点名 [livenovel.menu-hover, livenovel.text.font] 退出且工程已写出，带新 ID 接受时成功（batch-60-cli-gate.log、batch-60-sdk-novelc.log、batch-60-verify-sdk.log）。新增回调校验单测（乘数、操作码、目标变量、控制流、NotUpdate 变异全部拒绝）、defaults 越界测试与 page 级映射断言。门禁：`cargo xtask test`（47 项能力）、依赖架构通过；工作区全目标 Clippy 通过且无 nir-compiler 新告警，`-D warnings` 严格模式仅在 nir-core 现存 6 处 lint（批次 58 引入、此前以警告容忍）失败，与本批无关，留待核心批次清理。仅改导入器，按批次 53/55/59 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（对白映射句、近似规则清单、import-defaults 字段说明）、READING-SEMANTICS.md（LiveNovel 配置映射一节）。
+
+P2.3 的字速半边交付；来源字体面保持显式近似，P0 三示例与版本上限矩阵、来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-60-*.log。契约见 IMPORT.md、READING-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
