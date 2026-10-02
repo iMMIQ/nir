@@ -31,8 +31,8 @@ fn program(mode: &str, values: Option<&[i64]>, timeout_us: Option<u64>) -> Progr
             "choice":"route",
             "branches":{"walk":"after_walk","stay":"after_stay"},
             "on_empty":"failed",
-            "result": result.then(|| "picked"),
-            "on_cancel": cancel.then(|| "gave_up"),
+            "result": result.then_some("picked"),
+            "on_cancel": cancel.then_some("gave_up"),
         })
     };
     let f = p.functions.get_mut("main").unwrap();

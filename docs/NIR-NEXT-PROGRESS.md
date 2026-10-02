@@ -744,3 +744,11 @@ P0（P0.1 账本/回归/三样例 + P0.2 矩阵 + 第二来源认证）按计划
 - 文档同步：IMPORT.md（映射级别一节新规则句、系统菜单草稿段与尚非等价清单）、CAPABILITIES.md（外部引擎导入行、ui.menu-effects.v1 段）、MENU-EFFECTS-SEMANTICS.md（导入指针）、本进度 P2.4/P4 行。
 
 P4 的来源效果映射收口：menu-sfx（批次 59）与 menu-transition（本批）已交付；悬停音效/动画光标与来源字体面保持显式近似；逐元素进入动画无已认证来源约定（库存菜单以整层 Flip 呈现进出），不作映射声明。遗留：nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-64-*.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。
+
+## 批次 65：仓库内 clippy 警告清零
+
+- 清理批次 58 引入并此前以警告容忍的全部 10 处仓库内 clippy 警告，未使用 allow 属性绕过任何 lint：validate.rs 两处 typed-result 能力门的嵌套 if 合并为单条件（collapsible_if）；check_compose_child 九参签名收敛为五参——at/requires/asset_kind/audio_task/err 打包为借用型 ComposeCheck 上下文（too_many_arguments），递归与 validate_composition 两处调用点同步，逐条校验逻辑不变；vm.rs 类型化交互 values 构造与恢复校验的三处双操作数取引用移除（op_ref，语义等价）；coordination.rs 与 typed_result_contract.rs 的 `bool::then(\|\| 字面量)` 改为 then_some（unnecessary_lazy_evaluations）。工作区 Clippy 现仅余 3 处 vendor 警告（hb-subset 1、tiny_http 2）。
+- 门禁：`cargo test -p nir-core -p nir-player` 17 套通过；`cargo xtask test` 38 套测试、依赖架构 18 包、能力发行清单 47 项一一对应通过；`cargo clippy --workspace --all-targets --locked` 通过且仓库内零警告。本批触及 nir-core 运行时代码（vm.rs 语义等价改写），按批次 54/58 先例重建 SDK 并通过独立交付验证，随后浏览器整套 45 项全部通过。Windows 原生与硬件 WebGPU 仍待验证。
+- 证据：reports/nir-next/batch-65-*.log（本地保留）。
+
+批次 60/63/64 记录的「nir-core 现存 6 处 lint 清理」遗留至此收口。完整 P0–P6 计划其余各项状态见上表；本批随分支提交，未推送。

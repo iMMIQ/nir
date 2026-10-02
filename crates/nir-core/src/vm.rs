@@ -1475,7 +1475,7 @@ impl Core {
                         .filter_map(|o| {
                             c.options
                                 .iter()
-                                .find(|d| &d.id == &o.id)
+                                .find(|d| d.id == o.id)
                                 .and_then(|d| d.value.clone())
                                 .map(|value| (o.id.clone(), value))
                         })
@@ -2911,13 +2911,13 @@ impl Core {
                     definition
                         .options
                         .iter()
-                        .find(|d| &d.id == &o.id)
+                        .find(|d| d.id == o.id)
                         .and_then(|d| d.value.clone())
                         .map(|value| (o.id.clone(), value))
                 })
                 .collect();
             if c.result.is_some() {
-                if &expected != &c.values
+                if expected != c.values
                     || c.selected
                         .as_ref()
                         .is_none_or(|id| !c.options.iter().any(|o| &o.id == id && o.enabled))

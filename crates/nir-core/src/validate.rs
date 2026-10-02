@@ -3144,10 +3144,10 @@ fn validate_runtime_function(
             ..
         } = &block.terminator
         {
-            if result.is_some() || on_cancel.is_some() {
-                if !view.requires.iter().any(|c| c == "story.typed-result.v1") {
-                    return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
-                }
+            if (result.is_some() || on_cancel.is_some())
+                && !view.requires.iter().any(|c| c == "story.typed-result.v1")
+            {
+                return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
             }
             if let Some(definition) = view.choices.get(choice) {
                 if definition.options.len() != branches.len()
@@ -3294,19 +3294,34 @@ fn check_writer_tree(
     Ok(())
 }
 
+/// The cue-level facts a composition check borrows from its caller: the
+/// diagnostic location and capability list of the cue being validated, plus
+/// its asset typing, top-level audio task membership and diagnostic
+/// constructor. Bundling them keeps the recursive child check reviewable.
+struct ComposeCheck<'a> {
+    at: &'a str,
+    requires: &'a [String],
+    asset_kind: &'a dyn Fn(&str) -> Option<AssetKind>,
+    audio_task: &'a dyn Fn(&str) -> bool,
+    err: &'a dyn Fn(&str, &str, &str) -> Diagnostic,
+}
+
 /// One composition child: scope inheritance, forbidden kinds, capabilities,
 /// assets and stop targets, exactly like a top-level effect.
 fn check_compose_child<'a>(
-    at: &str,
     def: &'a EffectDef,
     parent_scope: Scope,
     depth: usize,
     names: &mut BTreeSet<&'a String>,
-    requires: &[String],
-    asset_kind: &impl Fn(&str) -> Option<AssetKind>,
-    audio_task: &impl Fn(&str) -> bool,
-    err: &impl Fn(&str, &str, &str) -> Diagnostic,
+    check: &ComposeCheck<'_>,
 ) -> Result<()> {
+    let ComposeCheck {
+        at,
+        requires,
+        asset_kind,
+        audio_task,
+        err,
+    } = *check;
     if !names.insert(&def.id) {
         return Err(err("E_DUPLICATE", at, &def.id));
     }
@@ -3385,17 +3400,7 @@ fn check_compose_child<'a>(
         }
     }
     for child in def.effect.compose_children().unwrap_or(&[]) {
-        check_compose_child(
-            at,
-            child,
-            def.scope,
-            depth + 1,
-            names,
-            requires,
-            asset_kind,
-            audio_task,
-            err,
-        )?;
+        check_compose_child(child, def.scope, depth + 1, names, check)?;
     }
     Ok(())
 }
@@ -3422,6 +3427,13 @@ fn validate_composition<'a>(
     if total > MAX_TASKS {
         return Err(err("E_LIMIT", id, "invalid cue size"));
     }
+    let check = ComposeCheck {
+        at: id,
+        requires,
+        asset_kind: &asset_kind,
+        audio_task: &audio_task,
+        err: &err,
+    };
     for def in &cue.effects {
         if def.effect.compose_children().is_none() {
             continue;
@@ -3456,17 +3468,7 @@ fn validate_composition<'a>(
             _ => {}
         }
         for child in def.effect.compose_children().unwrap_or(&[]) {
-            check_compose_child(
-                id,
-                child,
-                def.scope,
-                1,
-                names,
-                requires,
-                &asset_kind,
-                &audio_task,
-                &err,
-            )?;
+            check_compose_child(child, def.scope, 1, names, &check)?;
         }
     }
     Ok(())
@@ -4353,10 +4355,10 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     on_cancel,
                     ..
                 } => {
-                    if result.is_some() || on_cancel.is_some() {
-                        if !p.requires.iter().any(|c| c == "story.typed-result.v1") {
-                            return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
-                        }
+                    if (result.is_some() || on_cancel.is_some())
+                        && !p.requires.iter().any(|c| c == "story.typed-result.v1")
+                    {
+                        return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
                     }
                     let c = p
                         .choices

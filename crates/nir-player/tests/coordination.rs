@@ -81,8 +81,8 @@ fn typed_program(mode: &str) -> Program {
         serde_json::from_value(serde_json::json!({"terminator":{
             "type":"interact","choice":"route",
             "branches":{"walk":"after_walk","stay":"after_stay"},"on_empty":"failed",
-            "result":(mode != "plain").then(|| "picked"),
-            "on_cancel":(mode == "cancel").then(|| "gave_up")}}))
+            "result":(mode != "plain").then_some("picked"),
+            "on_cancel":(mode == "cancel").then_some("gave_up")}}))
         .unwrap(),
     );
     for (block, outcome) in [("after_walk", "walk"), ("after_stay", "stay"), ("gave_up", "gave_up")] {
