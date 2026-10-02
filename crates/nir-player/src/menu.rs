@@ -943,6 +943,24 @@ impl Player {
                 }
             }
         }
+        if !effects.elements.is_empty() && !self.preferences.reduced_motion {
+            // Same lease discipline as the fade: reuse the boundary's token when
+            // the enter fade already holds one, otherwise lease a fresh clock.
+            // Without a lease the tracks could never advance; the page rests at
+            // its authored values instead of stalling mid-animation.
+            if let Some(token) = self
+                .menu_effects_clock
+                .take()
+                .or_else(|| self.acquire_foreground_clock())
+            {
+                let page = self.core.program().theme.image_menus.get(id);
+                self.menu_effects
+                    .start_elements(page, &effects.elements, self.ui_clock_us.0);
+                if self.menu_effects.fade.is_some() || !self.menu_effects.elements.is_empty() {
+                    self.menu_effects_clock = Some(token);
+                }
+            }
+        }
         if let Some(music) = &effects.music {
             self.start_menu_music(music);
         }
@@ -1052,17 +1070,21 @@ impl Player {
         }
         let had_fade = self.menu_effects.fade.is_some();
         let exit = self.menu_effects.take_finished_close(self.ui_clock_us.0);
-        if exit.is_some() || self.menu_effects.fade.is_none() {
+        if (exit.is_some() || self.menu_effects.fade.is_none())
+            && self.menu_effects.elements.is_empty()
+        {
             self.menu_effects_clock = None;
         }
         self.menu_effects.settle_enter(self.ui_clock_us.0);
-        if self.menu_effects.fade.is_none() {
+        let drained = self.menu_effects.drain_finished_elements(self.ui_clock_us.0);
+        if self.menu_effects.fade.is_none() && self.menu_effects.elements.is_empty() {
             self.menu_effects_clock = None;
         }
-        if had_fade && self.menu_effects.fade.is_none() {
-            // The divert (or alpha ramp) lifted this tick — a discrete visual
-            // change that a clock-only tick would otherwise leave unprojected
-            // right as the clock token releases and the frame loop stops.
+        if (had_fade && self.menu_effects.fade.is_none()) || drained > 0 {
+            // The divert (or alpha ramp, or the last element track) lifted this
+            // tick — a discrete visual change that a clock-only tick would
+            // otherwise leave unprojected right as the clock token releases
+            // and the frame loop stops.
             self.ui_visual_pulse = true;
         }
         if let Some(exit) = exit {
@@ -1079,6 +1101,9 @@ impl Player {
             // owed no close fade; page effects never outlive their page.
             self.stop_menu_music();
             self.menu_effects.retire_page();
+            // Retiring drops in-flight element tracks that would otherwise
+            // hold the clock lease for animations no page will ever show.
+            self.menu_effects_clock = None;
         }
         if let Some((id, instance)) = identity {
             if self.menu_effects.closing.is_none()
@@ -3782,6 +3807,177 @@ mod tests {
             packet.menu_quad_range.is_some(),
             "page keeps interleaving on the shared surface"
         );
+    }
+
+    // ---- ui.menu-element-tween.v1: element enter animations ----------------
+    /// The overlay page animates three elements: a delayed opacity rise on
+    /// the speed readout, a slide-in on the same readout, and a quick scale
+    /// settle on the motion toggle that finishes while the others still run.
+    fn element_tween_program() -> Program {
+        let mut p = effects_program();
+        p.requires.push("ui.menu-element-tween.v1".into());
+        p.theme.image_menus.get_mut("system").unwrap().effects =
+            Some(serde_json::from_value(serde_json::json!({
+                "enter": {"sound": "audio.bell"},
+                "close": {"sound": "audio.bell", "fade_us": "300000"},
+                "elements": [
+                    {"element": "speed", "property": "opacity", "from": 0.0,
+                     "delay_us": "100000", "duration_us": "300000"},
+                    {"element": "speed", "property": "offset_x", "from": -40.0,
+                     "duration_us": "400000"},
+                    {"element": "motion", "property": "scale", "from": 0.5,
+                     "duration_us": "200000"}
+                ]
+            }))
+            .unwrap());
+        // The child page animates one element, so navigation must restart the
+        // track set rather than leak the parent page's.
+        let child = p.theme.image_menus.get_mut("system.child").unwrap();
+        child.effects = Some(serde_json::from_value(serde_json::json!({
+            "elements": [
+                {"element": "close", "property": "offset_y", "from": 20.0,
+                 "duration_us": "200000"}
+            ]
+        }))
+        .unwrap());
+        p
+    }
+    fn element_player_at_overlay() -> Player {
+        let mut p = Player::new(element_tween_program(), "r".into(), "t".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        p
+    }
+    fn tick_foreground(p: &mut Player, foreground_us: u64) {
+        p.pump(
+            vec![AppEvent::TickDomains {
+                story_us: 0,
+                foreground_us,
+            }],
+            1000,
+        );
+    }
+    #[test]
+    fn element_animations_require_their_capability() {
+        let mut p = element_tween_program();
+        p.requires.retain(|c| c != "ui.menu-element-tween.v1");
+        assert_eq!(
+            Player::new(p, "r".into(), "t".into()).err().unwrap().code,
+            "E_CAPABILITY"
+        );
+    }
+    #[test]
+    fn element_tracks_follow_the_foreground_clock_and_settle_to_authored() {
+        let mut p = element_player_at_overlay();
+        assert_eq!(p.menu_effects.elements.len(), 3, "all tracks started");
+        assert!(p.menu_effects_clock.is_some(), "clock lease held");
+        // Enter instant: the delayed opacity holds `from`, the slide-in sits
+        // at its authored-minus-offset place, the scale track is at 0.5.
+        let model = p.model();
+        let speed = &model.menu_element_animations["speed"];
+        assert_eq!(speed.opacity, Some(0.), "delay holds the from value");
+        assert_eq!(speed.offset, [-40., 0.]);
+        assert_eq!(model.menu_element_animations["motion"].scale, Some(0.5));
+        // Projection carries the overrides through layout: the readout text
+        // is displaced and fully transparent while the page behind it is not.
+        let packet = nir_presentation::project(
+            &model,
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        let readout = packet
+            .texts
+            .iter()
+            .find(|t| t.text == "1.00")
+            .expect("speed readout projected");
+        assert!((readout.x - (20. - 40.)).abs() < 1e-3, "displaced by the track");
+        assert_eq!(readout.color[3], 0.);
+        // Halfway into the delay window the opacity has not moved yet.
+        tick_foreground(&mut p, 50_000);
+        assert_eq!(p.model().menu_element_animations["speed"].opacity, Some(0.));
+        // At 200ms: the scale track has drained (its pulse fired), the other
+        // two are mid-flight, so the lease survives the partial drain.
+        tick_foreground(&mut p, 150_000);
+        let model = p.model();
+        let speed = &model.menu_element_animations["speed"];
+        assert!((speed.opacity.unwrap() - 1. / 3.).abs() < 1e-3, "delay shifts the ramp");
+        assert!((speed.offset[0] + 20.).abs() < 1e-3);
+        assert!(!model.menu_element_animations.contains_key("motion"), "scale settled");
+        assert_eq!(p.menu_effects.elements.len(), 2);
+        assert!(p.take_ui_visual_pulse(), "a drain is a discrete view change");
+        assert!(p.menu_effects_clock.is_some(), "lease outlives remaining tracks");
+        // At 400ms everything has settled: no overrides, authored projection,
+        // lease released, and the final drain pulsed the view once more.
+        tick_foreground(&mut p, 200_000);
+        let model = p.model();
+        assert!(model.menu_element_animations.is_empty());
+        assert!(p.menu_effects.elements.is_empty());
+        assert!(p.menu_effects_clock.is_none());
+        assert!(p.take_ui_visual_pulse(), "the settling tick pulses the view");
+        assert!(!p.take_ui_visual_pulse(), "the pulse is one-shot");
+        let settled = nir_presentation::project(
+            &model,
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        let readout = settled
+            .texts
+            .iter()
+            .find(|t| t.text == "1.00")
+            .expect("speed readout projected");
+        assert!((readout.x - 20.).abs() < 1e-3, "authored position restored");
+        assert_eq!(readout.color[3], 1.);
+    }
+    #[test]
+    fn element_tracks_restart_per_page_and_never_survive_leaving() {
+        let mut p = element_player_at_overlay();
+        // Navigate to the child page: its single track replaces the set.
+        let navigate = control(&p, "child");
+        let c = pump_action(&mut p, navigate);
+        settle(&mut p, c);
+        assert_eq!(p.menu_effects.elements.len(), 1);
+        assert_eq!(p.model().menu_element_animations["close"].offset, [0., 20.]);
+        tick_foreground(&mut p, 200_000);
+        assert!(p.menu_effects.elements.is_empty(), "child track settled");
+        // Open a fresh overlay: the animated system page fires its set again.
+        let c = pump_action(&mut p, UiAction::Close);
+        settle(&mut p, c);
+        assert_eq!(p.screen, Screen::Story);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        assert_eq!(p.menu_effects.elements.len(), 3, "tracks restart per enter");
+        // Leaving through the deferred close clears any in-flight tracks at
+        // the exit commit; they never outlive their page.
+        tick_foreground(&mut p, 50_000);
+        let c = pump_action(&mut p, UiAction::Close);
+        settle(&mut p, c);
+        assert_eq!(p.screen, Screen::Menu, "exit deferred behind the close fade");
+        tick_foreground(&mut p, 300_000);
+        assert_eq!(p.screen, Screen::Story);
+        assert!(p.menu_effects.elements.is_empty());
+        assert!(p.menu_effects_clock.is_none());
+    }
+    #[test]
+    fn reduced_motion_suppresses_element_animations_but_not_sounds() {
+        let mut p = Player::new(element_tween_program(), "r".into(), "t".into()).unwrap();
+        p.preferences.reduced_motion = true;
+        let c = p.pump(vec![], 1000);
+        let fired = settle(&mut p, c);
+        assert!(
+            ui_audio(&fired)
+                .iter()
+                .any(|(_, asset, ..)| *asset == "audio.bell"),
+            "sounds still fire"
+        );
+        assert!(p.menu_effects.elements.is_empty());
+        assert!(p.menu_effects_clock.is_none());
+        assert!(p.model().menu_element_animations.is_empty());
     }
     #[test]
     fn a_spatial_reveal_absorbs_the_spliced_history_bar_into_the_page() {

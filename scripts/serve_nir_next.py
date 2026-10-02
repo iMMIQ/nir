@@ -402,6 +402,43 @@ wipe_menu_project=build("browser-menu-wipe",menu_wipe,setup=menu_wipe_assets)
 wipe_menu_server=ThreadingHTTPServer(("127.0.0.1",4224),partial(SimpleHTTPRequestHandler,directory=str(wipe_menu_project)))
 Thread(target=wipe_menu_server.serve_forever,daemon=True).start()
 
+def menu_element_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # The system page slides one image element in from the right across the
+    # E_VIEW_EFFECTS 2 s cap while an unanimated anchor holds its authored
+    # spot as a page-composited control. No enter fade and no reveal style
+    # ride on top, so the element tracks are the only motion on the shared
+    # page surface and the spec can freeze both time domains on the slide.
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[[image_menus.system.effects.elements]]\nelement = "slide"\nproperty = "offset_x"\nfrom = 1400.0\nduration_us = "2000000"\n'
+    source += '\n[[image_menus.system.elements]]\nid = "slide"\nrect = [80,180,400,80]\ncontent = { type = "image", asset = "menu.blue" }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,320,300,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "anchor"\nrect = [80,600,400,80]\ncontent = { type = "image", asset = "menu.blue" }\n'
+    theme.write_text(source)
+
+element_menu_project=build("browser-menu-element-tween",lambda c:None,setup=menu_element_assets)
+element_menu_server=ThreadingHTTPServer(("127.0.0.1",4225),partial(SimpleHTTPRequestHandler,directory=str(element_menu_project)))
+Thread(target=element_menu_server.serve_forever,daemon=True).start()
+
+def audio_gain_tween(content):
+    # A looping chime starts under the intro dialogue and a linear gain tween
+    # ramps its envelope 1 -> 0.25 over 2 s while the reader parks on the
+    # line: playback never stops, the device envelope is the only thing
+    # moving, so the audit can follow the single scheduled ramp.
+    content["cues"]["intro"]["effects"].extend([
+        {"id": "chime", "scope": "session",
+         "effect": {"type": "audio", "asset": "audio.bell", "looped": True, "bus": "sfx"}},
+        {"id": "chime-gain", "scope": "session",
+         "effect": {"type": "tween",
+                    "target": {"type": "audio_instance", "task": "chime", "property": "gain"},
+                    "to": 0.25, "duration_us": "2000000"}}])
+
+gain_tween_project=build("browser-audio-gain-tween",audio_gain_tween)
+gain_tween_server=ThreadingHTTPServer(("127.0.0.1",4226),partial(SimpleHTTPRequestHandler,directory=str(gain_tween_project)))
+Thread(target=gain_tween_server.serve_forever,daemon=True).start()
+
 def replay_assets(project):
     menu_service_assets(project)
     theme=project/"themes/rain/theme.toml"

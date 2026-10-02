@@ -757,6 +757,19 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     }) {
         program.requires.retain(|cap| cap != "tween.target.v1");
     }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect.effect_tree_any(&|e| {
+            matches!(
+                e,
+                Effect::Tween {
+                    target: TweenTarget::AudioInstance { .. },
+                    ..
+                }
+            )
+        })
+    }) {
+        program.requires.retain(|cap| cap != "audio.gain-tween.v1");
+    }
     if !program
         .cues
         .values()
@@ -974,6 +987,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .any(|m| m.effects.iter().any(nir_format::MenuEffects::uses_transition))
     {
         program.requires.retain(|c| c != "ui.menu-transition.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(nir_format::MenuEffects::uses_element_tween))
+    {
+        program.requires.retain(|c| c != "ui.menu-element-tween.v1");
     }
     if !program
         .theme

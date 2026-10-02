@@ -24,14 +24,14 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 | --- | --- |
 | P0 来源基线、三例、完整版本/限额矩阵 | 部分：已有代码盘点和回归基线；第二来源认证与三个完整新样例未完成 |
 | P1.1 播放实例和终态原因 | 已有实例协议上补原因及验证；跨设备实测继续验收 |
-| P1.2 类型化目标 | 场景节点与消息根目标已接入共享轨道；UI/音频通用属性目标仍未实施 |
+| P1.2 类型化目标 | 计划所列四个域均已接入共享求值：场景节点与消息根（Core 故事轨道），AudioInstance 实例增益补间（`audio.gain-tween.v1`，Core 轨道）与 ViewElement 菜单元素动画（`ui.menu-element-tween.v1`，Player 瞬态）于批次 58 交付；跨设备实测继续验收 |
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
 | P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
 | P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射与硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；消息/UI 根上的通用补间目标仍待实施 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；来源系统菜单的效果/动画映射仍待完成 |
 | P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
 | P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
@@ -671,3 +671,14 @@ P2.4 的消息根半边交付；UI 菜单页根（MenuTransition 样式、ui.men
 - 转场完成脉冲（产品缺陷修复）：页面渐隐的收尾发生在纯时钟 tick 内（clock-only，无工作即不置脏），且同一刻 ForegroundClockToken 释放、宿主帧循环停摆，16 帧安全阀不再触发——落定帧可能永不重投影（批次 48 的 alpha 渐隐即已潜伏，空间揭示使其可见）。修复：Player 以 `ui_visual_pulse` 标记「本 tick 渐隐由有到无」的离散视觉变化（`take_ui_visual_pulse()` 取走），Engine 在 `pump()` 末尾将其并入 `state_dirty`；回归测试 a_completed_reveal_pulses_the_view_before_the_clock_token_releases 断言中途 tick 无脉冲、收尾 tick 恰好一次脉冲。浏览器规格连过 4 次后全量 43 项绿。
 
 P2.4 的菜单页根半边交付；P1.2 UI/音频通用目标与 P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-57-*.log。契约见 MENU-EFFECTS-SEMANTICS.md（空间揭示样式一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 58：实例增益补间与菜单元素进入动画（P1.2 收口）
+
+- Part A——AudioInstance 增益目标（`audio.gain-tween.v1`）：`tween.target.v1` 的目标联合增加 `audio_instance { task, property: gain }`，把一个已建立 Audio 实例的 0–1 包络乘子在有限时长内线性补间到 `to`（0–1）。包络叠加在事件 gain × 总线音量之上，不预乘 PCM、不改变播放位置与生命周期——声音始终 Running，设备侧只是包络节点上的一条线性 ramp；只允许 `easing = linear`（设备每次只渲染一条线性段，非线性行为由作者分段表达）。目标必须是同模块的另一音频任务，与 `audio_stop` 共享互斥的包络所有权（同 Cue 验证期 E_OWNERSHIP，运行中冲突在原子提交回滚）。补间完成提交终点并 Finished，声音留在该音量；Cancel 提交设备时钟当前值（设备领先剧情时钟时以设备值为准）；飞行中存读档保存剩余段、恢复续播，设备包络检查点（owner/elapsed）同样适用于补间 owner。Core 契约（audio_contract.rs）覆盖线性推进、取消提交设备值、与停止的所有权互斥、飞行中存读档剩余段与伪造 owner 拒绝。
+- Part A 实机链路：vm.rs 的包络段路径（原属 AudioStop）推广到补间 owner——`CoreIntent::AudioEnvelope` → Player `AppCommand::AudioEnvelope` → Web host 在语音专属包络 GainNode 上 `cancelScheduledValues/setValueAtTime/linearRampToValueAtTime`（与事件 gain、总线节点分离）。浏览器规格 tests/nir-next/audio-gain-tween.spec.js（端口 4226 fixture：循环铃声 + 2 s 补间到 0.25）审计设备上恰有一条指向 0.25 的排定 ramp、中途值单调、终点收敛且循环声源存活。AudioParam 绝不跨越 evaluate 边界（结构化克隆会丢弃活动节点）——一律在页内按下标解引用。
+- Part B——ViewElement 进入动画（`ui.menu-element-tween.v1`）：`MenuEffects.elements` 至多 128 条元素轨道（opacity/scale/offset_x/offset_y，from 落在属性界限内，时长 (0, 2 秒]、延迟 ≤ 2 秒，同一元素同一属性单轨），随进入边界在共享前台时钟上启动：延迟期保持 from，随后推进到落定值——opacity/scale 落定到元素作者值、偏移落定到 0，完成的轨道被丢弃，落定投影与未声明不可区分。投影层在布局前把轨道值覆盖到元素 Node（父级变换随之传播，透明度乘进颜色 alpha）；页面本身仍走共享菜单面（不建离屏页根、不叠加页面渐隐，`menu_opacity` 恒为 1）。换页逐页重启，离开菜单面清空轨道并释放时钟令牌（与页面渐隐共用同一枚 ForegroundClockToken，全部轨道落定才释放），最后一条轨道的落定 tick 复用批次 57 的 `ui_visual_pulse` 标记视图脏；reduced_motion 抑制动画不抑制音效。状态瞬态、不入故事快照；使用而无能力在源与 Runtime 校验以 E_CAPABILITY 拒绝；引擎状态面暴露 `menu_element_progress`（无动画为 null）。
+- Part B 实机验证：浏览器规格 tests/nir-next/menu-element-tween.spec.js（端口 4225 fixture：slide 元素 offset_x from=1400、2 s 滑入 + 不动画锚点）以 `hidden(true)` 冻结两域于飞行中途，像素采样断言滑动列被覆盖而未到达列为背景、锚点恒定，同时 `menu_transition === null`、`menu_opacity === 1` 证明走的是共享菜单面而非页根；解冻落定后滑动列回到背景、元素列回到作者位置；键盘关闭返回剧情无错误。开发期修正一处落定谓词写反（mid-flight 几何本已证明动画正确）。
+- 文档同步：AUDIO-SEMANTICS.md（实例增益补间一节）、MENU-EFFECTS-SEMANTICS.md（元素进入动画一节）、CAPABILITIES.md（两条能力段落与发行清单行，能力数 45→47）、TWEEN-SEMANTICS.md、TIME-DOMAINS.md（元素轨道共用前台时钟租约）。
+- 门禁：工作区 Rust 测试 49 套全绿、Clippy、依赖架构（18 包）、SDK 重建（batch-58-partb-tests/clippy/arch/sdk.log；Core 契约另见 batch-58-core.log）；浏览器整套 44 项通过后新增两条规格分别单独复跑通过（batch-58-partb-browser.log、batch-58-partb-browser-element.log、batch-58-parta-browser-gain.log）；`cargo xtask test` 常设门禁含 verify_capabilities.py 对 47 项能力的一一对应核对（batch-58-xtask-test.log）。
+
+P1.2 计划所列四个目标域（SceneNode/DialogueRoot/ViewElement/AudioInstance）全部接入共享求值；P4 的通用补间目标随之交付。遗留：P2.4/P4 来源映射（导入器菜单转场与元素动画）、P2.3 来源样式/字体映射、P0 三示例与版本上限矩阵。Windows 原生一律待验证。证据：reports/nir-next/batch-58-*.log。契约见 AUDIO-SEMANTICS.md（实例增益补间）、MENU-EFFECTS-SEMANTICS.md（元素进入动画）。完整 P0–P6 计划未完成；未提交或推送。

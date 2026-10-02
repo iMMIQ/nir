@@ -2,7 +2,7 @@
 //! live in `Core`; these voices never enter snapshots and are identified by a
 //! private task counter, so they cannot collide with story task ids even
 //! without the domain separation the host already enforces.
-use nir_format::MenuReadingMode;
+use nir_format::{MenuReadingMode, ScalarTween};
 use std::collections::BTreeMap;
 
 /// A page fade driven by the foreground clock. Enter fades run 0 -> 1, close
@@ -71,6 +71,29 @@ pub(super) enum DeferredExitKind {
     ReadingClose { mode: MenuReadingMode },
 }
 
+/// One in-flight element enter animation. The tween interpolates `from` to
+/// the element's authored value (zero for offsets), so a finished track is
+/// indistinguishable from no track and is dropped rather than settled.
+pub(super) struct ElementTrack {
+    pub element: String,
+    pub property: nir_format::MenuElementProperty,
+    pub track: ScalarTween,
+    /// The page's enter-boundary instant. The property holds `from` until
+    /// `delay_us` has elapsed on the foreground clock.
+    pub start_us: u64,
+    pub delay_us: u64,
+}
+impl ElementTrack {
+    fn value(&self, now_us: u64) -> f32 {
+        let elapsed = now_us.saturating_sub(self.start_us.saturating_add(self.delay_us));
+        self.track.sample(nir_format::Micros(elapsed))
+    }
+    fn finished(&self, now_us: u64) -> bool {
+        now_us.saturating_sub(self.start_us.saturating_add(self.delay_us))
+            >= self.track.duration_us.0
+    }
+}
+
 pub(super) struct MenuEffectsState {
     /// Session the voices and fades belong to; hosts reset audio per session.
     pub session: u32,
@@ -78,6 +101,8 @@ pub(super) struct MenuEffectsState {
     /// means no page owns the current voices.
     pub entered: Option<(String, u32)>,
     pub fade: Option<PageFade>,
+    /// In-flight element enter animations for the current page.
+    pub elements: Vec<ElementTrack>,
     pub music: Option<UiVoice>,
     pub sounds: BTreeMap<u32, UiVoice>,
     pub next_task: u32,
@@ -89,6 +114,7 @@ impl MenuEffectsState {
             session,
             entered: None,
             fade: None,
+            elements: Vec::new(),
             music: None,
             sounds: BTreeMap::new(),
             next_task: 0,
@@ -160,9 +186,92 @@ impl MenuEffectsState {
         }
         self.fade.is_none()
     }
+    /// Starts the page's element enter animations against its authored
+    /// element values. Tracks whose element vanished (validation keeps this
+    /// impossible) are skipped, not fatal.
+    pub fn start_elements(
+        &mut self,
+        page: Option<&nir_format::ImageMenu>,
+        authored: &[nir_format::MenuElementTween],
+        now_us: u64,
+    ) {
+        self.elements.clear();
+        self.elements.extend(authored.iter().filter_map(|t| {
+            let base = match t.property {
+                nir_format::MenuElementProperty::Opacity => page?
+                    .elements
+                    .iter()
+                    .find(|e| e.id == t.element)?
+                    .opacity,
+                nir_format::MenuElementProperty::Scale => {
+                    page?.elements.iter().find(|e| e.id == t.element)?.scale
+                }
+                // Offsets are transient displacement; their rest value is zero.
+                nir_format::MenuElementProperty::OffsetX
+                | nir_format::MenuElementProperty::OffsetY => 0.,
+            };
+            Some(ElementTrack {
+                element: t.element.clone(),
+                property: t.property,
+                track: ScalarTween {
+                    from: t.from,
+                    base,
+                    to: base,
+                    duration_us: t.duration_us,
+                    easing: t.easing,
+                    finish: nir_format::FinishPolicy::CommitEnd,
+                    cancel: nir_format::CancelPolicy::CommitCurrent,
+                },
+                start_us: now_us,
+                delay_us: t.delay_us.0,
+            })
+        }));
+    }
+    /// The in-flight element overrides for projection. Absent properties keep
+    /// their authored values; offsets are added displacement.
+    pub fn element_animations(
+        &self,
+        now_us: u64,
+    ) -> BTreeMap<String, nir_presentation::ElementAnimation> {
+        let mut out: BTreeMap<String, nir_presentation::ElementAnimation> = BTreeMap::new();
+        for track in &self.elements {
+            let entry = out.entry(track.element.clone()).or_default();
+            let value = track.value(now_us);
+            match track.property {
+                nir_format::MenuElementProperty::Opacity => entry.opacity = Some(value),
+                nir_format::MenuElementProperty::Scale => entry.scale = Some(value),
+                nir_format::MenuElementProperty::OffsetX => entry.offset[0] = value,
+                nir_format::MenuElementProperty::OffsetY => entry.offset[1] = value,
+            }
+        }
+        out
+    }
+    /// Drops finished tracks; returns how many drained this tick.
+    pub fn drain_finished_elements(&mut self, now_us: u64) -> usize {
+        let before = self.elements.len();
+        self.elements.retain(|track| !track.finished(now_us));
+        before - self.elements.len()
+    }
+    /// The furthest-along in-flight track's normalized progress across its
+    /// delay and ramp, or `None` when nothing animates. Hosts use it to
+    /// report presentation progress the way they do page reveals.
+    pub fn element_progress(&self, now_us: u64) -> Option<f32> {
+        self.elements
+            .iter()
+            .map(|track| {
+                let total = track.delay_us.saturating_add(track.track.duration_us.0);
+                if total == 0 {
+                    1.
+                } else {
+                    now_us.saturating_sub(track.start_us).min(total) as f32 / total as f32
+                }
+            })
+            .max_by(|a, b| a.total_cmp(b))
+    }
     /// Stops owning the current page without touching pending exits.
     pub fn retire_page(&mut self) {
         self.entered = None;
         self.fade = None;
+        self.elements.clear();
     }
 }

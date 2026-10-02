@@ -5,9 +5,9 @@ mod menu;
 mod transition;
 mod tween;
 pub use menu::{
-    MenuCondition, MenuContent, MenuEffects, MenuElement, MenuImageStates, MenuLocal, MenuMusic,
-    MenuPreference, MenuRangeBinding, MenuSlot, MenuToggleBinding, MenuTransition, MenuValue,
-    MenuValueInput, MAX_MENU_PARENTS,
+    MenuCondition, MenuContent, MenuEffects, MenuElement, MenuElementProperty, MenuElementTween,
+    MenuImageStates, MenuLocal, MenuMusic, MenuPreference, MenuRangeBinding, MenuSlot,
+    MenuToggleBinding, MenuTransition, MenuValue, MenuValueInput, MAX_MENU_PARENTS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +35,7 @@ pub const CAPABILITIES: &[&str] = &[
     "audio.buffer.v1",
     "audio.gain.v1",
     "audio.stop.v1",
+    "audio.gain-tween.v1",
     "ui.image-menu.v1",
     "text.visibility.v1",
     "text.window-transition.v1",
@@ -62,6 +63,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-values.v1",
     "ui.menu-effects.v1",
     "ui.menu-transition.v1",
+    "ui.menu-element-tween.v1",
     "ui.replay.v1",
     "task.compose.v1",
     "story.typed-result.v1",
@@ -1013,6 +1015,10 @@ impl Effect {
 pub enum TweenTarget {
     SceneNode { node: String, property: Property },
     DialogueRoot { property: DialogueProperty },
+    /// A live audio instance's envelope, by task handle. The envelope is the
+    /// 0..1 multiplier on top of the authored event gain; one envelope owner
+    /// (a gain tween or a timed stop) may target an instance at a time.
+    AudioInstance { task: String, property: AudioProperty },
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1021,6 +1027,12 @@ pub enum DialogueProperty {
     Opacity,
     BackgroundOpacity,
     TextOpacity,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioProperty {
+    Gain,
 }
 impl TweenTarget {
     pub fn accepts(&self, value: f32) -> bool {
@@ -1036,6 +1048,11 @@ impl TweenTarget {
                 } => value >= 0.,
                 _ => (0.0..=1.0).contains(&value),
             }
+    }
+    /// The device renders one linear ramp per envelope owner, so envelope
+    /// tracks must delegate linearly like timed stops do.
+    pub fn requires_linear_easing(&self) -> bool {
+        matches!(self, Self::AudioInstance { .. })
     }
 }
 impl Effect {
@@ -1117,7 +1134,7 @@ pub enum AudioBus {
     Sfx,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Easing {
     #[default]

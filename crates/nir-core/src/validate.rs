@@ -1898,6 +1898,19 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "ui.menu-transition.v1",
         ));
     }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_element_tween))
+        && !root.requires.iter().any(|c| c == "ui.menu-element-tween.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-element-tween.v1",
+        ));
+    }
     if (root.theme.menu_overlay.is_some()
         || root
             .theme
@@ -2610,6 +2623,25 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
             if let Some((address, track, _)) = def.effect.scalar_track(0., 0.) {
                 if !address.accepts(track.to) {
                     return Err(err("E_VISUAL", id, "invalid target value"));
+                }
+                if let TweenTarget::AudioInstance { task, .. } = &address {
+                    if !root.requires.iter().any(|c| c == "audio.gain-tween.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.gain-tween.v1"));
+                    }
+                    if !matches!(track.easing, Easing::Linear) {
+                        return Err(err("E_AUDIO_STOP", id, "envelope tweens are linear"));
+                    }
+                    if task == &def.id
+                        || root.task_owners.get(task) != Some(&package.module)
+                        || !view.task_definitions.get(task).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err("E_AUDIO_STOP", id, task));
+                    }
                 }
                 if !writers.insert(address) {
                     return Err(err("E_OWNERSHIP", id, "multiple property writers"));
@@ -3339,6 +3371,19 @@ fn check_compose_child<'a>(
     {
         return Err(err("E_VISUAL", at, "invalid target value"));
     }
+    if let Some((TweenTarget::AudioInstance { task, .. }, track, _)) =
+        def.effect.scalar_track(0., 0.)
+    {
+        if !requires.iter().any(|c| c == "audio.gain-tween.v1") {
+            return Err(err("E_CAPABILITY", at, "audio.gain-tween.v1"));
+        }
+        if !matches!(track.easing, Easing::Linear) {
+            return Err(err("E_AUDIO_STOP", at, "envelope tweens are linear"));
+        }
+        if task == def.id.as_str() || !audio_task(task.as_str()) {
+            return Err(err("E_AUDIO_STOP", at, task.as_str()));
+        }
+    }
     for child in def.effect.compose_children().unwrap_or(&[]) {
         check_compose_child(
             at,
@@ -3583,6 +3628,18 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             "E_CAPABILITY",
             "theme.image_menus",
             "ui.menu-transition.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_element_tween))
+        && !p.requires.iter().any(|c| c == "ui.menu-element-tween.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-element-tween.v1",
         ));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_replay)
@@ -3965,6 +4022,24 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             if let Some((address, track, _)) = def.effect.scalar_track(0., 0.) {
                 if !address.accepts(track.to) {
                     return Err(err("E_VISUAL", id, "invalid target value"));
+                }
+                if let TweenTarget::AudioInstance { task, .. } = &address {
+                    if !p.requires.iter().any(|c| c == "audio.gain-tween.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.gain-tween.v1"));
+                    }
+                    if !matches!(track.easing, Easing::Linear) {
+                        return Err(err("E_AUDIO_STOP", id, "envelope tweens are linear"));
+                    }
+                    if task == &def.id
+                        || !p.task_definitions.get(task).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err("E_AUDIO_STOP", id, task));
+                    }
                 }
                 if !writers.insert(address) {
                     return Err(err("E_OWNERSHIP", id, "multiple property writers"));

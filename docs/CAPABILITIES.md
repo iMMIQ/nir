@@ -41,9 +41,9 @@ M4 的发行操作、存档隔离、后端选择和验收入口见 [发行与桌
 
 NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROGRESS.md)；其余计划项尚未完成。
 
-音频事件增益、有限淡出停止、终态与恢复规则见 [音频语义](AUDIO-SEMANTICS.md)。淡入、作者总线动画和声明式菜单媒体仍属后续计划。
+音频事件增益、有限淡出停止、终态与恢复规则见 [音频语义](AUDIO-SEMANTICS.md)。`audio.gain-tween.v1` 在共享补间轨道上提供 `audio_instance` 增益目标：把已建立音频实例的 0–1 包络线性补间到声明值，声音保持播放，所有权与 `audio_stop` 互斥，取消提交设备时钟当前值，恢复续播剩余段，见 [音频语义](AUDIO-SEMANTICS.md) 的实例增益补间一节。作者总线动画和声明式菜单媒体仍属后续计划。
 
-类型化场景/消息框属性动画、与旧 Clip 的兼容及绘制边界见 [属性动画语义](TWEEN-SEMANTICS.md)。UI 页面目标尚未交付。Story/Foreground UI 的时钟、暂停令牌和音频路由基础见 [时间域](TIME-DOMAINS.md)，页面效果 owner 仍待后续挂接。
+类型化场景/消息框属性动画、与旧 Clip 的兼容及绘制边界见 [属性动画语义](TWEEN-SEMANTICS.md)。目标域已覆盖场景节点、消息根与音频实例（`audio.gain-tween.v1`）；UI 元素进入动画是 Player 前台瞬态（`ui.menu-element-tween.v1`），不进故事轨道。Story/Foreground UI 的时钟、暂停令牌和音频路由基础见 [时间域](TIME-DOMAINS.md)。
 
 对白与具体语音实例关联、Gate 后绑定和 Auto 等待策略见 [阅读语义](READING-SEMANTICS.md)。已提供玩家字速/等待偏好、Ctrl 按住快进，以及共享的背景点击和主键推进判定；已提供独立临时隐藏、显式 Story 暂停政策及自定义对白框静态提示；已接入共享键盘焦点导航，已提供滚动边界跟随与窄屏设置页验收；长选项专项、原生实机与来源隐藏政策认证仍待实施。
 
@@ -93,9 +93,11 @@ NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROG
 
 `ui.menu-history-availability.v1` 提供只读 `history_available` 条件，查询当前剧情历史是否非空；不冻结正文，不要求历史窗口。共享显隐、布局、命中和提交校验，事实改变使旧 revision 失效，见 [连续历史窗口](MENU-HISTORY-FLOW-SEMANTICS.md)。
 
-`ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画、效果等待或来源系统菜单的自动效果映射。
+`ui.menu-effects.v1` 提供页面边界的声明式呈现效果：进入/关闭的一次性音效与有限渐隐（≤2 秒，ForegroundClockToken 驱动）、接受提交的点击音效和前台域循环页面音乐；效果音频随页面图片进入准备与留存，Preparing 空窗从不发声，关闭把退出变成锁输入的有限事务。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。不含逐元素动画（见 `ui.menu-element-tween.v1`）、效果等待或来源系统菜单的自动效果映射。
 
 `ui.menu-transition.v1` 允许菜单页面边界的转场声明空间样式（wipe/mask，复用舞台 StageTransition 的方向、软边、遮罩通道语义）：呈现层把页面整体分流到离屏页根，以遮罩合成覆盖在冻结的底层帧上，替代旧的整层 alpha 渐隐；遮罩是 Image 类页面资产，随页面图片进入准备与留存。dissolve 或未声明样式保持旧 alpha 渐隐路径，不需本能力；飞行中持有前台时钟租约、锁定输入并暂停阅读，关闭延迟退出至擦除完成，reduced_motion 只抑制呈现不抑制音效。状态瞬态、不入故事快照，会话重置随宿主域重置终止。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)。
+
+`ui.menu-element-tween.v1` 允许进入边界声明至多 128 条元素轨道（opacity/scale/offset_x/offset_y，from 落在属性界限内，延迟与时长 ≤2 秒）：轨道随进入边界在共享前台时钟上启动（延迟保持 from，随后推进到落定值——opacity/scale 落定到作者值、偏移落定到 0），投影层在布局前覆盖元素 Node，父级变换随之传播；完成的轨道被丢弃，落定投影与未声明不可区分。换页逐页重启，离开页面即清空并释放时钟租约，动画绝不越过其页面；页面本身仍走共享菜单面，不建离屏页根也不叠加页面渐隐。reduced_motion 抑制动画不抑制音效；状态瞬态、不入故事快照，会话重置随宿主域重置终止，引擎状态面暴露 `menu_element_progress`。见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md) 的元素进入动画一节。
 
 `ui.replay.v1` 提供显式声明的回想事务：`replay` 控件动作冻结原会话（快照、检查点、菜单页与局部值、auto/skip），候选 Core 在屏障外独自准备后切换为唯一活动会话，结束（outcome 或手动 `exit_replay`）时冻结会话作为恢复候选重新验证并原样接回。活动期间 Profile 写入、保存/导出、读取/导入隔离，嵌套入口与存储动作在派发点复查即拒绝；入口媒体与冻结会话联合准入，重叠资产不重复计费；准入失败整事务作废且不提供 Retry。旧 `entry` 动作行为不变。见 [Replay 事务](REPLAY-SEMANTICS.md)。不含共享变量写回、sleep/awake 语义或来源系统的自动回想映射。
 
@@ -134,6 +136,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | audio.buffer.v1 | crates/nir-core/tests/audio_contract.rs（自然结束不被迟到事件改写） | 同文件（偏移时钟保活恢复）；crates/nir-player/tests/coordination.rs（设备包络按会话恢复） | tests/nir-next/audio.spec.js（循环/单次、结束事件、偏移恢复） | 待验证 | v0.1.0 基线 |
 | audio.gain.v1 | crates/nir-core/tests/audio_contract.rs（gain 为播放元数据+范围门） | 同文件（取消观测淡出提交设备值） | tests/nir-next/audio.spec.js（事件 gain×总线音量） | 待验证 | 事件音量与总线相乘，不预乘 PCM |
 | audio.stop.v1 | crates/nir-core/tests/audio_contract.rs（淡出停止后取消、剩余段恢复） | 同文件（拒绝无效目标/伪造所有权） | tests/nir-next/audio.spec.js（跨存读档停止包络） | 待验证 | 淡出走故事时钟 |
+| audio.gain-tween.v1 | crates/nir-core/tests/audio_contract.rs（线性 ramp/取消提交设备值/与停止互斥所有权） | 同文件（飞行中存读档剩余段、拒绝伪造 owner） | tests/nir-next/audio-gain-tween.spec.js | 待验证 | 批次 58；包络 0–1 乘子，只允许 linear |
 | ui.image-menu.v1 | crates/nir-player/src/lib.rs（media_tests 缩放/悬停/回想解锁门） | crates/nir-player/src/replay.rs（冻结菜单页随回想恢复） | tests/nir-next/menu-elements.spec.js；menu-* 规格均经图片菜单页 | 待验证 | v0.1.0 基线 |
 | text.visibility.v1 | crates/nir-player/tests/coordination.rs（临时隐藏不推进、不覆写脚本可见性） | 同测试（隐藏跨恢复/回退保持） | tests/nir-next/interface-hide.spec.js、tests/nir-next/reading.spec.js | 待验证 | 与 player.hide-policy.v1 分开声明 |
 | text.window-transition.v1 | crates/nir-core/tests/window_reveal_contract.rs（样式/时长门、截止提交、打断捕获覆盖度）；crates/nir-player/tests/coordination.rs（时钟冻结、遮罩只取一次、dissolve 只折叠窗口项、空间样式剥离窗口根） | crates/nir-core/tests/window_reveal_contract.rs（结构校验、伪造被拒）；crates/nir-player/tests/coordination.rs（飞行中存读档续播） | tests/nir-next/window.spec.js（边缘像素、暂停冻结、存读档进度） | 待验证 | 消息根复用舞台转场样式；HUD 不参与 |
@@ -161,6 +164,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | ui.menu-values.v1 | crates/nir-player/src/menu.rs（单次提交/过期拒绝/边界校验） | crates/nir-player/src/replay.rs（绑定局部值冻结恢复） | tests/nir-next/menu-values.spec.js | 待验证 | 语义见 MENU-VALUES-SEMANTICS.md |
 | ui.menu-effects.v1 | crates/nir-player/src/menu.rs（进入效果等待准备、关闭延迟退出） | 无运行态（不入故事快照）：会话重置终止（同文件） | tests/nir-next/menu-effects.spec.js | 待验证 | 批次 48；瞬态不入快照 |
 | ui.menu-transition.v1 | crates/nir-player/src/menu.rs（空间揭示飞行与关闭延迟退出）；crates/nir-core/tests/menu_transition_contract.rs（能力/界限/遮罩资产门） | 无运行态（不入故事快照）：会话重置终止（crates/nir-player/src/menu.rs） | tests/nir-next/menu-wipe.spec.js | 待验证 | 批次 57；dissolve 走旧 alpha 渐隐不需能力 |
+| ui.menu-element-tween.v1 | crates/nir-player/src/menu.rs（前台时钟轨道/延迟保持/逐页重启/退休清空）；crates/nir-core/tests/menu_transition_contract.rs（能力门） | 无运行态（不入故事快照）：会话重置终止（crates/nir-player/src/menu.rs） | tests/nir-next/menu-element-tween.spec.js | 待验证 | 批次 58；落定回作者值，偏移落定为 0 |
 | ui.replay.v1 | crates/nir-player/src/replay.rs（冻结/嵌套拒绝/准入失败整事务作废） | 同文件（outcome/手动退出恢复冻结会话、设备丢失续备） | tests/nir-next/replay.spec.js | 待验证 | 批次 49；实包全路线见批次 54 认证 |
 | task.compose.v1 | crates/nir-core/tests/compose_contract.rs（VM 等待时链前进、All 失败优先） | 同文件（链中途存读档只续播）；crates/nir-player/tests/coordination.rs（链中途回退不重播） | tests/nir-next/compose.spec.js | 待验证 | 批次 50；parallel_all 无浏览器直接断言 |
 | story.typed-result.v1 | crates/nir-core/tests/typed_result_contract.rs（写声明值后分支/超时 default/取消不写） | 同文件（游标快照恢复、篡改拒绝）；crates/nir-player/tests/coordination.rs（存读档/回退） | tests/nir-next/typed-result.spec.js | 待验证 | 批次 51；批次 52 LiveNovel 复用同核心 |

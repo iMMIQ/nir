@@ -828,6 +828,42 @@ fn menu_transition_capability_follows_spatial_style_usage() {
 }
 
 #[test]
+fn menu_element_tween_capability_follows_element_animation_usage() {
+    let d = project();
+    // The stock theme declares no element animations.
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-element-tween.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"row\"\nrect = [0,0,300,80]\ncontent = { type = \"hit_region\", label = \"Row\", action = {type = \"close\"} }\n[image_menus.title.effects.enter]\nfade_us = \"100000\"\n[[image_menus.title.effects.elements]]\nelement = \"row\"\nproperty = \"offset_x\"\nfrom = -40.0\nduration_us = \"300000\"\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    for cap in ["ui.menu-effects.v1", "ui.menu-element-tween.v1"] {
+        assert!(loaded.program.requires.iter().any(|c| c == cap), "{cap}");
+    }
+    compile(&loaded.program).unwrap();
+    // Dropping the animation trims the element capability but keeps the page
+    // on the effects path.
+    let path = d.path().join("themes/rain/theme.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\n[[image_menus.title.effects.elements]]\nelement = \"row\"\nproperty = \"offset_x\"\nfrom = -40.0\nduration_us = \"300000\"\n", "");
+    fs::write(path, text).unwrap();
+    let trimmed = load_project(d.path()).unwrap();
+    assert!(trimmed.program.requires.iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(!trimmed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-element-tween.v1"));
+    compile(&trimmed.program).unwrap();
+}
+
+#[test]
 fn media_capabilities_follow_the_packaged_containers() {
     let d = project();
     let sdk = test_sdk();

@@ -145,6 +145,19 @@ pub struct Task {
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
+/// The ramp duration of an envelope owner task (a timed stop or a gain
+/// tween), or `None` when the task does not own an audio envelope.
+fn envelope_owner_duration(task: &Task) -> Option<Micros> {
+    match &task.effect {
+        Effect::AudioStop { duration_us, .. } => Some(*duration_us),
+        Effect::Tween {
+            target: TweenTarget::AudioInstance { .. },
+            duration_us,
+            ..
+        } => Some(*duration_us),
+        _ => None,
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingActivation {
@@ -1698,6 +1711,29 @@ impl Core {
                     captured = self.sample_dialogue_appearance().get(*property);
                     base = self.state.dialogue_appearance.get(*property);
                 }
+                TweenTarget::AudioInstance { task, .. } => {
+                    let target_id = *self
+                        .state
+                        .handles
+                        .get(task)
+                        .ok_or_else(|| self.error("E_TASK", task))?;
+                    let audio = &self.state.tasks[&target_id];
+                    if !matches!(audio.effect, Effect::Audio { .. }) {
+                        return Err(
+                            self.error("E_TASK_TYPE", "gain tween requires an audio instance")
+                        );
+                    }
+                    if self.state.tasks.values().any(|t| {
+                        t.state == TaskState::Running && t.target_task == Some(target_id)
+                    }) {
+                        return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
+                    }
+                    target_task = Some(target_id);
+                    // The envelope is a 0..1 multiplier with unit base; the
+                    // captured value carries whatever a previous owner left.
+                    captured = audio.audio_envelope;
+                    base = 1.;
+                }
             }
             let old: Vec<_> = self
                 .state
@@ -1720,16 +1756,26 @@ impl Core {
             }
         }
         let id = self.id()?;
-        if let Effect::AudioStop { duration_us, .. } = &def.effect {
-            let target = target_task.expect("resolved audio stop target");
+        let envelope_segment = match &def.effect {
+            Effect::AudioStop { duration_us, .. } => Some((captured, 0., *duration_us)),
+            Effect::Tween {
+                target: TweenTarget::AudioInstance { .. },
+                to,
+                duration_us,
+                ..
+            } => Some((captured, *to, *duration_us)),
+            _ => None,
+        };
+        if let Some((from, to, duration_us)) = envelope_segment {
+            let target = target_task.expect("resolved audio envelope target");
             if self.state.tasks[&target].state == TaskState::Running {
                 self.intents.push(CoreIntent::AudioEnvelope {
                     owner: Some(id),
                     elapsed_us: Micros(0),
                     task: target,
-                    from: captured,
-                    to: 0.,
-                    duration_us: *duration_us,
+                    from,
+                    to,
+                    duration_us,
                 });
             }
         }
@@ -2012,7 +2058,15 @@ impl Core {
             }
         }
         if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
-            let value = track.settle(t.elapsed_us, status == TaskState::Finished);
+            // Envelope commits follow the device clock when one was observed,
+            // like timed stops; story-owned targets use the story clock.
+            let elapsed = match address {
+                TweenTarget::AudioInstance { .. } => {
+                    t.audio_device_elapsed_us.unwrap_or(t.elapsed_us)
+                }
+                _ => t.elapsed_us,
+            };
+            let value = track.settle(elapsed, status == TaskState::Finished);
             if self.track_is_current(&t, &address) {
                 match address {
                     TweenTarget::SceneNode { node, property } => {
@@ -2022,6 +2076,16 @@ impl Core {
                     }
                     TweenTarget::DialogueRoot { property } => {
                         self.state.dialogue_appearance.set(property, value)
+                    }
+                    TweenTarget::AudioInstance { .. } => {
+                        // Commit the settled envelope only onto a live
+                        // instance; the audio may have ended first.
+                        if let Some(target) = t
+                            .target_task
+                            .filter(|id| self.state.tasks[id].state == TaskState::Running)
+                        {
+                            self.state.tasks.get_mut(&target).unwrap().audio_envelope = value;
+                        }
                     }
                 }
             }
@@ -2070,6 +2134,28 @@ impl Core {
                 }
             }
         }
+        if let Effect::Tween {
+            target: TweenTarget::AudioInstance { .. },
+            ..
+        } = t.effect
+        {
+            // The device ramp must stop following the ended owner: pin the
+            // committed envelope value so the plan's owner is released.
+            let target = t
+                .target_task
+                .ok_or_else(|| self.error("E_TASK", "missing audio target"))?;
+            if self.state.tasks[&target].state == TaskState::Running {
+                let value = self.state.tasks[&target].audio_envelope;
+                self.intents.push(CoreIntent::AudioEnvelope {
+                    owner: None,
+                    elapsed_us: Micros(0),
+                    task: target,
+                    from: value,
+                    to: value,
+                    duration_us: Micros(0),
+                });
+            }
+        }
         if matches!(t.effect, Effect::Audio { .. }) {
             let dependents: Vec<_> = self
                 .state
@@ -2096,20 +2182,44 @@ impl Core {
     pub fn audio_envelope(&self, id: u32) -> (f32, f32, Micros) {
         for task in self.state.tasks.values() {
             if task.state == TaskState::Running && task.target_task == Some(id) {
-                if let Effect::AudioStop { duration_us, .. } = task.effect {
-                    let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
-                    let remaining = duration_us.0.saturating_sub(elapsed.0);
-                    let value = ScalarTween {
-                        from: task.captured,
-                        base: task.captured,
-                        to: 0.,
-                        duration_us,
-                        easing: Easing::Linear,
-                        finish: FinishPolicy::CommitEnd,
-                        cancel: CancelPolicy::CommitCurrent,
+                match task.effect {
+                    Effect::AudioStop { duration_us, .. } => {
+                        let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
+                        let remaining = duration_us.0.saturating_sub(elapsed.0);
+                        let value = ScalarTween {
+                            from: task.captured,
+                            base: task.captured,
+                            to: 0.,
+                            duration_us,
+                            easing: Easing::Linear,
+                            finish: FinishPolicy::CommitEnd,
+                            cancel: CancelPolicy::CommitCurrent,
+                        }
+                        .sample(elapsed);
+                        return (value, 0., Micros(remaining));
                     }
-                    .sample(elapsed);
-                    return (value, 0., Micros(remaining));
+                    Effect::Tween {
+                        target: TweenTarget::AudioInstance { .. },
+                        to,
+                        duration_us,
+                        easing,
+                        ..
+                    } => {
+                        let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
+                        let remaining = duration_us.0.saturating_sub(elapsed.0);
+                        let value = ScalarTween {
+                            from: task.captured,
+                            base: 1.,
+                            to,
+                            duration_us,
+                            easing,
+                            finish: FinishPolicy::CommitEnd,
+                            cancel: CancelPolicy::CommitCurrent,
+                        }
+                        .sample(elapsed);
+                        return (value, to, Micros(remaining));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2127,7 +2237,14 @@ impl Core {
             .find(|task| {
                 task.state == TaskState::Running
                     && task.target_task == Some(id)
-                    && matches!(task.effect, Effect::AudioStop { .. })
+                    && matches!(
+                        task.effect,
+                        Effect::AudioStop { .. }
+                            | Effect::Tween {
+                                target: TweenTarget::AudioInstance { .. },
+                                ..
+                            }
+                    )
             })
             .map_or((None, Micros(0)), |task| {
                 (
@@ -2430,8 +2547,9 @@ impl Core {
                 if let Some(task) = self.state.tasks.get(&envelope.owner).filter(|t| {
                     t.state == TaskState::Running && t.target_task == Some(position.task)
                 }) {
-                    if !matches!(task.effect,Effect::AudioStop {duration_us,..} if envelope.elapsed_us.0<=duration_us.0)
-                    {
+                    if !envelope_owner_duration(task).is_some_and(|duration| {
+                        envelope.elapsed_us.0 <= duration.0
+                    }) {
                         return Err(
                             self.error("E_AUDIO_POSITION", "invalid device envelope progress")
                         );
@@ -2448,7 +2566,7 @@ impl Core {
                     if let Some(task) = self.state.tasks.get_mut(&envelope.owner).filter(|t| {
                         t.state == TaskState::Running
                             && t.target_task == Some(position.task)
-                            && matches!(t.effect, Effect::AudioStop { .. })
+                            && envelope_owner_duration(t).is_some()
                     }) {
                         // Within one device incarnation progress is monotonic.
                         task.audio_device_elapsed_us = Some(Micros(
@@ -2923,6 +3041,36 @@ impl Core {
                         return Err(fail("invalid stop ownership or progress"));
                     }
                 }
+                Effect::Tween {
+                    target: TweenTarget::AudioInstance { task, .. },
+                    to,
+                    duration_us,
+                    easing,
+                    ..
+                } => {
+                    let target_id = t.target_task.ok_or_else(|| fail("missing stop target"))?;
+                    let audio = s
+                        .tasks
+                        .get(&target_id)
+                        .ok_or_else(|| fail("missing audio instance"))?;
+                    if target_id >= t.id
+                        || audio.name != *task
+                        || !matches!(audio.effect, Effect::Audio { .. })
+                        || !matches!(easing, Easing::Linear)
+                        || !to.is_finite()
+                        || !(0.0..=1.0).contains(to)
+                        || !t.captured.is_finite()
+                        || !(0.0..=1.0).contains(&t.captured)
+                        || !t.base.is_finite()
+                        || !(0.0..=1.0).contains(&t.base)
+                        || (t.state == TaskState::Running
+                            && (audio.state != TaskState::Running
+                                || t.elapsed_us.0 >= duration_us.0
+                                || !envelope_owners.insert(target_id)))
+                    {
+                        return Err(fail("invalid tween envelope ownership or progress"));
+                    }
+                }
                 _ if t.target_task.is_some() => return Err(fail("unexpected target task")),
                 _ => {}
             }
@@ -2945,8 +3093,7 @@ impl Core {
                 return Err(fail("orphan frame task"));
             }
             if let Some(elapsed) = t.audio_device_elapsed_us {
-                if !matches!(t.effect,Effect::AudioStop {duration_us,..} if elapsed.0<=duration_us.0)
-                {
+                if !envelope_owner_duration(t).is_some_and(|duration| elapsed.0 <= duration.0) {
                     return Err(fail("invalid device envelope checkpoint"));
                 }
             }

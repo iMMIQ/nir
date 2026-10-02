@@ -220,6 +220,15 @@ impl ImageMenu {
         self.validate_state()?;
         if let Some(effects) = &self.effects {
             effects.validate()?;
+            for tween in &effects.elements {
+                if !self.elements.iter().any(|e| e.id == tween.element) {
+                    return Err(Diagnostic::new(
+                        "E_VIEW_EFFECTS",
+                        "theme.image_menus.effects.elements",
+                        "element animation targets a missing element",
+                    ));
+                }
+            }
         }
         let fail = || {
             Diagnostic::new(
@@ -496,6 +505,11 @@ pub struct MenuEffects {
     /// wait-for-completion set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music: Option<MenuMusic>,
+    /// Per-element enter animations, started with the enter boundary. They
+    /// ride the foreground clock, settle to the authored element values, and
+    /// never enter any snapshot or restore projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<MenuElementTween>,
 }
 /// One page boundary: an optional one-shot sound plus a bounded fade. A
 /// spatial `style` (wipe/mask) turns the fade duration into a page-root
@@ -521,6 +535,33 @@ pub struct MenuMusic {
     pub bus: AudioBus,
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub gain: f32,
+}
+/// One element enter animation, started with the page's enter boundary and
+/// advanced on the foreground clock. Opacity and scale settle to the
+/// element's authored value and offsets settle to zero, so a finished track
+/// is indistinguishable from no track.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MenuElementTween {
+    pub element: String,
+    pub property: MenuElementProperty,
+    /// The property's value on the animation's first frame.
+    pub from: f32,
+    #[serde(default)]
+    pub delay_us: Micros,
+    pub duration_us: Micros,
+    #[serde(default)]
+    pub easing: Easing,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuElementProperty {
+    Opacity,
+    Scale,
+    OffsetX,
+    OffsetY,
 }
 fn one() -> f32 {
     1.
@@ -567,6 +608,33 @@ impl MenuEffects {
                 return Err(fail());
             }
         }
+        if self.elements.len() > 128 {
+            return Err(fail());
+        }
+        let mut tracks: BTreeSet<(&str, MenuElementProperty)> = BTreeSet::new();
+        for tween in &self.elements {
+            let bound = match tween.property {
+                MenuElementProperty::Opacity => {
+                    tween.from.is_finite() && (0. ..=1.).contains(&tween.from)
+                }
+                MenuElementProperty::Scale => {
+                    tween.from.is_finite() && (0. ..=8.).contains(&tween.from)
+                }
+                MenuElementProperty::OffsetX | MenuElementProperty::OffsetY => {
+                    tween.from.is_finite() && tween.from.abs() <= 4096.
+                }
+            };
+            if !bound
+                || tween.element.is_empty()
+                || tween.element.len() > 128
+                || tween.duration_us.0 == 0
+                || tween.duration_us.0 > 2_000_000
+                || tween.delay_us.0 > 2_000_000
+                || !tracks.insert((tween.element.as_str(), tween.property))
+            {
+                return Err(fail());
+            }
+        }
         Ok(())
     }
 }
@@ -587,6 +655,11 @@ impl MenuEffects {
             .into_iter()
             .flatten()
             .any(|t| t.style.as_ref().is_some_and(|s| !s.is_default()))
+    }
+    /// Whether any element enter animation requires the element tween
+    /// machinery. The effects capability alone does not admit one.
+    pub fn uses_element_tween(&self) -> bool {
+        !self.elements.is_empty()
     }
 }
 impl ImageMenu {
@@ -1356,6 +1429,7 @@ mod tests {
             close,
             click: None,
             music: None,
+            elements: vec![],
         };
         let transition = |style| MenuTransition {
             sound: None,
@@ -1418,5 +1492,113 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect()
         );
+    }
+
+    #[test]
+    fn element_tweens_round_trip_and_legacy_documents_default_empty() {
+        // Legacy effects documents predate element animations: the field is
+        // absent and serializes back absent.
+        let legacy: MenuEffects = serde_json::from_value(serde_json::json!({
+            "enter": {"fade_us": "400000"}
+        }))
+        .unwrap();
+        assert!(legacy.elements.is_empty());
+        assert!(!legacy.uses_element_tween());
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("elements"));
+        let styled: MenuEffects = serde_json::from_value(serde_json::json!({
+            "enter": {"fade_us": "400000"},
+            "elements": [
+                {"element": "row-save", "property": "offset_x", "from": -40.0,
+                 "delay_us": "120000", "duration_us": "300000"},
+                {"element": "row-save", "property": "opacity", "from": 0.0,
+                 "duration_us": "300000", "easing": "smooth"}
+            ]
+        }))
+        .unwrap();
+        assert!(styled.uses_element_tween());
+        assert_eq!(
+            styled.elements[0],
+            MenuElementTween {
+                element: "row-save".into(),
+                property: MenuElementProperty::OffsetX,
+                from: -40.,
+                delay_us: Micros(120_000),
+                duration_us: Micros(300_000),
+                easing: Easing::default(),
+            }
+        );
+        let round: MenuEffects =
+            serde_json::from_str(&serde_json::to_string(&styled).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&round).unwrap(),
+            serde_json::to_value(&styled).unwrap()
+        );
+        assert!(serde_json::from_value::<MenuElementTween>(serde_json::json!({
+            "element": "row", "property": "diagonal", "from": 0.0, "duration_us": "100000"
+        }))
+        .is_err(), "unknown properties stay denied");
+    }
+
+    #[test]
+    fn element_tweens_keep_their_authored_bounds() {
+        let menu = |elements: serde_json::Value| ImageMenu {
+            background: "menu.only".into(),
+            buttons: vec![],
+            elements: vec![serde_json::from_value(serde_json::json!({
+                "id": "row", "rect": [0., 0., 400., 40.],
+                "content": {"type": "text_button", "label": "Load",
+                    "size": 24., "color": [1.,1.,1.,1.], "hover_color": [1.,1.,1.,1.],
+                    "disabled_color": [1.,1.,1.,1.],
+                    "action": {"type": "close"}}
+            }))
+            .unwrap()],
+            effects: Some(MenuEffects {
+                enter: Some(MenuTransition {
+                    sound: None,
+                    fade_us: Micros(100_000),
+                    style: None,
+                }),
+                close: None,
+                click: None,
+                music: None,
+                elements: serde_json::from_value(elements).unwrap(),
+            }),
+            ..serde_json::from_value::<ImageMenu>(serde_json::json!({
+                "background": "menu.only", "buttons": []
+            }))
+            .unwrap()
+        };
+        let track = |property: &str, from: f32, duration_us: u64| {
+            serde_json::json!({"element": "row", "property": property, "from": from,
+                "duration_us": duration_us.to_string()})
+        };
+        assert!(menu(serde_json::Value::Array(vec![track("opacity", 0., 300_000)]))
+            .validate_elements()
+            .is_ok());
+        for bad in [
+            // Out-of-range from values per property.
+            vec![track("opacity", 1.5, 300_000)],
+            vec![track("opacity", -0.1, 300_000)],
+            vec![track("scale", 8.5, 300_000)],
+            vec![track("scale", -1., 300_000)],
+            vec![track("offset_y", 5000., 300_000)],
+            // Instant and over-ceiling durations, over-ceiling delay.
+            vec![track("opacity", 0., 0)],
+            vec![track("opacity", 0., 2_000_001)],
+            vec![serde_json::json!({"element": "row", "property": "opacity", "from": 0.0,
+                "duration_us": "100000", "delay_us": "2000001"})],
+            // Duplicate (element, property) track.
+            vec![track("opacity", 0., 300_000), track("opacity", 1., 300_000)],
+            // A missing element id, even though the track itself is sound.
+            vec![serde_json::json!({"element": "ghost", "property": "opacity", "from": 0.0,
+                "duration_us": "300000"})],
+        ] {
+            assert!(
+                menu(serde_json::Value::Array(bad))
+                    .validate_elements()
+                    .is_err(),
+                "expected rejection"
+            );
+        }
     }
 }

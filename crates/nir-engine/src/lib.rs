@@ -1001,6 +1001,7 @@ impl Engine {
         state["menu_opacity"] = serde_json::json!(self.player.menu_opacity());
         state["menu_transition"] =
             serde_json::json!(self.player.menu_transition().map(|(_, _, p)| p));
+        state["menu_element_progress"] = serde_json::json!(self.player.menu_element_progress());
         state["replay"] = serde_json::json!(self.player.replay_phase());
         state["foreground_paused"] =
             serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));

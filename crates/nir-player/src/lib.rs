@@ -893,6 +893,15 @@ impl Player {
         self.menu_effects
             .transition(self.ui_clock_us.0, self.preferences.reduced_motion)
     }
+    /// The furthest-along element enter animation's normalized progress,
+    /// or `None` when no element is animating (reduced motion included).
+    pub fn menu_element_progress(&self) -> Option<f32> {
+        if self.preferences.reduced_motion {
+            None
+        } else {
+            self.menu_effects.element_progress(self.ui_clock_us.0)
+        }
+    }
     pub fn acquire_foreground_clock(&self) -> Option<ForegroundClockToken> {
         self.ui_clock_demand.acquire()
     }
@@ -3485,6 +3494,11 @@ impl Player {
                 self.ui_clock_us.0,
                 self.preferences.reduced_motion,
             ),
+            menu_element_animations: if self.preferences.reduced_motion {
+                Default::default()
+            } else {
+                self.menu_effects.element_animations(self.ui_clock_us.0)
+            },
             dialogue: c
                 .dialogue()
                 .filter(|_| !c.state().dialogue_hidden || window_reveal_live)

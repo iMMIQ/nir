@@ -67,6 +67,15 @@ pub struct SlotView {
     pub label: String,
     pub exists: bool,
 }
+/// In-flight overrides for one menu element's enter animation. `None`
+/// properties keep the authored value; `offset` is added displacement that
+/// rests at zero. A finished animation leaves no entry at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ElementAnimation {
+    pub opacity: Option<f32>,
+    pub scale: Option<f32>,
+    pub offset: [f32; 2],
+}
 #[derive(Debug, Clone)]
 pub struct UiModel {
     pub transition_style: StageTransition,
@@ -92,6 +101,10 @@ pub struct UiModel {
     /// all) rides the legacy `menu_opacity` ramp instead; `None` keeps the
     /// page on the shared surface.
     pub menu_transition: Option<(StageTransition, bool, f32)>,
+    /// In-flight element enter animations, keyed by element id. Entries are
+    /// transient overrides projected before layout so parent transforms
+    /// propagate; the map is empty whenever nothing animates.
+    pub menu_element_animations: std::collections::BTreeMap<String, ElementAnimation>,
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
     pub choices: Vec<ChoiceView>,
@@ -856,16 +869,23 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                 }
                 _ => None,
             };
+            let anim = m
+                .menu_element_animations
+                .get(&e.id)
+                .copied()
+                .unwrap_or_default();
             Node {
                 id: e.id.clone(),
                 parent: e.parent.clone(),
                 asset,
-                x: positions[&e.id][0],
-                y: positions[&e.id][1],
+                // Enter animations override before layout so the parent
+                // transform chain propagates the displaced, scaled row.
+                x: positions[&e.id][0] + anim.offset[0],
+                y: positions[&e.id][1] + anim.offset[1],
                 width: if e.content.is_group() { 0. } else { e.rect[2] },
                 height: if e.content.is_group() { 0. } else { e.rect[3] },
-                scale: e.scale,
-                opacity: e.opacity,
+                scale: anim.scale.unwrap_or(e.scale),
+                opacity: anim.opacity.unwrap_or(e.opacity),
                 color,
                 order: 0,
                 clip: e.clip,
