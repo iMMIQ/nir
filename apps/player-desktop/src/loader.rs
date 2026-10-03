@@ -301,10 +301,12 @@ fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
                 samples.push(sample);
             }
             if let Some(tag) = &gapless {
+                ensure!(rate == tag.rate, "E_AUDIO_RATE");
                 if samples.len() as u64 > authored {
                     trim_unaware_mp3(&mut samples, tag.delay, channels, authored);
                 }
             }
+            ensure!(samples.len() as u64 == authored, "E_AUDIO_SIZE");
             Ok(AssetData::Audio {
                 samples: Arc::new(samples),
                 channels,
@@ -323,6 +325,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
+        path::Path,
         time::{Duration, Instant},
     };
 
@@ -548,6 +551,40 @@ mod tests {
         eprintln!("alignment: best offset {} rms {}", best.1, best.0);
         assert_eq!(best.1, 0, "trimmed stream must start at the first sample");
         assert!(best.0 < 0.05, "residual beyond encoding noise: {}", best.0);
+    }
+
+    #[test]
+    fn decoded_mp3_loops_without_inserting_delay_or_padding() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gapless-44100-mono.mp3");
+        let samples = decode_audio(&fs::read(path).unwrap(), 22_050);
+        let buffer =
+            crate::audio_source::AudioBuffer::from_parts(Arc::new(samples.clone()), 1, 44_100);
+        for (index, sample) in buffer.source(0, true).take(samples.len() * 100).enumerate() {
+            assert_eq!(sample, samples[index % samples.len()]);
+        }
+    }
+
+    #[test]
+    fn short_audio_decode_fails_the_authored_sample_contract() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gapless-44100-mono.mp3");
+        let bytes = fs::read(path).unwrap();
+        let (_temp, bundle) = bundle_with(&[(bytes.clone(), "mp3")]);
+        let descriptor = Asset {
+            kind: AssetKind::Audio,
+            object: nir_content::digest(&bytes),
+            bytes: bytes.len() as u64,
+            width: 0,
+            height: 0,
+            duration_us: Micros(500_000),
+            decoded_bytes: 22_051 * 4,
+        };
+        assert!(decode_asset(&bundle, &descriptor)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("E_AUDIO_SIZE"));
     }
 
     #[test]

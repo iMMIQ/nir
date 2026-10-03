@@ -56,9 +56,9 @@ Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末
 
 ## 打包媒体优化
 
-`build` 与 `dev` 默认优化发出的媒体对象：图像转有损 WebP（质量 92，alpha 通道无损保留），非循环音频转 MP3 CBR 160 kbps。素材来源仍登记 PNG/PCM16 WAV；转换只改写发行对象，尺寸、`duration_us` 与 `decoded_bytes` 描述符保持源资产值，MP3 对象带 LAME gapless 标签，各播放器裁剪后解码样本数与源 WAV 一致。
+`build` 与 `dev` 默认优化发出的媒体对象：图像转有损 WebP（质量 92，alpha 通道无损保留），全部音频（包括循环 BGM）转 MP3 CBR 160 kbps。素材来源仍登记 PNG/PCM16 WAV；转换只改写发行对象，尺寸、`duration_us` 与 `decoded_bytes` 描述符保持源资产值，MP3 对象带 LAME gapless 标签，原生播放器裁剪后样本数与源 WAV 一致；浏览器去除延迟/填充后会按 AudioContext 的采样率重采样。
 
-以下资产保持原始 WAV：声明 `looped = true` 的音频（样本精确循环）、采样率不在 MP3 档位（8/11.025/12/16/22.05/24/32/44.1/48 kHz）内的音频、码率与采样率组合超出 MPEG CBR 档位的音频（32–48 kHz 需 32–320 kbps，8–24 kHz 上限 160 kbps，如 44.1 kHz 源配 320 kbps 会被 LAME 静默改写码率）、首个 CBR 帧放不下 gapless 标签（约需 190 字节，如 44.1 kHz 立体声低于 64 kbps）的组合，以及转换后不缩小的对象。编码器输出采样率固定为源采样率，不会重采样。字体不受影响。
+循环与非循环音频采用同一 gapless 编码路径，移除编码延迟和尾部填充后按完整解码缓冲循环。自动 MP3 优化不回退 WAV：不支持的采样率、非法码率/采样率组合、首帧放不下 gapless 标签、编码失败或解码校验失败都会报 `E_OPTIMIZE_AUDIO` 并标明资产。每次编码及缓存命中均验证解码采样率、声道数与源样本数；通过校验的短音效即使转码后略大也保留 MP3。编码器输出采样率固定为源采样率。只有作者明确选择下述 WAV/原始/无损配置时才保留 WAV。图像转换不缩小时保留原图；字体不受影响。
 
 `build` 可覆盖参数：`--image-format webp|webp-lossless|png`、`--image-quality 1..=100`、`--audio-format mp3|wav`、`--audio-bitrate <kbps>`（合法 CBR 档位见 E_OPTIMIZE 报错列表）、`--no-optimize` 打包全部原始字节。`dev` 固定使用默认参数。逐资产例外在 catalog 写 `optimize = "lossless"`（图片转无损 WebP、音频保持 WAV）或 `optimize = "none"`。
 
