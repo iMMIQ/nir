@@ -82,6 +82,8 @@ enum Command {
     },
     Serve {
         directory: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         #[arg(long, default_value_t = 4173)]
         port: u16,
     },
@@ -495,7 +497,11 @@ fn run(cli: Cli) -> Result<()> {
             }
             dev(&cli.project, &sdk, port)?;
         }
-        Command::Serve { directory, port } => serve(&directory, port)?,
+        Command::Serve {
+            directory,
+            host,
+            port,
+        } => serve(&directory, &host, port)?,
         Command::Release { command } => match command {
             ReleaseCommand::Stage {
                 source,

@@ -83,7 +83,7 @@ schemas/                       由 SDK 生成的 JSON Schema
 ./novelc serve rain-letters-web
 ```
 
-在源码构建目录则运行 `./dist/novelc serve dist/rain-letters-web`。打开 `http://127.0.0.1:4173/`，使用启用 WebGPU 的桌面 Chromium。远程静态托管须使用 HTTPS；直接双击 HTML（`file://`）不能运行播放器。
+在源码构建目录则运行 `./dist/novelc serve dist/rain-letters-web`。打开 `http://127.0.0.1:4173/`，使用启用 WebGPU 的桌面 Chromium。serve 默认只监听本机回环；需要从其他设备访问时加 `--host 0.0.0.0`（监听全部网卡）或指定具体网卡地址。远程静态托管须使用 HTTPS；直接双击 HTML（`file://`）不能运行播放器。
 
 测试工程覆盖简中与英文正文、选项分支、场景与音频、存读档及回退等功能。运行方式与输入操作见 [测试工程说明](examples/rain-letters/README.md)，测试证据见 [验收报告](docs/TEST-REPORT.md)。
 
