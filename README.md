@@ -32,7 +32,7 @@ NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览
 
 作品输出位于 `dist/full/web/`。完整上传该目录即可，可部署到子路径。保留 `NOTICE.txt`。部署时先上传对象和发行清单，最后更新 `channels/stable.json`；不要删除仍可能被旧会话引用的对象。源码目录、测试、源素材路径和本地配置不会作为运行目录复制进去。
 
-构建默认做打包优化：图像转有损 WebP（质量 92，alpha 无损保留）、非循环音频转 MP3；循环音频保持 WAV，逐资产可用 catalog `optimize` 字段例外，`--no-optimize` 打包原始字节。详见 [编写说明](docs/AUTHORING.md) 的打包媒体优化。
+构建默认做打包优化：图像转有损 WebP（质量 92，alpha 无损保留）、全部音频（含循环 BGM）转带 gapless 标签的 MP3；编码或解码校验失败时构建报错，不自动回退 WAV，逐资产可用 catalog `optimize` 字段例外，`--no-optimize` 打包原始字节。详见 [编写说明](docs/AUTHORING.md) 的打包媒体优化。
 
 ## 外部引擎导入
 

@@ -17,7 +17,7 @@
 | 界面 | 标题、对白、选项、菜单、设置、回看分页与单条长记录翻阅、存读档、自动、已读快进 | Fluent 界面内嵌在 SDK |
 | 作品配置/主题 | `web-standard`、player 默认设置、字段来源报告、dialogue.main/choice.main 内置组件替换 | 原图按钮菜单、有序图文/分组裁切/透明命中区、解锁入口和消息框图片／舞台坐标；无任意组件或可执行主题脚本 |
 | 语言 | zh-Hans/en 界面，zh-Hans/en/ja 正文，独立偏好与字体计划；候选准备后原子切换；正文下一实例生效，已存在的对白/选项/历史冻结身份 | 正文按模块/语言获取并校验；不提供日文界面、繁简自动回退或多文字系统认证；详见 [语言/字体计划](LOCALE-FONTS.md) |
-| 音频 | PCM16 WAV、循环 BGM、短音效、合成测试语音、总线偏好与每事件 gain（0–4）相乘、手势解锁 | 来源 WAV，打包默认非循环资产转 MP3 CBR；无流式播放、真人配音，可听性需要人工设备检查 |
+| 音频 | PCM16 WAV、循环 BGM、短音效、合成测试语音、总线偏好与每事件 gain（0–4）相乘、手势解锁 | 来源 WAV，打包默认全部音频（含循环 BGM）转 gapless MP3 CBR；无流式播放、真人配音，可听性需要人工设备检查 |
 | 存储 | 按游戏/profile/发行隔离的三槽 IndexedDB、事务确认、修订冲突、导入导出、历史发行入口、独立偏好/Profile | 快照要求相同发行身份；无云同步 |
 | 恢复 | 候选先验证/准备、暂停提交、检查点回退、设备重建 | 无安全热更新 |
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告、打包媒体优化 | 无 PWA、签名/CDN 调度 |
@@ -115,7 +115,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 
 ### media.webp.v1 / media.mp3.v1
 
-打包媒体优化按实际发出的对象容器裁剪 `requires`：发行中存在 WebP 对象才声明 `media.webp.v1`，存在 MP3 对象才声明 `media.mp3.v1`；`--no-optimize` 或逐资产例外导致发行不含这两类对象时不声明，旧运行时仍可加载，播放器据此拒绝不支持的组合。默认构建把图像对象转有损 WebP（质量 92，alpha 通道在 ALPH 块中无损保留）、非循环音频转 MP3 CBR；尺寸、`duration_us` 和 `decoded_bytes` 描述符保持源资产值。MP3 对象带 LAME gapless 标签，原生加载器与浏览器 `decodeAudioData` 都按标签裁剪编码器延迟/填充，解码样本数与源 WAV 一致（原生加载器经测试逐样本对齐）。循环播放的音频保持 WAV（样本精确循环），MP3 不能表示的采样率、转换后不缩小的对象和字体不受影响；逐资产例外用 catalog `optimize` 字段，CLI 覆盖与转换缓存见 [编写与维护作品](AUTHORING.md)。
+打包媒体优化按实际发出的对象容器裁剪 `requires`：发行中存在 WebP 对象才声明 `media.webp.v1`，存在 MP3 对象才声明 `media.mp3.v1`；`--no-optimize` 或逐资产例外导致发行不含这两类对象时不声明，旧运行时仍可加载，播放器据此拒绝不支持的组合。默认构建把图像对象转有损 WebP（质量 92，alpha 通道在 ALPH 块中无损保留）、全部音频（含循环 BGM）转 MP3 CBR；尺寸、`duration_us` 和 `decoded_bytes` 描述符保持源资产值。MP3 对象带 LAME gapless 标签，原生加载器与浏览器 `decodeAudioData` 都按标签裁剪编码器延迟/填充，原生保留源 WAV 样本数（经测试逐样本对齐），浏览器随后按 AudioContext 的采样率重采样。循环播放复用裁剪后的完整解码缓冲，不增加编码延迟或尾部填充。自动 MP3 转码失败或解码采样率、声道数、样本数校验失败会使构建报错，不回退 WAV；通过校验的短音频即使变大也保留 MP3。WAV 仅由作者显式选择原始或无损音频配置保留，字体不受影响；逐资产例外用 catalog `optimize` 字段，CLI 覆盖与转换缓存见 [编写与维护作品](AUTHORING.md)。
 
 ## 能力发行清单
 
@@ -169,4 +169,4 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | task.compose.v1 | crates/nir-core/tests/compose_contract.rs（VM 等待时链前进、All 失败优先） | 同文件（链中途存读档只续播）；crates/nir-player/tests/coordination.rs（链中途回退不重播） | tests/nir-next/compose.spec.js | 待验证 | 批次 50；parallel_all 无浏览器直接断言 |
 | story.typed-result.v1 | crates/nir-core/tests/typed_result_contract.rs（写声明值后分支/超时 default/取消不写） | 同文件（游标快照恢复、篡改拒绝）；crates/nir-player/tests/coordination.rs（存读档/回退） | tests/nir-next/typed-result.spec.js | 待验证 | 批次 51；批次 52 LiveNovel 复用同核心 |
 | media.webp.v1 | crates/nir-compiler/src/optimize.rs（有损保 alpha/无损逐像素） | 无运行态（仅校验）：crates/nir-compiler/tests/project.rs（按容器裁剪 requires） | tests/nir-next/menu-elements.spec.js 等像素断言规格经 fixture 实际解码 | 待验证 | 无容器级直接断言，发行按对象出现声明 |
-| media.mp3.v1 | crates/nir-compiler/src/optimize.rs（采样率×码率编码门）；crates/nir-format/src/lame.rs（gapless 标签解析） | 无运行态（仅校验）：crates/nir-compiler/tests/project.rs | tests/nir-next/sampled-reading.spec.js、tests/nir-next/audio.spec.js（经 fixture 解码播放） | 待验证 | 循环音频保持 WAV |
+| media.mp3.v1 | crates/nir-compiler/src/optimize.rs（采样率×码率编码门）；crates/nir-format/src/lame.rs（gapless 标签解析） | 无运行态（仅校验）：crates/nir-compiler/tests/project.rs | tests/browser/audio-loop.spec.js（44.1/48 kHz 解码对齐与 100 次循环）；tests/nir-next/sampled-reading.spec.js、tests/nir-next/audio.spec.js（经 fixture 解码播放） | 待验证 | 循环 BGM 同用 gapless MP3；自动转码失败报错，不回退 WAV |

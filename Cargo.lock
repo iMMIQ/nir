@@ -2350,6 +2350,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "symphonia",
  "tempfile",
  "toml",
  "ttf-parser 0.25.1",

@@ -5,17 +5,13 @@
 //! MP3 for audio by default — while keeping the descriptor contract intact:
 //! `Asset.object`/`bytes` are rewritten from the converted bytes, dimensions
 //! and authored `duration_us`/`decoded_bytes` are preserved exactly, and every
-//! conversion is skipped (with a recorded reason) when it would not help:
+//! automatic MP3 conversion fails explicitly if its contract cannot be met.
 //!
-//! * assets played with `looped = true` stay WAV, because MP3 encoder
-//!   delay/padding breaks whole-buffer sample-accurate looping;
-//! * WAV sample rates MP3 cannot represent stay WAV, as do bitrate/rate
-//!   pairs MPEG CBR cannot express (LAME would silently rewrite the
-//!   bitrate) and pairs whose first CBR frame is too small to hold the
-//!   gapless tag (LAME would silently drop it); the encoder's output rate
-//!   is pinned to the authored rate so no pair can resample;
-//! * any conversion that does not shrink the object keeps the original bytes;
-//! * `optimize = "lossless" | "none"` in the asset catalog opts out per asset.
+//! Looping and non-looping audio share the same gapless MP3 path. Unsupported
+//! rates, invalid bitrate/rate pairs and missing gapless metadata are errors;
+//! even short audio that grows after encoding stays MP3. Explicit WAV settings
+//! and `optimize = "lossless" | "none"` remain author-controlled opt-outs.
+//! Image conversions that do not shrink the object keep the original bytes.
 //!
 //! MP3 files always carry a LAME gapless tag; the native loader trims the
 //! recorded delay/padding so decoded sample counts match the authored WAV and
@@ -26,7 +22,7 @@
 
 use crate::LoadedProject;
 use anyhow::{bail, Context, Result};
-use nir_format::{AssetKind, Effect};
+use nir_format::AssetKind;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,7 +34,7 @@ use std::{
 /// cached conversions from an older tool never leak into a new release.
 /// The lossless WebP path goes through the `image` crate, so it is named too.
 pub const OPTIMIZE_TOOL: &str =
-    "nir-media-optimize/2:webp-0.3.1+libwebp,image-0.25.10,mp3lame-encoder-0.2.5+lame-3.100";
+    "nir-media-optimize/3:webp-0.3.1+libwebp,image-0.25.10,mp3lame-encoder-0.2.5+lame-3.100";
 
 /// Container choice for packaged images.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -161,7 +157,7 @@ pub struct AssetOutcome {
     pub cache_hit: bool,
 }
 
-/// The WAV features the MP3 container can carry; other rates stay WAV.
+/// Sample rates the MP3 container can carry without resampling.
 const MP3_RATES: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
 
 fn mp3lame_bitrate(kbps: u16) -> Option<mp3lame_encoder::Bitrate> {
@@ -369,6 +365,75 @@ fn encode_mp3(wav: &WavPcm, bitrate: mp3lame_encoder::Bitrate) -> Result<Vec<u8>
     Ok(file)
 }
 
+/// Decode one frame at a time to verify the gapless contract without retaining
+/// another full PCM copy. This runs for fresh encodes and cache hits alike.
+fn validate_mp3(bytes: &[u8], wav: &WavPcm) -> Result<()> {
+    use symphonia::core::{
+        errors::Error, formats::FormatOptions, io::MediaSourceStream, probe::Hint,
+    };
+    anyhow::ensure!(
+        nir_format::lame::parse(bytes).is_some_and(|g| g.rate == wav.rate),
+        "E_OPTIMIZE_AUDIO: encoder output lacks a usable gapless tag at {} Hz",
+        wav.rate
+    );
+    let source = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let mut format = symphonia::default::get_probe()
+        .format(
+            &hint,
+            source,
+            &FormatOptions {
+                enable_gapless: true,
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .context("E_OPTIMIZE_AUDIO: verification probe")?
+        .format;
+    let track = format
+        .default_track()
+        .context("E_OPTIMIZE_AUDIO: missing audio track")?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &Default::default())
+        .context("E_OPTIMIZE_AUDIO: verification decoder")?;
+    let expected = wav.samples.len() / wav.channels as usize;
+    let mut frames = 0;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("E_OPTIMIZE_AUDIO: verification packet"),
+        };
+        anyhow::ensure!(
+            packet.track_id() == track_id,
+            "E_OPTIMIZE_AUDIO: unexpected audio track"
+        );
+        let decoded = decoder
+            .decode(&packet)
+            .context("E_OPTIMIZE_AUDIO: verification decode")?;
+        anyhow::ensure!(
+            decoded.spec().rate == wav.rate
+                && decoded.spec().channels.count() == wav.channels as usize,
+            "E_OPTIMIZE_AUDIO: decoded rate or channels changed"
+        );
+        frames += decoded.frames();
+        anyhow::ensure!(
+            frames <= expected,
+            "E_OPTIMIZE_AUDIO: decoded audio exceeds authored sample count"
+        );
+    }
+    anyhow::ensure!(
+        frames == expected,
+        "E_OPTIMIZE_AUDIO: decoded {frames} frames, expected {expected}"
+    );
+    Ok(())
+}
+
 /// Cache entry metadata; the payload sits in the sibling `.<ext>` file.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CacheMeta {
@@ -437,23 +502,6 @@ pub(crate) fn optimize_media(
     options: &OptimizeOptions,
     cache_root: &Path,
 ) -> Result<(OptimizeReport, BTreeMap<String, StoredMedia>)> {
-    // Whole-buffer loops must stay sample-exact; MP3 delay/padding would put
-    // a seam at the loop point, so looped audio always keeps WAV.
-    let looped: BTreeSet<String> = p
-        .program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .filter_map(|definition| match &definition.effect {
-            Effect::Audio {
-                asset,
-                looped: true,
-                ..
-            } => Some(asset.clone()),
-            _ => None,
-        })
-        .collect();
-
     let cache = Cache { root: cache_root };
     let mut report = OptimizeReport {
         tool: OPTIMIZE_TOOL.into(),
@@ -577,8 +625,6 @@ pub(crate) fn optimize_media(
                     } else {
                         "audio conversion disabled"
                     })
-                } else if looped.contains(id) {
-                    Some("looped playback keeps WAV sample-exact")
                 } else if policy == AssetPolicy::Lossless {
                     Some("lossless policy keeps WAV")
                 } else {
@@ -595,88 +641,43 @@ pub(crate) fn optimize_media(
                     report.assets.push(outcome);
                     continue;
                 }
-                let wav = parse_wav_pcm16(bytes)?;
-                if !MP3_RATES.contains(&wav.rate) {
-                    outcome.from = "wav";
-                    outcome.to = "wav";
-                    outcome.reason = Some(format!("{} Hz is not representable in MP3", wav.rate));
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
-                }
-                if !mp3_cbr_valid(wav.rate, options.audio_bitrate_kbps) {
-                    outcome.from = "wav";
-                    outcome.to = "wav";
-                    outcome.reason = Some(format!(
-                        "{} kbps CBR is not valid at {} Hz in MP3",
-                        options.audio_bitrate_kbps, wav.rate
-                    ));
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
-                }
-                if !mp3_cbr_tag_fits(wav.rate, options.audio_bitrate_kbps, wav.channels) {
-                    outcome.from = "wav";
-                    outcome.to = "wav";
-                    outcome.reason = Some(format!(
-                        "{} kbps at {} Hz {} leaves no room for a gapless tag",
-                        options.audio_bitrate_kbps,
-                        wav.rate,
-                        if wav.channels == 2 { "stereo" } else { "mono" }
-                    ));
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
-                }
+                let wav = parse_wav_pcm16(bytes)
+                    .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
+                anyhow::ensure!(
+                    MP3_RATES.contains(&wav.rate),
+                    "E_OPTIMIZE_AUDIO: asset {id}: {} Hz is not representable in MP3",
+                    wav.rate
+                );
+                anyhow::ensure!(
+                    mp3_cbr_valid(wav.rate, options.audio_bitrate_kbps),
+                    "E_OPTIMIZE_AUDIO: asset {id}: {} kbps CBR is not valid at {} Hz in MP3",
+                    options.audio_bitrate_kbps,
+                    wav.rate
+                );
+                anyhow::ensure!(
+                    mp3_cbr_tag_fits(wav.rate, options.audio_bitrate_kbps, wav.channels),
+                    "E_OPTIMIZE_AUDIO: asset {id}: {} kbps at {} Hz with {} channels leaves no room for a gapless tag",
+                    options.audio_bitrate_kbps, wav.rate, wav.channels
+                );
                 let bitrate = mp3lame_bitrate(options.audio_bitrate_kbps)
                     .context("E_OPTIMIZE_AUDIO: bitrate")?;
                 let params = format!("audio:mp3:cbr:{}:{}", options.audio_bitrate_kbps, wav.rate);
                 let key = cache.key(bytes, &params);
                 let (converted, cache_hit) = if let Some(hit) = cache.load(&key, "mp3") {
+                    validate_mp3(&hit, &wav)
+                        .with_context(|| format!("E_OPTIMIZE_AUDIO: cached asset {id}"))?;
                     (hit, true)
                 } else {
-                    let fresh = encode_mp3(&wav, bitrate)?;
+                    let fresh = encode_mp3(&wav, bitrate)
+                        .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
+                    // Validate before publishing a cache entry. A tagged file
+                    // alone is insufficient: decoding must also return every
+                    // authored sample at the original rate and channel count.
+                    validate_mp3(&fresh, &wav)
+                        .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
                     cache.store(&key, "mp3", &fresh, &nir_content::digest(bytes), &params)?;
                     (fresh, false)
                 };
-                // The gapless tag is the decode contract: every shipped MP3
-                // must carry one at the authored rate, or players cannot trim
-                // back to the authored sample count. Validated pairs always
-                // produce one; anything unexpected falls back to WAV instead
-                // of shipping a file with a broken contract.
-                if !nir_format::lame::parse(&converted).is_some_and(|g| g.rate == wav.rate) {
-                    outcome.from = "wav";
-                    outcome.to = "wav";
-                    outcome.reason = Some("encoder output lacks a usable gapless tag".into());
-                    outcome.cache_hit = cache_hit;
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
-                }
-                if converted.len() >= bytes.len() {
-                    outcome.from = "wav";
-                    outcome.to = "wav";
-                    outcome.reason = Some("conversion did not shrink the object".into());
-                    outcome.cache_hit = cache_hit;
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
-                }
                 outcome.action = "converted";
                 outcome.from = "wav";
                 outcome.to = "mp3";
@@ -811,6 +812,8 @@ mod tests {
                         gapless.rate, rate,
                         "{kbps} kbps at {rate} Hz ch{channels} resampled"
                     );
+                    validate_mp3(&mp3, &wav)
+                        .unwrap_or_else(|e| panic!("{kbps} kbps at {rate} Hz ch{channels}: {e:#}"));
                     converted += 1;
                 }
             }
@@ -820,6 +823,138 @@ mod tests {
             "suspiciously few admitted pairs: {converted}"
         );
         assert!(guarded > 20, "suspiciously few guarded pairs: {guarded}");
+    }
+
+    fn audio_project(rate: u32, channels: u16, frames: usize) -> LoadedProject {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/rain-letters");
+        let mut project = crate::load_project(&root).unwrap();
+        // audio.bgm is actually referenced by a looped cue in this project.
+        assert!(project.program.cues.values().flat_map(|c| &c.effects).any(|d| matches!(
+            &d.effect, nir_format::Effect::Audio { asset, looped: true, .. } if asset == "audio.bgm"
+        )));
+        let bytes = wav_pcm(rate, channels, frames);
+        let asset = project.program.assets.get_mut("audio.bgm").unwrap();
+        asset.object = nir_content::digest(&bytes);
+        asset.bytes = bytes.len() as u64;
+        asset.duration_us = nir_format::Micros(frames as u64 * 1_000_000 / rate as u64);
+        asset.decoded_bytes = frames as u64 * channels as u64 * 4;
+        project.media.insert("audio.bgm".into(), bytes);
+        project
+    }
+
+    #[test]
+    fn looped_bgm_and_short_audio_ship_mp3_including_cache_hits() {
+        let cache = tempfile::tempdir().unwrap();
+        let roots = BTreeSet::from(["audio.bgm".into()]);
+        for frames in [1, 44101] {
+            for cache_hit in [false, true] {
+                let mut p = audio_project(44100, 2, frames);
+                let authored = p.program.assets["audio.bgm"].clone();
+                let (report, stored) =
+                    optimize_media(&mut p, &roots, &OptimizeOptions::default(), cache.path())
+                        .unwrap();
+                assert_eq!(stored["audio.bgm"], StoredMedia::Mp3);
+                assert_eq!((report.audio.converted, report.audio.kept), (1, 0));
+                assert_eq!(report.assets[0].cache_hit, cache_hit);
+                assert_eq!(
+                    p.program.assets["audio.bgm"].duration_us,
+                    authored.duration_us
+                );
+                assert_eq!(
+                    p.program.assets["audio.bgm"].decoded_bytes,
+                    authored.decoded_bytes
+                );
+                if frames == 1 {
+                    assert!(report.audio.bytes_after > report.audio.bytes_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_mp3_parameters_fail_without_wav_fallback() {
+        let cache = tempfile::tempdir().unwrap();
+        let roots = BTreeSet::from(["audio.bgm".into()]);
+        for (rate, kbps, reason) in [
+            (44056, 160, "not representable"),
+            (44100, 8, "not valid"),
+            (44100, 32, "no room"),
+        ] {
+            let mut p = audio_project(rate, 2, 1200);
+            let before = p.media["audio.bgm"].clone();
+            let options = OptimizeOptions {
+                audio_bitrate_kbps: kbps,
+                ..Default::default()
+            };
+            let error = optimize_media(&mut p, &roots, &options, cache.path()).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("E_OPTIMIZE_AUDIO")
+                    && message.contains("audio.bgm")
+                    && message.contains(reason),
+                "{message}"
+            );
+            assert_eq!(p.media["audio.bgm"], before);
+        }
+    }
+
+    #[test]
+    fn invalid_cached_mp3_is_rejected_and_explicit_wav_policies_are_honored() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: directory.path(),
+        };
+        let roots = BTreeSet::from(["audio.bgm".into()]);
+        let mut p = audio_project(44100, 2, 1200);
+        let source = &p.media["audio.bgm"];
+        let params = "audio:mp3:cbr:160:44100";
+        let key = cache.key(source, params);
+        cache
+            .store(
+                &key,
+                "mp3",
+                b"invalid",
+                &nir_content::digest(source),
+                params,
+            )
+            .unwrap();
+        let error = optimize_media(
+            &mut p,
+            &roots,
+            &OptimizeOptions::default(),
+            directory.path(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("gapless tag"));
+        for policy in [AssetPolicy::None, AssetPolicy::Lossless] {
+            p.asset_optimize.insert("audio.bgm".into(), policy);
+            let (report, stored) = optimize_media(
+                &mut p,
+                &roots,
+                &OptimizeOptions::default(),
+                directory.path(),
+            )
+            .unwrap();
+            assert_eq!(stored["audio.bgm"], StoredMedia::Wav);
+            assert_eq!(report.audio.kept, 1);
+        }
+        p.asset_optimize.clear();
+        let (_, stored) =
+            optimize_media(&mut p, &roots, &OptimizeOptions::none(), directory.path()).unwrap();
+        assert_eq!(stored["audio.bgm"], StoredMedia::Wav);
+    }
+
+    #[test]
+    fn verification_rejects_wrong_sample_counts_and_truncated_mp3() {
+        for (rate, channels, kbps) in [(44100, 1, 160), (48000, 2, 160), (22050, 2, 64)] {
+            let mut wav = parse_wav_pcm16(&wav_pcm(rate, channels, 1201)).unwrap();
+            let mp3 = encode_mp3(&wav, mp3lame_bitrate(kbps).unwrap()).unwrap();
+            validate_mp3(&mp3, &wav).unwrap();
+            assert!(validate_mp3(&mp3[..mp3.len() / 2], &wav).is_err());
+            wav.samples
+                .extend(std::iter::repeat_n(0, channels as usize));
+            assert!(validate_mp3(&mp3, &wav).is_err());
+        }
     }
 
     #[test]
