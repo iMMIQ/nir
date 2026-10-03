@@ -1,0 +1,44 @@
+format = 1
+
+[[assets]]
+id = "bg.desk"
+kind = "image"
+source = "source/desk.png"
+rights = "CC0-1.0"
+expected_size = [1280, 720]
+
+[[assets]]
+id = "bg.window"
+kind = "image"
+source = "source/window.png"
+rights = "CC0-1.0"
+expected_size = [1280, 720]
+
+[[assets]]
+id = "audio.bgm"
+kind = "audio"
+source = "source/bgm.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.voice"
+kind = "audio"
+source = "source/voice.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.chime"
+kind = "audio"
+source = "source/chime.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "font.reader"
+kind = "font"
+source = "source/reader.otf"
+rights = "OFL-1.1"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/Noto-OFL.txt"

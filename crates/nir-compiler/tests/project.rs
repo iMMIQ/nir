@@ -442,6 +442,42 @@ fn runtime_rejects_missing_or_rewritten_index_and_recipe() {
 }
 
 #[test]
+fn window_transition_masks_join_the_release_roots_and_capability() {
+    // A mid-block mask reveal belongs to no cue recipe: its identity must
+    // still ship in the release root index, and the capability stays declared
+    // only while an op actually uses a styled reveal.
+    let d = project();
+    let catalog = d.path().join("assets/catalog.toml");
+    let mut s = fs::read_to_string(&catalog).unwrap();
+    s.push_str("\n[[assets]]\nid = \"mask.pattern\"\nkind = \"image\"\nsource = \"source/station.png\"\nrights = \"CC0-1.0\"\nexpected_size = [1280, 720]\n");
+    fs::write(&catalog, s).unwrap();
+    let path = d.path().join("content/ch01/story.nir.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["functions"]["main"]["blocks"]["intro"]["ops"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id":"window.reveal","operation":{
+            "type":"dialogue_visibility","visible":false,
+            "transition":{"type":"mask","asset":"mask.pattern","channel":"alpha"},
+            "duration_us":"500000"}}));
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let p = load_project(d.path()).unwrap();
+    assert!(p
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "text.window-transition.v1"));
+    assert!(runtime_roots(&p.program).contains("mask.pattern"));
+
+    let base = load_project(&source()).unwrap();
+    assert!(!base
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "text.window-transition.v1"));
+    assert!(!runtime_roots(&base.program).contains("mask.pattern"));
+}
+#[test]
 fn source_diagnostic_locates_reference_without_changing_program_identity() {
     let d = project();
     let path = d.path().join("content/ch01/story.nir.json");
@@ -749,6 +785,82 @@ fn reading_menu_actions_emit_only_their_used_capability() {
         .iter()
         .any(|c| c == "ui.menu-reading.v1"));
     compile(&loaded.program).unwrap();
+}
+
+#[test]
+fn menu_transition_capability_follows_spatial_style_usage() {
+    let d = project();
+    // The stock theme declares neither effects capability.
+    let requires = |path: &Path| {
+        load_project(path)
+            .unwrap()
+            .program
+            .requires
+    };
+    assert!(!requires(d.path()).iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(!requires(d.path()).iter().any(|c| c == "ui.menu-transition.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    // A dissolve fade claims only the effects capability; the wipe close adds
+    // the reveal capability.
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[image_menus.title.effects.enter]\nfade_us = \"400000\"\nstyle = {type = \"dissolve\"}\n[image_menus.title.effects.close]\nfade_us = \"300000\"\nstyle = {type = \"wipe\", direction = \"left_to_right\", softness = 0.2}\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    for cap in ["ui.menu-effects.v1", "ui.menu-transition.v1"] {
+        assert!(loaded.program.requires.iter().any(|c| c == cap), "{cap}");
+    }
+    compile(&loaded.program).unwrap();
+    // Dropping the spatial style trims the reveal capability but keeps the
+    // fade on the legacy path.
+    let path = d.path().join("themes/rain/theme.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("style = {type = \"wipe\", direction = \"left_to_right\", softness = 0.2}\n", "");
+    fs::write(path, text).unwrap();
+    let trimmed = load_project(d.path()).unwrap();
+    assert!(trimmed.program.requires.iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(!trimmed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-transition.v1"));
+    compile(&trimmed.program).unwrap();
+}
+
+#[test]
+fn menu_element_tween_capability_follows_element_animation_usage() {
+    let d = project();
+    // The stock theme declares no element animations.
+    assert!(!load_project(d.path())
+        .unwrap()
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-element-tween.v1"));
+    let path = d.path().join("themes/rain/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[[image_menus.title.elements]]\nid = \"row\"\nrect = [0,0,300,80]\ncontent = { type = \"hit_region\", label = \"Row\", action = {type = \"close\"} }\n[image_menus.title.effects.enter]\nfade_us = \"100000\"\n[[image_menus.title.effects.elements]]\nelement = \"row\"\nproperty = \"offset_x\"\nfrom = -40.0\nduration_us = \"300000\"\n");
+    fs::write(path, text).unwrap();
+    let loaded = load_project(d.path()).unwrap();
+    for cap in ["ui.menu-effects.v1", "ui.menu-element-tween.v1"] {
+        assert!(loaded.program.requires.iter().any(|c| c == cap), "{cap}");
+    }
+    compile(&loaded.program).unwrap();
+    // Dropping the animation trims the element capability but keeps the page
+    // on the effects path.
+    let path = d.path().join("themes/rain/theme.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\n[[image_menus.title.effects.elements]]\nelement = \"row\"\nproperty = \"offset_x\"\nfrom = -40.0\nduration_us = \"300000\"\n", "");
+    fs::write(path, text).unwrap();
+    let trimmed = load_project(d.path()).unwrap();
+    assert!(trimmed.program.requires.iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(!trimmed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-element-tween.v1"));
+    compile(&trimmed.program).unwrap();
 }
 
 #[test]

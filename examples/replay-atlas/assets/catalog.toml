@@ -1,0 +1,108 @@
+format = 1
+
+[[assets]]
+id = "bg.hall"
+kind = "image"
+source = "source/hall.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "bg.gallery"
+kind = "image"
+source = "source/gallery.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "bg.north"
+kind = "image"
+source = "source/north.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "bg.south"
+kind = "image"
+source = "source/south.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.begin"
+kind = "image"
+source = "source/begin.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.begin.hover"
+kind = "image"
+source = "source/begin.hover.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.gallery"
+kind = "image"
+source = "source/gallery.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.gallery.hover"
+kind = "image"
+source = "source/gallery.hover.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.back"
+kind = "image"
+source = "source/back.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.north"
+kind = "image"
+source = "source/north.thumb.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.north.locked"
+kind = "image"
+source = "source/north.locked.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.south"
+kind = "image"
+source = "source/south.thumb.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "ui.south.locked"
+kind = "image"
+source = "source/south.locked.png"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.bgm"
+kind = "audio"
+source = "source/bgm.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.click"
+kind = "audio"
+source = "source/click.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "audio.gallery"
+kind = "audio"
+source = "source/page.wav"
+rights = "CC0-1.0"
+
+[[assets]]
+id = "font.reader"
+kind = "font"
+source = "source/reader.otf"
+rights = "OFL-1.1"
+[assets.font]
+mode = "subset"
+face_index = 0
+extra_characters = ""
+license = "fonts/Noto-OFL.txt"

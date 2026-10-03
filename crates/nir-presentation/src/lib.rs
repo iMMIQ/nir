@@ -41,6 +41,9 @@ pub struct ChoiceView {
     pub id: String,
     pub label: String,
     pub enabled: bool,
+    /// Semantic selection cursor of a typed-result interaction. Hover and
+    /// keyboard focus are transients and never set this.
+    pub selected: bool,
     pub locale: String,
     pub font_plan_digest: String,
     pub font_assets: Vec<String>,
@@ -64,6 +67,15 @@ pub struct SlotView {
     pub label: String,
     pub exists: bool,
 }
+/// In-flight overrides for one menu element's enter animation. `None`
+/// properties keep the authored value; `offset` is added displacement that
+/// rests at zero. A finished animation leaves no entry at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ElementAnimation {
+    pub opacity: Option<f32>,
+    pub scale: Option<f32>,
+    pub offset: [f32; 2],
+}
 #[derive(Debug, Clone)]
 pub struct UiModel {
     pub transition_style: StageTransition,
@@ -82,9 +94,22 @@ pub struct UiModel {
     pub stage: [f32; 2],
     pub dialogue: Option<DialogueView>,
     pub hidden_dialogue: bool,
+    /// In-flight message-window reveal; `None` (including under reduced
+    /// motion) keeps the committed hidden/visible state with no interpolation.
+    pub window_transition: Option<WindowTransition>,
+    /// In-flight spatial menu-page reveal. Dissolve coverage (and no style at
+    /// all) rides the legacy `menu_opacity` ramp instead; `None` keeps the
+    /// page on the shared surface.
+    pub menu_transition: Option<(StageTransition, bool, f32)>,
+    /// In-flight element enter animations, keyed by element id. Entries are
+    /// transient overrides projected before layout so parent transforms
+    /// propagate; the map is empty whenever nothing animates.
+    pub menu_element_animations: std::collections::BTreeMap<String, ElementAnimation>,
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
     pub choices: Vec<ChoiceView>,
+    /// The pending interaction declares an explicit cancel target.
+    pub choice_cancellable: bool,
     pub prefs: Preferences,
     pub ui_locale: String,
     pub ui_fonts: Vec<String>,
@@ -102,10 +127,17 @@ pub struct UiModel {
     pub history_total: usize,
     pub menu_history: std::collections::BTreeMap<String, Vec<MenuHistoryRow>>,
     pub menu_history_flow: Option<std::sync::Arc<[MenuHistoryRow]>>,
+    /// Authored menu page opacity from finite enter/close fades; 1 when no
+    /// fade is active. Applies to the whole menu layer, never the story
+    /// scene below it.
+    pub menu_opacity: f32,
     pub slots: Vec<SlotView>,
     pub save_confirmation: Option<(u32, u32)>,
     pub busy_slots: std::collections::BTreeSet<u32>,
     pub can_save: bool,
+    /// A live replay owns the session: replay entries close, the exit opens,
+    /// and storage services hide until the frozen session returns.
+    pub replay_active: bool,
     pub menu_story: std::collections::BTreeMap<String, MenuValue>,
     pub menu_reading_modes: std::collections::BTreeSet<MenuReadingMode>,
     pub paused: bool,
@@ -211,6 +243,39 @@ pub enum MenuPaint {
     Quad(usize),
     Text(usize),
 }
+/// In-flight message-window reveal as seen by projection. Dissolve folds into
+/// the existing per-item opacity multiply; wipe/mask divert the window into
+/// the offscreen root and return through the `@window` sentinel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowTransition {
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+}
+/// The diverted window root: quads render into the offscreen root texture;
+/// `texts` indexes `DrawPacket::texts` (kept in the packet for layout) whose
+/// glyph areas route to the window pass instead of the shared text renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowLayers {
+    pub quads: Vec<Quad>,
+    pub texts: Vec<usize>,
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+}
+/// The diverted menu page root. `position` is the `@menu` sentinel's index in
+/// `DrawPacket::quads` — the underlying frame keeps every quad around it;
+/// `texts` index `DrawPacket::texts` (kept in the packet for layout) whose
+/// glyph areas route to the page pass instead of the shared renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuLayers {
+    pub quads: Vec<Quad>,
+    pub texts: Vec<usize>,
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub progress: f32,
+    pub position: usize,
+}
 #[derive(Debug, Default)]
 pub struct DrawPacket {
     pub(crate) history_flow: Option<reading::HistoryFlowView>,
@@ -220,6 +285,8 @@ pub struct DrawPacket {
     pub menu_paint: Vec<MenuPaint>,
     pub menu_controls: std::collections::BTreeMap<u32, String>,
     pub menu_quad_range: Option<(usize, usize)>,
+    pub(crate) menu_page_range: Option<(usize, usize)>,
+    pub(crate) menu_page_texts: Option<(usize, usize)>,
     pub quads: Vec<Quad>,
     pub texts: Vec<TextRun>,
     pub semantics: Vec<SemanticNode>,
@@ -232,6 +299,8 @@ pub struct DrawPacket {
     pub height: f32,
     pub stage_size: [u32; 2],
     pub transition_layers: Option<(Vec<Quad>, Vec<Quad>, f32)>,
+    pub window_layers: Option<WindowLayers>,
+    pub menu_layers: Option<MenuLayers>,
     pub scrolls: Vec<ScrollView>,
     pub(crate) dialogue_hint: Option<usize>,
     pub(crate) dialogue_hint_quad: Option<usize>,
@@ -362,6 +431,8 @@ impl DrawPacket {
             && self.stage_size == other.stage_size
             && self.transition_layers == other.transition_layers
             && self.transition_style == other.transition_style
+            && self.window_layers == other.window_layers
+            && self.menu_layers == other.menu_layers
     }
 
     fn rect(&mut self, r: [f32; 4], c: [f32; 4]) {
@@ -567,14 +638,21 @@ fn menu_service_enabled(action: &ImageMenuAction, m: &UiModel) -> bool {
         }
         ImageMenuAction::SaveSlot { slot } => {
             m.can_save
+                && !m.replay_active
                 && slot
                     .resolve(&m.menu_locals)
                     .is_some_and(|slot| !m.busy_slots.contains(&slot))
         }
-        ImageMenuAction::LoadSlot { slot } => slot.resolve(&m.menu_locals).is_some_and(|slot| {
-            m.slots.iter().any(|row| row.slot == slot && row.exists)
-                && !m.busy_slots.contains(&slot)
-        }),
+        ImageMenuAction::LoadSlot { slot } => {
+            !m.replay_active
+                && slot.resolve(&m.menu_locals).is_some_and(|slot| {
+                    m.slots.iter().any(|row| row.slot == slot && row.exists)
+                        && !m.busy_slots.contains(&slot)
+                })
+        }
+        // Nested replays never nest: the frozen session is the only one.
+        ImageMenuAction::Replay { .. } => !m.replay_active,
+        ImageMenuAction::ExitReplay => m.replay_active,
         _ => true,
     }
 }
@@ -791,16 +869,23 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                 }
                 _ => None,
             };
+            let anim = m
+                .menu_element_animations
+                .get(&e.id)
+                .copied()
+                .unwrap_or_default();
             Node {
                 id: e.id.clone(),
                 parent: e.parent.clone(),
                 asset,
-                x: positions[&e.id][0],
-                y: positions[&e.id][1],
+                // Enter animations override before layout so the parent
+                // transform chain propagates the displaced, scaled row.
+                x: positions[&e.id][0] + anim.offset[0],
+                y: positions[&e.id][1] + anim.offset[1],
                 width: if e.content.is_group() { 0. } else { e.rect[2] },
                 height: if e.content.is_group() { 0. } else { e.rect[3] },
-                scale: e.scale,
-                opacity: e.opacity,
+                scale: anim.scale.unwrap_or(e.scale),
+                opacity: anim.opacity.unwrap_or(e.opacity),
                 color,
                 order: 0,
                 clip: e.clip,
@@ -1046,7 +1131,68 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
 }
 
 pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> DrawPacket {
-    project_measured(m, width, height, messages, &[], 0., 0.)
+    let mut p = project_measured(m, width, height, messages, &[], 0., 0.);
+    divert_menu_page(&mut p, m);
+    p
+}
+
+/// Diverts the authored menu page into the offscreen page root while a
+/// spatial reveal is in flight. Must run after history flow/bar projection:
+/// the bar splices four quads inside the page span, so splitting earlier
+/// would invalidate its index fixups.
+pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
+    let Some((style, to_visible, progress)) = m.menu_transition.as_ref() else {
+        return;
+    };
+    let Some((start, end)) = p.menu_page_range else {
+        return;
+    };
+    // Page texts are the branch's own runs plus every page-marked text
+    // appended after it (history flow rows).
+    let mut texts: Vec<usize> = p
+        .menu_page_texts
+        .map(|(from, to)| from..to)
+        .into_iter()
+        .flatten()
+        .collect();
+    texts.extend(
+        p.menu_paint
+            .iter()
+            .filter_map(|paint| match paint {
+                MenuPaint::Text(i) => Some(*i),
+                _ => None,
+            }),
+    );
+    let tail = p.quads.split_off(end);
+    let quads = p.quads.split_off(start);
+    p.quads.push(Quad {
+        rect: [0., 0., p.width, p.height],
+        color: [1., 1., 1., 1.],
+        asset: Some("@menu".into()),
+        clip: None,
+    });
+    let position = p.quads.len() - 1;
+    p.quads.extend(tail);
+    // Quads after the page shift down by the page length minus the sentinel.
+    let shift = end - start - 1;
+    if let Some(index) = &mut p.dialogue_hint_quad {
+        if *index >= end {
+            *index -= shift;
+        }
+    }
+    // Interleaving is moot while the page lives in its own root.
+    p.menu_paint.clear();
+    p.menu_quad_range = None;
+    p.menu_page_range = None;
+    p.menu_page_texts = None;
+    p.menu_layers = Some(MenuLayers {
+        quads,
+        texts,
+        style: style.clone(),
+        to_visible: *to_visible,
+        progress: *progress,
+        position,
+    });
 }
 fn project_measured(
     m: &UiModel,
@@ -1101,6 +1247,12 @@ fn project_measured(
             let scale = (width / m.stage[0]).min(height / m.stage[1]);
             let ox = (width - m.stage[0] * scale) / 2.;
             let oy = (height - m.stage[1] * scale) / 2.;
+            // The fade owns everything this branch paints, never the story
+            // scene already projected underneath the overlay.
+            let fade_quads = p.quads.len();
+            let fade_texts = p.texts.len();
+            let fade_flows = p.history_flow.is_some();
+            let fade_bars = p.history_bar_view.is_some();
             p.quads.push(Quad {
                 rect: [ox, oy, m.stage[0] * scale, m.stage[1] * scale],
                 color: [1.; 4],
@@ -1197,6 +1349,25 @@ fn project_measured(
                     false,
                     t,
                 );
+            }
+            // The page owns everything this branch paints, including builtin
+            // navigation; a spatial reveal diverts exactly this span.
+            p.menu_page_range = Some((fade_quads, p.quads.len()));
+            p.menu_page_texts = Some((fade_texts, p.texts.len()));
+            let opacity = m.menu_opacity.clamp(0., 1.);
+            if opacity < 1. {
+                for quad in &mut p.quads[fade_quads..] {
+                    quad.color[3] *= opacity;
+                }
+                for text in &mut p.texts[fade_texts..] {
+                    text.color[3] *= opacity;
+                }
+                if fade_flows {
+                    p.history_flow.as_mut().unwrap().color[3] *= opacity;
+                }
+                if fade_bars {
+                    p.history_bar_view.as_mut().unwrap().quad.color[3] *= opacity;
+                }
             }
         }
         Screen::Title => {
@@ -1437,6 +1608,46 @@ fn project_measured(
                 for text in &mut p.texts[first_text..] {
                     text.color[3] *= appearance.opacity * appearance.text_opacity;
                 }
+                match m.window_transition.as_ref() {
+                    // Uniform coverage is the dissolve ramp: fold it into the
+                    // existing per-item opacity multiply.
+                    Some(w) if matches!(w.style, StageTransition::Dissolve) => {
+                        let coverage = if w.to_visible {
+                            w.progress
+                        } else {
+                            1. - w.progress
+                        };
+                        for quad in &mut p.quads[first_quad..] {
+                            quad.color[3] *= coverage;
+                        }
+                        for text in &mut p.texts[first_text..] {
+                            text.color[3] *= coverage;
+                        }
+                    }
+                    // Spatial coverage composites through the mix pass: divert
+                    // the window quads into the offscreen root, leave a
+                    // full-surface sentinel at their z-position. Window texts
+                    // stay in the packet for layout; their glyph areas route
+                    // to the window pass instead of the shared renderer.
+                    Some(w) => {
+                        let quads = p.quads.split_off(first_quad);
+                        p.dialogue_hint_quad = None;
+                        p.quads.push(Quad {
+                            rect: [0., 0., width, height],
+                            color: [1., 1., 1., 1.],
+                            asset: Some("@window".into()),
+                            clip: None,
+                        });
+                        p.window_layers = Some(WindowLayers {
+                            quads,
+                            texts: (first_text..p.texts.len()).collect(),
+                            style: w.style.clone(),
+                            to_visible: w.to_visible,
+                            progress: w.progress,
+                        });
+                    }
+                    None => {}
+                }
                 p.semantics.push(SemanticNode {
                     value: None,
                     id: 0,
@@ -1481,7 +1692,7 @@ fn project_measured(
                                 option: c.id.clone(),
                             },
                             [x, row_y, w, h],
-                            false,
+                            c.selected,
                             t,
                         );
                         p.quads.last_mut().unwrap().clip = Some(viewport);
@@ -1516,6 +1727,15 @@ fn project_measured(
                         },
                         m,
                         messages,
+                    );
+                }
+                if m.choice_cancellable {
+                    p.button(
+                        msg("cancel"),
+                        UiAction::CancelChoice,
+                        [x, y + view_height + 14., w, 36.],
+                        false,
+                        t,
                     );
                 }
             }
@@ -2079,6 +2299,9 @@ fn project_measured(
         p.menu_paint.clear();
         p.menu_controls.clear();
         p.menu_quad_range = None;
+        p.menu_page_range = None;
+        p.menu_page_texts = None;
+        p.menu_layers = None;
         p.transition_layers = None;
         p.rect([0., 0., width, height], t.background);
         let w = (width - 2. * margin).min(520.);

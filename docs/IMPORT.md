@@ -30,7 +30,7 @@
 
 ## LiveNovel 事件、菜单与媒体配置
 
-提供受限的 **LiveNovel 116 线性剧情／回想配置**。从 `ノベルシステム/START.lsb` 启动、带 `menu.lpm` 和回想分发脚本时自动识别。适配器读取实际主线跳转、回想目标、解锁 ID 与 LPM 按钮；替换标准系统脚本。当前配置的舞台、消息框和系统资源约定为 1024×768，不代表所有 LiveNovel 作品都能直接导入。未知事件或不匹配的剧情结构会报错，不会静默忽略。
+提供受限的 **LiveNovel 116 线性／选择剧情与回想配置**。从 `ノベルシステム/START.lsb` 启动、带 `menu.lpm` 和回想分发脚本时自动识别。适配器读取实际主线跳转、选择分发、回想目标、解锁 ID 与 LPM 按钮；替换标准系统脚本。当前配置的舞台、消息框和系统资源约定为 1024×768，不代表所有 LiveNovel 作品都能直接导入。未知事件或不匹配的剧情结构会报错，不会静默忽略。
 
 - `CREATECG`、`CHANGECG`、`DELETECG`：图层、位置、叠放顺序、纯色画面；替换不存在的图层时按原约定创建。原 wipe 用相同时长的 dissolve 替代。
 - `PLAYSND`、`STOPSND`：BGM 循环、语音替换、翻页停止非循环语音、原音量；WAV PCM16 与 Ogg/Vorbis 转成播放器支持的 WAV，六声道 WAV 下混成立体声。停止淡出保留时长，非循环语音翻页时以 50 ms 淡出；事件音量写入 Audio.gain，在播放时与玩家总线音量相乘，PCM16 不再预乘事件音量，系统音量初值从 LPB116 的作者默认配置换算为 NIR 值。
@@ -38,11 +38,30 @@
 - 标题菜单：从原背景、按钮普通／悬停图片和 LPM 坐标自动生成有限 MenuElement，等比例适配视口，指针点击与 Web 键盘／辅助语义。
 - 回想：原缩略图与网格坐标、独立入口、Profile 解锁，读完返回回想菜单。锁定项使用保留透明度的黑色替代图并拒绝执行；另保留 NIR 系统菜单和返回按钮，便于触摸访问。
 - 自动阅读：从 LPB 的 StatusAutoTextWait 读取固定等待，语音余量在 Auto 周期开始时采样并冻结，不再使用文本长度附加或并行语音等待。零等待有显式能力声明。
-- 对白：原消息框图片、位置、透明度、白色文字、32 像素基础字号和 40 像素行高。字体采用随 SDK 提供的字体，揭示间隔为 32 ms。
+- 剧情选择：识别标准選択メニュー约定——无条件调用 `ノベルシステム\選択メニュー\■選択実行.lsb`（调用参数与菜单外壳由 NIR 替代），其后紧跟对 `選択値` 变量与单个字符串字面量做相等比较（操作 12）的连续条件跳转分发链，链尾必须是 Exit（字面量恒命中，后继不可达）。每个分发字面量即选项文本，也是回调提交进 `選択値` 的值（選択.lsb 证据：`選択値 = @ParamStr[0]`）。整个调用点降级为一个类型化 Interact：选项声明字符串值、VM 独占写入 `選択値`、分支目标继续各自标签处的路线；合流分支合并为同一续块，回到自身可达路径的分支按路线循环拒绝。条件调用、缺失/单选项链、重复选项文本、链后非 Exit 一律 `E_IMPORT_CHOICE` 报错。菜单皮肤、悬停/选择音效、倒计时与对齐参数不迁移，报告保持 `converted_with_adaptations`。
+- 对白：原消息框图片、位置、透明度、白色文字、32 像素基础字号和 40 像素行高。字体采用随 SDK 提供的字体；揭示间隔映射 live.lpb 的 `StatusTextSpeed`——单位为每字符毫秒（由固定滑条回调 `StatusTextSpeed = @ParamStr[0] × 64` 与官方文档的每字符毫秒语义双重认证，0 表示瞬时），换算为每字素簇微秒。
 
 GAL 105/106 支持有界的单帧 8/24/32 位图、原始／zlib 数据、块引用、透明度、调色板、图层合成与尾部矩形列表。动画 GAL、LCM 视频和归档解包尚未支持；本配置不会导入未引用的动画光标。解码由 Rust 在同一个 `novelc` 内完成，没有外部媒体进程。
 
-**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。原 wipe、声音／消息框渐变、回想菜单音乐、菜单音效、动画光标、逐字符原字体样式尚未完整复刻。报告状态为 `converted_with_adaptations`，逐项列出这些差异；不是无差异转换认证。
+**尚未等同于原引擎的部分：** 存读档、设置、历史记录使用 NIR 系统界面；旧 LiveMaker 存档不兼容。标题／回想选择音与回想 BGM、消息框渐变和 wipe、系统菜单进出渐隐（`--draft` 草稿页）以有界 NIR 机制映射（账本记为 adapted）；悬停音效、动画光标和逐字符原字体样式尚未复刻。报告逐项列出这些差异；不是无差异转换认证。
+
+### 映射级别、证据与近似接受（报告格式 2）
+
+`import-report.json` 的 `mappings` 数组按规则记录兼容结论，行为级别与证据强度分开：
+
+- **级别（行为结论）**：`exact`（行为经等价机制保留）、`adapted`（以不同但有界面的 NIR 机制替代，差异已记录）、`approximate`（存在已知分歧、等价性未认证）、`unsupported`（无法映射；严格模式报错，草稿降级为故障块）。
+- **证据（结论依据）**：`documented`（公开格式文档）或 `decoded-source`（从固定源码解码定型）。原版实机对照与跨后端验证尚未作为证据类出现，相关未决项保留在近似说明与保真警告中。
+- 每条记录包含规则 ID、源版本（LSB116／LPB116／LPM106／GAL105/106）、规范行为一句话、依赖的目标能力与近似位置/未决项；公共记录不含私有路径或正文。
+
+聚合状态由账本推导：含 `approximate` 时为 `converted_with_approximations`，否则含 `adapted` 为 `converted_with_adaptations`，全部 `exact` 才是 `converted`。近似不是可忽略的 warning：未显式接受的近似规则会让命令在工程与报告写出后以 `E_IMPORT_APPROXIMATE` 退出，并逐个点名规则；接受必须按规则 ID 显式给出：
+
+```sh
+./novelc import livemaker "/path/to/extracted-game" --out imported-story \
+  --game-id org.example.story --title "My Story" \
+  --accept-approximate livenovel.menu-hover,livenovel.text.font
+```
+
+拼错的 ID 不会静默通过——真实规则仍未接受并被点名。当前 LiveNovel 配置的近似规则固定为 `livenovel.menu-hover`（悬停音效／动画光标无对应机制）、`livenovel.text.font`（来源字体为工程外的 Windows 系统字体，无法打包注册，正文以 NIR 内置日文字体渲染）。`livenovel.text.reveal` 已升为 adapted：`StatusTextSpeed`（每字符毫秒，0 瞬时）映射为每字素簇微秒的揭示间隔，单位经固定滑条回调 `@ParamStr[0] × 64` 与官方文档双重认证。`livenovel.menu-sfx` 亦为 adapted：标题与回想网格的选择音映射为生成页面的点击效果、回想画面 BGM 映射为循环页面音乐（`ui.menu-effects.v1`），音量随 live.lpb 解码的 sfx/bgm 总线默认值；悬停参数留在 `livenovel.menu-hover` 近似中。`livenovel.menu-transition` 同为 adapted：初始化脚本的进入 Flip 与右クリック处理的关闭 Flip（wipe 3、字面量参数 20/1、菜单背景层）按原毫秒时序映射为 `--draft` 系统菜单草稿页的整层进出渐隐（`ui.menu-effects.v1`），空间 wipe 形状以整层渐隐近似，子页选择、存档截图与游戏退出 Flip 不映射；角色签名不符的 Flip（含动态签名）不认领，角色被识别但钉定参数、目标或时序异常（含超出 NIR 渐隐上限、同向时序二义）时以 `E_IMPORT_MENU_TRANSITION` 拒绝。`livenovel.textbox.fade` 同为 adapted：MESON/MESOFF 的非零渐隐毫秒映射为等时长的 dissolve 窗口揭示，零渐隐保持立即翻转；存在渐隐位点时依赖 `text.window-transition.v1`（见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)）。`--draft` 保持自己的不完整契约，不走该门禁。
 
 ### 系统菜单解析与映射状态
 
@@ -81,7 +100,7 @@ LiveNovel 另导出 `import-menu-items.json`，从原初始化脚本的字面量
 
 转换仅沿入口的可达控制流进行。遇到未支持指令后，该路径的分析停止；报告不宣称覆盖后续内容。可先用 `inspect` 查看全包结构。
 
-默认严格模式遇到阻塞项不生成目录，JSON 报告写到 stdout，命令以非零状态退出。报告保留源文件、指令索引、LineNo、字节偏移和 NIR ID 映射。
+默认严格模式遇到阻塞项不生成目录，JSON 报告写到 stdout，命令以非零状态退出。报告保留源文件、指令索引、LineNo、字节偏移和 NIR ID 映射。通用路径同样携带映射账本：`lsb.control-flow`（exact）、`lsb.text`（adapted，正文排版由 NIR 阅读器呈现、媒体仅报告不转换）；阻塞时另有一条 `lsb.unsupported-commands`（unsupported）汇总未支持位置。
 
 ```sh
 ./novelc import livemaker "/path/to/extracted-game" --out migration-draft --draft
@@ -111,16 +130,26 @@ cargo test -p nir-compiler real_livenovel_conversion_and_all_routes -- --ignored
 
 该测试导入实际包，自动推进主线和所有回想入口，检查故障、结束、解锁和快照恢复。正常测试使用自行生成的中性 LSB、GAL、WAV 样本与菜单配置，覆盖格式边界、透明度、块引用、声道转换、菜单缩放和锁定入口。
 
+完整的 Player 级路线认证（阅读/界面/存读档/回想事务走共享播放器，而非 VM 直驱）：
+
+```sh
+NIR_IMPORT_SOURCE="/path/to/extracted-game" \
+NIR_IMPORT_OUT="/path/to/new-project" \
+cargo test -p nir-compiler real_livenovel_player_certifies -- --ignored --nocapture
+```
+
+认证内容：Auto 自动阅读走完主线并集齐回想解锁；未解锁档案下回想入口经真实菜单控件分发时被拒绝，不切换会话也不离开菜单；经作者菜单控件进入全部回想入口，读完经 return-to-title 结果返回回想菜单；已读主线在按住快进下整线快进；隐藏（默认继续政策）与恢复不推进；菜单暂停/关闭恢复同页；演出中保存→前进→回退→槽位读档恢复保存页后走完全程。
+
 新导入的 LiveNovel 页首及页内 Gate 事件后会绑定具体非循环 Voice 实例，Auto 不再被无关语音阻塞；逻辑页、视口翻页和并行等待的边界见 [阅读语义](READING-SEMANTICS.md)。
 
 
-`import-defaults.json` 记录 LPB 输入哈希、选取的音量/等待值及尚未映射的字速原值，不复制作者工程目录、项目标题或全部系统设置。来源未知类型、缺失或越界的必要值会报错，不能无提示地替换成模板默认值。LPB116 后续编辑器数据区保留为未解释部分，不执行、不导出。
+`import-defaults.json` 记录 LPB 输入哈希、选取的音量/等待/字速值（`text_speed_ms`，每字符毫秒），不复制作者工程目录、项目标题或全部系统设置。来源未知类型、缺失或越界的必要值会报错，不能无提示地替换成模板默认值。LPB116 后续编辑器数据区保留为未解释部分，不执行、不导出。
 
 ### 原系统菜单草稿
 
-识别上述 LiveNovel 配置时，`--draft` 另生成不完整的系统菜单覆盖页；普通导入暂不启用。标签和顺序来自原名称／动作表，位置、字号、行距与文字颜色来自原 Menu 声明。已校验分派与分支体的 Auto／已读快进／隐藏文字动作绑定阅读服务；历史动作在来源校验后进入生成的子页。绑定依据动作 ID，不依据显示标签；其可用性由播放器再次检查。未映射的项目以灰色静态文字呈现，不携带占位动作。Escape 使用播放器的逐层关闭服务。
+识别上述 LiveNovel 配置时，`--draft` 另生成不完整的系统菜单覆盖页；普通导入暂不启用。标签和顺序来自原名称／动作表，位置、字号、行距与文字颜色来自原 Menu 声明。已校验分派与分支体的 Auto／已读快进／隐藏文字动作绑定阅读服务；历史动作在来源校验后进入生成的子页。绑定依据动作 ID，不依据显示标签；其可用性由播放器再次检查。未映射的项目以灰色静态文字呈现，不携带占位动作。Escape 使用播放器的逐层关闭服务。原初始化进入 Flip 与右クリック关闭 Flip 的毫秒时序映射为该页的整层进出渐隐（账本规则 `livenovel.menu-transition`，缺失约定时不带效果）；空间 wipe 形状、子页选择、存档截图与游戏退出 Flip 不在其中。
 
-该草稿尚未迁移其余原显示条件、子菜单、容器／截图恢复和 200 ms 退出动画；字体替代、字号／行距单位、固定行宽和半透明变暗只是预览近似。`import-menu-preview.json` 格式 2 记录来源哈希、绑定、限制及历史页报告引用；`import-report.json` 状态为 `incomplete_ui_preview`，附错误诊断与 `MIGRATION-INCOMPLETE.txt`，工程验证后写出，命令仍以非零状态退出。它是转换链路的中间验收产物，不是原菜单完整兼容的声明。
+该草稿尚未迁移其余原显示条件、子菜单、容器／截图恢复及进出动画的空间 wipe 形状；字体替代、字号／行距单位、固定行宽和半透明变暗只是预览近似。`import-menu-preview.json` 格式 2 记录来源哈希、绑定、进出渐隐时序（`menu_fades`）、限制及历史页报告引用；`import-report.json` 状态为 `incomplete_ui_preview`，附错误诊断与 `MIGRATION-INCOMPLETE.txt`，工程验证后写出，命令仍以非零状态退出。它是转换链路的中间验收产物，不是原菜单完整兼容的声明。
 
 菜单草稿现也校验已读快进分支的容器恢复、退出参数、三个跳过标记及两项消息框属性，并核对原菜单中的已读／无选择／非回想条件。匹配后绑定 SkipRead 服务：未读、选择期间和回想中隐藏该项。转换器为主线／回想包装入口生成 bool 上下文，使用 `ui.menu-story.v1` 显式只读导出；该字段按现有故事快照保存恢复。尚未证明原菜单初始化的全部控制流、数组全程序不变性及原设备时序，草稿不完整状态保留。
 

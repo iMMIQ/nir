@@ -18,7 +18,7 @@
 }
 ```
 
-`scene_node` 接受 `node` 和 `property`；属性为 x/y/scale/opacity。`dialogue_root` 接受 opacity/background_opacity/text_opacity。消息属性均为有限 0–1，初始为 1；场景属性沿用 Clip 的范围。未知域、属性和字段拒绝解析。当前目标不包含 UI 页面、任意对象路径或音频总线；音频停止仍通过 AudioStop 绑定具体播放实例。
+`scene_node` 接受 `node` 和 `property`；属性为 x/y/scale/opacity。`dialogue_root` 接受 opacity/background_opacity/text_opacity。消息属性均为有限 0–1，初始为 1；场景属性沿用 Clip 的范围。未知域、属性和字段拒绝解析。`audio_instance`（property: gain）把已建立音频实例的 0–1 包络乘子补间到声明值——声音保持播放、只允许 linear 缓动、需另行声明 `audio.gain-tween.v1`，语义见 [音频语义](AUDIO-SEMANTICS.md)。UI View 的元素进入动画是 Player 前台瞬态（`ui.menu-element-tween.v1`，见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md)），不进故事轨道与快照。当前目标仍不包含任意对象路径或音频总线；音频停止仍通过 AudioStop 绑定具体播放实例。
 
 旧 `Clip` 保持原有编码，在执行与占用判断时归一化为 scene_node。同一 Cue 内对同一属性写入两次会拒绝，混用 Clip 与 Tween 也不能绕过。新格式需要显式声明 `tween.target.v1`；编译器仅在实际使用 Tween 时加入这项能力。任务数量和执行预算沿用 Core 现有限额。
 
@@ -42,4 +42,4 @@ Source/runtime/content 版本不因这项可声明的新增能力整体升级。
 
 Core 契约测试覆盖独立通道、零时长、完成/取消、替换捕获、跨场景作用域、坏快照及能力/属性错误；旧 Clip 与 typed scene_node 使用两条公共路线对比 trace。Player 测试检查实际绘制 packet 的颜色相乘和场景不受影响。浏览器测试入口为 `playwright.nir-next.config.js`，包含画面像素变化及菜单暂停检查，实际运行结果记录在实施进展中。
 
-LiveNovel 的 MESON/MESOFF 仍使用旧立即显隐映射；源命令的等待/中断规则尚未认证，不能仅依据参数名称宣称已精确映射。Windows 真机与硬件 WebGPU 尚待实测。消息文字阴影、遮罩、动画指示器和 UI View 目标仍属后续交付。
+LiveNovel 的 MESON/MESOFF 非零渐隐现映射为等时长的 dissolve 窗口揭示（`text.window-transition.v1`，见 [场景转场语义](STAGE-TRANSITION-SEMANTICS.md)），零渐隐保持立即翻转；源命令的等待/中断规则尚未认证，不能仅依据参数名称宣称已精确映射。Windows 真机与硬件 WebGPU 尚待实测。消息文字阴影（`text.shadow.v1`）与 UI 元素进入动画（`ui.menu-element-tween.v1`）已另文交付；装饰性循环指示器与来源样式的精确映射仍属后续交付。

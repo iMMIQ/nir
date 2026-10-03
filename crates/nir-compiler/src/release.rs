@@ -358,6 +358,9 @@ fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
                 Effect::Audio { asset, .. } => {
                     assets.insert(asset.clone());
                 }
+                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                    definition.effect.collect_audio_assets(&mut assets);
+                }
                 _ => {}
             }
         }
@@ -398,6 +401,16 @@ fn asset_consumers(
                         .or_default()
                         .insert(format!("module:{module}"));
                 }
+                if effect.effect.uses_compose() {
+                    let mut child_audio = BTreeSet::new();
+                    effect.effect.collect_audio_assets(&mut child_audio);
+                    for asset in child_audio {
+                        consumers
+                            .entry(asset)
+                            .or_default()
+                            .insert(format!("module:{module}"));
+                    }
+                }
             }
         }
     }
@@ -406,6 +419,17 @@ fn asset_consumers(
             .entry(asset)
             .or_default()
             .insert("bootstrap".into());
+    }
+    for asset in program
+        .theme
+        .image_menus
+        .values()
+        .flat_map(nir_format::ImageMenu::effect_assets)
+    {
+        consumers
+            .entry(asset)
+            .or_default()
+            .insert("menu-effects".into());
     }
     let title_nodes = program
         .title_scene

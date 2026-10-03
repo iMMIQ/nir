@@ -314,6 +314,7 @@ fn main() -> Result<()> {
             run(command.args(args))?;
             if !quick {
                 run(Command::new("python3").arg("scripts/check_architecture.py"))?;
+                run(Command::new("python3").arg("scripts/verify_capabilities.py"))?;
             }
         }
         _ => println!("cargo xtask sdk | check-architecture | test [--quick] [cargo test args...]"),

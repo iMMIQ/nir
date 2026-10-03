@@ -1160,7 +1160,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             const s=state(),view=s.scrolls.find(v=>v.region==='choices')||s.scrolls[0];
             if(view){e.preventDefault();action(scrollAction(view,e.key==='PageDown'?1:-1,true),s);}return;
         }
-        if(e.key==='Escape'){e.preventDefault();const s=state();action({type:s.menu_depth>0||['Menu','Settings','Saves','History'].includes(s.screen)?'close':'menu'});return;}
+        if(e.key==='Escape'){e.preventDefault();const s=state();action({type:s.choice_cancellable?'cancel_choice':s.menu_depth>0||['Menu','Settings','Saves','History'].includes(s.screen)?'close':'menu'});return;}
         // Let browser chrome and host-owned controls remain reachable at the
         // boundary; only movement within the player uses its semantic order.
         if(e.key==='Tab'&&document.activeElement?.closest('#actions')) {

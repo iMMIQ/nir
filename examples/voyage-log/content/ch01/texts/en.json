@@ -1,0 +1,62 @@
+{
+  "log1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The boat leaves the shore at dusk. You sit before the lamp and open the blank logbook.",
+        "emphasis": false
+      }
+    ]
+  },
+  "log2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The first line records the wind: southeast, force two, low swells.",
+        "emphasis": false
+      }
+    ]
+  },
+  "log3": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Now and then the filament jumps, pinning your shadow to the cabin wall.",
+        "emphasis": false
+      }
+    ]
+  },
+  "log4": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Past the halfway mark, only three grains of shore light remain.",
+        "emphasis": false
+      }
+    ]
+  },
+  "log5": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The night is almost over. You close the log; mist already waits toward the shore.",
+        "emphasis": false
+      }
+    ]
+  }
+}

@@ -80,6 +80,31 @@ def mask(content,invert=False):
     content["cues"]["intro"]["effects"][0]["effect"]["transition"]={"type":"mask","asset":"mask.pattern","channel":"alpha","invert":invert,"softness":0.2}
     content["functions"]["main"]["blocks"]["wait_intro"]["ops"].append({"id":"hide-mask-text","operation":{"type":"dialogue_visibility","visible":False}})
 
+def window_assets(project):
+    # A 1x1 opaque green backdrop: over the solid red scene the message
+    # window reads as pure green wherever the wipe has not erased it.
+    def chunk(kind,data):
+        return struct.pack(">I",len(data))+kind+data+struct.pack(">I",zlib.crc32(kind+data)&0xffffffff)
+    rgba=bytes([0,0,255,0,255])
+    png=b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",1,1,8,6,0,0,0))+chunk(b"IDAT",zlib.compress(rgba))+chunk(b"IEND",b"")
+    (project/"assets/source/window.png").write_bytes(png)
+    with (project/"assets/catalog.toml").open("a") as f:
+        f.write('\n[[assets]]\nid = "window.green"\nkind = "image"\nsource = "source/window.png"\nrights = "CC0-1.0"\nexpected_size = [1, 1]\n')
+    theme=project/"themes/rain/theme.toml"
+    theme.write_text(theme.read_text().replace(
+        "[dialogue]", '[dialogue]\nrect = [20.0, 450.0, 1240.0, 220.0]\nbackground = "window.green"\n'))
+
+
+def window_reveal(content):
+    # A mid-block styled hide over a solid red opening scene (the `opening`
+    # cue presents `station` with no stage transition): while the reader parks
+    # on the intro line the window wipes away left-to-right over 10s.
+    content["scenes"]["station"]=[{"id":"solid","x":0,"y":0,"width":1280,"height":720,"color":[1.,0.,0.,1.]}]
+    content["functions"]["main"]["blocks"]["wait_intro"]["ops"].append(
+        {"id":"hide-window","operation":{"type":"dialogue_visibility","visible":False,
+         "transition":{"type":"wipe","direction":"left_to_right","softness":0.2},
+         "duration_us":"10000000"}})
+
 def menu_assets(project):
     def png(name, rgba):
         def chunk(kind,data):
@@ -327,6 +352,170 @@ def navigation_assets(project):
 navigation_project=build("browser-menu-navigation",lambda c:history_lines(c,6),setup=navigation_assets)
 navigation_server=ThreadingHTTPServer(("127.0.0.1",4219),partial(SimpleHTTPRequestHandler,directory=str(navigation_project)))
 Thread(target=navigation_server.serve_forever,daemon=True).start()
+
+def menu_effects_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.title]",1)[0]
+    # Title: enter sound plus looping page music. Overlay: the full set --
+    # enter/close fades, click feedback and different looping music -- so the
+    # page-change, close-transaction and accepted-commit boundaries all fire.
+    source += '\n[image_menus.title]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.title.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
+    source += '\n[image_menus.title.effects.music]\nasset = "audio.bgm"\n'
+    source += '\n[[image_menus.title.elements]]\nid = "start"\nrect = [80,100,400,80]\ncontent = { type = "button", label = "Start", asset = "menu.blue", action = {type = "new_game"} }\n'
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.system.effects]\nclick = "audio.bell"\n'
+    source += '\n[image_menus.system.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
+    source += '\n[image_menus.system.effects.close]\nsound = "audio.bell"\nfade_us = "700000"\n'
+    source += '\n[image_menus.system.effects.music]\nasset = "audio.voice"\nbus = "voice"\ngain = 0.5\n'
+    source += '\n[[image_menus.system.elements]]\nid = "increase"\nrect = [80,180,300,70]\ncontent = { type = "button", label = "Increase speed", asset = "menu.blue", action = {type = "adjust_preference", field = "text_speed", delta = 0.25 } }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,320,300,70]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+effects_menu_project=build("browser-menu-effects",lambda c:None,setup=menu_effects_assets)
+effects_menu_server=ThreadingHTTPServer(("127.0.0.1",4220),partial(SimpleHTTPRequestHandler,directory=str(effects_menu_project)))
+Thread(target=effects_menu_server.serve_forever,daemon=True).start()
+
+def menu_wipe(content):
+    # The story parks on a solid red station scene so the page reveal can be
+    # sampled against a known underlying frame.
+    content["scenes"]["station"]=[{"id":"solid","x":0,"y":0,"width":1280,"height":720,"color":[1.,0.,0.,1.]}]
+
+def menu_wipe_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # Both pages wipe in over the underlying frame; the overlay wipes out
+    # again. Styled boundaries cap at 2 s (E_VIEW_EFFECTS), so the spec cannot
+    # lean on the stage fixtures' long durations: it freezes both time domains
+    # on the crossing frame and samples the frozen composite's pure page and
+    # frame columns.
+    source += '\n[image_menus.title.effects.enter]\nfade_us = "1200000"\nstyle = {type = "wipe", direction = "left_to_right", softness = 0.2}\n'
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[image_menus.system.effects.enter]\nfade_us = "2000000"\nstyle = {type = "wipe", direction = "left_to_right", softness = 0.1}\n'
+    source += '\n[image_menus.system.effects.close]\nsound = "audio.bell"\nfade_us = "2000000"\nstyle = {type = "wipe", direction = "right_to_left", softness = 0.1}\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [490,320,300,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+wipe_menu_project=build("browser-menu-wipe",menu_wipe,setup=menu_wipe_assets)
+wipe_menu_server=ThreadingHTTPServer(("127.0.0.1",4224),partial(SimpleHTTPRequestHandler,directory=str(wipe_menu_project)))
+Thread(target=wipe_menu_server.serve_forever,daemon=True).start()
+
+def menu_element_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # The system page slides one image element in from the right across the
+    # E_VIEW_EFFECTS 2 s cap while an unanimated anchor holds its authored
+    # spot as a page-composited control. No enter fade and no reveal style
+    # ride on top, so the element tracks are the only motion on the shared
+    # page surface and the spec can freeze both time domains on the slide.
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[[image_menus.system.effects.elements]]\nelement = "slide"\nproperty = "offset_x"\nfrom = 1400.0\nduration_us = "2000000"\n'
+    source += '\n[[image_menus.system.elements]]\nid = "slide"\nrect = [80,180,400,80]\ncontent = { type = "image", asset = "menu.blue" }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,320,300,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "anchor"\nrect = [80,600,400,80]\ncontent = { type = "image", asset = "menu.blue" }\n'
+    theme.write_text(source)
+
+element_menu_project=build("browser-menu-element-tween",lambda c:None,setup=menu_element_assets)
+element_menu_server=ThreadingHTTPServer(("127.0.0.1",4225),partial(SimpleHTTPRequestHandler,directory=str(element_menu_project)))
+Thread(target=element_menu_server.serve_forever,daemon=True).start()
+
+def audio_gain_tween(content):
+    # A looping chime starts under the intro dialogue and a linear gain tween
+    # ramps its envelope 1 -> 0.25 over 2 s while the reader parks on the
+    # line: playback never stops, the device envelope is the only thing
+    # moving, so the audit can follow the single scheduled ramp.
+    content["cues"]["intro"]["effects"].extend([
+        {"id": "chime", "scope": "session",
+         "effect": {"type": "audio", "asset": "audio.bell", "looped": True, "bus": "sfx"}},
+        {"id": "chime-gain", "scope": "session",
+         "effect": {"type": "tween",
+                    "target": {"type": "audio_instance", "task": "chime", "property": "gain"},
+                    "to": 0.25, "duration_us": "2000000"}}])
+
+gain_tween_project=build("browser-audio-gain-tween",audio_gain_tween)
+gain_tween_server=ThreadingHTTPServer(("127.0.0.1",4226),partial(SimpleHTTPRequestHandler,directory=str(gain_tween_project)))
+Thread(target=gain_tween_server.serve_forever,daemon=True).start()
+
+def replay_assets(project):
+    menu_service_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().split("[image_menus.system]",1)[0]
+    # Overlay with a locked replay control (profile key "seen") and a live-only
+    # exit; the replay function itself replays the arrival cue and merges a
+    # profile key that must never escape the transaction.
+    source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
+    source += '\n[[image_menus.system.elements]]\nid = "replay"\nrect = [80,160,420,80]\ncontent = { type = "button", label = "Replay arrival", asset = "menu.blue", action = {type = "replay", function = "replay"}, requires = "seen" }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "exit"\nrect = [80,280,420,80]\ncontent = { type = "button", label = "Exit replay", asset = "menu.blue", action = {type = "exit_replay"} }\n'
+    source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,400,420,80]\ncontent = { type = "button", label = "Return to story", asset = "menu.blue", action = {type = "close"} }\n'
+    theme.write_text(source)
+
+def replay_function(content):
+    content["functions"]["replay"]={
+        "entry":"start",
+        "blocks":{
+            "start":{"ops":[],"terminator":{"type":"activate","cue":"arrival","next":"wait"}},
+            "wait":{"ops":[],"terminator":{"type":"await",
+                "conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"mark","on_cancelled":"mark","on_failed":"mark"}},
+            "mark":{"ops":[{"id":"seen.once","operation":{"type":"profile_merge","key":"replay-seen"}}],
+                    "terminator":{"type":"end","outcome":"replay-done"}}
+        }
+    }
+
+replay_project=build("browser-replay",replay_function,setup=replay_assets)
+replay_server=ThreadingHTTPServer(("127.0.0.1",4221),partial(SimpleHTTPRequestHandler,directory=str(replay_project)))
+Thread(target=replay_server.serve_forever,daemon=True).start()
+
+def compose(content):
+    # The sample Activate/Await cannot compile: while the VM waits on the
+    # dialogue, a chain first fades the panel and then the text on its own.
+    content["cues"]["intro"]["effects"][0]["effect"]["reveal_us"]="200000"
+    content["cues"]["intro"]["effects"].append({"id":"chain","scope":"session",
+        "effect":{"type":"sequence","children":[
+            {"id":"panel-fade","scope":"session",
+             "effect":{"type":"tween","target":{"type":"dialogue_root","property":"background_opacity"},
+                        "to":0.2,"duration_us":"1500000"}},
+            {"id":"text-fade","scope":"session",
+             "effect":{"type":"tween","target":{"type":"dialogue_root","property":"text_opacity"},
+                        "to":0.35,"duration_us":"1500000"}},
+        ]}})
+
+compose_project=build("browser-compose",compose)
+compose_server=ThreadingHTTPServer(("127.0.0.1",4222),partial(SimpleHTTPRequestHandler,directory=str(compose_project)))
+Thread(target=compose_server.serve_forever,daemon=True).start()
+
+def typed_result(content):
+    # The story opens on a typed interaction: the VM writes the chosen
+    # option's declared value, a switch turns that value into different
+    # dialogue, and a declared cancel path exits without any write.
+    content["variables"]["picked"]={"type":"i32","value":0}
+    for option,value in zip(content["choices"]["route"]["options"],[1,2]):
+        option["value"]={"type":"i32","value":value}
+    blocks=content["functions"]["main"]["blocks"]
+    blocks["choose"]["terminator"]={
+        "type":"interact","choice":"route",
+        "branches":{"walk":"typed_commit","stay":"typed_commit"},
+        "on_empty":"failed","result":"picked","on_cancel":"typed_cancel"}
+    blocks["typed_commit"]={"ops":[],"terminator":{"type":"switch",
+        "value":{"type":"var","name":"picked"},
+        "cases":{"1":"walk_line","2":"stay_line"},"default":"failed"}}
+    blocks["typed_cancel"]={"ops":[],"terminator":{"type":"activate","cue":"arrival","next":"wait_cancel"}}
+    blocks["wait_cancel"]={"ops":[],"terminator":{"type":"await",
+        "conditions":[{"task":"line","milestone":{"type":"finished"}}],
+        "next":"cancel_end","on_cancelled":"cancelled","on_failed":"failed"}}
+    blocks["cancel_end"]={"ops":[],"terminator":{"type":"end","outcome":"gave_up"}}
+    content["functions"]["main"]["entry"]="choose"
+
+typed_project=build("browser-typed-result",typed_result)
+typed_server=ThreadingHTTPServer(("127.0.0.1",4223),partial(SimpleHTTPRequestHandler,directory=str(typed_project)))
+Thread(target=typed_server.serve_forever,daemon=True).start()
+
+window_project=build("browser-window-reveal",window_reveal,setup=window_assets)
+window_server=ThreadingHTTPServer(("127.0.0.1",4216),partial(SimpleHTTPRequestHandler,directory=str(window_project)))
+Thread(target=window_server.serve_forever,daemon=True).start()
 
 wipe_project=build("browser-wipe-project",wipe)
 wipe_server=ThreadingHTTPServer(("127.0.0.1",4201),partial(SimpleHTTPRequestHandler,directory=str(wipe_project)))

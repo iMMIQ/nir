@@ -438,6 +438,9 @@ pub fn cue_assets(p: &Program, cue: &str) -> BTreeSet<String> {
                 Effect::Audio { asset, .. } => {
                     set.insert(asset.clone());
                 }
+                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                    def.effect.collect_audio_assets(&mut set);
+                }
                 _ => {}
             }
         }

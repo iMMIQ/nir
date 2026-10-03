@@ -1,0 +1,130 @@
+{
+  "speaker.lamp": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "the lamp",
+        "emphasis": false
+      }
+    ]
+  },
+  "intro": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "When the desk lamp comes on, the room folds back into a small circle of warmth. You open the notebook lying on the desk.",
+        "emphasis": false
+      }
+    ]
+  },
+  "note": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Wind slips through the window seam, and the pages rustle softly.",
+        "emphasis": false
+      },
+      {
+        "type": "gate",
+        "id": "chime"
+      },
+      {
+        "type": "text",
+        "id": "tail",
+        "text": "You press the page flat and read on.",
+        "emphasis": false
+      }
+    ]
+  },
+  "spoken": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The filament flickers: “This page holds the day the wind rose.”",
+        "emphasis": false
+      },
+      {
+        "type": "gate",
+        "id": "rest"
+      },
+      {
+        "type": "text",
+        "id": "tail",
+        "text": "“Read further, and the sky will soon be light.”",
+        "emphasis": false
+      }
+    ]
+  },
+  "ask": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The night is almost over. Will you keep the lamp lit until sunrise?",
+        "emphasis": false
+      }
+    ]
+  },
+  "opt.bright": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Keep the lamp lit until sunrise",
+        "emphasis": false
+      }
+    ]
+  },
+  "opt.dim": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "Put out the lamp and sleep now",
+        "emphasis": false
+      }
+    ]
+  },
+  "bright_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "The light settles on the last line, like a good-night that was never finished.",
+        "emphasis": false
+      }
+    ]
+  },
+  "dim_line": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "You close the notebook, and the dark gently takes over the room.",
+        "emphasis": false
+      }
+    ]
+  }
+}

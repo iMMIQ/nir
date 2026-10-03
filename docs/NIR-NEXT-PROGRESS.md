@@ -22,16 +22,18 @@ SDK 与 CLI 必须配套重新构建/resolve；源树修改不自动升级已经
 
 | 计划 | 状态 |
 | --- | --- |
-| P0 来源基线、三例、完整版本/限额矩阵 | 部分：已有代码盘点和回归基线；第二来源认证与三个完整新样例未完成 |
+| P0 来源基线、三例、完整版本/限额矩阵 | 已交付：N01–N10/R01–R06 账本、中性样例 A/B/C 与 P0.2 版本/限额矩阵（批次 61–62，docs/NIR-NEXT-P0-BASELINE.md、docs/NIR-NEXT-VERSION-LIMITS.md）；KAG 第二来源规格认证（批次 63，docs/NIR-NEXT-SECOND-SOURCE-KAG.md，原版运行对照与导入器按计划标待认证/未交付）；Windows 原生各项待验证 |
 | P1.1 播放实例和终态原因 | 已有实例协议上补原因及验证；跨设备实测继续验收 |
-| P1.2 类型化目标 | 场景节点与消息根目标已接入共享轨道；UI/音频通用属性目标仍未实施 |
+| P1.2 类型化目标 | 计划所列四个域均已接入共享求值：场景节点与消息根（Core 故事轨道），AudioInstance 实例增益补间（`audio.gain-tween.v1`，Core 轨道）与 ViewElement 菜单元素动画（`ui.menu-element-tween.v1`，Player 瞬态）于批次 58 交付；跨设备实测继续验收 |
 | P1.3 分域时钟/暂停 | Story/Foreground UI 逻辑时钟、独立暂停和宿主音频路由基础已实施；页面 owner 与关闭效果尚待 P3/P4 接入 |
 | P2.1 事件增益、淡出停止 | 两项代码已贯通；Core/采样包络/WebGL2 回归通过，Windows 真机待验收 |
 | P2.2 阅读边界 | 语音绑定、Auto、字速/等待偏好、隐藏、held skip 与设备包络检查点已实现并有 Web 回归；原版全路线与硬件认证待完成 |
-| P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源样式/字体及完整源映射仍待完成 |
-| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息/UI 目标、来源映射与硬件验证仍待完成 |
+| P2.3 消息框 | 消息根轨道、阴影与阅读提示已接入；来源字速已映射（批次 60），来源字体面与完整源映射仍待完成 |
+| P2.4 遮罩 | 方向 wipe 与纹理 mask 已有恢复及软件 WebGL2 验证；消息根窗口揭示（dissolve/空间样式、时钟冻结、存读档续播）已交付（批次 56）；UI 菜单页根空间揭示（MenuTransition 样式、ui.menu-transition.v1）已交付（批次 57）；来源映射的整层进出渐隐已交付（批次 64），空间 wipe 形状以整层渐隐近似；硬件验证仍待完成 |
 | P3 页面组合与服务 | 静态组合、有限局部状态、故事只读条件、Stack／文字按钮、Range／Toggle、偏好和存读档绑定、确认令牌与固定／连续历史已实现；图片滚动条及有界子页返回已完成 Web 验收。原系统菜单已有三个阅读动作及历史页草稿自动迁移，历史格式器／分页间隔／保留规则仍有差异；完整来源系统页、通用集合与服务覆盖仍待完成 |
-| P4–P6 页面效果、Replay、演出组合及多来源认证 | 待实施；不得按已有基础能力视为完成 |
+| P4 页面效果 | 菜单页效果与预置效果音频已实现（批次 49）；消息根转场已交付（批次 56）；菜单页面根空间揭示转场已交付（批次 57）；进入边界逐元素动画已交付（批次 58，`ui.menu-element-tween.v1`）；LiveNovel 来源菜单的效果映射已交付（批次 59，标题/回想选择音与回想 BGM → 页面点击音效/循环页面音乐；批次 64，系统菜单进入/关闭 Flip → 草稿页整层进出渐隐），悬停音效/动画光标保持显式近似；逐元素进入动画无已认证的来源约定（库存菜单以整层 Flip 呈现），不作映射声明 |
+| P5 有限组合与故事交互 | Sequence/ParallelAll（批次 50）、类型化结果与语义游标（批次 51）、第二来源（LiveNovel 選択メニュー）复用同一核心（批次 52）均已交付；关卡三条全部满足 |
+| P6 兼容认证与困难案例 | 三项已交付：ImportReport 映射级别与证据类（批次 53，报告格式 2 + 显式近似接受门禁）、完整路线认证（批次 54，Player 级实包 Auto/回想锁与入口/按住快进/隐藏/菜单切换/演出中存读档全路线，含 256 MiB 内存账本修正）、能力发行清单（批次 55，43 能力逐项执行/恢复/后端证据 + verify_capabilities.py 门禁） |
 
 Windows 宿主已同步修改，但 Linux 上的公共 Rust 测试不覆盖 cfg(windows) 原生运行路径；不得据此声明 Windows 实机验收通过。实际测试日志保留在本地 `reports/nir-next/`。
 
@@ -558,3 +560,195 @@ SDK 已重建，Schema 已更新；独立发行验证与浏览器整套 33 项�
 - 独立 Pillow GAL 解码器逐像素验证 11 张状态 PNG 与完整平铺 RGBA 边框一致。最终实际生成工程从主线积累 30 条历史后，验证原几何、96 像素滚轮、40 像素箭头、361 像素轨道翻页、滑块持续拖动和首尾夹取；截图文字随滚动变化。立即 Home、两端原箭头、Escape／右键返回父页、新实例与旧父／子／布局请求拒绝全部通过。菜单操作期间观测的 Core 位置、tick、交互、变量、对白、选择及历史数保持不变，无页面异常；返回父页后继续暂停，根页 Close 返回同一剧情。
 
 本批第四个根菜单动作已完成自动转换链路及实际播放验收，历史仍为明确不完整草稿：NIR 字体与有界记录替代来源格式器；scenario-page 间隔、按格式器页数保留、字体阴影／描边、动态样式、箭头按住重复及精确轨道拉伸尚未等价迁移。原可执行文件对照和 Windows 设备待验收，完整 P0–P6 计划未完成；未提交或推送。最终证据：本地忽略目录 source-history-rust-verified.log、source-history-clippy-verified.log、source-history-windows-verified.log、source-history-sdk-verified.log、source-history-sdk-verify-verified.log、source-history-browser-verified.log、source-history-convert-verified.log、source-history-source-verified.log、source-history-pixel-evidence.json 与 source-history-page-browser-evidence.json。此前失败记录保留；契约见 MENU-HISTORY-FLOW-SEMANTICS.md、MENU-SERVICES-SEMANTICS.md 与 IMPORT.md。
+
+## 批次 48：菜单页面效果（P4.1）
+
+- 新增 `ui.menu-effects.v1`：页面边界声明式效果——进入/关闭 MenuTransition（可选一次性音效 + ≤2 秒渐隐）、接受提交点击音效、前台域循环页面音乐（可配总线和 0–4 增益）。`deny_unknown_fields` 与 `E_VIEW_EFFECTS` 校验；编译器按实际声明保留能力并连带菜单服务。
+- 所有权与静默准备：进入效果属主为 `(页面 ID, 菜单实例)`，覆盖页只在自身 prepared stamp 完整后触发，标题闭包页随启动准备就绪；换页/离开面立即停旧页音乐并退休旧页效果，revision 变化不重播。点击音效只在通过实例/版本/守卫校验的提交上播放，过期请求与恢复投影不触发。
+- 关闭事务：声明关闭效果时退出变为有限事务——关闭音效立即播放、旧输入锁定、渐隐保持页面与暂停，淡出完成才提交退出（含阅读模式以原始交互身份重放开关、取消的槽位恢复重启激活准备）；故障/紧急路径可立即退出，进入故障保持标题静默。
+- 时间与音频域：效果状态属前台域，渐隐先取 ForegroundClockToken（MAX_TASKS 上限，完成/取消释放；令牌不可得时进入全不透明立即呈现、关闭立即提交，不产生隐形死页）。一次性音效与音乐走 `foreground_ui` 域 `(域, 会话, 任务)` 寻址；会话重置随宿主 AudioReset 终止全部效果声音，循环音乐从不进入等待集合，未知前台音频失败不构成故障。`reduced_motion` 保留声音、跳过全部渐隐。
+- 设计缺口修复：效果音频资产并入页面准备闭包——新增 `ImageMenu::prepared_assets`（图片 ∪ 效果资产），标题闭包准备、覆盖页 `prepare_active_menu`、准备完成 stamp 子集检查与菜单留存全部改用；否则宿主 `playVoice` 只能播已解码缓冲、留存修剪会立即删掉刚准备的音频（浏览器实测 E_AUDIO_BUFFER 全静默）。
+- 呈现与状态：UiModel.menu_opacity 全页绘制透明度乘数（作者菜单分支），engine state() 暴露 `menu_opacity`；MenuEffectsState 会话瞬态，不入故事快照。
+- Rust 契约覆盖：标题/覆盖静默准备空窗、每 (id,instance) 单次进入、音乐随页（换页停旧起新）、关闭声音/锁输入/延迟退出/音乐停止、点击仅在受提交、reduced_motion（有声无渐隐无令牌）、ForegroundUi AudioEnded 按 (task,session)、未知失败不故障、会话重置全清、进入故障标题静默。最终 `cargo xtask test` 33 套件通过（batch-48-xtask-test.log）。
+- SDK 重构后浏览器验收通过（batch-48-browser-menu-effects.log）：标题进入恰一次（1 音效 + 1 循环音乐），200ms 稳定后不再重播；Start 后会话重置终止 UI 域声音、Story 域 BGM 起；覆盖页就绪后进入（累计 4 起）且稳定；过期 data-action 不增点击音效、真实提交恰 +1；Escape 关闭立即响铃、渐隐中保持 Menu 与音乐停止数不变、完成后才切 Story 并停音乐，透明度全程 0→1 可观测。无页面错误。
+
+P4.1 完成；Replay 事务（P4.2）开始。证据：reports/nir-next/batch-48-xtask-test.log、batch-48-xtask-sdk.log、batch-48-browser-menu-effects.log。契约见 MENU-EFFECTS-SEMANTICS.md、CAPABILITIES.md 与 TIME-DOMAINS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 49：Replay 事务（P4.2）
+
+- 新增 `ui.replay.v1`：图片菜单 `replay` 控件动作（具名函数 + 可选 `requires` 解锁键）与活动相限定的 `exit_replay`。三相事务 entering/active/returning（engine `state().replay` 暴露），启动时冻结原会话描述——Core 快照、检查点、屏幕/返回屏、菜单面、菜单页与局部值/父链/挂起标题页（FrozenMenu 含 instance/revision）、auto/skip；候选 Core 以 `Core::new_at` 创建，入口块只在候选内以独立预算推进到第一个激活/内容屏障，声音、痕迹与 Profile 意图在切换前不存在。
+- 切换与返回：候选媒体（`Purpose::Replay`，激活号取候选待定 Cue id，`CoreInput::Prepared` 与之一致）准备完成后切换——会话自增、音频重置、检查点重记、菜单面关闭；回想函数 outcome 结束或手动 `exit_replay` 进入 returning，冻结会话作为 Restore 候选重新验证/准备，提交后在新会话与菜单实例/版本下接回（unfreeze 同时提升 instance 和 revision，冻结前菜单输入全部过期，页面效果按新实例重放）。回标题/NewGame 显式放弃整个事务。
+- 隔离不变量：单一活动 Core；活动回想（active/returning）内 `profile_merge` 不落玩家 Profile 也不发出 `PersistProfile`；Save/Export 活动期拒绝，Load/Import 存在任何回想事务即拒绝，Rollback 仅无事务或 active 后允许（returning 中回退会覆盖返回候选）；嵌套 replay 与存储控件动作在 `resolve_menu_control` 和动作派发双重复查即死亡，`exit_replay` 非活动相幂等；已有准备/恢复候选/槽位读取进行中时新 replay 静默忽略。菜单投影按 `replay_active` 门控保存/读取/回想/退出控件。
+- 失败与恢复：entering 中资源失败保留冻结页与原会话，Retry 重启候选自身媒体；准入失败整事务即刻作废（候选与冻结态同弃，诊断剥除 Retry——重试已无可提交候选），释放后重新点击从头开始；设备丢失经 DeviceReady 按候选自身资源恢复；取消准备不再丢弃 entering 中的回想（重试/设备恢复路径复用同一候选），真正的放弃只在标题/NewGame 分支显式清除。设计自查修复四项：Replay 准备激活号 0 与候选 pending 不符、cancel_preparation 误毁 entering 事务、Returning 中 Rollback 覆盖返回候选、槽位读取与回想并发竞态。
+- 资源：候选媒体与冻结会话联合准入（`active.retain` 释放不再交集的冻结资产，重叠回想在 LIMIT-1 仍可进入；含未保留资产的回想在零余量下明确 E_BUDGET）；入口块内容屏障按 `ContentPurpose::ReplayEntry` 获取；`E_THEME_ENTRY` 覆盖 replay 动作；源/Runtime 双重校验 `ui.replay.v1`（uses_replay 时编译器保留）。
+- Rust 契约 12 项（nir-player replay_tests）：锁定未解锁拒绝、双击仅一次进入、outcome 返回（Profile 隔离 + 返回中 ExitReplay 幂等 + 冻结位置/检查点/新菜单实例 + 冻结前权威过期）、手动退出返回、无活动回想时退出拒绝、活动相内嵌套入口/存储派发复查死亡、资源失败保留冻结页并可 Retry、准入失败整事务作废无 Retry 且后续新点击可用、标题/NewGame 放弃、入口期设备丢失恢复候选、旧 entry 不回归。最终 `cargo xtask test` 33 套件全部通过（batch-49-xtask-test.log）、SDK 重建通过（batch-49-xtask-sdk.log）。
+- 浏览器验收（端口 4221，`replay.spec.js` 2 项 + 整套 36 项全过，batch-49-browser-replay.log / batch-49-browser-full.log）：锁定控件禁用且伪造当前授权动作同样死亡；IndexedDB 播种 "seen" 解锁；同一 data-action 双投递仅一次进入，entering 期间冻结页保持屏幕；active 后回想正文与冻结正文不同、覆盖层仅提供退出；outcome 后返回原页原正文、控制件恢复可用而冻结前点击不再起效；手动 `Exit replay` 经覆盖控件完整返回。无页面错误。
+
+P4.2 完成；P5（Sequence/ParallelAll 组合）待实施。证据：reports/nir-next/batch-49-xtask-test.log、batch-49-xtask-sdk.log、batch-49-browser-replay.log、batch-49-browser-full.log。契约见 REPLAY-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 50：Sequence/ParallelAll 有限组合（P5.1）
+
+- 新增 `task.compose.v1` 与 `Effect::Sequence`/`Effect::ParallelAll`：组合是一个自主任务，主 VM 停驻于等待、选项或内容屏障时链仍自行前进——以“主 VM 等对白时，另一条先位移再淡出链仍前进”的样例证明仅靠 Activate/Await（单一等待槽）不可编译。子项经与 Cue 提交共用的 `commit_effect` 路径派生：作用域继承、所有权检查、AudioStart 意图与句柄注册完全一致，但派生发生在子项自己开始的时刻，序列后项捕获前项结束后的当前值。
+- 执行语义：结果归并失败 > 取消 > 完成（ParallelAll 取消仍在运行的兄弟）；已完成副作用不回滚；链被 Finish 控制时运行中子项按各自 FinishPolicy 落终值、未派生子项永不执行；`end`/作用域退出照常级联。零时长子项在同一提交的追赶轮内连锁完成，每次派生消耗一个执行预算单位（预算耗尽跨步续跑、work_used 可见），追赶不收敛显式 E_LIMIT 故障，无限零时长循环不可表达。
+- 校验（源与 Runtime 根共用）：子项作用域必须继承组合 scope、禁用 StagePresent/Dialogue 子项、全树 ID 唯一、并发写冲突（序列位置可改写前项地址，Parallel 兄弟及链外并发效果不可）、嵌套深度 ≤ 8、单 Cue 叶子 ≤ MAX_TASKS 256、停止子项只指向同模块顶层音频任务。子项 ID 不进入故事名字索引：Await/TaskControl/DialogueVoice 按子项名寻址直接 E_TASK，组合只能作为整体被等待或控制。
+- 快照与恢复：children/cursor 恒等、已派生子项逐项匹配声明、序列至多一个运行中子项、Finished 链无待办；损坏即拒绝。链中途存档读档/回退后已完成音频不重启、运行中音频只按保存的故事偏移重发一次 AudioStart（续播非重播）、Tween 的 elapsed/captured 原样恢复。
+- 编译器盲区修复：能力裁剪（audio.gain.v1/audio.stop.v1/tween.target.v1）此前只扫描 Cue 顶层效果，嵌套子项会被误裁——新增 `Effect::effect_tree_any` 全树判定；`runtime_roots` 与激活配方 `cue_assets` 改用 `collect_audio_assets` 遍历子项音频资产，否则嵌套音频不进准备闭包。端到端由浏览器夹具构建失败（E_CAPABILITY tween.target.v1）发现并验证。
+- Core 契约 8 项（compose_contract.rs）：VM 等对白时链自主前进且对白正常收束、零时长连锁与预算可见、子项失败保留已完成副作用、ParallelAll 归并与兄弟取消、Finish/Cancel 整链、链中途快照恢复零重播、源校验八类拒绝、恢复校验拒绝损坏组合。Player 协调 2 项：并行链中途本地变量（affection=5）改变后存读档、链中途检查点回退，均断言恰好一次携带故事偏移的 AudioStart、冻结 Tween 值保留、链恰完成一次、结局到达（batch-50-core.log、batch-50-player.log）。
+- 浏览器验收（端口 4222，compose.spec.js 1 项 + 整套通过）：真实 Web 播放器中主 VM 等待对白揭示时，先淡面板（background_opacity→0.2）再淡正文（text_opacity→0.35）的序列链自行按序走完两段，无页面错误（batch-50-browser-compose.log）。SDK 已用修复后的编译器重建。
+
+P5.1 完成；P5.2（故事交互与类型化结果）待实施。证据：reports/nir-next/batch-50-xtask-test.log、batch-50-xtask-sdk.log、batch-50-core.log、batch-50-player.log、batch-50-browser-compose.log。契约见 COMPOSE-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 51：故事交互与类型化结果（P5.2）
+
+- 新增 `story.typed-result.v1`：Interact 扩展 `result`（目标变量）与 `on_cancel`（取消路径块），选项以 `value` 携带常量值。值由唯一 VM 写入——宿主只报告选项 id，`OfferedChoice.values` 是呈现快照，提交以声明为准；超时按显式选择 default 行提交其声明值。取消是完整输入（last_input、Checkpoint、`input:cancel` 痕迹），跳转 `on_cancel` 且不写任何值；未声明取消路径的交互是模态的，派发点复查即拒绝。
+- 语义选择游标：类型化交互携带 `OfferedChoice.selected`（进入交互时为 default 行，缺省首个启用行），进入 Core 快照并随恢复返回；悬停与键盘焦点保持呈现瞬态、永不进快照。`SelectChoice` 是对挂起交互的观察——无输入身份、不推进 last_input、无检查点、序列号被忽略，未知/陈旧/禁用一律忽略。引擎把落在选项行上的键盘焦点经 `sync_focus_selection` 以普通动作路径（`AppEvent::Action`，序列 0）同步为游标观察。
+- 校验（源与 Runtime 共用 + 恢复权威校验）：目标变量存在（E_VARIABLE）、逐选项带值且类型匹配（E_TYPE）、on_cancel 命名同函数块（E_BLOCK）、能力门控 E_CAPABILITY（编译器按实际使用裁剪）；恢复时 values 逐项等于声明、selected 命名存活启用行、result/on_cancel 与规范终结符一致、普通交互不携带结果状态，损坏即拒绝。恢复的交互获得全新交互身份（含会话轮换）。
+- E_INFINITE_WAIT 推广：定义的效果树内任何位置出现循环音频叶子都使自然 Finished 不可达（序列停在该叶子、ParallelAll 永远等不齐），包级与源级两站点对整棵效果树扫描——直接 Await 循环音频、sequence/parallel_all 内嵌循环子项一律诊断，非循环音频保持可等待。
+- 宿主集成：`UiAction::SelectChoice`/`CancelChoice`；Web host 的 Escape 在可取消交互上优先取消，紧凑状态暴露 `choice_cancellable`；桌面 Escape 路径与呈现层取消出口据同一状态渲染。
+- Core 契约 8 项（typed_result_contract.rs）：提交先写值后分支、普通交互不携带结果状态、取消无写入且陈旧取消拒绝、游标观察与快照恢复零进度、超时提交 default 值、恢复七类篡改拒绝、源校验五类拒绝、循环音频三形态 E_INFINITE_WAIT（含非循环反例）。Player 协调 3 项：交互中途存读档恢复挂起交互与游标（恢复身份轮换用 assert_ne 断言）、类型化提交后回退撤销写入并重新挂起、取消分支无写入且未声明路径时拒绝（batch-51-core.log、batch-51-player.log）。
+- 浏览器验收（端口 4223，typed-result.spec.js 4 项 + 整套通过）：选项声明值经 Switch 驱动不同对白、键盘焦点移动语义游标且 sequence/interaction 不变、Escape 经声明路径取消且 picked 保持 0、交互中途存读档恢复游标后照常提交（batch-51-browser-typed.log）。SDK 已重建并核对夹具 wasm 与 dist/sdk 哈希一致。
+- P5 关卡核对：并行链中途局部状态改变后存读档/回退不重播（批次 50+51 测试覆盖）；无限循环媒体与 All 的不可完成组合被诊断（本批 E_INFINITE_WAIT）。“第二来源案例复用相同核心”未满足——LiveNovel 导入器尚无 Interact/选项到类型化结果核心的映射（import/*.rs 无相关引用），留待导入器批次。
+
+P5.2 完成；P5 关卡三条中“第二来源复用相同核心”未满足（导入器无 Interact 映射，留待后续批次）。证据：reports/nir-next/batch-51-xtask-test.log、batch-51-xtask-sdk.log、batch-51-core.log、batch-51-player.log、batch-51-browser-typed.log。契约见 TYPED-RESULT-SEMANTICS.md、CAPABILITIES.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 52：第二来源选择映射复用类型化结果核心（P5 收口）
+
+- 证据先行：解码标准选择系统三页并据此定型约定——`選択.lsb` 回调把所选项文本 `@ParamStr[0]` 写入 `選択値`（`選択番号 = @ParamStr[1]`）；`■選択実行.lsb` 清空结果变量后按 `@ParamStr` 数组参数（位置/皮肤/音效/倒计时配置，选项文本即 `@ParamStr[0]`）创建 kind 25 Menu 对象并等待关闭；调用方以连续条件跳转对 `選択値` 与单个字符串字面量做操作 12 比较分发（标题分发实测：はじめから/つづきから/回想三条 Jump）。选项的显示文本、分发字面量与提交值三者同源。
+- 导入器降级（livenovel.rs）：识别"无条件调用選択メニュー执行页 + 紧随的選択値 字面量分发链 + 链尾 Exit（后继不可达）"，整个调用点合成一个类型化 Interact——每个字面量声明为选项，`value` 为该字符串（等于源回调提交值），`result` 指向导入器声明的 `選択値` 字符串变量（初值空串，经 fragment `variables` 合入 Program），分支目标为对应标签处续块。提交、写入、快照、恢复、回退全部走批次 51 的同一核心路径，无导入器私有分支；能力 `story.typed-result.v1` 由编译器按实际使用裁剪机制自动声明。
+- 路线图行走：主线行走从线性单指针改为队列驱动图行走（entries 映射命令位置到续块，合流跳转合并为同一续块不复制内容，回到自身可达路径的跳转按路线循环拒绝），剧情内选择可嵌套；主线函数改用显式块 id 组装，剧集函数、回想包装、文本/媒体管线不变。此前用于寻找新游戏路线的标题分发现有 `selection_dispatch` 统一谓词匹配，不再各写一份。
+- 严格拒绝（E_IMPORT_CHOICE）：条件调用选择执行页、调用后缺失分发链、链不足两项、选项文本重复、链尾非 Exit。菜单皮肤、悬停/选择音效、倒计时与对齐参数不迁移；报告状态保持 `converted_with_adaptations`，coverage 按选择位数注明"Branching … typed choice site(s)"并新增差异警告。IMPORT.md 与 TYPED-RESULT-SEMANTICS.md 记录映射契约与证据。
+- 测试：livenovel 单元 6 项新增/重整（selection_dispatch 单字面量谓词、选择点降级为类型化交互并经 nir_format 反序列化校验、合流分支合并、路线循环与四类畸形拒绝）；真实语料回归（RJ061378 全量转换 1357 页 17 函数不变，main+8 回想在 VM 中走完、快照恢复、解锁断言）确认线性路径行为不变（batch-52-corpus.log）。
+- P5 关卡核对（三条全部满足）：并行链中途局部状态改变后存读档/回退不重播（批次 50/51 测试覆盖）；"第二来源案例复用相同核心"（本批：LiveNovel 選択メニュー约定降级到 story.typed-result.v1 核心，import/*.rs 现有 Interact 映射）；无限循环媒体与 All 的不可完成组合被诊断（批次 51 E_INFINITE_WAIT）。
+
+P5 收口；P4 遗留（消息/UI 根遮罩与通用目标）与 P6（映射级别/完整路线认证/发行清单）待后续批次。证据：reports/nir-next/batch-52-corpus.log 及本批五项门禁日志（batch-52-xtask-test.log、batch-52-clippy.log、batch-52-architecture.log、batch-52-xtask-sdk.log、batch-52-browser-full.log）。契约见 IMPORT.md、TYPED-RESULT-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 53：ImportReport 映射级别与显式近似接受（P6.1）
+
+- 报告格式升为 2：新增 `mappings` 账本与 `approximate` 计数。每条记录规则 ID、行为级别（exact/adapted/approximate/unsupported）、证据类（documented/decoded-source）、源版本（LSB116/LPB116/LPM106/GAL105/106）、规范行为一句话、依赖的目标能力与近似位置/未决项；公共记录不含私有路径或正文。聚合状态由账本推导（converted → converted_with_adaptations → converted_with_approximations；unsupported 维持 blocked/草稿契约），不再是硬编码字符串。
+- 近似是兼容声明而非可忽略 warning：`enforce_acceptance` 在工程与报告发布之后执行，任何未按规则 ID 显式接受的 approximate 规则以 `E_IMPORT_APPROXIMATE` 失败并逐个点名；拼错的 ID 无法静默通过（真实规则仍被点名）。`--draft` 保持自己的 incomplete 契约、跳过该门禁。
+- LiveNovel 账本 13 条（choice 位置按实际位数出现）：settings exact；startup/system-services/title-menu/stage.wipe/auto-policy/media.image/media.audio/replay/story.choice adapted（分别标注 ui.menu-elements.v1、ui.replay.v1、story.typed-result.v1、audio.gain.v1、player.auto-delay-policy.v1+text.voice-timer.v1 等依赖能力）；menu-sfx/text.reveal/textbox.fade 三条 approximate——原版实机与跨后端尚未作为证据类出现，未决项保留在近似说明与保真警告。通用 LSB 路径账本：control-flow exact、text adapted、阻塞时汇总 unsupported。
+- CLI 新增 `--accept-approximate <ids>`（逗号分隔）。中性测试：账本完整性（级别/证据域、exact 与 adapted 不携带近似说明、规则唯一、无私有路径）、三条 approximate 恰为文档所列、状态推导、接受门禁（部分接受点名缺失规则、typo 不放行、全接受通过、draft 跳过）；通用路径两用例补映射断言（converted_with_adaptations + lsb.unsupported-commands）。
+- 本批只改离线导入器/CLI 与报告格式，不触及 Player/运行时；按批次 37/38/42 先例不重复浏览器整套验收。真实语料回归（RJ061378）经 ignored 测试（其 options 预接受三条规则）与独立 CLI 双向验证：不带门禁标志转换在发布后以 E_IMPORT_APPROXIMATE 退出并列出三规则，带 `--accept-approximate` 全列表成功且 1357 页/17 函数不变。
+
+P6.1 完成；P6 余下完整路线认证与能力发行清单，P4 遗留（消息/UI 根遮罩与通用目标）待后续批次。证据：reports/nir-next/batch-53-xtask-test.log、batch-53-clippy.log、batch-53-architecture.log、batch-53-xtask-sdk.log、batch-53-verify-sdk.log、batch-53-corpus.log、batch-53-corpus-gate.log。契约见 IMPORT.md（映射级别、证据与近似接受一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 54：完整路线认证（P6.2）
+
+- 新增 Player 级实包认证 `real_livenovel_player_certifies_full_routes`（import/certify.rs，ignored，需 NIR_IMPORT_SOURCE/NIR_IMPORT_OUT；tests.rs 的 options/sdk 提升为 pub(super) 供其复用）。与既有 VM 直驱回归不同，全部路线经共享 Player 的输入路由、阅读策略、菜单控件解析与存档事务。四个场景：A）Auto 自动阅读走完主线至结果，解锁集与导入器在菜单控件上声明的 lm.replay.* 完全一致，read: 标记落盘，结果清除自动阅读。B0）全新档案经真实 MenuControl 分发带锁回想入口被拒——不切换会话、不离开标题、停留在原菜单。B）经作者菜单控件（标题菜单 Menu 控件 → 回想菜单 Entry 控件）进入全部回想入口，每条读完经 return-to-title 结果回到回想菜单且无故障。C）已读主线在按住快进下整线快进至结果；无 auto/skip 时 tick 不推进。D）隐藏（默认继续政策）剧情时钟继续、恢复不推进；菜单暂停/关闭恢复同页；演出中保存 → 前进 → 回退（Continue 释放 restored 暂停）→ 槽位读档精确恢复保存页与阅读位置（text_id、span/cluster、gate/awaiting 位逐一相等）→ 走完全程。
+- 认证 harness 承担宿主的音频结束职责：每次 tick 前对全部 Running 非循环 Audio 任务注入 AudioEnded（宿主契约同 coordination.rs）。缺了它，语音 WAV 作为 Running 任务永久钉住解码资产，内存账本必然耗尽——属 harness 缺陷而非产品缺陷，在本测试内修复。
+- 读档断言认证页面与阅读位置的精确往返（text_id、span/cluster 揭示进度、gate/awaiting 位在菜单暂停下随存档冻结、读档后逐一相等），不比对 interaction 令牌：Core 快照恢复按设计为恢复中的对白/选择重铸交互身份（vm.rs restore："restored interactions receive fresh identities, in addition to the host epoch change"），陈旧输入拒绝由会话纪元承担；比对保存时的令牌值是错误断言（全语料首两轮运行先后在 15≠17 与揭示位上误报）。
+- 产品修复：MEMORY_LEDGER_LIMIT 128→256 MiB（nir-player 常量 + 注释）。全语料多次运行在 episode7/b000680 确定性达到 ~130 MiB 峰值（105.76 MiB 已钉 + 24.16 MiB 待入：场景交叉淡入需新旧 cue 同驻，加常驻字体），admission 剪枝正确、无泄漏——是上限过紧而非泄漏。256 MiB 仍为硬上界，防失控租约；replay.rs 与 media_tests 的测试常量改为引用同一常量（其 admission 测试压到零余量，必须与真实上限一致）。
+- 本批触及 Player 运行时 → 按先例恢复浏览器整套验收（先 cargo xtask sdk 重建 dist/novelc）。nir-compiler 测试 dev-dependencies 加入 nir-player/nir-presentation。
+
+P6.2 完成；P6 余下能力发行清单，P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）待后续批次。证据：reports/nir-next/batch-54-corpus-certify.log、batch-54-xtask-test.log、batch-54-xtask-sdk.log、batch-54-verify-sdk.log、batch-54-clippy.log、batch-54-architecture.log、batch-54-browser.log。契约见 IMPORT.md（完整 Player 级路线认证一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 55：能力发行清单（P6.3）
+
+- docs/CAPABILITIES.md 新增「能力发行清单」：代码 `CAPABILITIES` 全部 43 项逐一登记执行证据（Rust 测试）、恢复证据（快照/存读档/回退，或「无运行态（仅校验）」并给出校验测试）、Web 后端（浏览器 E2E 规格的实际执行）与 Windows 原生状态。Windows 原生全部如实记为「待验证」——公共 Rust 测试不覆盖 cfg(windows) 原生路径，不据此声明实机通过。个别能力的浏览器覆盖为间接，备注如实标注而不当作直接断言：ui.menu-chrome.v1 的 builtin_navigation=false 页实际运行但无按钮缺失直接断言；media.webp.v1/media.mp3.v1 经 fixture 产物实际解码播放，无容器级直接断言；task.compose.v1 浏览器仅直接覆盖 sequence，parallel_all 经 Rust 组合/协调测试。
+- 新增 scripts/verify_capabilities.py 并接入 `cargo xtask test`（check_architecture.py 之后）：代码能力表与清单必须一一对应（缺行、幽灵行分别点名），引用的 .rs/.js 证据路径必须存在，Windows 列只允许「待验证/✓」。负例已验证：缺行报 "advertised in code but no ledger row"、非法 Windows 值报 "Windows column must be 待验证 or ✓"、幽灵行报 "ledger row for unknown capability"。
+- 能力→证据映射由两路独立检索汇总（Rust 测试侧与浏览器规格侧），引用路径全部经文件存在性核对；基线能力（v0.1.0）与 NIR-NEXT 批次交付在备注中区分，批次号取自实施进度文档。
+- 本批只改文档/脚本/xtask 测试挂接，不触及 Player/格式/编译器运行时；dist/novelc 自批次 54 门禁后未变，按批次 53 先例不重复浏览器整套验收。
+
+P6 三项（映射账本、完整路线认证、能力发行清单）全部交付；P4 遗留（P2.4 消息/UI 根遮罩转场与 P1.2 UI/音频通用目标）与 P0 三个完整示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-55-xtask-test.log、batch-55-xtask-sdk.log、batch-55-verify-sdk.log、batch-55-clippy.log、batch-55-architecture.log。契约见 docs/CAPABILITIES.md（能力发行清单一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 56：消息根窗口转场（P2.4）
+
+- `dialogue_visibility` 增加可选 `transition` 与 `duration_us`（0 < duration_us ≤ 60 秒），缺省与旧两字段操作仍是立即翻转；样式化操作要求 `text.window-transition.v1`，源校验（nir-core validate：能力、样式、时长门）与 runtime 加载双侧执行，nir-format 契约测试覆盖旧文件缺省读取与样式化序列化往返。
+- Core：`WindowReveal { style, to_visible, from_coverage, started_us, duration_us }` 跟随 Story 时钟并加入 needs_clock；提交的 `dialogue_hidden` 只在截止时刻翻转，反向同款操作以打断时刻覆盖度为新起点，与已提交状态一致的同款操作立即提交，旧立即翻转会中断在飞揭示；恢复对样式/遮罩做结构校验（invalid window reveal / invalid window reveal mask），遮罩必须是 Image 类并进入准备闭包与恢复资产。契约测试 window_reveal_contract.rs 5 项（截止提交、打断捕获、冗余立即提交、立即翻转中断、校验/恢复门）。
+- Player/Presentation/Renderer：dissolve 把覆盖度乘进消息框背景与文字透明度（HUD 不参与）；擦除/遮罩把消息框项剥离为窗口根并在原位留下覆盖全表面的哨兵四边形（@window），复用舞台转场的双输入混合路径——隐藏方向把已渲染窗口放在 source 侧由覆盖度擦除，窗口根本身每帧重绘以保持正文揭示与外观动画。协调测试 76 项含：投影跟随时钟并截止提交、reduced_motion 跳过动画直接提交、飞行中存读档续播、遮罩只取一次并钉住时钟、dissolve 仅折叠窗口项、wipe 哨兵几何与前后绘制序不变。TopUp 遮罩请求会并入状态资产，宿主须喂满整个扣留请求。
+- 引擎状态桥 `state.window` 暴露进度（null 或 0..1）。浏览器规格 tests/nir-next/window.spec.js 在固体红开场场景 + 1×1 绿色窗口背景 fixture（4216 端口）上采样：领先侧擦除为场景色、尾侧保持纯绿、软边覆盖度与进度一致；暂停冻结、飞行中存读档恢复同进度、恢复后继续清空。fixture 修正过一处：复用 wipe() 场景改写会连带注入舞台擦除转场，导致背景本身处于蓝红擦除中途——改为仅改写 `station` 场景，开场静态呈纯红。
+- 导入器：MESON/MESOFF 非零渐隐毫秒映射为等时长 dissolve 窗口揭示（fade_sites 计数入账本），零渐隐保持立即翻转；账本规则 `livenovel.textbox.fade` 由 approximate 升为 adapted（存在渐隐位点时依赖 text.window-transition.v1），批次 53 记录的近似清单相应收窄为 menu-sfx/text.reveal 两条。发行侧遮罩随窗口揭示进入媒体根（window_transition_masks_join_the_release_roots_and_capability）。文档同步：CAPABILITIES.md（能力段落 + 发行清单行）、STAGE-TRANSITION-SEMANTICS.md（消息根一节）、TWEEN-SEMANTICS.md、IMPORT.md。
+
+P2.4 的消息根半边交付；UI 菜单页根（MenuTransition 样式、ui.menu-transition.v1）与 P1.2 UI/音频通用目标、P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-56-*.log。契约见 STAGE-TRANSITION-SEMANTICS.md（消息根一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 57：菜单页面根空间揭示（P2.4）
+
+- MenuTransition（进入/关闭转场）增加可选 `style`，复用舞台 StageTransition 的 wipe（方向 + 软边）与 mask（图片遮罩 + 通道）；dissolve 或未声明样式保持旧的整层 alpha 渐隐路径（menu_opacity），不需新能力。`MenuEffects::uses_transition()` 判定空间样式使用；mask 的遮罩是 Image 类页面资产，经 `MenuEffects::mask_assets()` 并入 `ImageMenu::image_assets()`（Image 类校验、准备与留存），不从音效闭包取用。nir-format 契约测试覆盖旧文件缺省读取、样式化序列化往返、遮罩闭包与能力语义。
+- 新能力 `ui.menu-transition.v1`：源（nir-core validate）与 runtime（from_runtime）双侧拒绝「使用空间样式而无能力」（E_CAPABILITY），仅声明未使用合法（编译器裁剪，menu_transition_capability_follows_spatial_style_usage）；样式边界时长仍须 0 < fade_us ≤ 2 秒（E_VIEW_EFFECTS），遮罩非 Image 资产以 E_THEME_ASSET 拒绝。契约测试 menu_transition_contract.rs 4 项。
+- Player：空间揭示持有 ForegroundClockToken，期间输入锁定、阅读暂停；进入等页面准备落定后才起播；关闭立即播放音效并锁定，退出延迟至擦除完成提交；reduced_motion 抑制呈现不抑制音效。协调/菜单测试新增 7 项：无能力拒绝、进入分流页根跟随前台时钟（@menu 哨兵、页资产只出现在页根、menu_paint 清空、进度推进与收尾复位）、关闭反向合成与延迟退出、reduced_motion、无样式停留共享面、连续历史滚动条拼接随页面吸收进页根。
+- Presentation/Renderer：`divert_menu_page()` 后置通道把页面四边形与页面文本分流到离屏页根（历史拼接吸收在 menu_page_range.to + 4），页面在共享菜单面清空；渲染器双根合成复用舞台转场混合路径（进入 bind(底层,页面)、关闭 bind(页面,底层)），期间 menu_opacity 恒为 1。
+- 引擎状态桥 `state.menu_transition` 暴露进度（null 或 0..1），与 `state.window` 同型。浏览器规格 tests/nir-next/menu-wipe.spec.js 在固体红剧情场景 + 黑色菜单背景 fixture（4224 端口）上采样：进入中途左侧为页面、右侧为冻结帧，完成覆盖全帧；关闭中途反向（页面保留在左、帧回归在右），延迟退出期间 screen 保持 Menu 且 paused，完成后回 Story 且 paused=false；全程 menu_opacity=1。文档同步：CAPABILITIES.md（能力段落 + 发行清单行）、MENU-EFFECTS-SEMANTICS.md、TIME-DOMAINS.md。
+- 转场完成脉冲（产品缺陷修复）：页面渐隐的收尾发生在纯时钟 tick 内（clock-only，无工作即不置脏），且同一刻 ForegroundClockToken 释放、宿主帧循环停摆，16 帧安全阀不再触发——落定帧可能永不重投影（批次 48 的 alpha 渐隐即已潜伏，空间揭示使其可见）。修复：Player 以 `ui_visual_pulse` 标记「本 tick 渐隐由有到无」的离散视觉变化（`take_ui_visual_pulse()` 取走），Engine 在 `pump()` 末尾将其并入 `state_dirty`；回归测试 a_completed_reveal_pulses_the_view_before_the_clock_token_releases 断言中途 tick 无脉冲、收尾 tick 恰好一次脉冲。浏览器规格连过 4 次后全量 43 项绿。
+
+P2.4 的菜单页根半边交付；P1.2 UI/音频通用目标与 P0 三示例/版本上限矩阵待后续批次。证据：reports/nir-next/batch-57-*.log。契约见 MENU-EFFECTS-SEMANTICS.md（空间揭示样式一节）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 58：实例增益补间与菜单元素进入动画（P1.2 收口）
+
+- Part A——AudioInstance 增益目标（`audio.gain-tween.v1`）：`tween.target.v1` 的目标联合增加 `audio_instance { task, property: gain }`，把一个已建立 Audio 实例的 0–1 包络乘子在有限时长内线性补间到 `to`（0–1）。包络叠加在事件 gain × 总线音量之上，不预乘 PCM、不改变播放位置与生命周期——声音始终 Running，设备侧只是包络节点上的一条线性 ramp；只允许 `easing = linear`（设备每次只渲染一条线性段，非线性行为由作者分段表达）。目标必须是同模块的另一音频任务，与 `audio_stop` 共享互斥的包络所有权（同 Cue 验证期 E_OWNERSHIP，运行中冲突在原子提交回滚）。补间完成提交终点并 Finished，声音留在该音量；Cancel 提交设备时钟当前值（设备领先剧情时钟时以设备值为准）；飞行中存读档保存剩余段、恢复续播，设备包络检查点（owner/elapsed）同样适用于补间 owner。Core 契约（audio_contract.rs）覆盖线性推进、取消提交设备值、与停止的所有权互斥、飞行中存读档剩余段与伪造 owner 拒绝。
+- Part A 实机链路：vm.rs 的包络段路径（原属 AudioStop）推广到补间 owner——`CoreIntent::AudioEnvelope` → Player `AppCommand::AudioEnvelope` → Web host 在语音专属包络 GainNode 上 `cancelScheduledValues/setValueAtTime/linearRampToValueAtTime`（与事件 gain、总线节点分离）。浏览器规格 tests/nir-next/audio-gain-tween.spec.js（端口 4226 fixture：循环铃声 + 2 s 补间到 0.25）审计设备上恰有一条指向 0.25 的排定 ramp、中途值单调、终点收敛且循环声源存活。AudioParam 绝不跨越 evaluate 边界（结构化克隆会丢弃活动节点）——一律在页内按下标解引用。
+- Part B——ViewElement 进入动画（`ui.menu-element-tween.v1`）：`MenuEffects.elements` 至多 128 条元素轨道（opacity/scale/offset_x/offset_y，from 落在属性界限内，时长 (0, 2 秒]、延迟 ≤ 2 秒，同一元素同一属性单轨），随进入边界在共享前台时钟上启动：延迟期保持 from，随后推进到落定值——opacity/scale 落定到元素作者值、偏移落定到 0，完成的轨道被丢弃，落定投影与未声明不可区分。投影层在布局前把轨道值覆盖到元素 Node（父级变换随之传播，透明度乘进颜色 alpha）；页面本身仍走共享菜单面（不建离屏页根、不叠加页面渐隐，`menu_opacity` 恒为 1）。换页逐页重启，离开菜单面清空轨道并释放时钟令牌（与页面渐隐共用同一枚 ForegroundClockToken，全部轨道落定才释放），最后一条轨道的落定 tick 复用批次 57 的 `ui_visual_pulse` 标记视图脏；reduced_motion 抑制动画不抑制音效。状态瞬态、不入故事快照；使用而无能力在源与 Runtime 校验以 E_CAPABILITY 拒绝；引擎状态面暴露 `menu_element_progress`（无动画为 null）。
+- Part B 实机验证：浏览器规格 tests/nir-next/menu-element-tween.spec.js（端口 4225 fixture：slide 元素 offset_x from=1400、2 s 滑入 + 不动画锚点）以 `hidden(true)` 冻结两域于飞行中途，像素采样断言滑动列被覆盖而未到达列为背景、锚点恒定，同时 `menu_transition === null`、`menu_opacity === 1` 证明走的是共享菜单面而非页根；解冻落定后滑动列回到背景、元素列回到作者位置；键盘关闭返回剧情无错误。开发期修正一处落定谓词写反（mid-flight 几何本已证明动画正确）。
+- 文档同步：AUDIO-SEMANTICS.md（实例增益补间一节）、MENU-EFFECTS-SEMANTICS.md（元素进入动画一节）、CAPABILITIES.md（两条能力段落与发行清单行，能力数 45→47）、TWEEN-SEMANTICS.md、TIME-DOMAINS.md（元素轨道共用前台时钟租约）。
+- 门禁：工作区 Rust 测试 49 套全绿、Clippy、依赖架构（18 包）、SDK 重建（batch-58-partb-tests/clippy/arch/sdk.log；Core 契约另见 batch-58-core.log）；浏览器整套 44 项通过后新增两条规格分别单独复跑通过（batch-58-partb-browser.log、batch-58-partb-browser-element.log、batch-58-parta-browser-gain.log）；`cargo xtask test` 常设门禁含 verify_capabilities.py 对 47 项能力的一一对应核对（batch-58-xtask-test.log）。
+
+P1.2 计划所列四个目标域（SceneNode/DialogueRoot/ViewElement/AudioInstance）全部接入共享求值；P4 的通用补间目标随之交付。遗留：P2.4/P4 来源映射（导入器菜单转场与元素动画）、P2.3 来源样式/字体映射、P0 三示例与版本上限矩阵。Windows 原生一律待验证。证据：reports/nir-next/batch-58-*.log。契约见 AUDIO-SEMANTICS.md（实例增益补间）、MENU-EFFECTS-SEMANTICS.md（元素进入动画）。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 59：LiveNovel 菜单音效映射（P4 来源映射）
+
+- 导入器新增三个严格按引擎固定约定提取的助手（缺失约定静默为 None，识别但畸形以 E_IMPORT_LIVENOVEL 拒绝）：`title_select_sound` 读引导脚本中对 `プレビューメニュー\■選択実行.lsb` 调用的第 6 参（选择音，空串为无音）；`replay_select_sound` 读 `サムネイル・マウス処理.lsb` 中 `選択` 标签之下的 kind-42 "SE" 对象文件字段；`replay_bgm` 把 `■関数.lsb` 的 `BGM再生` 标签区间解析为行号范围，只接受落在该区间、单参数字面量的调用——匹配约定而非「任意带声音路径的调用」。路径反斜杠统一归一为 `/`，经 `self.sound(path, 1.)` 进入既有音频资产管线（Ogg 经 lewton 转 WAV）。
+- 映射落点：标题页与回想网格页的 `ImageMenu.effects` 各获得 click 一次性音效（Player 侧 `play_ui_sound` 走 Sfx 总线，音量随 live.lpb 的 StatusSEVolume → sfx_volume 默认值），回想页另获得循环页面音乐（`MenuMusic { bus: Bgm, gain: 1 }`，音量随 StatusBGMVolume）；两个页面各自计入 menu_sounds。`ImageMenu::image_assets()`/`MenuEffects::assets()` 已把 click/music 并入页面媒体闭包，编译器按 `uses_effects` 自动保留 `ui.menu-effects.v1`——无需播放器侧改动。
+- 账本拆分：`livenovel.menu-sfx` 由 approximate 升为 adapted（存在映射位点时依赖 ui.menu-effects.v1，行为句记录 {menu_sounds} 与音量语义）；悬停音效与动画光标无 NIR 对应机制，新设近似规则 `livenovel.menu-hover` 显式点名（「NIR 菜单无悬停驱动音频或自定义指针光标」），沿用批次 53 起的原则——近似必须显式接受而非静默警告。近似清单收窄为 menu-hover/text.reveal 两条；`--accept-approximate` 示例与 `APPROXIMATE_RULES` 测试常量同步更新。
+- 实证：真实语料转换（1357 页、main + 8 条回想全路线含快照恢复）通过（batch-59-corpus-test.log）；重建发行 CLI 后，无接受时以 E_IMPORT_APPROXIMATE 点名 [livenovel.menu-hover, livenovel.text.reveal] 退出且工程已写出，带新 ID 接受时成功——theme.toml 中 title.click 与 replay.click/music（bgm 总线）及 import-media.json 中 tm2_switch002.wav/BGM054mama.ogg（gain 1.0）逐项核对（batch-59-cli-gate.log、batch-59-sdk-novelc.log、batch-59-verify-sdk.log）；助手单测覆盖空/缺参/非字面量/二义调用、悬停-only 处理器、非 SE 对象、区间外调用与多参数调用。门禁：`cargo xtask test`（47 项能力）、Clippy、依赖架构（batch-59-xtask-test/clippy/architecture.log）。仅改导入器，按批次 53/55 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（近似规则清单与菜单音效描述、保真边界句）、CAPABILITIES.md（ui.menu-effects.v1 段落与外部引擎导入行）、MENU-EFFECTS-SEMANTICS.md（不包含清单改为指向导入映射）。
+
+P4 的来源效果映射半边交付；悬停音效/动画光标保持显式近似，来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）、P2.3 来源字体样式与字速单位、P0 三示例与版本上限矩阵待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-59-*.log。契约见 MENU-EFFECTS-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 60：来源字速映射（P2.3）
+
+- 单位认证（证据先行）：LiveNovel 官方帮助（pylivemaker 镜像）明确「テキスト速度変更／１文字の表示時間」按毫秒指定（標準 50ms／ノーウエイト 0ms／スロー 300ms）；固定滑条回调 `ノベルシステム/システムメニュー/オプションテキスト速度スライダー変化時.lsb` 仅一条 Calc：`StatusTextSpeed = @ParamStr[0] × 64`（操作码 10=索引、4=乘、1=赋值；操作 4=乘经等待滑条字幕证据 `StatusAutoTextWait ÷ 1000 + "秒"` 与 `× 1000` 写回对称定型）。创作侧滑条 0..10 步 1 → StatusTextSpeed ∈ {0,…,640} ms/字符，live.lpb 默认 128；0 为瞬时（既読跳过路径写 0，经消息框 SetProperty 属性 82 消费）。
+- 映射：新增 `verify_text_speed_callback` 严格校验回调形状——唯一非静音、缩进 0、非 NotUpdate 的 Calc，目标与 `Index[@ParamStr,0] × 64` 表达式完全匹配，畸形以 `E_IMPORT_TEXT_SPEED` 拒绝；在 run() 中紧随 verify_auto_timer 执行。`ImportedDefaults.text_speed_raw` 更名 `text_speed_ms` 并按认证范围 0..=640 校验（import-defaults.json 字段随更名）。page() 的对白揭示间隔由固定 32 ms 改为 `StatusTextSpeed × 1000` 微秒/字素簇；0 保持瞬时语义，玩家字速偏好继续在 Core 侧作为除数生效。通用 LSB 路径（非 LiveNovel 配置）不受影响，其固定间隔与既有「替代揭示速度」警告保持。
+- 账本拆分：`livenovel.text.reveal` 升为 adapted（行为句记录单位认证、×1000 换算与默认值），`mapping_ledger` 增加 reveal_us 参数记录实际映射值；字体面拆分为新近似规则 `livenovel.text.font`——live.lpb 的 StatusFontName 是工程外的 Windows 系统字体，无法打包注册为 NIR 内容，正文以内置日文字体渲染、字号/行高保留。近似清单收窄为 menu-hover/text.font 两条；`--accept-approximate` 示例与 `APPROXIMATE_RULES` 测试常量、账本门禁断言同步更新。
+- 实证：真实语料转换 1357 页、main + 8 条回想全路线含快照恢复通过（batch-60-corpus-test.log），1357 条对白 cue 全部 `reveal_us=128000`、import-defaults.json `text_speed_ms=128`；重建发行 CLI 后，无接受时以 E_IMPORT_APPROXIMATE 点名 [livenovel.menu-hover, livenovel.text.font] 退出且工程已写出，带新 ID 接受时成功（batch-60-cli-gate.log、batch-60-sdk-novelc.log、batch-60-verify-sdk.log）。新增回调校验单测（乘数、操作码、目标变量、控制流、NotUpdate 变异全部拒绝）、defaults 越界测试与 page 级映射断言。门禁：`cargo xtask test`（47 项能力）、依赖架构通过；工作区全目标 Clippy 通过且无 nir-compiler 新告警，`-D warnings` 严格模式仅在 nir-core 现存 6 处 lint（批次 58 引入、此前以警告容忍）失败，与本批无关，留待核心批次清理。仅改导入器，按批次 53/55/59 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（对白映射句、近似规则清单、import-defaults 字段说明）、READING-SEMANTICS.md（LiveNovel 配置映射一节）。
+
+P2.3 的字速半边交付；来源字体面保持显式近似，P0 三示例与版本上限矩阵、来源菜单转场/元素动画映射（批次 57/58 能力的导入侧）待后续批次。Windows 原生一律待验证。证据：reports/nir-next/batch-60-*.log。契约见 IMPORT.md、READING-SEMANTICS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 61：P0 基线账本与中性样例 A/B（P0.1）
+
+- 新增 docs/NIR-NEXT-P0-BASELINE.md：需求账本 N01–N10（对应计划 §3 阶段表与 §5–§9 验收条款，逐项状态/批次/常设证据载体，Windows 原生一律待验证）；回归账本 R01–R06（计划 P0.1「已修复六项回归」，锚定仍在本仓库运行的常设测试：8c44ace 三项 player 资源生命周期/预约/准入重试 + 次要指针输入路由、e9612c2 预览连接风暴、32e36d8 Web 设备丢失；95cbf6e Windows 构建支持脚注不计运行时回归）；验收样例清单与素材/字体重建程序；P0.2 版本/限额矩阵与 KAG 第二来源认证指针化为待批次 62/63。
+- 新增生成器 scripts/make_p0_examples.py（纯标准库，确定性原创内容）：自带 PNG/WAV 编码器、UI 副本字符闭包扫描（nir-presentation .ftl + src + ASCII + 标点 + 正文 + 标题）、与 nir-format 逐字节一致的文本账本 digest 算法。样例 A examples/reading-lamp（夜灯书页）：页内 Gate×2（chime/rest marker）后继续同一对白、显式语音绑定 sampled_remaining、页尾 50 ms 语音淡出停止、wipe/dissolve 消息窗口显隐、舞台转场、BGM gain 0.7、固定 Auto 策略、类型化选择结果写入 kept 变量（sunrise/rest 两场景含 typed 断言）。样例 B examples/replay-atlas（回想图集）：标题图片菜单 + 回想图集子菜单（profile 守卫：atlas.north 剧情授予、atlas.south 恒锁）、Replay 动作入口函数以 replay_completed 返回、页面点击音/循环页面音乐/进入关闭转场/逐元素进入动画。
+- 字体子集：母本 templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf（静态 CFF1，OFL-1.1），经编译器自身 fonts::prepare()（vendored hb-subset）按 assets/source/reader.chars.txt 生成两份 reader.otf 子集随仓库提交（152,972/141,340 字节）；OFL 全文与 credits/README.md（中文来源声明+重建指引）随样例提交。标题字符经 collect_strings 进入字体计划，须列入字符表（E_FONT_COVERAGE 教训）。
+- 新增常设集成测试 crates/nir-compiler/tests/p0_examples.rs（3 项）：A/B 加载+编译+validate+场景运行与能力推导精确断言（A：voice-binding/voice-timer/window-transition/audio.gain/audio.stop/typed-result/auto-delay-policy；B：ui.replay/menu-effects/menu-transition/menu-element-tween）；B 的锁定不变量（授予集恰为 atlas.north）与 gallery 守卫双向断言；三个入口函数经 Core 驱动至 replay_completed/completed 终态。nir-core 已是 nir-compiler 常规依赖，无需新增 dev-dep。
+- 两样例走完整作者管线：novelc resolve → check --locked → test → build --locked 全通过（A 1 函数/10 cues，B 3 函数/8 cues，两 locale）；game.lock 随仓库提交，.nir/ 与 dist 产物按既有 gitignore 排除。开发期教训：ImageMenu.buttons 无 serde 缺省必须显式空数组；title_scene 须指向存在的场景（空场景即导入器惯例）；op id 同函数内须唯一；Expect 仅 outcome/affection/variables 三字段（typed 断言入 [expect.variables]）；ui.replay.v1 仅由 Replay/ExitReplay 动作推导（Entry 动作不推导——语义上Entry销毁启动会话，Replay才是隔离回想）。
+- 门禁：cargo test -p nir-compiler 135 项全绿（batch-61-compiler-test.log）、cargo xtask test（47 项能力一一对应核对，batch-61-xtask-test.log）、Clippy 全目标通过（batch-61-clippy.log，现存警告容忍）。本批不触及 Player/格式/编译器运行时代码，按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点随批次 58 整套（44 项全绿）成立。
+
+P0.1 大部分交付；样例 C（页签设置/存档/历史，player 级验证）与 P0.2 完整版本/限额矩阵待批次 62，KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-61-*.log。契约见 docs/NIR-NEXT-P0-BASELINE.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 62：中性样例 C 与 P0.2 版本/限额矩阵（P0.1/P0.2 收口）
+
+- 样例 C examples/voyage-log（夜航日志）：单页三页签（设置/存档/历史）系统页。enum/int/bool 局部值与 set_local 页签切换、visible_when 条件页、text_local/text_preference/text_slot 三种动态文字；设置行以 stack 容器纵向排列；值控件覆盖偏好滑条（字速/音乐音量）、reduced_motion 开关、局部 bool 开关与局部有界 int 滑条（无图片依赖）；存档页 0–2 槽位局部选择 + save_slot/load_slot 局部槽位解析；历史页固定行窗口（limit 2）+ history_page 更早/更近分页；标题页 push_menu 进入面板，menu_overlay 使剧情内菜单键直达同一页。七项能力（ui.menu-state/values/services/storage/history/navigation/stack.v1）全部由编译器按实际使用推导，样例走完整作者管线（1 函数 6 cues 两 locale，24 objects/17,357,528 bytes）。
+- player 级验收（p0_examples.rs 扩至 5 项）：新测试以与 nir-player 套件同契约的驱动 harness（action/settle/hit/tap/commit_value/advance_pages）走完——标题 push 保持 Title 屏仅加深层（push_menu 只换活动页不改屏幕）、设置页签交互性与隐藏页命中排除、back 恢复；NewGame 后推进 4 页（历史含正在揭示页共 5 行）；覆盖页以 Menu 屏深度 0 打开并暂停剧情；值提交写偏好与局部（局部 glow 滑条 44→40 按 step 10 向下吸附）；存档页槽位局部 Int(2) 解析进 Save 事务（slot 2/expected_revision 0/job）并经 Saved 回执收尾；历史页偏移分页至最旧端钳制（钳制位按钮经 menu_service_enabled 禁用、hit 返回 None，以禁用检测断言边界而非期待空点击）再翻回 0；关闭恢复 Story 同页、解除暂停、无 outcome。开发期四轮失败日志（借用检查/屏幕断言/凭据重放/历史钳制）保留为 batch-62-p0-*-run.log。
+- P0.2 交付 docs/NIR-NEXT-VERSION-LIMITS.md：版本矩阵（source 1 / runtime 2 / 内容包 2 / 快照 2（v1 拒绝）/ 各 TOML format 1 / 导入报告 2（UI 报告 3）/ 字体工具链串 / 宿主协议 nir-player/0.1 + web-v1 / LSB116·LPB116·LPM106·Gale105-106 / preferences 无版本号补默认）；语义状态表（任务终态原因、目标身份四域、时间域与前台令牌、源页边界三分、输入消费四元身份 + 菜单 (instance, revision, control) 凭据、ImageMenuAction 18 变体白名单、Replay 三相状态表、存档 CAS 事务）；数量上限矩阵逐项锚定代码常量（MAX_TASKS 256、快照任务 512、帧 64、节点 1024、输入 16 MiB、内存账本 256 MiB、组合深度 8/叶子 256、菜单元素 256/文字承载 64/层级 8/导航父页 8/局部 32/枚举 32/条件 16、几何 8192/Stack gap 0–1024 累计 8192、历史 1000 条/窗口行 1–16/偏移 0–999/翻页 |δ|≤16、fade ≤2 s/元素轨道 128 (0,2 s]、gain 0–4/补间与停止 ≤60 s（零时长合法）/窗口揭示 (0,60 s]、导入表达式 64 指令/256 节点/16 KiB、转换媒体 ≤1 GiB、来源字速 0..=640 ms、偏好钳制域），未设独立上限项（函数/块/页数/正文长度/快照字节）如实标注间接约束；source/runtime/content/snapshot/preferences/schema/host protocol 逐项影响表与「只有实际变化才升级、旧文件缺省行为不改」承诺。
+- 文档同步：P0-BASELINE N08 行收口、样例 C 行落地（覆盖需求与两项测试载体）、§4 重建程序纳入 voyage-log、§5 P0.2 指针改为已交付、§6 追加批次 62 基线记录；PROGRESS P0 行更新。
+- 门禁：`cargo test -p nir-compiler` 137 项通过（5 项私有来源忽略，p0_examples 5 项）；样例 C `novelc resolve → check --locked → test → build --locked` 全通过；`cargo xtask test`（依赖架构 18 包 PASS、能力发行清单 47 项一一对应 PASS）；`cargo clippy --workspace --all-targets --locked` 通过（19 处现存警告容忍，与本批文件无关）。本批不触及 Player/Presentation 运行时代码（仅作 nir-compiler dev-dep 引用），按批次 53/55/59 先例不重跑浏览器整套；R01–R06 浏览器锚点仍随批次 58 整套成立。
+
+P0.1/P0.2 收口；KAG 第二来源认证待批次 63。证据：reports/nir-next/batch-62-compiler-test.log、batch-62-p0-final.log、batch-62-novelc-pipeline.log、batch-62-xtask-test.log、batch-62-clippy.log（本地保留）。契约见 docs/NIR-NEXT-P0-BASELINE.md、docs/NIR-NEXT-VERSION-LIMITS.md。完整 P0–P6 计划未完成；未提交或推送。
+
+## 批次 63：KAG 第二来源规格认证（P0 收口）
+
+- 认证记录 docs/NIR-NEXT-SECOND-SOURCE-KAG.md：引擎家族 KiriKiri2＋KAG3，精确版本与提交逐项登记——KAG 版本串 `3.32 stable rev. 2`（krkrz/kag3 data/system/Initialize.tjs:5 @ `1f3ab309106d210e3169bbbe0fb4e066ae463b42`，2017-12-24）；场景解析器 krkrz/KAGParser @ `c2269b26b390bd09aa1f2b39d7d779cb79c26f2e`（2024-09-17）；引擎稳定线 KiriKiri2 2.32 stable rev.2 = krkrz/krkr2 `kirikiri2/branches/2.32stable` 头部 `9c892a7fa773b66077369bb85fc9637906a71907`（2010-10-26T08:28:03Z，提交信息「2.32stable2コミット」，与 kr2_232r2.zip 发布同日）；主镜像 master `dec49af9…`（GPL-2.0）。许可边界记录在案：仓库不复制其源码/素材，只登记身份与语义。
+- 小型固定子集规格冻结（正文与 `;` 注释/`[[` 转义、[l] 行等待、[p] 页等待、`*标签|页名`、[jump]、[if]/[elsif]/[else]/[endif]、[link]…[endlink]、[s] 终止），语义逐项锚定公开源码行号：执行期标签在 kag3 系统层处理器字典（MainWindow.tjs [l]:4977、[p]:4983、[s]:5116、[link]:4888 → MessageLayer.tjs beginHyperLink:1640 参数字典、endHyperLink:1664、onMouseDown:2163 → findLink → processLink:1991 经 window.process(storage,target,countPage) 跳转），解析期在 KAGParser.cpp（`;`:1105、`*标签|页名`:1108-1120、`[[`:1491/1539、特殊标签分发表含 if/else/elsif/endif/jump:1583-1616）；分层结构事实 Conductor.tjs:13 `class BaseConductor extends KAGParser`。子集仅用方括号标签形式（`@` 形式不进入子集）。
+- 证据方式：documented（公开源码精确提交＋官方文档镜像 krkrz.github.io/krkr2doc/kag3doc/），不涉及解码私有二进制；原版运行对照与 KAG 导入器如实标注「待认证/未交付」（计划 §1 不运行未知原版可执行文件；第二来源不要求先行交付导入器）。映射笔记（非交付承诺）记录与 NIR 概念对应：[p]≈源页边界、[l]≈页内等待细分、[s]≈终态、[link] 区间≈Interact 选项——与 LiveNovel 選択値 约定同构，均可降级 story.typed-result.v1 同一核心（P5「第二来源复用相同核心」在 KAG 侧的对应面）。
+- 本批仅文档：认证记录 + 基线账本 N10/§5/§6 与进度 P0 行同步。门禁 `cargo xtask test`（依赖架构 18 包、能力发行清单 47 项一一对应）与 `cargo clippy --workspace --all-targets --locked`（19 处现存警告容忍，均与本批无关）通过；按批次 53/55/59/62 先例不跑浏览器套件。
+
+P0（P0.1 账本/回归/三样例 + P0.2 矩阵 + 第二来源认证）按计划自身判据收口。遗留：LiveNovel 导入器侧来源映射（批次 57/58 能力的菜单转场/元素动画映射、menu-hover/text.font 显式近似）、nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-63-xtask-test.log、batch-63-clippy.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。
+
+## 批次 64：来源系统菜单进出渐隐映射（P4 来源映射收口）
+
+- 证据先行（真实语料 data_flow 的字面量形状）：`初期化.lsb` 进入 Flip（act 1、delete 0、无目标）与 `右クリック時.lsb` 关闭 Flip（act 0、delete 1、stop_event 1、目标 メニュー背景）同为 wipe 3、字面量参数 20/1、空 source、200 ms；子页选择进入（stop_event 1、parameter_0 8）、存档截图（wipe 1、`__tmpscreen`）、游戏退出与反向阅读退出 Flip 均为不同角色签名，不属本约定。
+- 新增 `system_menu_fades` 严格提取器：按字面量角色签名分类（act/delete/reverse/stop_event/targets），动态或他种签名不认领、直接跳过；角色一旦识别，钉定参数（wipe 3、20/1、空 source）必须精确匹配，time 须为 1..=2000 ms 字面量（超出 NIR 渐隐界拒绝、不钳制），同方向多枚 Flip 必须同一时序否则二义拒绝；enter/close 两方向独立映射为微秒 `MenuFades`，无任何约定 Flip 时为 None。提取在 run() 两种模式都执行，畸形在普通导入同样以 `E_IMPORT_MENU_TRANSITION` 拒绝。
+- 映射落点：`--draft` 系统菜单草稿页的 `ImageMenu.effects` 获得整层 enter/close 渐隐（不声明空间样式，只需 `ui.menu-effects.v1`；空间 wipe 形状以整层渐隐近似，与批次 56 textbox.fade 同口径）；`import-menu-preview.json` 新增 `menu_fades` 字段，LIMITS 限制句同步。
+- 账本：新规则 `livenovel.menu-transition`（adapted／decoded-source／LSB116），`ui.menu-effects.v1` 仅在计数 >0（draft 且确有约定对）时列出；近似清单保持 menu-hover/text.font 两条不变。
+- 测试：提取器单测覆盖库存对、单向、空脚本、他角色跳过（子页进入、反向关闭、动态签名、静音、异层目标、动态目标）与七类畸形拒绝（wipe/parameter_0/动态 parameter_1/非空 source/零与超界时长/动态时长）及同时序重复、二义时序；ui_preview 测试覆盖无约定无效果、半约定单方向、成对整层渐隐（无声音无样式）；mapping_ledger 断言扩 menu_transitions 维度。
+- 门禁与实证：`cargo test -p nir-compiler` 139 项通过；`cargo xtask test`（18 包、47 能力）与工作区 Clippy（19 处现存警告容忍）通过。真实语料非 draft 回归 1357 页、17 函数，main+8 回想全路线含快照恢复通过，报告 15 条映射中 menu-transition 计数 0、无能力、聚合状态不变；重建发行 CLI（xtask sdk + verify_sdk.py）后 `--draft` 实测：theme.toml 草稿页 effects enter/close `fade_us="200000"`、`import-menu-preview.json` `menu_fades` 200000/200000、账本行 adapted + `ui.menu-effects.v1` + 1 mapped transition pair，CLI 按 incomplete 契约非零退出且工程已写出。仅改导入器，按批次 53/55/59/60 先例不跑浏览器套件。
+- 文档同步：IMPORT.md（映射级别一节新规则句、系统菜单草稿段与尚非等价清单）、CAPABILITIES.md（外部引擎导入行、ui.menu-effects.v1 段）、MENU-EFFECTS-SEMANTICS.md（导入指针）、本进度 P2.4/P4 行。
+
+P4 的来源效果映射收口：menu-sfx（批次 59）与 menu-transition（本批）已交付；悬停音效/动画光标与来源字体面保持显式近似；逐元素进入动画无已认证来源约定（库存菜单以整层 Flip 呈现进出），不作映射声明。遗留：nir-core 现存 6 处 clippy lint 清理；Windows 原生一律待验证，硬件 WebGPU 未认证。证据：reports/nir-next/batch-64-*.log（本地保留）。完整 P0–P6 计划其余各项状态见上表；未提交或推送。
+
+## 批次 65：仓库内 clippy 警告清零
+
+- 清理批次 58 引入并此前以警告容忍的全部 10 处仓库内 clippy 警告，未使用 allow 属性绕过任何 lint：validate.rs 两处 typed-result 能力门的嵌套 if 合并为单条件（collapsible_if）；check_compose_child 九参签名收敛为五参——at/requires/asset_kind/audio_task/err 打包为借用型 ComposeCheck 上下文（too_many_arguments），递归与 validate_composition 两处调用点同步，逐条校验逻辑不变；vm.rs 类型化交互 values 构造与恢复校验的三处双操作数取引用移除（op_ref，语义等价）；coordination.rs 与 typed_result_contract.rs 的 `bool::then(\|\| 字面量)` 改为 then_some（unnecessary_lazy_evaluations）。工作区 Clippy 现仅余 3 处 vendor 警告（hb-subset 1、tiny_http 2）。
+- 门禁：`cargo test -p nir-core -p nir-player` 17 套通过；`cargo xtask test` 38 套测试、依赖架构 18 包、能力发行清单 47 项一一对应通过；`cargo clippy --workspace --all-targets --locked` 通过且仓库内零警告。本批触及 nir-core 运行时代码（vm.rs 语义等价改写），按批次 54/58 先例重建 SDK 并通过独立交付验证，随后浏览器整套 45 项全部通过。Windows 原生与硬件 WebGPU 仍待验证。
+- 证据：reports/nir-next/batch-65-*.log（本地保留）。
+
+批次 60/63/64 记录的「nir-core 现存 6 处 lint 清理」遗留至此收口。完整 P0–P6 计划其余各项状态见上表；本批随分支提交，未推送。

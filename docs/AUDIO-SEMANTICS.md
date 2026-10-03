@@ -1,6 +1,6 @@
 # 音频实例、增益与停止
 
-当前新增能力为 `audio.gain.v1` 和 `audio.stop.v1`。仍使用既有 Effect/Task、Activate/Await、scope 与准备提交，不增加另一条剧情执行流。
+当前新增能力为 `audio.gain.v1`、`audio.stop.v1` 与 `audio.gain-tween.v1`。仍使用既有 Effect/Task、Activate/Await、scope 与准备提交，不增加另一条剧情执行流。
 
 ## 播放与音量
 
@@ -37,6 +37,25 @@
 
 停止任务不能引用尚未建立的音频；同 Cue 内顺序建立的前一项 Audio 可以被随后 Stop 引用。未知目标类型、跨模块目标、非法时长和缺少能力声明在验证时拒绝；活跃实例和冲突在原子提交时再次检查。
 
+## 实例增益补间
+
+```json
+{
+  "id": "swell",
+  "scope": "session",
+  "effect": {
+    "type": "tween",
+    "target": { "type": "audio_instance", "task": "sample", "property": "gain" },
+    "to": 0.25,
+    "duration_us": "800000"
+  }
+}
+```
+
+`audio.gain-tween.v1` 在 `tween.target.v1` 的共享轨道上加一个 `audio_instance` 目标：把一个已建立 Audio 实例的包络（0–1 的乘子，叠加在事件 gain × 总线音量之上）在有限时长内线性补间到 `to`。包络不是 PCM 预乘，也不改变播放位置与生命周期——声音始终 Running，只在设备包络节点上排入一条线性 ramp。只允许 `easing = linear`（设备每次只渲染一条线性段，非线性行为由作者自行分段表达）；`to` 必须在 0–1。
+
+目标必须是同模块的另一音频任务（不能引用补间自身，目标的全部定义都得是 Audio），与 `audio_stop` 共享互斥的包络所有权：同 Cue 内两个包络写者在验证期以 E_OWNERSHIP 拒绝，运行中重复占用在原子提交时回滚。补间完成提交终点值并 Finished，声音留在该音量继续播放；Cancel 提交设备时钟已到达的当前值（设备领先剧情时钟时以设备值为准，与淡出停止同一规则），迟到的旧 owner 观测不能再移动它。飞行中存读档保存捕获值、目标与剩余段，恢复从剩余段继续，不从单位增益重来；设备包络检查点（owner/elapsed）同样适用于补间 owner。
+
 ## 恢复和后端
 
 快照 v2 保存终态原因、停止目标实例、捕获值、包络基值、任务 elapsed、可选的设备播放位置 audio_position_us 与停止任务的 audio_device_elapsed_us。恢复验证引用、任务类型、单实例所有权及进度，并从剩余包络继续；不重新从单位增益开始。重复/迟到的音频结束回调不能改写已停止任务或新声音。
@@ -57,4 +76,4 @@ LiveNovel 适配将 BGM `STOPSND ... PASS` 转为不阻塞主流的停止任务�
 
 原生语义回归：`cargo test -p nir-core --test audio_contract`。采样包络及存储回归：`cargo test -p player-desktop --lib`；Linux 执行该命令不代表 Windows 音频设备实测。
 
-构建配套 SDK 后，`npx playwright test --config playwright.nir-next.config.js` 会生成中性工程并检查 WebGL2 的事件增益、连续淡出、暂停、存读档剩余包络及会话清理。该入口不使用私有游戏或外部媒体工具。Windows 真机和硬件 WebGPU 仍需独立验收。
+构建配套 SDK 后，`npx playwright test --config playwright.nir-next.config.js` 会生成中性工程并检查 WebGL2 的事件增益、连续淡出、暂停、存读档剩余包络及会话清理；`tests/nir-next/audio-gain-tween.spec.js` 审计实例增益补间在设备包络节点上的单条 ramp 与循环存活。该入口不使用私有游戏或外部媒体工具。Windows 真机和硬件 WebGPU 仍需独立验收。

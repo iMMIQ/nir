@@ -134,6 +134,29 @@ pub struct Task {
     pub dialogue: Option<Dialogue>,
     pub source: Vec<Node>,
     pub target: Vec<Node>,
+    /// Spawned child task ids, in order, for a composition effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<u32>,
+    /// How many of the composition's children have been spawned; always
+    /// equals `children.len()`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cursor: u32,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+/// The ramp duration of an envelope owner task (a timed stop or a gain
+/// tween), or `None` when the task does not own an audio envelope.
+fn envelope_owner_duration(task: &Task) -> Option<Micros> {
+    match &task.effect {
+        Effect::AudioStop { duration_us, .. } => Some(*duration_us),
+        Effect::Tween {
+            target: TweenTarget::AudioInstance { .. },
+            duration_us,
+            ..
+        } => Some(*duration_us),
+        _ => None,
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +186,19 @@ pub struct OfferedChoice {
     pub branches: BTreeMap<String, String>,
     pub deadline_us: Option<Micros>,
     pub default: Option<String>,
+    /// Typed-result mode: the variable the chosen option's value writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Explicit cancel target; absent means the interaction is modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_cancel: Option<String>,
+    /// Typed values of the offered options, by option id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, Value>,
+    /// Semantic selection cursor for typed-result interactions; hover and
+    /// keyboard focus are presentation transients and never reach this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +207,20 @@ pub struct Waiting {
     pub next: String,
     pub on_cancelled: String,
     pub on_failed: String,
+}
+/// In-flight message-window reveal. Coverage interpolates linearly from the
+/// captured `from_coverage` toward the hidden/visible endpoint so a reversing
+/// op (show mid-hide) continues from the visual state it interrupted. Not a
+/// task: it is committed by a `DialogueVisibility` operation, joins the
+/// Story clock's deadline set, and is validated structurally on restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowReveal {
+    pub style: StageTransition,
+    pub to_visible: bool,
+    pub from_coverage: f32,
+    pub started_us: Micros,
+    pub duration_us: Micros,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +254,10 @@ pub struct Snapshot {
     pub choice: Option<OfferedChoice>,
     #[serde(default)]
     pub dialogue_hidden: bool,
+    /// Deferred visibility flip: while set, `dialogue_hidden` still holds the
+    /// pre-op value and the window's committed state lands at the deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_reveal: Option<WindowReveal>,
     #[serde(default)]
     pub dialogue_appearance: DialogueAppearance,
     pub history: Vec<HistoryEntry>,
@@ -225,6 +279,18 @@ pub enum CoreInput {
     Choose {
         interaction: u32,
         option: String,
+        sequence: u32,
+    },
+    /// Move the semantic selection cursor of a typed-result interaction.
+    /// No story progress, no checkpoint; snapshot-relevant only.
+    SelectChoice {
+        interaction: u32,
+        option: String,
+        sequence: u32,
+    },
+    /// Cancel a typed-result interaction through its declared cancel target.
+    CancelChoice {
+        interaction: u32,
         sequence: u32,
     },
     Time {
@@ -357,6 +423,7 @@ impl Core {
             waiting: None,
             choice: None,
             dialogue_hidden: false,
+            window_reveal: None,
             dialogue_appearance: DialogueAppearance::default(),
             history: vec![],
             locale,
@@ -827,13 +894,60 @@ impl Core {
                         && c.options.iter().any(|o| o.id == option && o.enabled)
                     {
                         self.state.last_input = sequence;
+                        // The VM owns the typed write; the host only names an
+                        // offered option and never supplies the value itself.
+                        let typed = c
+                            .result
+                            .as_ref()
+                            .and_then(|target| Some((target.clone(), c.values.get(&option)?.clone())));
                         let dest = c.branches[&option].clone();
+                        if let Some((target, value)) = typed {
+                            self.write(&target, value)?;
+                        }
                         self.trace(format!("choose:{option}"));
                         self.state.choice = None;
                         self.jump(dest);
                         self.state.unsuspended_ops = 0;
                         self.intents.push(CoreIntent::Checkpoint);
                     }
+                }
+            }
+            CoreInput::SelectChoice {
+                interaction,
+                option,
+                sequence,
+            } => {
+                let _ = sequence;
+                if let Some(c) = &mut self.state.choice {
+                    if c.interaction == interaction
+                        && c.result.is_some()
+                        && c.options.iter().any(|o| o.id == option && o.enabled)
+                    {
+                        // A cursor move is an observation on a suspended
+                        // interaction: no input identity, no story progress.
+                        c.selected = Some(option);
+                    }
+                }
+            }
+            CoreInput::CancelChoice {
+                interaction,
+                sequence,
+            } => {
+                if sequence <= self.state.last_input {
+                    return Ok(());
+                }
+                let dest = self
+                    .state
+                    .choice
+                    .as_ref()
+                    .and_then(|c| (c.interaction == interaction).then(|| c.on_cancel.clone()).flatten());
+                if let Some(dest) = dest {
+                    self.state.last_input = sequence;
+                    self.trace("input:cancel");
+                    self.state.choice = None;
+                    self.jump(dest);
+                    self.state.unsuspended_ops = 0;
+                    self.intents.push(CoreIntent::Checkpoint);
                 }
             }
             CoreInput::AudioEnded { task } => {
@@ -854,6 +968,9 @@ impl Core {
         Ok(())
     }
     fn run(&mut self) -> Result<()> {
+        // Compositions advance even while the VM itself is parked on a wait,
+        // a choice or a content barrier: the chain is autonomous.
+        self.advance_compositions()?;
         if self
             .intents
             .iter()
@@ -862,6 +979,7 @@ impl Core {
             return Ok(());
         }
         while self.work_remaining > 0 {
+            self.advance_compositions()?;
             if self.state.pending.is_some()
                 || self.state.choice.is_some()
                 || self.state.outcome.is_some()
@@ -1022,7 +1140,40 @@ impl Core {
                     .ok_or_else(|| Diagnostic::new("E_NODE", at, node))?;
                 n.set(*property, *value);
             }
-            Operation::DialogueVisibility { visible } => self.state.dialogue_hidden = !visible,
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                // An instant flip commits directly. A styled flip defers the
+                // committed value to the reveal deadline; the window keeps its
+                // old committed state while presentation interpolates coverage
+                // from the captured start (so a reversing op continues from
+                // the visual state it interrupted).
+                let reveal = transition
+                    .clone()
+                    .filter(|style| duration_us.0 > 0 && style.valid())
+                    .filter(|_| {
+                        self.state.window_reveal.is_some()
+                            || self.state.dialogue_hidden == *visible
+                    });
+                match reveal {
+                    Some(style) => {
+                        let from_coverage = self.window_coverage();
+                        self.state.window_reveal = Some(WindowReveal {
+                            style,
+                            to_visible: *visible,
+                            from_coverage,
+                            started_us: self.state.tick_us,
+                            duration_us: *duration_us,
+                        });
+                    }
+                    None => {
+                        self.state.dialogue_hidden = !visible;
+                        self.state.window_reveal = None;
+                    }
+                }
+            }
             Operation::ProfileMerge { key } => self
                 .intents
                 .push(CoreIntent::ProfileMerge { key: key.clone() }),
@@ -1279,6 +1430,8 @@ impl Core {
                 choice,
                 branches,
                 on_empty,
+                result,
+                on_cancel,
             } => {
                 let c = self.program().choices[&choice].clone();
                 let mut options = vec![];
@@ -1312,6 +1465,29 @@ impl Core {
                             .ok_or_else(|| self.error("E_TIME", "choice deadline overflow"))
                     })
                     .transpose()?;
+                // Typed-result mode carries the declared values of the offered
+                // options and a semantic selection cursor; the host selects
+                // among ids, never values. The cursor starts at the declared
+                // default when it is offered, else at the first enabled row.
+                let values = result.as_ref().map(|_| {
+                    options
+                        .iter()
+                        .filter_map(|o| {
+                            c.options
+                                .iter()
+                                .find(|d| d.id == o.id)
+                                .and_then(|d| d.value.clone())
+                                .map(|value| (o.id.clone(), value))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                });
+                let selected = values.as_ref().and_then(|_| {
+                    c.default
+                        .as_ref()
+                        .filter(|d| options.iter().any(|o| &o.id == *d && o.enabled))
+                        .or_else(|| options.iter().find(|o| o.enabled).map(|o| &o.id))
+                        .cloned()
+                });
                 self.state.choice = Some(OfferedChoice {
                     id: choice,
                     locale: self.state.locale.clone(),
@@ -1323,6 +1499,10 @@ impl Core {
                     branches,
                     deadline_us,
                     default: c.default,
+                    result,
+                    on_cancel,
+                    values: values.unwrap_or_default(),
+                    selected,
                 });
                 self.state.unsuspended_ops = 0;
                 self.intents.push(CoreIntent::Checkpoint);
@@ -1351,214 +1531,24 @@ impl Core {
     }
     fn commit_inner(&mut self) -> Result<()> {
         let p = self.state.pending.take().unwrap();
+        let planned: usize = p
+            .effects
+            .iter()
+            .map(|def| def.effect.compose_leaves())
+            .sum();
         if self
             .state
             .tasks
             .values()
             .filter(|t| t.state == TaskState::Running)
             .count()
-            + p.effects.len()
+            + planned
             > MAX_TASKS
         {
             return Err(self.error("E_LIMIT", "active tasks"));
         }
-        for def in p.effects {
-            let mut source = vec![];
-            let mut target = vec![];
-            let mut captured = 0.;
-            let mut base = 0.;
-            let mut target_task = None;
-            match &def.effect {
-                Effect::AudioStop { target, .. } => {
-                    let target_id = *self
-                        .state
-                        .handles
-                        .get(target)
-                        .ok_or_else(|| self.error("E_TASK", target))?;
-                    let audio = &self.state.tasks[&target_id];
-                    if !matches!(audio.effect, Effect::Audio { .. }) {
-                        return Err(
-                            self.error("E_TASK_TYPE", "audio stop requires an audio instance")
-                        );
-                    }
-                    if self.state.tasks.values().any(|task| {
-                        task.state == TaskState::Running && task.target_task == Some(target_id)
-                    }) {
-                        return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
-                    }
-                    target_task = Some(target_id);
-                    captured = audio.audio_envelope;
-                }
-                Effect::StagePresent { scene, .. } => {
-                    if self.state.tasks.values().any(|t| {
-                        t.state == TaskState::Running
-                            && matches!(t.effect, Effect::StagePresent { .. })
-                    }) {
-                        return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
-                    }
-                    source = self.sample_scene();
-                    target = if !self.state.draft.is_empty() {
-                        std::mem::take(&mut self.state.draft)
-                    } else {
-                        self.program().scenes[scene].clone()
-                    };
-                    let ids: Vec<_> = self
-                        .state
-                        .tasks
-                        .values()
-                        .filter(|t| t.scope == Scope::Scene && t.state == TaskState::Running)
-                        .map(|t| t.id)
-                        .collect();
-                    for id in ids {
-                        self.end_task(id, TaskEndReason::ScopeExited)?;
-                    }
-                    self.state.scene = target.clone();
-                    self.state.scene_generation = self
-                        .state
-                        .scene_generation
-                        .checked_add(1)
-                        .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
-                }
-                Effect::Dialogue { .. } => {
-                    let old: Vec<_> = self
-                        .state
-                        .tasks
-                        .values()
-                        .filter(|t| {
-                            t.state == TaskState::Running
-                                && (t.dialogue.is_some() || t.scope == Scope::Interaction)
-                        })
-                        .map(|t| t.id)
-                        .collect();
-                    for id in old {
-                        self.end_task(id, TaskEndReason::Replaced)?;
-                    }
-                }
-                _ => {}
-            }
-            if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
-                match &address {
-                    TweenTarget::SceneNode { node, property } => {
-                        if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
-                            return Err(self.error("E_OWNERSHIP", "transition owns root"));
-                        }
-                        captured = self
-                            .sample_scene()
-                            .iter()
-                            .find(|n| &n.id == node)
-                            .ok_or_else(|| self.error("E_NODE", node))?
-                            .get(*property);
-                        base = self
-                            .state
-                            .scene
-                            .iter()
-                            .find(|n| &n.id == node)
-                            .ok_or_else(|| self.error("E_NODE", node))?
-                            .get(*property);
-                    }
-                    TweenTarget::DialogueRoot { property } => {
-                        captured = self.sample_dialogue_appearance().get(*property);
-                        base = self.state.dialogue_appearance.get(*property);
-                    }
-                }
-                let old: Vec<_> = self
-                    .state
-                    .tasks
-                    .values()
-                    .filter(|t| {
-                        t.state == TaskState::Running
-                            && self.track_is_current(t, &address)
-                            && t.effect
-                                .scalar_track(0., 0.)
-                                .is_some_and(|(a, _, _)| a == address)
-                    })
-                    .map(|t| t.id)
-                    .collect();
-                if !old.is_empty() && !replace {
-                    return Err(self.error("E_OWNERSHIP", format!("{address:?}")));
-                }
-                for id in old {
-                    self.end_task(id, TaskEndReason::Replaced)?;
-                }
-            }
-            let id = self.id()?;
-            if let Effect::AudioStop { duration_us, .. } = &def.effect {
-                let target = target_task.expect("resolved audio stop target");
-                if self.state.tasks[&target].state == TaskState::Running {
-                    self.intents.push(CoreIntent::AudioEnvelope {
-                        owner: Some(id),
-                        elapsed_us: Micros(0),
-                        task: target,
-                        from: captured,
-                        to: 0.,
-                        duration_us: *duration_us,
-                    });
-                }
-            }
-            let dialogue = p.dialogues.get(&def.id).cloned();
-            if let Some(d) = &dialogue {
-                self.state.history.push(HistoryEntry {
-                    text_id: d.text_id.clone(),
-                    meaning_revision: d.meaning_revision,
-                    source_revision: d.source_revision,
-                    contract_digest: d.contract_digest.clone(),
-                    locale: d.locale.clone(),
-                    font_plan_digest: d.font_plan_digest.clone(),
-                    speaker: d.speaker.clone(),
-                    text: d.full_text(),
-                });
-                while self.state.history.len() > 1000
-                    || self
-                        .state
-                        .history
-                        .iter()
-                        .map(|h| h.text.len() + h.speaker.len())
-                        .sum::<usize>()
-                        > 4 * 1024 * 1024
-                {
-                    self.state.history.remove(0);
-                }
-            }
-            if let Effect::Audio {
-                asset,
-                bus,
-                looped,
-                gain,
-            } = &def.effect
-            {
-                self.intents.push(CoreIntent::AudioStart {
-                    task: id,
-                    asset: asset.clone(),
-                    bus: *bus,
-                    looped: *looped,
-                    gain: *gain,
-                    position_us: Micros(0),
-                });
-            }
-            let task = Task {
-                id,
-                name: def.id.clone(),
-                frame: self.frame().id,
-                scene_generation: self.state.scene_generation,
-                scope: def.scope,
-                effect: def.effect,
-                state: TaskState::Running,
-                end_reason: None,
-                target_task,
-                audio_envelope: 1.,
-                audio_position_us: None,
-                audio_device_elapsed_us: None,
-                started_us: self.state.tick_us,
-                elapsed_us: Micros(0),
-                milestones: BTreeSet::from([Milestone::Started]),
-                captured,
-                base,
-                dialogue,
-                source,
-                target,
-            };
-            self.state.handles.insert(def.id, id);
-            self.state.tasks.insert(id, task);
+        for def in &p.effects {
+            self.commit_effect(def, &p.dialogues)?;
         }
         self.jump(p.next);
         self.trace(format!("activate:{}", p.cue));
@@ -1582,6 +1572,7 @@ impl Core {
         for id in ended_stops {
             self.finish_task(id, TaskState::Finished)?;
         }
+        self.advance_compositions()?;
         let keep: BTreeSet<_> = self
             .state
             .handles
@@ -1610,6 +1601,389 @@ impl Core {
             .tasks
             .retain(|id, t| t.state == TaskState::Running || keep.contains(id));
         Ok(())
+    }
+    /// Spawn one effect definition as a task: ownership checks, property
+    /// capture at start, side-effect intents, handle registration. Cue
+    /// commits and composition child spawns share this path so a child gets
+    /// exactly the semantics a top-level effect gets; children arrive with
+    /// an empty dialogue map because composition validation forbids
+    /// dialogue children.
+    fn commit_effect(
+        &mut self,
+        def: &EffectDef,
+        dialogues: &BTreeMap<String, Dialogue>,
+    ) -> Result<u32> {
+        let mut source = vec![];
+        let mut target = vec![];
+        let mut captured = 0.;
+        let mut base = 0.;
+        let mut target_task = None;
+        match &def.effect {
+            Effect::AudioStop { target, .. } => {
+                let target_id = *self
+                    .state
+                    .handles
+                    .get(target)
+                    .ok_or_else(|| self.error("E_TASK", target))?;
+                let audio = &self.state.tasks[&target_id];
+                if !matches!(audio.effect, Effect::Audio { .. }) {
+                    return Err(self.error("E_TASK_TYPE", "audio stop requires an audio instance"));
+                }
+                if self.state.tasks.values().any(|task| {
+                    task.state == TaskState::Running && task.target_task == Some(target_id)
+                }) {
+                    return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
+                }
+                target_task = Some(target_id);
+                captured = audio.audio_envelope;
+            }
+            Effect::StagePresent { scene, .. } => {
+                if self.state.tasks.values().any(|t| {
+                    t.state == TaskState::Running
+                        && matches!(t.effect, Effect::StagePresent { .. })
+                }) {
+                    return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
+                }
+                source = self.sample_scene();
+                target = if !self.state.draft.is_empty() {
+                    std::mem::take(&mut self.state.draft)
+                } else {
+                    self.program().scenes[scene].clone()
+                };
+                let ids: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|t| t.scope == Scope::Scene && t.state == TaskState::Running)
+                    .map(|t| t.id)
+                    .collect();
+                for id in ids {
+                    self.end_task(id, TaskEndReason::ScopeExited)?;
+                }
+                self.state.scene = target.clone();
+                self.state.scene_generation = self
+                    .state
+                    .scene_generation
+                    .checked_add(1)
+                    .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
+            }
+            Effect::Dialogue { .. } => {
+                let old: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.state == TaskState::Running
+                            && (t.dialogue.is_some() || t.scope == Scope::Interaction)
+                    })
+                    .map(|t| t.id)
+                    .collect();
+                for id in old {
+                    self.end_task(id, TaskEndReason::Replaced)?;
+                }
+            }
+            // Compositions spawn their children through advance_compositions
+            // so each child captures the properties current at its own start.
+            Effect::Sequence { .. } | Effect::ParallelAll { .. } => {}
+            _ => {}
+        }
+        if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
+            match &address {
+                TweenTarget::SceneNode { node, property } => {
+                    if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
+                        return Err(self.error("E_OWNERSHIP", "transition owns root"));
+                    }
+                    captured = self
+                        .sample_scene()
+                        .iter()
+                        .find(|n| &n.id == node)
+                        .ok_or_else(|| self.error("E_NODE", node))?
+                        .get(*property);
+                    base = self
+                        .state
+                        .scene
+                        .iter()
+                        .find(|n| &n.id == node)
+                        .ok_or_else(|| self.error("E_NODE", node))?
+                        .get(*property);
+                }
+                TweenTarget::DialogueRoot { property } => {
+                    captured = self.sample_dialogue_appearance().get(*property);
+                    base = self.state.dialogue_appearance.get(*property);
+                }
+                TweenTarget::AudioInstance { task, .. } => {
+                    let target_id = *self
+                        .state
+                        .handles
+                        .get(task)
+                        .ok_or_else(|| self.error("E_TASK", task))?;
+                    let audio = &self.state.tasks[&target_id];
+                    if !matches!(audio.effect, Effect::Audio { .. }) {
+                        return Err(
+                            self.error("E_TASK_TYPE", "gain tween requires an audio instance")
+                        );
+                    }
+                    if self.state.tasks.values().any(|t| {
+                        t.state == TaskState::Running && t.target_task == Some(target_id)
+                    }) {
+                        return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
+                    }
+                    target_task = Some(target_id);
+                    // The envelope is a 0..1 multiplier with unit base; the
+                    // captured value carries whatever a previous owner left.
+                    captured = audio.audio_envelope;
+                    base = 1.;
+                }
+            }
+            let old: Vec<_> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| {
+                    t.state == TaskState::Running
+                        && self.track_is_current(t, &address)
+                        && t.effect
+                            .scalar_track(0., 0.)
+                            .is_some_and(|(a, _, _)| a == address)
+                })
+                .map(|t| t.id)
+                .collect();
+            if !old.is_empty() && !replace {
+                return Err(self.error("E_OWNERSHIP", format!("{address:?}")));
+            }
+            for id in old {
+                self.end_task(id, TaskEndReason::Replaced)?;
+            }
+        }
+        let id = self.id()?;
+        let envelope_segment = match &def.effect {
+            Effect::AudioStop { duration_us, .. } => Some((captured, 0., *duration_us)),
+            Effect::Tween {
+                target: TweenTarget::AudioInstance { .. },
+                to,
+                duration_us,
+                ..
+            } => Some((captured, *to, *duration_us)),
+            _ => None,
+        };
+        if let Some((from, to, duration_us)) = envelope_segment {
+            let target = target_task.expect("resolved audio envelope target");
+            if self.state.tasks[&target].state == TaskState::Running {
+                self.intents.push(CoreIntent::AudioEnvelope {
+                    owner: Some(id),
+                    elapsed_us: Micros(0),
+                    task: target,
+                    from,
+                    to,
+                    duration_us,
+                });
+            }
+        }
+        let dialogue = dialogues.get(&def.id).cloned();
+        if let Some(d) = &dialogue {
+            self.state.history.push(HistoryEntry {
+                text_id: d.text_id.clone(),
+                meaning_revision: d.meaning_revision,
+                source_revision: d.source_revision,
+                contract_digest: d.contract_digest.clone(),
+                locale: d.locale.clone(),
+                font_plan_digest: d.font_plan_digest.clone(),
+                speaker: d.speaker.clone(),
+                text: d.full_text(),
+            });
+            while self.state.history.len() > 1000
+                || self
+                    .state
+                    .history
+                    .iter()
+                    .map(|h| h.text.len() + h.speaker.len())
+                    .sum::<usize>()
+                    > 4 * 1024 * 1024
+            {
+                self.state.history.remove(0);
+            }
+        }
+        if let Effect::Audio {
+            asset,
+            bus,
+            looped,
+            gain,
+        } = &def.effect
+        {
+            self.intents.push(CoreIntent::AudioStart {
+                task: id,
+                asset: asset.clone(),
+                bus: *bus,
+                looped: *looped,
+                gain: *gain,
+                position_us: Micros(0),
+            });
+        }
+        let task = Task {
+            id,
+            name: def.id.clone(),
+            frame: self.frame().id,
+            scene_generation: self.state.scene_generation,
+            scope: def.scope,
+            effect: def.effect.clone(),
+            state: TaskState::Running,
+            end_reason: None,
+            target_task,
+            audio_envelope: 1.,
+            audio_position_us: None,
+            audio_device_elapsed_us: None,
+            started_us: self.state.tick_us,
+            elapsed_us: Micros(0),
+            milestones: BTreeSet::from([Milestone::Started]),
+            captured,
+            base,
+            dialogue,
+            source,
+            target,
+            children: vec![],
+            cursor: 0,
+        };
+        self.state.handles.insert(def.id.clone(), id);
+        self.state.tasks.insert(id, task);
+        Ok(id)
+    }
+    /// Advance every composition: spawn due children, merge child results,
+    /// finish completed chains. Each spawn costs one unit of step budget, so
+    /// a finite zero-duration chain still pays for every spawn and spreads
+    /// across steps when the budget runs out; the guard turns a chase that
+    /// refuses to converge into an explicit fault instead of a hang.
+    fn advance_compositions(&mut self) -> Result<()> {
+        let mut guard = 0usize;
+        loop {
+            let composites: Vec<u32> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| t.state == TaskState::Running && t.effect.compose_children().is_some())
+                .map(|t| t.id)
+                .collect();
+            if composites.is_empty() {
+                return Ok(());
+            }
+            guard += 1;
+            if guard > MAX_TASKS * 2 {
+                return Err(self.error("E_LIMIT", "composition did not converge"));
+            }
+            let mut acted = false;
+            for id in composites {
+                acted |= self.advance_composition(id)?;
+            }
+            if !acted {
+                return Ok(());
+            }
+        }
+    }
+    /// One chase round for one composition; true when its state changed.
+    fn advance_composition(&mut self, id: u32) -> Result<bool> {
+        let defs = match self.state.tasks.get(&id) {
+            Some(t) if t.state == TaskState::Running => match &t.effect {
+                Effect::Sequence { children } | Effect::ParallelAll { children } => {
+                    children.clone()
+                }
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        let spawned: Vec<u32> = self.state.tasks[&id].children.clone();
+        let running_child = spawned
+            .iter()
+            .any(|c| self.state.tasks.get(c).is_some_and(|t| t.state == TaskState::Running));
+        if matches!(self.state.tasks[&id].effect, Effect::Sequence { .. }) {
+            if running_child {
+                return Ok(false);
+            }
+            if let Some(last) = spawned.last() {
+                let (state, reason) = {
+                    let child = &self.state.tasks[last];
+                    (child.state, child.end_reason)
+                };
+                if state != TaskState::Finished {
+                    // Failure and cancellation propagate to the chain;
+                    // completed children stay settled because their side
+                    // effects are not rolled back.
+                    self.end_task(id, reason.unwrap_or(TaskEndReason::Failed))?;
+                    return Ok(true);
+                }
+            }
+            if spawned.len() == defs.len() {
+                self.finish_task(id, TaskState::Finished)?;
+                return Ok(true);
+            }
+            self.spawn_child(id, &defs[spawned.len()])
+        } else {
+            while self.state.tasks[&id].children.len() < defs.len() {
+                let next = self.state.tasks[&id].children.len();
+                if !self.spawn_child(id, &defs[next])? {
+                    return Ok(false);
+                }
+            }
+            let kids: Vec<TaskState> = self.state.tasks[&id]
+                .children
+                .iter()
+                .map(|c| self.state.tasks[c].state)
+                .collect();
+            // Failure beats cancellation beats completion, like every All.
+            if let Some(index) = kids.iter().position(|s| *s == TaskState::Failed) {
+                let reason = self.state.tasks[&self.state.tasks[&id].children[index]].end_reason;
+                self.end_task(id, reason.unwrap_or(TaskEndReason::Failed))?;
+                return Ok(true);
+            }
+            if let Some(index) = kids.iter().position(|s| *s == TaskState::Cancelled) {
+                let reason = self.state.tasks[&self.state.tasks[&id].children[index]].end_reason;
+                self.end_task(id, reason.unwrap_or(TaskEndReason::CancelledByControl))?;
+                return Ok(true);
+            }
+            if kids.iter().all(|s| *s == TaskState::Finished) {
+                self.finish_task(id, TaskState::Finished)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+    /// Spawn the next child of a composition; false when the step budget is
+    /// spent and the spawn defers to the next step.
+    fn spawn_child(&mut self, parent: u32, def: &EffectDef) -> Result<bool> {
+        if self.state.tasks.values().filter(|t| t.state == TaskState::Running).count() + 1
+            > MAX_TASKS
+        {
+            return Err(self.error("E_LIMIT", "active tasks"));
+        }
+        if self.work_remaining == 0 {
+            return Ok(false);
+        }
+        self.work_remaining -= 1;
+        let child = self.commit_effect(def, &BTreeMap::new())?;
+        let task = self.state.tasks.get_mut(&parent).unwrap();
+        task.children.push(child);
+        task.cursor += 1;
+        // Zero-duration children complete inside the same chase round, and a
+        // stop whose target already ended completes immediately.
+        let finish_now = match &self.state.tasks[&child].effect {
+            Effect::Clip { duration_us, .. }
+            | Effect::Tween { duration_us, .. }
+            | Effect::Delay { duration_us } => duration_us.0 == 0,
+            Effect::AudioStop {
+                duration_us,
+                target,
+            } => {
+                duration_us.0 == 0
+                    || self
+                        .state
+                        .handles
+                        .get(target)
+                        .is_some_and(|id| self.state.tasks[id].state != TaskState::Running)
+            }
+            _ => false,
+        };
+        if finish_now {
+            self.finish_task(child, TaskState::Finished)?;
+        }
+        Ok(true)
     }
     fn resolve_wait(&mut self) -> Result<bool> {
         let w = self.state.waiting.as_ref().unwrap();
@@ -1660,8 +2034,39 @@ impl Core {
         if t.state != TaskState::Running {
             return Ok(());
         }
+        // A composition ending takes its children with it: finished children
+        // stay settled (their side effects are not rolled back), running
+        // children end so their own finish/cancel policies apply, and
+        // children never spawned never run. A failing or cancelled chain
+        // stops its running children as cancellations; a finished chain
+        // settles them at their end values.
+        if t.effect.compose_children().is_some() {
+            let reason = if reason == TaskEndReason::Failed {
+                TaskEndReason::CancelledByControl
+            } else {
+                reason
+            };
+            for child in t.children.clone() {
+                if self
+                    .state
+                    .tasks
+                    .get(&child)
+                    .is_some_and(|c| c.state == TaskState::Running)
+                {
+                    self.end_task(child, reason)?;
+                }
+            }
+        }
         if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
-            let value = track.settle(t.elapsed_us, status == TaskState::Finished);
+            // Envelope commits follow the device clock when one was observed,
+            // like timed stops; story-owned targets use the story clock.
+            let elapsed = match address {
+                TweenTarget::AudioInstance { .. } => {
+                    t.audio_device_elapsed_us.unwrap_or(t.elapsed_us)
+                }
+                _ => t.elapsed_us,
+            };
+            let value = track.settle(elapsed, status == TaskState::Finished);
             if self.track_is_current(&t, &address) {
                 match address {
                     TweenTarget::SceneNode { node, property } => {
@@ -1671,6 +2076,16 @@ impl Core {
                     }
                     TweenTarget::DialogueRoot { property } => {
                         self.state.dialogue_appearance.set(property, value)
+                    }
+                    TweenTarget::AudioInstance { .. } => {
+                        // Commit the settled envelope only onto a live
+                        // instance; the audio may have ended first.
+                        if let Some(target) = t
+                            .target_task
+                            .filter(|id| self.state.tasks[id].state == TaskState::Running)
+                        {
+                            self.state.tasks.get_mut(&target).unwrap().audio_envelope = value;
+                        }
                     }
                 }
             }
@@ -1719,6 +2134,28 @@ impl Core {
                 }
             }
         }
+        if let Effect::Tween {
+            target: TweenTarget::AudioInstance { .. },
+            ..
+        } = t.effect
+        {
+            // The device ramp must stop following the ended owner: pin the
+            // committed envelope value so the plan's owner is released.
+            let target = t
+                .target_task
+                .ok_or_else(|| self.error("E_TASK", "missing audio target"))?;
+            if self.state.tasks[&target].state == TaskState::Running {
+                let value = self.state.tasks[&target].audio_envelope;
+                self.intents.push(CoreIntent::AudioEnvelope {
+                    owner: None,
+                    elapsed_us: Micros(0),
+                    task: target,
+                    from: value,
+                    to: value,
+                    duration_us: Micros(0),
+                });
+            }
+        }
         if matches!(t.effect, Effect::Audio { .. }) {
             let dependents: Vec<_> = self
                 .state
@@ -1745,20 +2182,44 @@ impl Core {
     pub fn audio_envelope(&self, id: u32) -> (f32, f32, Micros) {
         for task in self.state.tasks.values() {
             if task.state == TaskState::Running && task.target_task == Some(id) {
-                if let Effect::AudioStop { duration_us, .. } = task.effect {
-                    let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
-                    let remaining = duration_us.0.saturating_sub(elapsed.0);
-                    let value = ScalarTween {
-                        from: task.captured,
-                        base: task.captured,
-                        to: 0.,
-                        duration_us,
-                        easing: Easing::Linear,
-                        finish: FinishPolicy::CommitEnd,
-                        cancel: CancelPolicy::CommitCurrent,
+                match task.effect {
+                    Effect::AudioStop { duration_us, .. } => {
+                        let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
+                        let remaining = duration_us.0.saturating_sub(elapsed.0);
+                        let value = ScalarTween {
+                            from: task.captured,
+                            base: task.captured,
+                            to: 0.,
+                            duration_us,
+                            easing: Easing::Linear,
+                            finish: FinishPolicy::CommitEnd,
+                            cancel: CancelPolicy::CommitCurrent,
+                        }
+                        .sample(elapsed);
+                        return (value, 0., Micros(remaining));
                     }
-                    .sample(elapsed);
-                    return (value, 0., Micros(remaining));
+                    Effect::Tween {
+                        target: TweenTarget::AudioInstance { .. },
+                        to,
+                        duration_us,
+                        easing,
+                        ..
+                    } => {
+                        let elapsed = task.audio_device_elapsed_us.unwrap_or(task.elapsed_us);
+                        let remaining = duration_us.0.saturating_sub(elapsed.0);
+                        let value = ScalarTween {
+                            from: task.captured,
+                            base: 1.,
+                            to,
+                            duration_us,
+                            easing,
+                            finish: FinishPolicy::CommitEnd,
+                            cancel: CancelPolicy::CommitCurrent,
+                        }
+                        .sample(elapsed);
+                        return (value, to, Micros(remaining));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1776,7 +2237,14 @@ impl Core {
             .find(|task| {
                 task.state == TaskState::Running
                     && task.target_task == Some(id)
-                    && matches!(task.effect, Effect::AudioStop { .. })
+                    && matches!(
+                        task.effect,
+                        Effect::AudioStop { .. }
+                            | Effect::Tween {
+                                target: TweenTarget::AudioInstance { .. },
+                                ..
+                            }
+                    )
             })
             .map_or((None, Micros(0)), |task| {
                 (
@@ -1873,6 +2341,14 @@ impl Core {
             if let Some(deadline) = self.state.choice.as_ref().and_then(|c| c.deadline_us) {
                 next = next.min(deadline.0.max(now.saturating_add(1)));
             }
+            if let Some(reveal) = &self.state.window_reveal {
+                let due = reveal
+                    .started_us
+                    .0
+                    .saturating_add(reveal.duration_us.0)
+                    .max(now.saturating_add(1));
+                next = next.min(due);
+            }
             self.state.tick_us = Micros(next);
             for t in self
                 .state
@@ -1914,9 +2390,24 @@ impl Core {
                     _ => {}
                 }
             }
+            if let Some(reveal) = self.state.window_reveal.clone() {
+                if next >= reveal.started_us.0.saturating_add(reveal.duration_us.0) {
+                    self.state.window_reveal = None;
+                    self.state.dialogue_hidden = !reveal.to_visible;
+                }
+            }
             if let Some(c) = self.state.choice.clone() {
                 if c.deadline_us.is_some_and(|v| v.0 <= next) {
                     if let Some(option) = c.default {
+                        // A timeout commits the default option, typed value
+                        // included, exactly like an explicit choice.
+                        if let (Some(target), Some(value)) =
+                            (&c.result, c.values.get(&option))
+                        {
+                            let target = target.clone();
+                            let value = value.clone();
+                            self.write(&target, value)?;
+                        }
                         self.state.choice = None;
                         self.jump(c.branches[&option].clone());
                         self.trace(format!("timeout:{option}"));
@@ -2007,6 +2498,34 @@ impl Core {
             }
         })
     }
+    /// In-flight message-window reveal: (style, direction, linear progress).
+    /// The committed `dialogue_hidden` still holds the pre-op value; coverage
+    /// blends from `from_coverage` so reversals stay continuous.
+    pub fn window_reveal(&self) -> Option<(&StageTransition, bool, f32)> {
+        let reveal = self.state.window_reveal.as_ref()?;
+        let progress = (self.state.tick_us.0.saturating_sub(reveal.started_us.0) as f64
+            / reveal.duration_us.0 as f64)
+            .min(1.) as f32;
+        Some((&reveal.style, reveal.to_visible, progress))
+    }
+    fn window_coverage(&self) -> f32 {
+        match &self.state.window_reveal {
+            Some(reveal) => {
+                let progress = (self.state.tick_us.0.saturating_sub(reveal.started_us.0) as f64
+                    / reveal.duration_us.0 as f64)
+                    .clamp(0., 1.) as f32;
+                let target = if reveal.to_visible { 1. } else { 0. };
+                reveal.from_coverage + (target - reveal.from_coverage) * progress
+            }
+            None => {
+                if self.state.dialogue_hidden {
+                    0.
+                } else {
+                    1.
+                }
+            }
+        }
+    }
     /// Observations never execute story code or change task time/milestones.
     pub fn observe_audio_positions(&mut self, positions: &[AudioPosition]) -> Result<()> {
         if positions.len() > MAX_TASKS
@@ -2028,8 +2547,9 @@ impl Core {
                 if let Some(task) = self.state.tasks.get(&envelope.owner).filter(|t| {
                     t.state == TaskState::Running && t.target_task == Some(position.task)
                 }) {
-                    if !matches!(task.effect,Effect::AudioStop {duration_us,..} if envelope.elapsed_us.0<=duration_us.0)
-                    {
+                    if !envelope_owner_duration(task).is_some_and(|duration| {
+                        envelope.elapsed_us.0 <= duration.0
+                    }) {
                         return Err(
                             self.error("E_AUDIO_POSITION", "invalid device envelope progress")
                         );
@@ -2046,7 +2566,7 @@ impl Core {
                     if let Some(task) = self.state.tasks.get_mut(&envelope.owner).filter(|t| {
                         t.state == TaskState::Running
                             && t.target_task == Some(position.task)
-                            && matches!(t.effect, Effect::AudioStop { .. })
+                            && envelope_owner_duration(t).is_some()
                     }) {
                         // Within one device incarnation progress is monotonic.
                         task.audio_device_elapsed_us = Some(Micros(
@@ -2082,6 +2602,9 @@ impl Core {
             .choice
             .as_ref()
             .is_some_and(|c| c.deadline_us.is_some())
+            // A reveal in flight must reach its deadline even when the VM is
+            // otherwise parked at an input barrier.
+            || self.state.window_reveal.is_some()
             || self.state.tasks.values().any(|t| {
                 t.state == TaskState::Running
                     && match t.effect {
@@ -2202,6 +2725,44 @@ impl Core {
                     return Err(fail("invalid frozen reveal interval"));
                 }
             }
+            // Composition snapshots: the cursor counts spawned children, each
+            // spawned child matches its declared definition and scope, a
+            // sequence runs at most its last spawned child, and a finished
+            // composition has no pending work left.
+            if let Some(defs) = t.effect.compose_children() {
+                if t.cursor as usize != t.children.len()
+                    || t.children.len() > defs.len()
+                    || t.children.iter().any(|c| !s.tasks.contains_key(c))
+                {
+                    return Err(fail("composition cursor/children"));
+                }
+                for (index, child) in t.children.iter().enumerate() {
+                    let c = &s.tasks[child];
+                    if c.name != defs[index].id
+                        || c.scope != t.scope
+                        || serde_json::to_value(&c.effect).unwrap()
+                            != serde_json::to_value(&defs[index].effect).unwrap()
+                    {
+                        return Err(fail("composition child mismatch"));
+                    }
+                }
+                if matches!(t.effect, Effect::Sequence { .. })
+                    && t.children.len() > 1
+                    && t.children[..t.children.len() - 1]
+                        .iter()
+                        .any(|c| s.tasks[c].state == TaskState::Running)
+                {
+                    return Err(fail("sequence runs more than one child"));
+                }
+                if t.milestones.contains(&Milestone::Finished)
+                    && (t.children.len() != defs.len()
+                        || t.children
+                            .iter()
+                            .any(|c| s.tasks[c].state == TaskState::Running))
+                {
+                    return Err(fail("finished composition has pending children"));
+                }
+            }
             if let Some(d) = &t.dialogue {
                 if !p.locales.contains_key(&d.locale)
                     || p.locale_config
@@ -2304,7 +2865,20 @@ impl Core {
             }
         }
         if let Some(c) = &s.choice {
-            if !matches!(&block.terminator,Terminator::Interact{choice,branches,..} if choice==&c.id&&branches==&c.branches)
+            let Terminator::Interact {
+                choice,
+                branches,
+                on_empty: _,
+                result,
+                on_cancel,
+            } = &block.terminator
+            else {
+                return Err(fail("choice continuation mismatch"));
+            };
+            if choice != &c.id
+                || branches != &c.branches
+                || result != &c.result
+                || on_cancel != &c.on_cancel
                 || top.op != block.ops.len()
                 || c.interaction >= s.next_id
                 || !p.locales.contains_key(&c.locale)
@@ -2326,6 +2900,33 @@ impl Core {
             {
                 return Err(fail("unavailable timeout default"));
             }
+            // Typed-result snapshots: the values are exactly the declared
+            // values of the offered options, the cursor names a live enabled
+            // row, and non-result interactions carry neither.
+            let definition = p.choices.get(&c.id).ok_or_else(|| fail("missing choice"))?;
+            let expected: BTreeMap<_, _> = c
+                .options
+                .iter()
+                .filter_map(|o| {
+                    definition
+                        .options
+                        .iter()
+                        .find(|d| d.id == o.id)
+                        .and_then(|d| d.value.clone())
+                        .map(|value| (o.id.clone(), value))
+                })
+                .collect();
+            if c.result.is_some() {
+                if expected != c.values
+                    || c.selected
+                        .as_ref()
+                        .is_none_or(|id| !c.options.iter().any(|o| &o.id == id && o.enabled))
+                {
+                    return Err(fail("invalid typed-result interaction"));
+                }
+            } else if !c.values.is_empty() || c.selected.is_some() {
+                return Err(fail("plain interaction carries no result state"));
+            }
         }
         for (index, f) in s.frames.iter().enumerate() {
             if index == 0 {
@@ -2345,6 +2946,24 @@ impl Core {
         }
         if !s.dialogue_appearance.valid() {
             return Err(fail("invalid dialogue appearance"));
+        }
+        if let Some(reveal) = &s.window_reveal {
+            // Structural only: the reveal is operation-committed, so unlike
+            // tasks it has no cue declaration to match against.
+            if !p.requires.iter().any(|c| c == "text.window-transition.v1")
+                || !reveal.style.valid()
+                || reveal.duration_us.0 == 0
+                || !reveal.from_coverage.is_finite()
+                || !(0. ..=1.).contains(&reveal.from_coverage)
+                || reveal.started_us.0.saturating_add(reveal.duration_us.0) <= s.tick_us.0
+            {
+                return Err(fail("invalid window reveal"));
+            }
+            if reveal.style.asset().is_some_and(|asset| {
+                p.asset(asset).is_none_or(|a| a.kind != AssetKind::Image)
+            }) {
+                return Err(fail("invalid window reveal mask"));
+            }
         }
         let mut property_owners = BTreeSet::new();
         let mut envelope_owners = BTreeSet::new();
@@ -2422,6 +3041,36 @@ impl Core {
                         return Err(fail("invalid stop ownership or progress"));
                     }
                 }
+                Effect::Tween {
+                    target: TweenTarget::AudioInstance { task, .. },
+                    to,
+                    duration_us,
+                    easing,
+                    ..
+                } => {
+                    let target_id = t.target_task.ok_or_else(|| fail("missing stop target"))?;
+                    let audio = s
+                        .tasks
+                        .get(&target_id)
+                        .ok_or_else(|| fail("missing audio instance"))?;
+                    if target_id >= t.id
+                        || audio.name != *task
+                        || !matches!(audio.effect, Effect::Audio { .. })
+                        || !matches!(easing, Easing::Linear)
+                        || !to.is_finite()
+                        || !(0.0..=1.0).contains(to)
+                        || !t.captured.is_finite()
+                        || !(0.0..=1.0).contains(&t.captured)
+                        || !t.base.is_finite()
+                        || !(0.0..=1.0).contains(&t.base)
+                        || (t.state == TaskState::Running
+                            && (audio.state != TaskState::Running
+                                || t.elapsed_us.0 >= duration_us.0
+                                || !envelope_owners.insert(target_id)))
+                    {
+                        return Err(fail("invalid tween envelope ownership or progress"));
+                    }
+                }
                 _ if t.target_task.is_some() => return Err(fail("unexpected target task")),
                 _ => {}
             }
@@ -2444,8 +3093,7 @@ impl Core {
                 return Err(fail("orphan frame task"));
             }
             if let Some(elapsed) = t.audio_device_elapsed_us {
-                if !matches!(t.effect,Effect::AudioStop {duration_us,..} if elapsed.0<=duration_us.0)
-                {
+                if !envelope_owner_duration(t).is_some_and(|duration| elapsed.0 <= duration.0) {
                     return Err(fail("invalid device envelope checkpoint"));
                 }
             }
@@ -2557,12 +3205,7 @@ pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView
         .cues
         .values()
         .flat_map(|cue| &cue.effects)
-        .any(|definition| {
-            definition.id == task.name
-                && definition.scope == task.scope
-                && serde_json::to_value(&definition.effect).unwrap()
-                    == serde_json::to_value(&task.effect).unwrap()
-        })
+        .any(|definition| def_matches_task(definition, task))
     {
         return Err(Diagnostic::new(
             "E_SNAPSHOT",
@@ -2571,6 +3214,19 @@ pub(crate) fn validate_task_definition(task: &Task, program: &RuntimeProgramView
         ));
     }
     Ok(())
+}
+
+/// A task matches its declaration anywhere in the cue's effect tree,
+/// composition children included.
+fn def_matches_task(def: &EffectDef, task: &Task) -> bool {
+    (def.id == task.name
+        && def.scope == task.scope
+        && serde_json::to_value(&def.effect).unwrap()
+            == serde_json::to_value(&task.effect).unwrap())
+        || def
+            .effect
+            .compose_children()
+            .is_some_and(|children| children.iter().any(|child| def_matches_task(child, task)))
 }
 
 pub(crate) fn validate_dialogue(

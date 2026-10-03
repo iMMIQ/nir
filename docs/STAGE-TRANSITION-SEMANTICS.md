@@ -1,6 +1,6 @@
 # 场景方向擦除
 
-StagePresent 保留唯一任务、资源准备及前后场景所有权，增加可选 transition。缺省与旧文件仍为 dissolve；非默认 wipe 要求 `stage.wipe.v1`，编译器按实际使用推导。纹理阈值遮罩使用下节的独立能力；消息根/UI 根与动态输入继续作为计划后续增量。
+StagePresent 保留唯一任务、资源准备及前后场景所有权，增加可选 transition。缺省与旧文件仍为 dissolve；非默认 wipe 要求 `stage.wipe.v1`，编译器按实际使用推导。纹理阈值遮罩使用下节的独立能力；消息窗口与菜单页面作为转场根见文末一节，其余 UI 根与动态输入继续作为计划后续增量。
 
 ```json
 {"type":"stage_present","scene":"next","duration_us":"600000",
@@ -33,4 +33,21 @@ asset 必须是已声明的 Image；channel 当前只允许 alpha，其他值拒
 
 遮罩加入 cue 媒体闭包、发行根索引、模块消费者、激活配方、运行中资产留存及读档目录/媒体准备。runtime 拒绝缺少遮罩的配方，按已有图片尺寸与解码/驻留成本记账；转场结束后释放活动留存，恢复运行中任务时重新准备。图片与前后场景联合准备成功后才提交，不在播放过程中偷偷请求遮罩。字段、方向/极性/软边都作为任务定义冻结并接受恢复一致性校验。
 
-此项只支持冻结场景根。消息/UI 根、动态/live 输入、来源图像通道与 vague/ramplen 的精确换算仍待后续交付。硬件 WebGPU 和 Windows 实机仍需单独认证。
+此项只支持冻结场景根。消息根见下节；UI 根、动态/live 输入、来源图像通道与 vague/ramplen 的精确换算仍待后续交付。硬件 WebGPU 和 Windows 实机仍需单独认证。
+
+## 消息根（窗口揭示）
+
+`text.window-transition.v1` 把同一转场样式集挂到消息窗口：`dialogue_visibility` 增加可选 `transition` 与 `duration_us`（0 < duration_us ≤ 60 秒），缺省与旧文件仍是立即翻转，不要求该能力。
+
+```json
+{"type":"dialogue_visibility","visible":false,
+ "transition":{"type":"wipe","direction":"left_to_right","softness":0.2},
+ "duration_us":"10000000"}
+```
+
+揭示不是独立任务：它跟随 Story 时钟并加入 needs_clock，暂停冻结进度；提交的 `dialogue_hidden` 只在截止时刻翻转。dissolve 把覆盖度乘进消息框背景四边形与文字的透明度，其余绘制项不动；擦除/遮罩等空间样式把消息框四边形与文字从主绘制序剥离成窗口根，原位留下覆盖整个表面的哨兵四边形（`@window`），经与舞台转场相同的双输入混合路径呈现——隐藏方向把已渲染窗口放在 source 侧由覆盖度擦除，显示方向放在 target 侧。HUD 按钮在消息框之后绘制，不属于窗口根，不参与揭示。窗口根本身每帧重绘，正文揭示与外观动画在覆盖之下继续。
+
+反向同款操作以打断时刻的覆盖度为新起点（from_coverage）；与已提交状态一致的同款操作立即提交；旧两字段立即翻转会中断在飞的揭示。快照捕获飞行中的样式、方向、起点覆盖与起止时刻，恢复做结构校验，样式或遮罩与发行定义不一致时拒绝（invalid window reveal / invalid window reveal mask）。遮罩资产必须是已声明的 Image，与状态资产一起进入准备闭包与 TopUp 需求，整段揭示期间只取一次；减少动态效果跳过动画、在截止时刻直接提交。
+
+来源映射：LiveNovel 的 MESON/MESOFF 渐隐毫秒数大于零时映射为 dissolve 揭示（duration_us = 毫秒×1000），为零时保持立即翻转；导入账本据此把 `livenovel.textbox.fade` 从 approximate 升为 adapted（仅当确有渐隐位点，见 [导入](IMPORT.md)）。菜单页面根已按 `ui.menu-transition.v1` 复用同一组样式与混合路径（见 [菜单页面效果](MENU-EFFECTS-SEMANTICS.md) 的空间揭示样式一节）；其余 UI 根、硬件 WebGPU 和 Windows 实机仍需单独认证。
+

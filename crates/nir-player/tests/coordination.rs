@@ -57,6 +57,52 @@ fn playing() -> Player {
     ready(&mut p, c);
     p
 }
+/// A rain.json variant whose story opens on a typed interaction: the route
+/// options carry i32 values written to `picked`, and `mode` picks between
+/// plain, typed, and typed-plus-cancel destinations.
+fn typed_program(mode: &str) -> Program {
+    let mut p: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    if mode != "plain" {
+        p.requires.push("story.typed-result.v1".into());
+    }
+    p.variables.insert(
+        "picked".into(),
+        serde_json::from_value(serde_json::json!({"type":"i32","value":0})).unwrap(),
+    );
+    for (option, value) in p.choices.get_mut("route").unwrap().options.iter_mut().zip([1, 2]) {
+        option.value =
+            Some(serde_json::from_value(serde_json::json!({"type":"i32","value":value})).unwrap());
+    }
+    let f = p.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({"terminator":{
+            "type":"interact","choice":"route",
+            "branches":{"walk":"after_walk","stay":"after_stay"},"on_empty":"failed",
+            "result":(mode != "plain").then_some("picked"),
+            "on_cancel":(mode == "cancel").then_some("gave_up")}}))
+        .unwrap(),
+    );
+    for (block, outcome) in [("after_walk", "walk"), ("after_stay", "stay"), ("gave_up", "gave_up")] {
+        f.blocks.insert(
+            block.into(),
+            serde_json::from_value(serde_json::json!({"terminator":{"type":"end","outcome":outcome}}))
+                .unwrap(),
+        );
+    }
+    p
+}
+fn typed_playing(mode: &str) -> Player {
+    let mut p = Player::new(typed_program(mode), "release".into(), "Test".into()).unwrap();
+    let c = p.pump(vec![], 1000);
+    ready(&mut p, c);
+    let c = action(&mut p, UiAction::NewGame);
+    ready(&mut p, c);
+    assert!(p.core().state().choice.is_some(), "typed interaction pending");
+    p
+}
 #[test]
 fn stale_asset_callbacks_cannot_commit() {
     let mut p = player();
@@ -221,6 +267,95 @@ fn consecutive_rollbacks_keep_the_earlier_checkpoints() {
     assert!(p.generation.session > epoch);
     assert!(p.paused());
     assert!(p.error.is_none(), "{:?}", p.error);
+}
+
+#[test]
+fn typed_interaction_save_and_load_restores_the_selection() {
+    let mut p = typed_playing("typed");
+    let interaction = p.current_interaction();
+    // The semantic cursor moves through the same action path the engine's
+    // focus sync uses; hover and keyboard focus stay presentation-only.
+    let c = action(&mut p, UiAction::SelectChoice { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(
+        p.core().state().choice.as_ref().unwrap().selected.as_deref(),
+        Some("stay")
+    );
+    let snapshot = p.core().snapshot();
+    let digest = nir_content::digest(&serde_json::to_vec(&snapshot).unwrap());
+    let epoch = p.generation.session;
+    let c = p.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(SaveEnvelope {
+                format: 1,
+                slot: 0,
+                revision: 1,
+                snapshot,
+                digest,
+            }),
+        }],
+        1000,
+    );
+    ready(&mut p, c);
+    assert!(p.generation.session > epoch);
+    assert!(p.paused());
+    action(&mut p, UiAction::Continue);
+    // The pending interaction and its cursor restore together; restored
+    // interactions receive fresh identities on top of the session change.
+    let choice = p.core().state().choice.as_ref().unwrap();
+    assert_ne!(choice.interaction, interaction);
+    assert_eq!(choice.selected.as_deref(), Some("stay"));
+    assert_eq!(choice.result.as_deref(), Some("picked"));
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+}
+
+#[test]
+fn rollback_after_a_typed_commit_rewinds_the_write() {
+    let mut p = typed_playing("typed");
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+    // The offer checkpoint precedes the commit, so rollback re-suspends the
+    // interaction with the typed variable back at its prior value.
+    let epoch = p.generation.session;
+    let c = action(&mut p, UiAction::Rollback);
+    ready(&mut p, c);
+    assert!(p.generation.session > epoch);
+    assert!(p.paused());
+    assert!(p.error.is_none(), "{:?}", p.error);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
+    assert_eq!(p.core().state().outcome, None);
+    let choice = p.core().state().choice.as_ref().expect("interaction re-offered");
+    assert_eq!(choice.selected.as_deref(), Some("walk"));
+    action(&mut p, UiAction::Continue);
+    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(2));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
+}
+
+#[test]
+fn player_cancel_branches_without_a_typed_write() {
+    let mut p = typed_playing("cancel");
+    let before = p.core().state().last_input;
+    let c = action(&mut p, UiAction::CancelChoice);
+    ready(&mut p, c);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
+    assert_eq!(p.core().state().outcome.as_deref(), Some("gave_up"));
+    assert_eq!(p.core().state().last_input, before + 1);
+
+    // Without a declared cancel target the affordance is refused: the
+    // interaction stays pending and nothing is written.
+    let mut p = typed_playing("typed");
+    let c = action(&mut p, UiAction::CancelChoice);
+    ready(&mut p, c);
+    assert!(p.core().state().choice.is_some());
+    assert_eq!(p.core().state().outcome, None);
+    assert_eq!(p.core().state().variables["picked"], Value::I32(0));
 }
 
 #[test]
@@ -1002,6 +1137,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             id: "walk".into(),
             label: "Walk".into(),
             enabled: true,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1010,6 +1146,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             id: "stay".into(),
             label: "Stay".into(),
             enabled: false,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1245,6 +1382,7 @@ fn measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions() {
                 format!("{i} 沿着河边，一起走回去。留在车站，读完这封信。")
             },
             enabled: i != 7,
+            selected: false,
             locale: m.text_locale.clone(),
             font_plan_digest: m.text_font_plan_digest.clone(),
             font_assets: m.text_fonts.clone(),
@@ -1390,6 +1528,317 @@ fn dialogue_opacity_multiplies_author_colors_without_fading_scene() {
         }
         assert_eq!(before.semantics.len(), after.semantics.len());
     }
+}
+
+/// A story whose entry block commits a styled window reveal and then parks on
+/// the intro dialogue, so the reveal runs while the reader holds input.
+fn reveal_player(style: StageTransition, duration_us: u64, reduced_motion: bool) -> Player {
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.requires.push("text.window-transition.v1".into());
+    let f = program.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({
+            "ops":[{"id":"reveal","operation":{
+                "type":"dialogue_visibility","visible":false,
+                "transition":serde_json::to_value(&style).unwrap(),
+                "duration_us":duration_us.to_string()}}],
+            "terminator":{"type":"activate","cue":"intro","next":"hold"}
+        }))
+        .unwrap(),
+    );
+    for (block, body) in [
+        (
+            "hold",
+            serde_json::json!({"terminator":{
+                "type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"done","on_cancelled":"done","on_failed":"done"}}),
+        ),
+        (
+            "done",
+            serde_json::json!({"terminator":{"type":"end","outcome":"done"}}),
+        ),
+    ] {
+        f.blocks
+            .insert(block.into(), serde_json::from_value(body).unwrap());
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    p.preferences.reduced_motion = reduced_motion;
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    p
+}
+
+#[test]
+fn window_reveal_projection_follows_the_story_clock_and_commits_at_the_deadline() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, false);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    let w = m.window_transition.as_ref().expect("reveal live in the model");
+    assert_eq!(w.style, StageTransition::Dissolve);
+    assert!(!w.to_visible);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    assert!(!m.hidden_dialogue, "the committed flag lands at the deadline");
+    assert!(m.dialogue.is_some(), "the view stays projectable while live");
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 600_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    assert!(m.window_transition.is_none());
+    assert!(m.hidden_dialogue);
+    assert!(m.dialogue.is_none());
+}
+
+#[test]
+fn reduced_motion_suppresses_the_reveal_and_jumps_at_the_deadline() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, true);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    assert!(m.window_transition.is_none());
+    assert!(
+        !m.hidden_dialogue,
+        "committed flag still deferred under reduced motion"
+    );
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 600_000 }], 1000);
+    ready(&mut p, commands);
+    assert!(p.model().hidden_dialogue);
+}
+
+#[test]
+fn mid_reveal_save_and_load_restores_the_flight() {
+    let mut p = reveal_player(StageTransition::Dissolve, 1_000_000, false);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let envelope = slot_envelope(&p, 0);
+    let commands = p.pump(vec![AppEvent::Loaded { envelope }], 1000);
+    ready(&mut p, commands);
+    assert!(p.paused());
+    action(&mut p, UiAction::Continue);
+    let m = p.model();
+    let w = m.window_transition.expect("reveal restored mid-flight");
+    assert_eq!(w.style, StageTransition::Dissolve);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    assert!(!m.hidden_dialogue);
+}
+
+#[test]
+fn window_mask_reveals_fetch_their_mask_once_and_hold_the_story_clock() {
+    let style = StageTransition::Mask {
+        asset: "bg.river".into(),
+        channel: MaskChannel::Alpha,
+        invert: false,
+        softness: 0.2,
+    };
+    let mut program: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    program.requires.push("text.window-transition.v1".into());
+    let f = program.functions.get_mut("main").unwrap();
+    f.entry = "test".into();
+    f.blocks.insert(
+        "test".into(),
+        serde_json::from_value(serde_json::json!({
+            "ops":[{"id":"reveal","operation":{
+                "type":"dialogue_visibility","visible":false,
+                "transition":serde_json::to_value(&style).unwrap(),
+                "duration_us":"1000000"}}],
+            "terminator":{"type":"activate","cue":"intro","next":"hold"}
+        }))
+        .unwrap(),
+    );
+    for (block, body) in [
+        (
+            "hold",
+            serde_json::json!({"terminator":{
+                "type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],
+                "next":"done","on_cancelled":"done","on_failed":"done"}}),
+        ),
+        (
+            "done",
+            serde_json::json!({"terminator":{"type":"end","outcome":"done"}}),
+        ),
+    ] {
+        f.blocks
+            .insert(block.into(), serde_json::from_value(body).unwrap());
+    }
+    let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    // Drive the new session but withhold the mask top-up request once it
+    // appears: the reveal must not run while its media is outstanding.
+    let mut queue = action(&mut p, UiAction::NewGame);
+    let mut mask_request: Option<(u32, Vec<String>)> = None;
+    for _ in 0..40 {
+        let mut next = vec![];
+        for c in queue {
+            match c {
+                AppCommand::GetAssets { request, assets, .. } => {
+                    if assets.iter().any(|a| a == "bg.river") {
+                        assert!(mask_request.replace((request, assets)).is_none(),
+                            "the mask is fetched by exactly one top-up");
+                    } else {
+                        for asset in assets {
+                            next.extend(
+                                p.pump(vec![AppEvent::AssetReady { request, asset }], 1000)
+                            );
+                        }
+                    }
+                }
+                AppCommand::PreparePresentation { request } => next
+                    .extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000)),
+                AppCommand::PrepareLocale { request, .. } => {
+                    next.extend(p.pump(vec![AppEvent::LocaleReady { request }], 1000))
+                }
+                _ => {}
+            }
+        }
+        queue = next;
+        if queue.is_empty() {
+            break;
+        }
+    }
+    let (request, withheld) =
+        mask_request.expect("the reveal mask is fetched by a top-up");
+    assert!(
+        p.paused(),
+        "the story clock holds while the mask is outstanding"
+    );
+    let before = p.core().state().tick_us;
+    p.pump(vec![AppEvent::Tick { delta_us: 5_000_000 }], 1000);
+    assert_eq!(
+        p.core().state().tick_us, before,
+        "no story time passes before the media lands"
+    );
+    let commands = p.pump(
+        withheld
+            .into_iter()
+            .map(|asset| AppEvent::AssetReady { request, asset })
+            .collect(),
+        1000,
+    );
+    ready(&mut p, commands);
+    action(&mut p, UiAction::Advance);
+    assert!(p.retained_assets().contains("bg.river"));
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
+    ready(&mut p, commands);
+    let m = p.model();
+    let w = m.window_transition
+        .as_ref()
+        .expect("reveal resumed after the fetch");
+    assert_eq!(w.style, style);
+    assert!((w.progress - 0.5).abs() < 0.001);
+    // One top-up per reveal: the completed fetch is not re-issued.
+    let later = p.pump(vec![], 1000);
+    assert!(!later.iter().any(|c| match c {
+        AppCommand::GetAssets { assets, .. } => assets.contains(&"bg.river".to_owned()),
+        _ => false,
+    }));
+}
+
+#[test]
+fn window_reveal_dissolve_folds_coverage_into_window_items_only() {
+    use nir_presentation::{project, Messages, WindowTransition};
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.loading = false;
+    model.paused = false;
+    let messages = Messages::default();
+    let before = project(&model, 1280., 800., &messages);
+    assert!(model.dialogue.is_some());
+    model.window_transition = Some(WindowTransition {
+        style: StageTransition::Dissolve,
+        to_visible: false,
+        progress: 0.25,
+    });
+    let after = project(&model, 1280., 800., &messages);
+    assert_eq!(before.quads.len(), after.quads.len());
+    assert_eq!(before.texts.len(), after.texts.len());
+    assert!(after.window_layers.is_none(), "dissolve needs no diversion");
+    // The window items (box, accent, window texts) take the coverage; the
+    // backdrop quad and the HUD controls outside the range keep their color.
+    let mut faded_quads = 0;
+    for (a, b) in before.quads.iter().zip(&after.quads) {
+        assert_eq!(b.asset, a.asset);
+        if a.color != b.color {
+            faded_quads += 1;
+            assert!((b.color[3] - a.color[3] * 0.75).abs() < 0.00001);
+        }
+    }
+    assert!(faded_quads > 0, "the window box must fade");
+    assert!(faded_quads < before.quads.len(), "HUD quads keep their color");
+    let mut faded_texts = 0;
+    for (a, b) in before.texts.iter().zip(&after.texts) {
+        assert_eq!(b.text, a.text);
+        if a.color != b.color {
+            faded_texts += 1;
+            assert!((b.color[3] - a.color[3] * 0.75).abs() < 0.00001);
+        }
+    }
+    assert!(faded_texts > 0, "the window text must fade");
+    assert!(
+        faded_texts < before.texts.len(),
+        "HUD button labels keep their color"
+    );
+}
+
+#[test]
+fn window_reveal_wipe_diverts_window_layers_behind_a_sentinel() {
+    use nir_presentation::{project, Messages, WindowTransition};
+    let wipe = StageTransition::Wipe {
+        direction: WipeDirection::LeftToRight,
+        softness: 0.,
+    };
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.loading = false;
+    model.paused = false;
+    let messages = Messages::default();
+    let before = project(&model, 1280., 800., &messages);
+    model.window_transition = Some(WindowTransition {
+        style: wipe.clone(),
+        to_visible: true,
+        progress: 0.5,
+    });
+    let after = project(&model, 1280., 800., &messages);
+    let layers = after.window_layers.as_ref().expect("spatial styles divert");
+    assert_eq!(layers.style, wipe);
+    assert!(layers.to_visible);
+    assert_eq!(layers.progress, 0.5);
+    // The diverted window run left the main list exactly once, replaced in
+    // place by a full-surface sentinel at the window's z-position.
+    let at = after
+        .quads
+        .iter()
+        .position(|q| q.asset.as_deref() == Some("@window"))
+        .expect("a sentinel quad marks the window");
+    let sentinel = &after.quads[at];
+    assert_eq!(sentinel.rect, [0., 0., 1280., 800.]);
+    let diverted = layers.quads.len();
+    assert!(diverted > 0);
+    assert_eq!(&before.quads[..at], &after.quads[..at]);
+    assert_eq!(&layers.quads, &before.quads[at..at + diverted]);
+    assert_eq!(&after.quads[at + 1..], &before.quads[at + diverted..]);
+    assert_eq!(
+        after.quads.len(),
+        before.quads.len() - diverted + 1
+    );
+    // Window texts stay in the packet for layout, routed to the window pass.
+    assert_eq!(after.texts, before.texts);
+    assert!(!layers.texts.is_empty());
+    assert!(layers
+        .texts
+        .windows(2)
+        .all(|pair| pair[0] + 1 == pair[1]));
+    assert!(layers.texts.iter().any(|&i| before.texts[i].region.is_some()));
+    assert!(after
+        .semantics
+        .iter()
+        .any(|s| s.action == UiAction::Advance));
 }
 
 #[test]
@@ -1928,6 +2377,7 @@ fn shared_primary_router_obeys_available_title_actions_and_choice_focus() {
         id: "one".into(),
         label: "one".into(),
         enabled: true,
+        selected: false,
         locale: "en".into(),
         font_plan_digest: String::new(),
         font_assets: vec![],
@@ -1980,7 +2430,11 @@ fn interface_player(policy: HidePolicy, script_hidden: bool) -> Player {
             .ops
             .push(Op {
                 id: "script-hidden".into(),
-                operation: Operation::DialogueVisibility { visible: false },
+                operation: Operation::DialogueVisibility {
+                    visible: false,
+                    transition: None,
+                    duration_us: Micros(0),
+                },
             });
     }
     let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
@@ -2486,4 +2940,307 @@ fn invalid_slot_envelope_does_not_cancel_existing_story_preparation() {
     ready(&mut p, original);
     assert!(p.core().dialogue().is_some());
     assert!(p.error.is_none());
+}
+
+/// A dialogue cue with a parallel composition beside it: the VM parks on the
+/// dialogue wait while the bell rings and the background fades concurrently.
+/// The story changes local state (affection) before activating the cue, and a
+/// second short cue follows so the chain is mid-flight across checkpoints.
+fn compose_program() -> Program {
+    let mut p: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    p.requires.push("tween.target.v1".into());
+    p.requires.push("task.compose.v1".into());
+    p.cues.insert(
+        "compose".into(),
+        serde_json::from_value(serde_json::json!({
+            "effects": [
+                {"id":"stage","scope":"scene","effect":{"type":"stage_present","scene":"station","duration_us":"0"}},
+                {"id":"line","scope":"interaction","effect":{"type":"dialogue","text":"intro","speaker":"","reveal_us":"10000000"}},
+                {"id":"chain","scope":"session","effect":{"type":"parallel_all","children":[
+                    {"id":"ring","scope":"session","effect":{"type":"audio","asset":"audio.bell","bus":"bgm","looped":false}},
+                    {"id":"fade","scope":"session","effect":{"type":"tween","target":{"type":"scene_node","node":"background","property":"opacity"},"to":0.2,"duration_us":"10000000"}}
+                ]}}
+            ]
+        }))
+        .unwrap(),
+    );
+    p.cues.insert(
+        "beat".into(),
+        serde_json::from_value(serde_json::json!({
+            "effects":[{"id":"beat","scope":"session","effect":{"type":"delay","duration_us":"4000000"}}]
+        }))
+        .unwrap(),
+    );
+    p.cues.insert(
+        "beat2".into(),
+        serde_json::from_value(serde_json::json!({
+            "effects":[{"id":"beat2","scope":"session","effect":{"type":"delay","duration_us":"100000"}}]
+        }))
+        .unwrap(),
+    );
+    let main = p.functions.get_mut("main").unwrap();
+    main.entry = "test".into();
+    for (block, body) in [
+        (
+            "test",
+            serde_json::json!({
+                "ops":[{"id":"affection.set","operation":{"type":"assign","target":"affection","value":{"type":"const","value":{"type":"i32","value":5}}}}],
+                "terminator":{"type":"activate","cue":"compose","next":"hold"}
+            }),
+        ),
+        (
+            "hold",
+            serde_json::json!({
+                "terminator":{"type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],"next":"second","on_cancelled":"second","on_failed":"second"}
+            }),
+        ),
+        (
+            "second",
+            serde_json::json!({"terminator":{"type":"activate","cue":"beat","next":"wait_beat"}}),
+        ),
+        (
+            "wait_beat",
+            serde_json::json!({
+                "terminator":{"type":"await","conditions":[{"task":"beat","milestone":{"type":"finished"}}],"next":"third","on_cancelled":"third","on_failed":"third"}
+            }),
+        ),
+        (
+            "third",
+            serde_json::json!({"terminator":{"type":"activate","cue":"beat2","next":"wait_beat2"}}),
+        ),
+        (
+            "wait_beat2",
+            serde_json::json!({
+                "terminator":{"type":"await","conditions":[{"task":"beat2","milestone":{"type":"finished"}}],"next":"wait_chain","on_cancelled":"wait_chain","on_failed":"wait_chain"}
+            }),
+        ),
+        (
+            "wait_chain",
+            serde_json::json!({
+                "terminator":{"type":"await","conditions":[{"task":"chain","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}
+            }),
+        ),
+        (
+            "done",
+            serde_json::json!({"terminator":{"type":"end","outcome":"done"}}),
+        ),
+    ] {
+        main.blocks
+            .insert(block.into(), serde_json::from_value(body).unwrap());
+    }
+    p
+}
+
+fn audio_starts(commands: &[AppCommand]) -> Vec<(u32, Micros, u32)> {
+    commands
+        .iter()
+        .filter_map(|c| {
+            if let AppCommand::AudioStart {
+                task,
+                position_us,
+                session,
+                ..
+            } = c
+            {
+                Some((*task, *position_us, *session))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
+    let mut p = Player::new(compose_program(), "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    // The VM parks on the dialogue wait while both children run beside it.
+    let state = p.core().state();
+    assert!(state.waiting.is_some());
+    assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
+    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
+    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Running);
+    // Local state changed and the chain is mid-flight.
+    p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 1000);
+    let state = p.core().state();
+    assert_eq!(state.variables["affection"], Value::I32(5));
+    assert_eq!(state.tasks[&state.handles["fade"]].elapsed_us, Micros(1_000_000));
+
+    // The save envelope freezes the mid-flight chain and the changed state.
+    let commands = action(&mut p, UiAction::Save { slot: 0 });
+    let (job, envelope) = commands
+        .into_iter()
+        .find_map(|c| {
+            if let AppCommand::Save {
+                job, envelope, ..
+            } = c
+            {
+                Some((job, envelope))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let saved = &envelope.snapshot;
+    assert_eq!(saved.variables["affection"], Value::I32(5));
+    assert_eq!(saved.tasks[&saved.handles["chain"]].cursor, 2);
+    assert_eq!(
+        saved.tasks[&saved.handles["ring"]].elapsed_us,
+        Micros(1_000_000)
+    );
+    let saved_fade = &saved.tasks[&saved.handles["fade"]];
+    assert_eq!((saved_fade.elapsed_us, saved_fade.captured), (Micros(1_000_000), 1.));
+    p.pump(
+        vec![AppEvent::Saved {
+            job,
+            slot: 0,
+            revision: 1,
+        }],
+        1000,
+    );
+
+    // Loading the slot restores the composition and resumes it exactly once.
+    let session = p.generation.session;
+    let job = slot_load_job(&mut p, 0);
+    let commands = p.pump(
+        vec![AppEvent::SlotLoaded {
+            job,
+            envelope,
+        }],
+        1000,
+    );
+    let commands = ready(&mut p, commands);
+    assert!(p.generation.session > session);
+    assert!(p.paused());
+    let ring = p.core().state().handles["ring"];
+    // One AudioStart total: the restore resume carrying the saved offset.
+    assert_eq!(
+        audio_starts(&commands),
+        vec![(ring, Micros(1_000_000), p.generation.session)]
+    );
+    // The restored chain continues from its frozen values, not from a restart.
+    let state = p.core().state();
+    assert_eq!(state.variables["affection"], Value::I32(5));
+    let fade = &state.tasks[&state.handles["fade"]];
+    assert_eq!((fade.elapsed_us, fade.captured), (Micros(1_000_000), 1.));
+    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
+    assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
+
+    // Release the restored pause; the chain finishes without any replay.
+    action(&mut p, UiAction::Continue);
+    let commands = p.pump(
+        vec![AppEvent::AudioEnded {
+            domain: TimeDomain::Story,
+            task: ring,
+            session: p.generation.session,
+        }],
+        1000,
+    );
+    let commands = ready(&mut p, commands);
+    assert!(audio_starts(&commands).is_empty());
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 9_000_000 }], 1000);
+    ready(&mut p, commands);
+    let state = p.core().state();
+    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Finished);
+    assert_eq!(
+        state
+            .scene
+            .iter()
+            .find(|n| n.id == "background")
+            .unwrap()
+            .opacity,
+        0.2
+    );
+    assert!(state.tasks[&state.handles["chain"]]
+        .milestones
+        .contains(&nir_format::Milestone::Finished));
+    // The parked dialogue resolves on reader input and the story ends.
+    let commands = action(&mut p, UiAction::Advance);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::Advance);
+    ready(&mut p, commands);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 9_000_000 }], 1000);
+    ready(&mut p, commands);
+    // The beat cue's activation stops the clock mid-tick; the next host frame
+    // resumes it, exactly like a render loop would.
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 1000);
+    ready(&mut p, commands);
+    assert_eq!(p.core().state().outcome.as_deref(), Some("done"));
+}
+
+#[test]
+fn parallel_chain_rolls_back_mid_flight_without_replay() {
+    let mut p = Player::new(compose_program(), "release".into(), "Test".into()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::NewGame);
+    ready(&mut p, commands);
+    p.pump(vec![AppEvent::Tick { delta_us: 2_000_000 }], 1000);
+    // Finish the dialogue so the beat cue activates and checkpoints a state
+    // with the chain mid-flight at the two-second mark.
+    let commands = action(&mut p, UiAction::Advance);
+    ready(&mut p, commands);
+    let commands = action(&mut p, UiAction::Advance);
+    ready(&mut p, commands);
+    assert!(p.core().state().waiting.is_some());
+    assert_eq!(
+        p.core().state().tasks[&p.core().state().handles["fade"]].elapsed_us,
+        Micros(2_000_000)
+    );
+    // Run past that checkpoint so the rollback really rewinds live progress.
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 4_000_000 }], 1000);
+    ready(&mut p, commands);
+    let commands = p.pump(vec![], 1000);
+    ready(&mut p, commands);
+    assert_eq!(
+        p.core().state().tasks[&p.core().state().handles["fade"]].elapsed_us,
+        Micros(6_000_000)
+    );
+
+    // Rolling back returns to that checkpoint: the chain rewinds to its
+    // frozen two-second values and the running audio resumes exactly once.
+    let session = p.generation.session;
+    let commands = action(&mut p, UiAction::Rollback);
+    let commands = ready(&mut p, commands);
+    assert!(p.generation.session > session);
+    assert!(p.paused());
+
+    let ring = p.core().state().handles["ring"];
+    assert_eq!(
+        audio_starts(&commands),
+        vec![(ring, Micros(2_000_000), p.generation.session)]
+    );
+    let state = p.core().state();
+    let fade = &state.tasks[&state.handles["fade"]];
+    assert_eq!((fade.elapsed_us, fade.captured), (Micros(2_000_000), 1.));
+    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
+    assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
+    assert_eq!(state.variables["affection"], Value::I32(5));
+
+    // The rewound chain completes exactly once and the story still ends.
+    action(&mut p, UiAction::Continue);
+    let commands = p.pump(
+        vec![AppEvent::AudioEnded {
+            domain: TimeDomain::Story,
+            task: ring,
+            session: p.generation.session,
+        }],
+        1000,
+    );
+    let commands = ready(&mut p, commands);
+    assert!(audio_starts(&commands).is_empty());
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 8_000_000 }], 1000);
+    ready(&mut p, commands);
+    let commands = p.pump(vec![AppEvent::Tick { delta_us: 10_000_000 }], 1000);
+    ready(&mut p, commands);
+    let state = p.core().state();
+    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Finished);
+    assert!(state.tasks[&state.handles["chain"]]
+        .milestones
+        .contains(&nir_format::Milestone::Finished));
+    assert_eq!(state.outcome.as_deref(), Some("done"));
 }

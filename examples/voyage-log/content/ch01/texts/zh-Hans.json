@@ -1,0 +1,62 @@
+{
+  "log1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "暮色里船离了岸。你在掌灯前坐下，翻开这本空白的夜航日志。",
+        "emphasis": false
+      }
+    ]
+  },
+  "log2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "第一行先记风：东南，二级，浪不高。",
+        "emphasis": false
+      }
+    ]
+  },
+  "log3": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "灯芯偶尔一跳，把你的影子钉在舱壁上。",
+        "emphasis": false
+      }
+    ]
+  },
+  "log4": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "过半程的时候，岸上的灯火只剩下三粒。",
+        "emphasis": false
+      }
+    ]
+  },
+  "log5": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "spans": [
+      {
+        "type": "text",
+        "id": "body",
+        "text": "天将亮未亮。你合上日志，靠岸的方向已经有雾。",
+        "emphasis": false
+      }
+    ]
+  }
+}

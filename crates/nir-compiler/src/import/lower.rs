@@ -38,6 +38,27 @@ pub struct SourceLocation {
     pub byte: usize,
     pub command: String,
 }
+/// One mapping-rule conclusion for the compatibility report: the behavior
+/// level (exact/adapted/approximate/unsupported) is kept separate from the
+/// evidence class behind it. Public records must not contain private paths
+/// or story text.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportMapping {
+    pub rule: String,
+    pub level: String,
+    pub evidence: String,
+    pub source_version: String,
+    pub behavior: String,
+    pub capabilities: Vec<String>,
+    /// Where divergence is allowed and which items remain open; `None` for
+    /// exact/adapted rules.
+    pub approximation: Option<String>,
+}
+impl ImportMapping {
+    pub fn approximate(&self) -> bool {
+        self.level == "approximate"
+    }
+}
 #[derive(Debug, Serialize)]
 pub struct ImportReport {
     pub format: u32,
@@ -45,11 +66,31 @@ pub struct ImportReport {
     pub status: String,
     pub written: bool,
     pub errors: usize,
+    /// Number of approximate mapping rules that require explicit
+    /// author acceptance.
+    pub approximate: usize,
     pub text_pages: usize,
     pub functions: usize,
     pub coverage: String,
+    pub mappings: Vec<ImportMapping>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub source_map: BTreeMap<String, SourceLocation>,
+}
+impl ImportReport {
+    /// The aggregate status a mapping ledger implies: unsupported content
+    /// blocks strict conversion through `errors`, approximations change the
+    /// claim, adaptations keep the converted-with-adaptations wording.
+    pub fn status_from_mappings(mappings: &[ImportMapping]) -> &'static str {
+        if mappings.iter().any(|m| m.level == "unsupported") {
+            "blocked"
+        } else if mappings.iter().any(|m| m.approximate()) {
+            "converted_with_approximations"
+        } else if mappings.iter().any(|m| m.level == "adapted") {
+            "converted_with_adaptations"
+        } else {
+            "converted"
+        }
+    }
 }
 
 pub(super) struct Lowering {
@@ -139,10 +180,60 @@ impl Lowering {
             .iter()
             .filter(|d| d.severity == "error")
             .count();
-        ImportReport { format: 1, engine: "livemaker".into(), status: if errors > 0 { "blocked" } else { "converted" }.into(),
-            written: false, errors, text_pages: self.texts.len(), functions: self.functions.len(),
+        let mut mappings = vec![
+            ImportMapping {
+                rule: "lsb.control-flow".into(),
+                level: "exact".into(),
+                evidence: "documented".into(),
+                source_version: "LSB1xx".into(),
+                behavior: "Label/Jump/Call/Exit/Terminate with literal conditions map onto goto/call/end with the original targets.".into(),
+                capabilities: vec![],
+                approximation: None,
+            },
+            ImportMapping {
+                rule: "lsb.text".into(),
+                level: "adapted".into(),
+                evidence: "documented".into(),
+                source_version: "LSB1xx".into(),
+                behavior: "Synchronous TextIns becomes NIR dialogue with the original history/wait/stop flags and page breaks.".into(),
+                capabilities: vec![],
+                approximation: Some(
+                    "Source typography (font, styles, ruby) is presented by the NIR reader; media references are reported, not converted."
+                        .into(),
+                ),
+            },
+        ];
+        if errors > 0 {
+            mappings.push(ImportMapping {
+                rule: "lsb.unsupported-commands".into(),
+                level: "unsupported".into(),
+                evidence: "documented".into(),
+                source_version: "LSB1xx".into(),
+                behavior: format!(
+                    "{errors} unsupported location(s) block strict analysis; drafts lower them to fault blocks for manual migration."
+                ),
+                capabilities: vec![],
+                approximation: None,
+            });
+        }
+        ImportReport {
+            format: 2,
+            engine: "livemaker".into(),
+            status: if errors > 0 {
+                "blocked".into()
+            } else {
+                ImportReport::status_from_mappings(&mappings).into()
+            },
+            written: false,
+            errors,
+            approximate: mappings.iter().filter(|m| m.approximate()).count(),
+            text_pages: self.texts.len(),
+            functions: self.functions.len(),
             coverage: "Reachable control flow only. Unsupported instructions terminate analysis on their path. NIR reader presentation replaces source typography; no source media are copied.".into(),
-            diagnostics: self.diagnostics.clone(), source_map: self.locations.clone() }
+            mappings,
+            diagnostics: self.diagnostics.clone(),
+            source_map: self.locations.clone(),
+        }
     }
     fn function(&mut self, start: Point) -> Result<()> {
         let mut blocks = BTreeMap::new();

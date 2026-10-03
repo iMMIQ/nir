@@ -1,0 +1,37 @@
+{
+  "log1": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "log2": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "log3": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "log4": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  },
+  "log5": {
+    "source_revision": 1,
+    "contract_revision": 1,
+    "meaning_revision": 1,
+    "gates": [],
+    "params": {}
+  }
+}

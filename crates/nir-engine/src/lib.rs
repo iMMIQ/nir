@@ -257,12 +257,44 @@ impl Engine {
     ) -> Option<UiAction> {
         nir_presentation::control_value_action(&self.packet, id, expected, direction)
     }
-    pub fn focus_control(&mut self, id: Option<u32>) {
+    pub fn focus_control(&mut self, id: Option<u32>) -> std::result::Result<(), String> {
         self.keyboard_focus
             .select(&self.packet, self.input_identity(), self.player.screen, id);
         self.visual_invalidated = true;
+        self.sync_focus_selection()
     }
-    pub fn navigate_focus(&mut self, direction: u8) -> Option<u32> {
+    /// Keyboard focus that lands on a choice row of a typed-result interaction
+    /// moves the semantic selection cursor. The observation rides the normal
+    /// action path; it carries no input identity and cannot progress the story.
+    fn sync_focus_selection(&mut self) -> std::result::Result<(), String> {
+        let option = self
+            .keyboard_focus
+            .node(&self.packet, self.input_identity(), self.player.screen)
+            .and_then(|node| match &node.action {
+                UiAction::Choose { option } => Some(option.clone()),
+                _ => None,
+            });
+        let Some(option) = option else {
+            return Ok(());
+        };
+        if !self
+            .player
+            .core()
+            .state()
+            .choice
+            .as_ref()
+            .is_some_and(|c| c.result.is_some())
+        {
+            return Ok(());
+        }
+        self.pump(vec![AppEvent::Action {
+            action: UiAction::SelectChoice { option },
+            interaction: self.player.current_interaction(),
+            sequence: 0,
+            session: self.player.generation.session,
+        }])
+    }
+    pub fn navigate_focus(&mut self, direction: u8) -> std::result::Result<Option<u32>, String> {
         let identity = self.input_identity();
         let screen = self.player.screen;
         let current = self
@@ -348,7 +380,8 @@ impl Engine {
                         self.keyboard_focus.select(&projected, identity, screen, id);
                         self.packet = projected;
                         self.visual_invalidated = true;
-                        return id;
+                        self.sync_focus_selection()?;
+                        return Ok(id);
                     }
                 }
             }
@@ -357,7 +390,8 @@ impl Engine {
             .keyboard_focus
             .navigate(&self.packet, identity, screen, direction);
         self.visual_invalidated = true;
-        id
+        self.sync_focus_selection()?;
+        Ok(id)
     }
     pub fn focused_center(&self) -> Option<(f32, f32)> {
         let n =
@@ -958,11 +992,17 @@ impl Engine {
         let residency = self.player.content_residency();
         let mut state = serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.presentation_screen()),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()});
         state["history_scrollbar"] = serde_json::json!(self.packet.history_bar);
+        state["window"] = serde_json::json!(c.window_reveal().map(|(_, _, p)| p));
         state["menu_depth"] = serde_json::json!(self.player.menu_depth());
         state["history_pending"] = serde_json::json!(self.reading.history_pending());
         state["history_error"] = serde_json::json!(self.reading.history_error());
         state["interface_hidden"] = serde_json::json!(self.player.interface_hidden());
         state["foreground_clock_us"] = serde_json::json!(self.player.foreground_clock());
+        state["menu_opacity"] = serde_json::json!(self.player.menu_opacity());
+        state["menu_transition"] =
+            serde_json::json!(self.player.menu_transition().map(|(_, _, p)| p));
+        state["menu_element_progress"] = serde_json::json!(self.player.menu_element_progress());
+        state["replay"] = serde_json::json!(self.player.replay_phase());
         state["foreground_paused"] =
             serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));
         state["dialogue_appearance"] = serde_json::json!(c.sample_dialogue_appearance());
@@ -982,6 +1022,11 @@ impl Engine {
             "paused": self.player.paused(),
             "loading": self.player.is_loading(),
             "has_dialogue": c.dialogue().is_some(),
+            "choice_cancellable": c
+                .state()
+                .choice
+                .as_ref()
+                .is_some_and(|choice| choice.on_cancel.is_some()),
             "frames": self.renderer.submitted,
             "backend": self.renderer.backend.as_str(),
             "resident_bytes": self.player.memory_used(),
@@ -1190,6 +1235,10 @@ impl Engine {
             self.work_remaining -= used;
         }
         self.state_dirty |= !clock_only || work > admitted;
+        // Foreground-owned visuals (menu page fades) complete inside
+        // clock-only ticks and release their clock token at that instant;
+        // without this the settled frame may never be projected.
+        self.state_dirty |= self.player.take_ui_visual_pulse();
         Ok(())
     }
 

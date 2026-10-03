@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-pub use lower::{ImportDiagnostic, ImportReport, SourceLocation};
+pub use lower::{ImportDiagnostic, ImportMapping, ImportReport, SourceLocation};
 pub use ui::UiInventory;
 
 #[derive(Debug)]
@@ -32,6 +32,10 @@ pub struct ImportOptions {
     pub entry: Option<String>,
     pub line: u32,
     pub draft: bool,
+    /// Approximate mapping rules the author explicitly accepted by rule id;
+    /// any other approximate rule blocks the conversion after the report is
+    /// written. Draft conversions keep their own incomplete contract.
+    pub accept_approximate: Vec<String>,
     pub game_id: String,
     pub title: String,
     pub locale: String,
@@ -279,6 +283,31 @@ fn destination(source: &Path, out: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Approximate mappings are a compatibility claim, not an ignorable warning:
+/// after the project and report are published, any approximate rule the author
+/// did not accept by id fails the command. A typo'd id cannot silently pass —
+/// the real rule stays unaccepted and is named in the error.
+pub(super) fn enforce_acceptance(
+    mappings: &[ImportMapping],
+    options: &ImportOptions,
+) -> Result<()> {
+    if options.draft {
+        return Ok(());
+    }
+    let unaccepted: Vec<&str> = mappings
+        .iter()
+        .filter(|m| m.approximate())
+        .map(|m| m.rule.as_str())
+        .filter(|rule| !options.accept_approximate.iter().any(|a| a == rule))
+        .collect();
+    ensure!(
+        unaccepted.is_empty(),
+        "E_IMPORT_APPROXIMATE: approximate rule(s) [{}] require explicit acceptance (--accept-approximate); see mappings in import-report.json",
+        unaccepted.join(", ")
+    );
+    Ok(())
+}
+
 /// Strict mode writes nothing on unsupported semantics. Draft mode emits explicit
 /// runtime faults, an incomplete marker and a source map, never silent no-ops.
 pub fn convert(options: &ImportOptions, sdk: &Path) -> Result<ImportReport> {
@@ -319,6 +348,7 @@ pub fn convert(options: &ImportOptions, sdk: &Path) -> Result<ImportReport> {
         "E_IMPORT_EXISTS: output appeared during import"
     );
     fs::rename(&project, &out).context("E_IMPORT_OUTPUT: cannot publish generated project")?;
+    enforce_acceptance(&report.mappings, options)?;
     Ok(report)
 }
 
@@ -421,5 +451,7 @@ fn export(
     Ok(())
 }
 
+#[cfg(test)]
+mod certify;
 #[cfg(test)]
 mod tests;

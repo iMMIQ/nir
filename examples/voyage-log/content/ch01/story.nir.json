@@ -1,0 +1,266 @@
+{
+  "fragment_format": 1,
+  "variables": {},
+  "functions": {
+    "main": {
+      "entry": "start",
+      "blocks": {
+        "start": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "open",
+            "next": "page1"
+          }
+        },
+        "page1": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "log1",
+            "next": "wait1"
+          }
+        },
+        "wait1": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page2",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page2": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "log2",
+            "next": "wait2"
+          }
+        },
+        "wait2": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page3",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page3": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "log3",
+            "next": "wait3"
+          }
+        },
+        "wait3": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page4",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page4": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "log4",
+            "next": "wait4"
+          }
+        },
+        "wait4": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "page5",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "page5": {
+          "ops": [],
+          "terminator": {
+            "type": "activate",
+            "cue": "log5",
+            "next": "wait5"
+          }
+        },
+        "wait5": {
+          "ops": [],
+          "terminator": {
+            "type": "await",
+            "conditions": [
+              {
+                "task": "line",
+                "milestone": {
+                  "type": "finished"
+                }
+              }
+            ],
+            "next": "done",
+            "on_cancelled": "cancelled",
+            "on_failed": "failed"
+          }
+        },
+        "done": {
+          "ops": [],
+          "terminator": {
+            "type": "end",
+            "outcome": "completed"
+          }
+        },
+        "cancelled": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_CANCELLED",
+            "message": "A required performance was cancelled."
+          }
+        },
+        "failed": {
+          "ops": [],
+          "terminator": {
+            "type": "fault",
+            "code": "E_PERFORMANCE",
+            "message": "A required performance failed."
+          }
+        }
+      }
+    }
+  },
+  "scenes": {
+    "deck": [
+      {
+        "id": "background",
+        "asset": "bg.deck",
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 720
+      }
+    ],
+    "title": []
+  },
+  "cues": {
+    "open": {
+      "effects": [
+        {
+          "id": "stage",
+          "scope": "scene",
+          "effect": {
+            "type": "stage_present",
+            "scene": "deck",
+            "duration_us": "0"
+          }
+        }
+      ]
+    },
+    "log1": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "log1",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "log2": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "log2",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "log3": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "log3",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "log4": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "log4",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    },
+    "log5": {
+      "effects": [
+        {
+          "id": "line",
+          "scope": "interaction",
+          "effect": {
+            "type": "dialogue",
+            "text": "log5",
+            "speaker": "",
+            "reveal_us": "36000"
+          }
+        }
+      ]
+    }
+  },
+  "choices": {}
+}

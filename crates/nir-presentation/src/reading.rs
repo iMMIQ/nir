@@ -161,6 +161,8 @@ impl ReadingState {
         self.project_history_flow(&mut p, m, identity.0, messages, text);
         let added = p.menu_paint.len() - paints;
         self.project_history_bar(&mut p, m, added);
+        // The page-root divert runs after the bar splice fixed its indices.
+        super::divert_menu_page(&mut p, m);
         text.layout(&p);
         let mut views = vec![];
         for r in &mut p.texts {

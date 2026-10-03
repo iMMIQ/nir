@@ -5,8 +5,9 @@ mod menu;
 mod transition;
 mod tween;
 pub use menu::{
-    MenuCondition, MenuContent, MenuElement, MenuImageStates, MenuLocal, MenuPreference,
-    MenuRangeBinding, MenuSlot, MenuToggleBinding, MenuValue, MenuValueInput, MAX_MENU_PARENTS,
+    MenuCondition, MenuContent, MenuEffects, MenuElement, MenuElementProperty, MenuElementTween,
+    MenuImageStates, MenuLocal, MenuMusic, MenuPreference, MenuRangeBinding, MenuSlot,
+    MenuToggleBinding, MenuTransition, MenuValue, MenuValueInput, MAX_MENU_PARENTS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,8 +35,10 @@ pub const CAPABILITIES: &[&str] = &[
     "audio.buffer.v1",
     "audio.gain.v1",
     "audio.stop.v1",
+    "audio.gain-tween.v1",
     "ui.image-menu.v1",
     "text.visibility.v1",
+    "text.window-transition.v1",
     "text.voice-binding.v1",
     "text.voice-timer.v1",
     "player.hide-policy.v1",
@@ -58,6 +61,12 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-history-flow.v1",
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
+    "ui.menu-effects.v1",
+    "ui.menu-transition.v1",
+    "ui.menu-element-tween.v1",
+    "ui.replay.v1",
+    "task.compose.v1",
+    "story.typed-result.v1",
     "media.webp.v1",
     "media.mp3.v1",
 ];
@@ -111,6 +120,11 @@ impl TryFrom<String> for Micros {
 impl From<Micros> for String {
     fn from(v: Micros) -> Self {
         v.0.to_string()
+    }
+}
+impl Micros {
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -710,6 +724,11 @@ pub struct Op {
 pub enum Operation {
     DialogueVisibility {
         visible: bool,
+        /// Styled reveal; absent or zero-duration commits flip instantly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transition: Option<StageTransition>,
+        #[serde(default, skip_serializing_if = "Micros::is_zero")]
+        duration_us: Micros,
     },
     Assign {
         target: String,
@@ -802,6 +821,13 @@ pub enum Terminator {
         choice: String,
         branches: BTreeMap<String, String>,
         on_empty: String,
+        /// Typed-result mode: the chosen option's declared value is written to
+        /// this variable by the VM before the branch. The host never writes.
+        #[serde(default)]
+        result: Option<String>,
+        /// Explicit cancel target; absent means the interaction is modal.
+        #[serde(default)]
+        on_cancel: Option<String>,
     },
     End {
         outcome: String,
@@ -914,6 +940,73 @@ pub enum Effect {
     Delay {
         duration_us: Micros,
     },
+    /// Children run one after another: the next child starts only after the
+    /// previous one completed, capturing the current property values at its
+    /// own start. The composition is itself a task; children are tasks with
+    /// the composition's scope.
+    Sequence {
+        children: Vec<EffectDef>,
+    },
+    /// Children all start together; the composition finishes when every child
+    /// finished, and fails or cancels as soon as any child does.
+    ParallelAll {
+        children: Vec<EffectDef>,
+    },
+}
+impl Effect {
+    /// Children of a composition, for tree walks shared by validation,
+    /// compilation and the runtime.
+    pub fn compose_children(&self) -> Option<&[EffectDef]> {
+        match self {
+            Self::Sequence { children } | Self::ParallelAll { children } => Some(children),
+            _ => None,
+        }
+    }
+    /// Whether this subtree contains any composition node. Children exist
+    /// only inside compositions, so the root being one is the whole answer.
+    pub fn uses_compose(&self) -> bool {
+        self.compose_children().is_some()
+    }
+    /// Total effect definitions in this subtree, including composites.
+    pub fn compose_leaves(&self) -> usize {
+        1 + self
+            .compose_children()
+            .map(|children| children.iter().map(|def| def.effect.compose_leaves()).sum())
+            .unwrap_or(0)
+    }
+    /// Composition nesting depth; a leaf has depth 0.
+    pub fn compose_depth(&self) -> usize {
+        self.compose_children()
+            .map(|children| {
+                1 + children
+                    .iter()
+                    .map(|def| def.effect.compose_depth())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+    /// Depth-first test over this effect and every composition child; cue
+    /// walkers that gate capabilities or media on effect kind must see the
+    /// whole tree, not only top-level definitions.
+    pub fn effect_tree_any(&self, predicate: &impl Fn(&Self) -> bool) -> bool {
+        predicate(self)
+            || self
+                .compose_children()
+                .is_some_and(|children| {
+                    children.iter().any(|def| def.effect.effect_tree_any(predicate))
+                })
+    }
+    /// Every audio asset this effect subtree starts, compositions included.
+    /// Stage present transitions are handled by the caller (scene nodes).
+    pub fn collect_audio_assets(&self, out: &mut BTreeSet<String>) {
+        if let Self::Audio { asset, .. } = self {
+            out.insert(asset.clone());
+        }
+        for def in self.compose_children().unwrap_or(&[]) {
+            def.effect.collect_audio_assets(out);
+        }
+    }
 }
 /// Typed property addresses. UI-owned objects are deliberately not addressable by Story.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -922,6 +1015,10 @@ pub enum Effect {
 pub enum TweenTarget {
     SceneNode { node: String, property: Property },
     DialogueRoot { property: DialogueProperty },
+    /// A live audio instance's envelope, by task handle. The envelope is the
+    /// 0..1 multiplier on top of the authored event gain; one envelope owner
+    /// (a gain tween or a timed stop) may target an instance at a time.
+    AudioInstance { task: String, property: AudioProperty },
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -930,6 +1027,12 @@ pub enum DialogueProperty {
     Opacity,
     BackgroundOpacity,
     TextOpacity,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioProperty {
+    Gain,
 }
 impl TweenTarget {
     pub fn accepts(&self, value: f32) -> bool {
@@ -945,6 +1048,11 @@ impl TweenTarget {
                 } => value >= 0.,
                 _ => (0.0..=1.0).contains(&value),
             }
+    }
+    /// The device renders one linear ramp per envelope owner, so envelope
+    /// tracks must delegate linearly like timed stops do.
+    pub fn requires_linear_easing(&self) -> bool {
+        matches!(self, Self::AudioInstance { .. })
     }
 }
 impl Effect {
@@ -1017,15 +1125,16 @@ pub fn valid_audio_gain(value: f32) -> bool {
     value.is_finite() && (0.0..=4.0).contains(&value)
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioBus {
+    #[default]
     Bgm,
     Voice,
     Sfx,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Easing {
     #[default]
@@ -1126,6 +1235,10 @@ pub struct ChoiceOption {
     pub visible: Option<Expr>,
     #[serde(default)]
     pub enabled: Option<Expr>,
+    /// Typed result committed by the VM when an Interact declares `result`.
+    /// Every option must carry one of the target variable's type.
+    #[serde(default)]
+    pub value: Option<Value>,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1253,6 +1366,9 @@ pub struct ImageMenu {
     pub elements: Vec<MenuElement>,
     pub background: String,
     pub buttons: Vec<ImageButton>,
+    /// Finite page presentation effects; absent keeps legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects: Option<MenuEffects>,
 }
 fn builtin_navigation_default() -> bool {
     true
@@ -1296,6 +1412,13 @@ pub enum ImageMenuAction {
     Title,
     Menu { menu: String },
     Entry { function: String },
+    /// Isolated replay: freeze the current session, run the function as a
+    /// temporary one, and return to the frozen session afterwards. Unlike
+    /// Entry this never destroys the launching session.
+    Replay { function: String },
+    /// Manual return from an active replay to the frozen session. Only
+    /// enabled while a replay session is live.
+    ExitReplay,
 }
 impl ImageMenuAction {
     pub fn ui_action(&self) -> Option<UiAction> {
@@ -1318,6 +1441,10 @@ impl ImageMenuAction {
             Self::Entry { function } => UiAction::ImageMenuEntry {
                 function: function.clone(),
             },
+            Self::Replay { function } => UiAction::ImageMenuReplay {
+                function: function.clone(),
+            },
+            Self::ExitReplay => UiAction::ExitReplay,
         })
     }
 }
@@ -1336,17 +1463,7 @@ impl Theme {
             assets.insert(asset.clone());
         }
         for menu in self.image_menus.values() {
-            assets.extend(
-                menu.elements
-                    .iter()
-                    .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
-            );
-            assets.insert(menu.background.clone());
-            for button in &menu.buttons {
-                assets.insert(button.asset.clone());
-                assets.extend(button.hover_asset.clone());
-                assets.extend(button.locked_asset.clone());
-            }
+            assets.extend(menu.image_assets());
         }
         assets
     }
@@ -1877,6 +1994,10 @@ pub enum UiAction {
     ImageMenuEntry {
         function: String,
     },
+    ImageMenuReplay {
+        function: String,
+    },
+    ExitReplay,
     HoverImage {
         id: Option<String>,
     },
@@ -1885,6 +2006,14 @@ pub enum UiAction {
     Choose {
         option: String,
     },
+    /// Move the semantic selection cursor of the pending typed-result
+    /// interaction. An observation: no input identity, no story progress.
+    SelectChoice {
+        option: String,
+    },
+    /// Cancel the pending typed-result interaction through its declared
+    /// cancel target. Hosts only offer this while a cancel affordance exists.
+    CancelChoice,
     Menu,
     Close,
     Settings,
@@ -2102,4 +2231,61 @@ pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// text.window-transition.v1: the styled reveal fields are optional and
+    /// omit cleanly; the legacy two-field op still deserializes unchanged.
+    #[test]
+    fn dialogue_visibility_transition_fields_roundtrip_and_default_away() {
+        let legacy: Operation = serde_json::from_value(serde_json::json!({
+            "type":"dialogue_visibility","visible":false
+        }))
+        .unwrap();
+        match &legacy {
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                assert!(!*visible);
+                assert_eq!(transition, &None);
+                assert_eq!(*duration_us, Micros(0));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({"type":"dialogue_visibility","visible":false})
+        );
+        let styled: Operation = serde_json::from_value(serde_json::json!({
+            "type":"dialogue_visibility","visible":true,
+            "transition":{"type":"dissolve"},
+            "duration_us":"1000000"
+        }))
+        .unwrap();
+        match &styled {
+            Operation::DialogueVisibility {
+                visible,
+                transition,
+                duration_us,
+            } => {
+                assert!(*visible);
+                assert_eq!(transition, &Some(StageTransition::Dissolve));
+                assert_eq!(*duration_us, Micros(1_000_000));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(
+            serde_json::to_value(&styled).unwrap(),
+            serde_json::json!({
+                "type":"dialogue_visibility","visible":true,
+                "transition":{"type":"dissolve"},
+                "duration_us":"1000000"
+            })
+        );
+    }
 }

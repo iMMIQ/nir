@@ -205,6 +205,9 @@ impl RuntimeProgramView {
                     Effect::Audio { asset, .. } => {
                         set.insert(asset.clone());
                     }
+                    Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                        effect.effect.collect_audio_assets(&mut set);
+                    }
                     _ => {}
                 }
             }
@@ -345,6 +348,9 @@ impl RuntimeProgramView {
                         }
                         Effect::Audio { asset, .. } => {
                             assets.insert(asset.clone());
+                        }
+                        Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                            effect.effect.collect_audio_assets(&mut assets);
                         }
                         _ => {}
                     }
@@ -1804,6 +1810,24 @@ impl ValidatedProgram {
     pub fn cue_assets(&self, cue: &str) -> BTreeSet<String> {
         self.program.cue_assets(cue)
     }
+    /// Mask identities referenced by `DialogueVisibility` reveal styles in
+    /// every loaded function body. Runtime roots only see admitted modules;
+    /// the in-flight reveal carries its own mask for the first encounter.
+    pub fn window_transition_assets(&self) -> BTreeSet<String> {
+        self.program
+            .functions
+            .values()
+            .flat_map(|function| function.blocks.values())
+            .flat_map(|block| block.ops.iter())
+            .filter_map(|op| match &op.operation {
+                Operation::DialogueVisibility {
+                    transition: Some(style),
+                    ..
+                } => style.asset().map(str::to_owned),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn bad_runtime(at: &str, message: &str) -> Diagnostic {
@@ -1823,8 +1847,17 @@ fn validate_image_menus(
         }
     }
     for menu in theme.image_menus.values() {
+        for id in menu.effect_assets() {
+            if asset(&id) != Some(AssetKind::Audio) {
+                return Err(err("E_THEME_ASSET", &id, "menu effects require an audio asset"));
+            }
+        }
+    }
+    for menu in theme.image_menus.values() {
         for (_, action, _) in menu.controls() {
-            if let ImageMenuAction::Entry { function: id } = action {
+            if let ImageMenuAction::Entry { function: id } | ImageMenuAction::Replay { function: id } =
+                action
+            {
                 if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
                     return Err(err(
                         "E_THEME_ENTRY",
@@ -1839,6 +1872,45 @@ fn validate_image_menus(
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_effects)
+        && !root.requires.iter().any(|c| c == "ui.menu-effects.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-effects.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_transition))
+        && !root.requires.iter().any(|c| c == "ui.menu-transition.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-transition.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_element_tween))
+        && !root.requires.iter().any(|c| c == "ui.menu-element-tween.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-element-tween.v1",
+        ));
+    }
     if (root.theme.menu_overlay.is_some()
         || root
             .theme
@@ -1852,6 +1924,15 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "theme.image_menus",
             "ui.menu-services.v1",
         ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_replay)
+        && !root.requires.iter().any(|c| c == "ui.replay.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.replay.v1"));
     }
     if root
         .theme
@@ -2543,6 +2624,25 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                 if !address.accepts(track.to) {
                     return Err(err("E_VISUAL", id, "invalid target value"));
                 }
+                if let TweenTarget::AudioInstance { task, .. } = &address {
+                    if !root.requires.iter().any(|c| c == "audio.gain-tween.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.gain-tween.v1"));
+                    }
+                    if !matches!(track.easing, Easing::Linear) {
+                        return Err(err("E_AUDIO_STOP", id, "envelope tweens are linear"));
+                    }
+                    if task == &def.id
+                        || root.task_owners.get(task) != Some(&package.module)
+                        || !view.task_definitions.get(task).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err("E_AUDIO_STOP", id, task));
+                    }
+                }
                 if !writers.insert(address) {
                     return Err(err("E_OWNERSHIP", id, "multiple property writers"));
                 }
@@ -2627,6 +2727,23 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
         if stages > 1 || dialogues > 1 {
             return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
         }
+        validate_composition(
+            id,
+            cue,
+            &view.requires,
+            &mut names,
+            |asset| view.asset_kind(asset),
+            |target| {
+                root.task_owners.get(target) == Some(&package.module)
+                    && view.task_definitions.get(target).is_some_and(|defs| {
+                        !defs.is_empty()
+                            && defs
+                                .iter()
+                                .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                    })
+            },
+            err,
+        )?;
         let recipe = &package.activation_recipes[id];
         if recipe.iter().any(|asset| {
             view.asset_kind(asset)
@@ -2649,6 +2766,20 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                         id,
                         "audio asset missing from activation recipe",
                     ));
+                }
+            }
+            if effect.effect.uses_compose() {
+                let mut child_audio = BTreeSet::new();
+                effect.effect.collect_audio_assets(&mut child_audio);
+                for asset in child_audio {
+                    if !recipe.contains(&asset) {
+                        return Err(err(
+                            "E_RECIPE",
+                            id,
+                            "audio asset missing from activation recipe",
+                        ));
+                    }
+                    expected.insert(asset);
                 }
             }
             if let Effect::StagePresent {
@@ -2833,6 +2964,36 @@ fn validate_runtime_function(
                         "expected local dialogue and non-looping Voice task",
                     ));
                 }
+                if let Operation::DialogueVisibility {
+                    transition: Some(style),
+                    duration_us,
+                    ..
+                } = &op.operation
+                {
+                    if !view
+                        .requires
+                        .iter()
+                        .any(|c| c == "text.window-transition.v1")
+                    {
+                        return Err(err("E_CAPABILITY", &op.id, "text.window-transition.v1"));
+                    }
+                    if !style.valid() {
+                        return Err(err("E_TRANSITION", &op.id, "invalid window reveal style"));
+                    }
+                    if duration_us.0 == 0 || duration_us.0 > 60_000_000 {
+                        return Err(err(
+                            "E_TIME",
+                            &op.id,
+                            "window reveal requires a duration within 0..60s",
+                        ));
+                    }
+                    if style
+                        .asset()
+                        .is_some_and(|asset| view.asset_kind(asset) != Some(AssetKind::Image))
+                    {
+                        return Err(err("E_ASSET", &op.id, "mask must reference an image"));
+                    }
+                }
             }
             match &op.operation {
                 Operation::Assign { target, value }
@@ -2946,9 +3107,16 @@ fn validate_runtime_function(
         if let Terminator::Await { conditions, .. } = &block.terminator {
             for condition in conditions {
                 if let Some(definitions) = view.task_definitions.get(&condition.task) {
+                    // A looped-audio leaf anywhere in a def's tree makes its
+                    // natural Finished unreachable: sequences stall at it and
+                    // parallels never see all children finished. Ending it by
+                    // control or a stop child resolves as cancellation, not
+                    // as the awaited milestone.
                     if condition.milestone == Milestone::Finished
                         && definitions.iter().all(|effect| {
-                            matches!(effect.as_ref(), Effect::Audio { looped: true, .. })
+                            effect
+                                .as_ref()
+                                .effect_tree_any(&|e| matches!(e, Effect::Audio { looped: true, .. }))
                         })
                     {
                         return Err(err("E_INFINITE_WAIT", &at, &condition.task));
@@ -2969,9 +3137,18 @@ fn validate_runtime_function(
             }
         }
         if let Terminator::Interact {
-            choice, branches, ..
+            choice,
+            branches,
+            result,
+            on_cancel,
+            ..
         } = &block.terminator
         {
+            if (result.is_some() || on_cancel.is_some())
+                && !view.requires.iter().any(|c| c == "story.typed-result.v1")
+            {
+                return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
+            }
             if let Some(definition) = view.choices.get(choice) {
                 if definition.options.len() != branches.len()
                     || definition
@@ -2980,6 +3157,20 @@ fn validate_runtime_function(
                         .any(|option| !branches.contains_key(&option.id))
                 {
                     return Err(err("E_CHOICE", &at, "branch coverage"));
+                }
+                if let Some(target) = result {
+                    let ty = view
+                        .variables
+                        .get(target)
+                        .map(Value::ty)
+                        .ok_or_else(|| err("E_VARIABLE", &at, target))?;
+                    if definition
+                        .options
+                        .iter()
+                        .any(|option| option.value.as_ref().is_none_or(|v| v.ty() != ty))
+                    {
+                        return Err(err("E_TYPE", &at, "typed-result option values"));
+                    }
                 }
             }
         }
@@ -3049,6 +3240,239 @@ fn err(code: &str, at: &str, message: &str) -> Diagnostic {
     Diagnostic::new(code, at, message)
 }
 const MAX_CONTENT_BATCH_ITEMS: usize = 128;
+/// Composition nesting cap; the task graph stays reviewable and the runtime
+/// chase loop stays bounded without trusting author intent.
+const MAX_COMPOSE_DEPTH: usize = 8;
+
+/// Every property address a def subtree writes.
+fn subtree_writers(def: &EffectDef) -> BTreeSet<TweenTarget> {
+    let mut set = BTreeSet::new();
+    if let Some((address, _, _)) = def.effect.scalar_track(0., 0.) {
+        set.insert(address);
+    }
+    for child in def.effect.compose_children().unwrap_or(&[]) {
+        set.extend(subtree_writers(child));
+    }
+    set
+}
+
+/// Writers may never overlap between effects that can run at the same
+/// instant: the def against `ambient`, then recursively. Sequence positions
+/// run alone, so a chain may rewrite the address an earlier position wrote;
+/// parallel siblings and everything outside the chain may not.
+fn check_writer_tree(
+    at: &str,
+    def: &EffectDef,
+    ambient: &BTreeSet<TweenTarget>,
+    err: &impl Fn(&str, &str, &str) -> Diagnostic,
+) -> Result<()> {
+    let own = subtree_writers(def);
+    if !ambient.is_disjoint(&own) {
+        return Err(err(
+            "E_OWNERSHIP",
+            at,
+            "concurrent effects write the same property",
+        ));
+    }
+    if let Effect::ParallelAll { children } = &def.effect {
+        let sets: Vec<_> = children.iter().map(subtree_writers).collect();
+        for (index, child) in children.iter().enumerate() {
+            let mut inner = ambient.clone();
+            for (other, set) in sets.iter().enumerate() {
+                if other != index {
+                    inner.extend(set.iter().cloned());
+                }
+            }
+            check_writer_tree(at, child, &inner, err)?;
+        }
+    }
+    if let Effect::Sequence { children } = &def.effect {
+        for child in children {
+            check_writer_tree(at, child, ambient, err)?;
+        }
+    }
+    Ok(())
+}
+
+/// The cue-level facts a composition check borrows from its caller: the
+/// diagnostic location and capability list of the cue being validated, plus
+/// its asset typing, top-level audio task membership and diagnostic
+/// constructor. Bundling them keeps the recursive child check reviewable.
+struct ComposeCheck<'a> {
+    at: &'a str,
+    requires: &'a [String],
+    asset_kind: &'a dyn Fn(&str) -> Option<AssetKind>,
+    audio_task: &'a dyn Fn(&str) -> bool,
+    err: &'a dyn Fn(&str, &str, &str) -> Diagnostic,
+}
+
+/// One composition child: scope inheritance, forbidden kinds, capabilities,
+/// assets and stop targets, exactly like a top-level effect.
+fn check_compose_child<'a>(
+    def: &'a EffectDef,
+    parent_scope: Scope,
+    depth: usize,
+    names: &mut BTreeSet<&'a String>,
+    check: &ComposeCheck<'_>,
+) -> Result<()> {
+    let ComposeCheck {
+        at,
+        requires,
+        asset_kind,
+        audio_task,
+        err,
+    } = *check;
+    if !names.insert(&def.id) {
+        return Err(err("E_DUPLICATE", at, &def.id));
+    }
+    if def.scope != parent_scope {
+        return Err(err("E_SCOPE", at, &def.id));
+    }
+    if depth > MAX_COMPOSE_DEPTH {
+        return Err(err("E_LIMIT", at, "composition nesting"));
+    }
+    if matches!(
+        def.effect,
+        Effect::StagePresent { .. } | Effect::Dialogue { .. }
+    ) {
+        return Err(err(
+            "E_COMPOSE",
+            at,
+            "composition children cannot present stages or dialogue",
+        ));
+    }
+    if matches!(def.effect, Effect::Tween { .. }) && !requires.iter().any(|c| c == "tween.target.v1")
+    {
+        return Err(err("E_CAPABILITY", at, "tween.target.v1"));
+    }
+    match &def.effect {
+        Effect::Audio { gain, .. } if *gain != 1.0 && !requires.iter().any(|c| c == "audio.gain.v1") => {
+            return Err(err("E_CAPABILITY", at, "audio.gain.v1"));
+        }
+        Effect::Audio { gain, .. } if !valid_audio_gain(*gain) => {
+            return Err(err(
+                "E_AUDIO_GAIN",
+                at,
+                "event gain must be finite and within 0..4",
+            ));
+        }
+        Effect::Audio { asset, .. } if asset_kind(asset) != Some(AssetKind::Audio) => {
+            return Err(err("E_ASSET_TYPE", at, asset));
+        }
+        Effect::AudioStop {
+            target,
+            duration_us,
+        } => {
+            if !requires.iter().any(|cap| cap == "audio.stop.v1") {
+                return Err(err("E_CAPABILITY", at, "audio.stop.v1"));
+            }
+            if duration_us.0 > 60_000_000
+                || target == &def.id
+                || !audio_task(target)
+            {
+                return Err(err(
+                    "E_AUDIO_STOP",
+                    at,
+                    "stop requires an audio target and duration within 0..60s",
+                ));
+            }
+        }
+        _ => {}
+    }
+    if def
+        .effect
+        .scalar_track(0., 0.)
+        .is_some_and(|(address, track, _)| !address.accepts(track.to))
+    {
+        return Err(err("E_VISUAL", at, "invalid target value"));
+    }
+    if let Some((TweenTarget::AudioInstance { task, .. }, track, _)) =
+        def.effect.scalar_track(0., 0.)
+    {
+        if !requires.iter().any(|c| c == "audio.gain-tween.v1") {
+            return Err(err("E_CAPABILITY", at, "audio.gain-tween.v1"));
+        }
+        if !matches!(track.easing, Easing::Linear) {
+            return Err(err("E_AUDIO_STOP", at, "envelope tweens are linear"));
+        }
+        if task == def.id.as_str() || !audio_task(task.as_str()) {
+            return Err(err("E_AUDIO_STOP", at, task.as_str()));
+        }
+    }
+    for child in def.effect.compose_children().unwrap_or(&[]) {
+        check_compose_child(child, def.scope, depth + 1, names, check)?;
+    }
+    Ok(())
+}
+
+/// Composition cue rules shared by source and package validation. Runs after
+/// the top-level loop; `names` carries the cue's task ids so children cannot
+/// shadow them.
+fn validate_composition<'a>(
+    id: &str,
+    cue: &'a Cue,
+    requires: &[String],
+    names: &mut BTreeSet<&'a String>,
+    asset_kind: impl Fn(&str) -> Option<AssetKind>,
+    audio_task: impl Fn(&str) -> bool,
+    err: impl Fn(&str, &str, &str) -> Diagnostic,
+) -> Result<()> {
+    if !cue.effects.iter().any(|def| def.effect.uses_compose()) {
+        return Ok(());
+    }
+    if !requires.iter().any(|c| c == "task.compose.v1") {
+        return Err(err("E_CAPABILITY", id, "task.compose.v1"));
+    }
+    let total: usize = cue.effects.iter().map(|def| def.effect.compose_leaves()).sum();
+    if total > MAX_TASKS {
+        return Err(err("E_LIMIT", id, "invalid cue size"));
+    }
+    let check = ComposeCheck {
+        at: id,
+        requires,
+        asset_kind: &asset_kind,
+        audio_task: &audio_task,
+        err: &err,
+    };
+    for def in &cue.effects {
+        if def.effect.compose_children().is_none() {
+            continue;
+        }
+        if def.effect.compose_depth() > MAX_COMPOSE_DEPTH {
+            return Err(err("E_LIMIT", id, "composition nesting"));
+        }
+        let ambient: BTreeSet<_> = cue
+            .effects
+            .iter()
+            .filter(|other| other.id != def.id)
+            .flat_map(subtree_writers)
+            .collect();
+        match &def.effect {
+            Effect::Sequence { children } => {
+                for child in children {
+                    check_writer_tree(id, child, &ambient, &err)?;
+                }
+            }
+            Effect::ParallelAll { children } => {
+                let sets: Vec<_> = children.iter().map(subtree_writers).collect();
+                for (index, child) in children.iter().enumerate() {
+                    let mut inner = ambient.clone();
+                    for (other, set) in sets.iter().enumerate() {
+                        if other != index {
+                            inner.extend(set.iter().cloned());
+                        }
+                    }
+                    check_writer_tree(id, child, &inner, &err)?;
+                }
+            }
+            _ => {}
+        }
+        for child in def.effect.compose_children().unwrap_or(&[]) {
+            check_compose_child(child, def.scope, 1, names, &check)?;
+        }
+    }
+    Ok(())
+}
 pub fn expr_type(e: &Expr, vars: &BTreeMap<String, ValueType>, at: &str) -> Result<ValueType> {
     use BinaryOp::*;
     match e {
@@ -3116,11 +3540,15 @@ fn outgoing(t: &Terminator) -> Vec<&str> {
             ..
         } => vec![next, on_cancelled, on_failed],
         Terminator::Interact {
-            branches, on_empty, ..
+            branches,
+            on_empty,
+            on_cancel,
+            ..
         } => branches
             .values()
             .map(String::as_str)
             .chain(std::iter::once(on_empty.as_str()))
+            .chain(on_cancel.iter().map(String::as_str))
             .collect(),
         _ => vec![],
     }
@@ -3182,6 +3610,44 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
     }
     for menu in p.theme.image_menus.values() {
         menu.validate_story_exports(&p.variables)?;
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_effects)
+        && !p.requires.iter().any(|c| c == "ui.menu-effects.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-effects.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_transition))
+        && !p.requires.iter().any(|c| c == "ui.menu-transition.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-transition.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(MenuEffects::uses_element_tween))
+        && !p.requires.iter().any(|c| c == "ui.menu-element-tween.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-element-tween.v1",
+        ));
+    }
+    if p.theme.image_menus.values().any(ImageMenu::uses_replay)
+        && !p.requires.iter().any(|c| c == "ui.replay.v1")
+    {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.replay.v1"));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_reading)
         && !p.requires.iter().any(|c| c == "ui.menu-reading.v1")
@@ -3559,6 +4025,24 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 if !address.accepts(track.to) {
                     return Err(err("E_VISUAL", id, "invalid target value"));
                 }
+                if let TweenTarget::AudioInstance { task, .. } = &address {
+                    if !p.requires.iter().any(|c| c == "audio.gain-tween.v1") {
+                        return Err(err("E_CAPABILITY", id, "audio.gain-tween.v1"));
+                    }
+                    if !matches!(track.easing, Easing::Linear) {
+                        return Err(err("E_AUDIO_STOP", id, "envelope tweens are linear"));
+                    }
+                    if task == &def.id
+                        || !p.task_definitions.get(task).is_some_and(|defs| {
+                            !defs.is_empty()
+                                && defs
+                                    .iter()
+                                    .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                        })
+                    {
+                        return Err(err("E_AUDIO_STOP", id, task));
+                    }
+                }
                 if !writers.insert(address) {
                     return Err(err("E_OWNERSHIP", id, "multiple property writers"));
                 }
@@ -3639,6 +4123,22 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         if stage_count > 1 || dialogue_count > 1 {
             return Err(err("E_CUE", id, "at most one stage and dialogue per cue"));
         }
+        validate_composition(
+            id,
+            cue,
+            &p.requires,
+            &mut names,
+            |asset| p.assets.get(asset).map(|a| a.kind),
+            |target| {
+                p.task_definitions.get(target).is_some_and(|defs| {
+                    !defs.is_empty()
+                        && defs
+                            .iter()
+                            .all(|effect| matches!(effect.as_ref(), Effect::Audio { .. }))
+                })
+            },
+            err,
+        )?;
     }
     for (id, c) in p.choices.iter() {
         let mut ids = BTreeSet::new();
@@ -3731,6 +4231,31 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         ));
                     }
                 }
+                if let Operation::DialogueVisibility {
+                    transition: Some(style),
+                    duration_us,
+                    ..
+                } = &op.operation
+                {
+                    if !p.requires.iter().any(|c| c == "text.window-transition.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "text.window-transition.v1"));
+                    }
+                    if !style.valid() {
+                        return Err(err("E_TRANSITION", &op.id, "invalid window reveal style"));
+                    }
+                    if duration_us.0 == 0 || duration_us.0 > 60_000_000 {
+                        return Err(err(
+                            "E_TIME",
+                            &op.id,
+                            "window reveal requires a duration within 0..60s",
+                        ));
+                    }
+                    if style.asset().is_some_and(|asset| {
+                        p.assets.get(asset).is_none_or(|a| a.kind != AssetKind::Image)
+                    }) {
+                        return Err(err("E_ASSET", &op.id, "mask must reference an image"));
+                    }
+                }
                 match &op.operation {
                     Operation::Assign { target, value }
                         if vars.get(target).copied() != Some(expr_type(value, &vars, &op.id)?) =>
@@ -3807,9 +4332,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                             .get(c.task.as_str())
                             .ok_or_else(|| err("E_TASK", &at, &c.task))?;
                         if c.milestone == Milestone::Finished
-                            && defs
-                                .iter()
-                                .all(|e| matches!(e, Effect::Audio { looped: true, .. }))
+                            && defs.iter().all(|e| {
+                                e.effect_tree_any(&|x| matches!(x, Effect::Audio { looped: true, .. }))
+                            })
                         {
                             return Err(err("E_INFINITE_WAIT", &at, &c.task));
                         }
@@ -3824,8 +4349,17 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     }
                 }
                 Terminator::Interact {
-                    choice, branches, ..
+                    choice,
+                    branches,
+                    result,
+                    on_cancel,
+                    ..
                 } => {
+                    if (result.is_some() || on_cancel.is_some())
+                        && !p.requires.iter().any(|c| c == "story.typed-result.v1")
+                    {
+                        return Err(err("E_CAPABILITY", &at, "story.typed-result.v1"));
+                    }
                     let c = p
                         .choices
                         .get(choice)
@@ -3834,6 +4368,19 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         || c.options.iter().any(|o| !branches.contains_key(&o.id))
                     {
                         return Err(err("E_CHOICE", &at, "branch coverage"));
+                    }
+                    if let Some(target) = result {
+                        let ty = p
+                            .variables
+                            .get(target)
+                            .map(Value::ty)
+                            .ok_or_else(|| err("E_VARIABLE", &at, target))?;
+                        if c.options
+                            .iter()
+                            .any(|o| o.value.as_ref().is_none_or(|v| v.ty() != ty))
+                        {
+                            return Err(err("E_TYPE", &at, "typed-result option values"));
+                        }
                     }
                 }
                 _ => {}
@@ -4576,6 +5123,7 @@ mod runtime_tests {
                     text: "m.label".into(),
                     visible: None,
                     enabled: None,
+                    value: None,
                 }],
                 timeout_us: None,
                 default: None,
@@ -4594,6 +5142,8 @@ mod runtime_tests {
                             choice: "m.choice".into(),
                             branches: BTreeMap::from([("no".into(), "done".into())]),
                             on_empty: "done".into(),
+                            result: None,
+                            on_cancel: None,
                         },
                         vec![],
                     ),

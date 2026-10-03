@@ -1,0 +1,18 @@
+format = 1
+id = "rest"
+entry = "main"
+text_locale = "zh-Hans"
+
+[[steps]]
+action = "await_choice"
+id = "keep"
+
+[[steps]]
+action = "choose"
+option_id = "dim"
+
+[expect]
+outcome = "lamp_dimmed"
+
+[expect.variables]
+kept = { type = "string", value = "rest" }

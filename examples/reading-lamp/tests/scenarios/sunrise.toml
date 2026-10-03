@@ -1,0 +1,18 @@
+format = 1
+id = "sunrise"
+entry = "main"
+text_locale = "zh-Hans"
+
+[[steps]]
+action = "await_choice"
+id = "keep"
+
+[[steps]]
+action = "choose"
+option_id = "bright"
+
+[expect]
+outcome = "lamp_lit"
+
+[expect.variables]
+kept = { type = "string", value = "sunrise" }

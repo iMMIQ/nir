@@ -739,29 +739,65 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     {
         program.requires.retain(|c| c != "ui.menu-chrome.v1");
     }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::Audio { gain, .. } if gain != 1.0))
-    {
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::Audio { gain, .. } if *gain != 1.0))
+    }) {
         program.requires.retain(|cap| cap != "audio.gain.v1");
     }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::AudioStop { .. }))
-    {
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::AudioStop { .. }))
+    }) {
         program.requires.retain(|cap| cap != "audio.stop.v1");
+    }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect
+            .effect_tree_any(&|e| matches!(e, Effect::Tween { .. }))
+    }) {
+        program.requires.retain(|cap| cap != "tween.target.v1");
+    }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def| {
+        def.effect.effect_tree_any(&|e| {
+            matches!(
+                e,
+                Effect::Tween {
+                    target: TweenTarget::AudioInstance { .. },
+                    ..
+                }
+            )
+        })
+    }) {
+        program.requires.retain(|cap| cap != "audio.gain-tween.v1");
     }
     if !program
         .cues
         .values()
         .flat_map(|cue| &cue.effects)
-        .any(|def| matches!(def.effect, Effect::Tween { .. }))
+        .any(|def| def.effect.uses_compose())
     {
-        program.requires.retain(|cap| cap != "tween.target.v1");
+        program.requires.retain(|cap| cap != "task.compose.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .any(|b| {
+            matches!(
+                &b.terminator,
+                Terminator::Interact {
+                    result: Some(_),
+                    ..
+                } | Terminator::Interact {
+                    on_cancel: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "story.typed-result.v1");
     }
     if !program
         .functions
@@ -790,6 +826,25 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         })
     {
         program.requires.retain(|cap| cap != "text.voice-timer.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| {
+            matches!(
+                op.operation,
+                Operation::DialogueVisibility {
+                    transition: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "text.window-transition.v1");
     }
     if program.player.auto_delay_policy == nir_format::AutoDelayPolicy::LengthScaled {
         program
@@ -921,6 +976,38 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .theme
         .image_menus
         .values()
+        .any(nir_format::ImageMenu::uses_effects)
+    {
+        program.requires.retain(|c| c != "ui.menu-effects.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(nir_format::MenuEffects::uses_transition))
+    {
+        program.requires.retain(|c| c != "ui.menu-transition.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(|m| m.effects.iter().any(nir_format::MenuEffects::uses_element_tween))
+    {
+        program.requires.retain(|c| c != "ui.menu-element-tween.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_replay)
+    {
+        program.requires.retain(|c| c != "ui.replay.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
         .any(nir_format::ImageMenu::uses_history_scrollbar)
     {
         program
@@ -1034,6 +1121,12 @@ pub fn validate_executable(e: &Executable) -> Result<()> {
 pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
     roots.extend(p.theme.image_assets());
+    roots.extend(
+        p.theme
+            .image_menus
+            .values()
+            .flat_map(nir_format::ImageMenu::effect_assets),
+    );
     // Every scene declaration is shipped in one module Static package, so its
     // media identity must be in the root index even when the scene is not the
     // current title scene. Media bytes remain lazy at runtime.
@@ -1045,8 +1138,22 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
             if let Effect::StagePresent { transition, .. } = &effect.effect {
                 roots.extend(transition.asset().map(str::to_owned));
             }
-            if let Effect::Audio { asset, .. } = &effect.effect {
-                roots.insert(asset.clone());
+            effect.effect.collect_audio_assets(&mut roots);
+        }
+    }
+    // Window reveal masks are committed by mid-block operations, not cue
+    // effects, so no activation recipe can pin them; the root index keeps
+    // their identity addressable for the story-context admission set.
+    for function in p.functions.values() {
+        for block in function.blocks.values() {
+            for op in &block.ops {
+                if let Operation::DialogueVisibility {
+                    transition: Some(transition),
+                    ..
+                } = &op.operation
+                {
+                    roots.extend(transition.asset().map(str::to_owned));
+                }
             }
         }
     }

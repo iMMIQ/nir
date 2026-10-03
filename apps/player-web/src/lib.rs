@@ -237,8 +237,8 @@ impl Engine {
     pub fn pointer_action(&self, x: f32, y: f32, button: u8) -> String {
         serde_json::to_string(&self.inner.pointer_action(x, y, button)).unwrap()
     }
-    pub fn navigate_focus(&mut self, direction: u8) -> Option<u32> {
-        self.inner.navigate_focus(direction)
+    pub fn navigate_focus(&mut self, direction: u8) -> Result<Option<u32>, JsValue> {
+        self.inner.navigate_focus(direction).map_err(js)
     }
     pub fn focus_value_action(&self, direction: u8) -> String {
         serde_json::to_string(&self.inner.focus_value_action(direction)).unwrap()
@@ -249,8 +249,8 @@ impl Engine {
             .and_then(|expected| self.inner.control_value_action(id, &expected, direction));
         serde_json::to_string(&action).unwrap()
     }
-    pub fn focus_control(&mut self, id: Option<u32>) {
-        self.inner.focus_control(id)
+    pub fn focus_control(&mut self, id: Option<u32>) -> Result<(), JsValue> {
+        self.inner.focus_control(id).map_err(js)
     }
     pub fn primary_action(&self) -> String {
         serde_json::to_string(&self.inner.primary_action()).unwrap()

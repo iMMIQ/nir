@@ -1,0 +1,82 @@
+format = 1
+id = "theme.atlas"
+base = "builtin.reader"
+tokens = "tokens.json"
+return_to_title = true
+
+[slots]
+"dialogue.main" = "builtin.dialogue"
+"choice.main" = "builtin.choice"
+
+[dialogue]
+height = 240.0
+padding = 24.0
+font_size = 23.0
+
+[choice]
+width = 520.0
+item_height = 58.0
+
+[image_menus.title]
+background = "bg.hall"
+builtin_navigation = true
+buttons = []
+effects = { click = "audio.click" }
+
+[[image_menus.title.elements]]
+id = "begin"
+rect = [520.0, 296.0, 240.0, 64.0]
+content = { type = "button", label = "新的开始", asset = "ui.begin", hover_asset = "ui.begin.hover", action = { type = "new_game" } }
+
+[[image_menus.title.elements]]
+id = "gallery"
+rect = [520.0, 386.0, 240.0, 64.0]
+content = { type = "button", label = "回想图集", asset = "ui.gallery", hover_asset = "ui.gallery.hover", action = { type = "menu", menu = "gallery" } }
+
+[image_menus.gallery]
+background = "bg.gallery"
+builtin_navigation = true
+buttons = []
+[image_menus.gallery.effects]
+click = "audio.click"
+[image_menus.gallery.effects.enter]
+fade_us = "250000"
+[image_menus.gallery.effects.enter.style]
+type = "wipe"
+direction = "left_to_right"
+[image_menus.gallery.effects.close]
+fade_us = "200000"
+[image_menus.gallery.effects.music]
+asset = "audio.gallery"
+bus = "bgm"
+[[image_menus.gallery.effects.elements]]
+element = "north"
+property = "opacity"
+from = 0.0
+duration_us = "400000"
+[[image_menus.gallery.effects.elements]]
+element = "south"
+property = "opacity"
+from = 0.0
+delay_us = "120000"
+duration_us = "400000"
+[[image_menus.gallery.effects.elements]]
+element = "back"
+property = "offset_y"
+from = 24.0
+duration_us = "300000"
+
+[[image_menus.gallery.elements]]
+id = "north"
+rect = [180.0, 180.0, 300.0, 200.0]
+content = { type = "button", label = "北岸", asset = "ui.north", locked_asset = "ui.north.locked", action = { type = "replay", function = "replay_north" }, requires = "atlas.north" }
+
+[[image_menus.gallery.elements]]
+id = "south"
+rect = [520.0, 180.0, 300.0, 200.0]
+content = { type = "button", label = "南径", asset = "ui.south", locked_asset = "ui.south.locked", action = { type = "replay", function = "replay_south" }, requires = "atlas.south" }
+
+[[image_menus.gallery.elements]]
+id = "back"
+rect = [900.0, 560.0, 200.0, 56.0]
+content = { type = "button", label = "返回", asset = "ui.back", action = { type = "back" } }
