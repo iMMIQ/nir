@@ -61,8 +61,7 @@ fn playing() -> Player {
 /// options carry i32 values written to `picked`, and `mode` picks between
 /// plain, typed, and typed-plus-cancel destinations.
 fn typed_program(mode: &str) -> Program {
-    let mut p: Program =
-        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    let mut p: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
     if mode != "plain" {
         p.requires.push("story.typed-result.v1".into());
     }
@@ -70,7 +69,14 @@ fn typed_program(mode: &str) -> Program {
         "picked".into(),
         serde_json::from_value(serde_json::json!({"type":"i32","value":0})).unwrap(),
     );
-    for (option, value) in p.choices.get_mut("route").unwrap().options.iter_mut().zip([1, 2]) {
+    for (option, value) in p
+        .choices
+        .get_mut("route")
+        .unwrap()
+        .options
+        .iter_mut()
+        .zip([1, 2])
+    {
         option.value =
             Some(serde_json::from_value(serde_json::json!({"type":"i32","value":value})).unwrap());
     }
@@ -85,11 +91,17 @@ fn typed_program(mode: &str) -> Program {
             "on_cancel":(mode == "cancel").then_some("gave_up")}}))
         .unwrap(),
     );
-    for (block, outcome) in [("after_walk", "walk"), ("after_stay", "stay"), ("gave_up", "gave_up")] {
+    for (block, outcome) in [
+        ("after_walk", "walk"),
+        ("after_stay", "stay"),
+        ("gave_up", "gave_up"),
+    ] {
         f.blocks.insert(
             block.into(),
-            serde_json::from_value(serde_json::json!({"terminator":{"type":"end","outcome":outcome}}))
-                .unwrap(),
+            serde_json::from_value(
+                serde_json::json!({"terminator":{"type":"end","outcome":outcome}}),
+            )
+            .unwrap(),
         );
     }
     p
@@ -100,7 +112,10 @@ fn typed_playing(mode: &str) -> Player {
     ready(&mut p, c);
     let c = action(&mut p, UiAction::NewGame);
     ready(&mut p, c);
-    assert!(p.core().state().choice.is_some(), "typed interaction pending");
+    assert!(
+        p.core().state().choice.is_some(),
+        "typed interaction pending"
+    );
     p
 }
 #[test]
@@ -275,10 +290,21 @@ fn typed_interaction_save_and_load_restores_the_selection() {
     let interaction = p.current_interaction();
     // The semantic cursor moves through the same action path the engine's
     // focus sync uses; hover and keyboard focus stay presentation-only.
-    let c = action(&mut p, UiAction::SelectChoice { option: "stay".into() });
+    let c = action(
+        &mut p,
+        UiAction::SelectChoice {
+            option: "stay".into(),
+        },
+    );
     ready(&mut p, c);
     assert_eq!(
-        p.core().state().choice.as_ref().unwrap().selected.as_deref(),
+        p.core()
+            .state()
+            .choice
+            .as_ref()
+            .unwrap()
+            .selected
+            .as_deref(),
         Some("stay")
     );
     let snapshot = p.core().snapshot();
@@ -306,7 +332,12 @@ fn typed_interaction_save_and_load_restores_the_selection() {
     assert_ne!(choice.interaction, interaction);
     assert_eq!(choice.selected.as_deref(), Some("stay"));
     assert_eq!(choice.result.as_deref(), Some("picked"));
-    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    let c = action(
+        &mut p,
+        UiAction::Choose {
+            option: "stay".into(),
+        },
+    );
     ready(&mut p, c);
     assert_eq!(p.core().state().variables["picked"], Value::I32(2));
     assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
@@ -315,7 +346,12 @@ fn typed_interaction_save_and_load_restores_the_selection() {
 #[test]
 fn rollback_after_a_typed_commit_rewinds_the_write() {
     let mut p = typed_playing("typed");
-    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    let c = action(
+        &mut p,
+        UiAction::Choose {
+            option: "stay".into(),
+        },
+    );
     ready(&mut p, c);
     assert_eq!(p.core().state().variables["picked"], Value::I32(2));
     assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
@@ -329,10 +365,20 @@ fn rollback_after_a_typed_commit_rewinds_the_write() {
     assert!(p.error.is_none(), "{:?}", p.error);
     assert_eq!(p.core().state().variables["picked"], Value::I32(0));
     assert_eq!(p.core().state().outcome, None);
-    let choice = p.core().state().choice.as_ref().expect("interaction re-offered");
+    let choice = p
+        .core()
+        .state()
+        .choice
+        .as_ref()
+        .expect("interaction re-offered");
     assert_eq!(choice.selected.as_deref(), Some("walk"));
     action(&mut p, UiAction::Continue);
-    let c = action(&mut p, UiAction::Choose { option: "stay".into() });
+    let c = action(
+        &mut p,
+        UiAction::Choose {
+            option: "stay".into(),
+        },
+    );
     ready(&mut p, c);
     assert_eq!(p.core().state().variables["picked"], Value::I32(2));
     assert_eq!(p.core().state().outcome.as_deref(), Some("stay"));
@@ -1580,12 +1626,21 @@ fn window_reveal_projection_follows_the_story_clock_and_commits_at_the_deadline(
     let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
     ready(&mut p, commands);
     let m = p.model();
-    let w = m.window_transition.as_ref().expect("reveal live in the model");
+    let w = m
+        .window_transition
+        .as_ref()
+        .expect("reveal live in the model");
     assert_eq!(w.style, StageTransition::Dissolve);
     assert!(!w.to_visible);
     assert!((w.progress - 0.5).abs() < 0.001);
-    assert!(!m.hidden_dialogue, "the committed flag lands at the deadline");
-    assert!(m.dialogue.is_some(), "the view stays projectable while live");
+    assert!(
+        !m.hidden_dialogue,
+        "the committed flag lands at the deadline"
+    );
+    assert!(
+        m.dialogue.is_some(),
+        "the view stays projectable while live"
+    );
     let commands = p.pump(vec![AppEvent::Tick { delta_us: 600_000 }], 1000);
     ready(&mut p, commands);
     let m = p.model();
@@ -1677,20 +1732,25 @@ fn window_mask_reveals_fetch_their_mask_once_and_hold_the_story_clock() {
         let mut next = vec![];
         for c in queue {
             match c {
-                AppCommand::GetAssets { request, assets, .. } => {
+                AppCommand::GetAssets {
+                    request, assets, ..
+                } => {
                     if assets.iter().any(|a| a == "bg.river") {
-                        assert!(mask_request.replace((request, assets)).is_none(),
-                            "the mask is fetched by exactly one top-up");
+                        assert!(
+                            mask_request.replace((request, assets)).is_none(),
+                            "the mask is fetched by exactly one top-up"
+                        );
                     } else {
                         for asset in assets {
                             next.extend(
-                                p.pump(vec![AppEvent::AssetReady { request, asset }], 1000)
+                                p.pump(vec![AppEvent::AssetReady { request, asset }], 1000),
                             );
                         }
                     }
                 }
-                AppCommand::PreparePresentation { request } => next
-                    .extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000)),
+                AppCommand::PreparePresentation { request } => {
+                    next.extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000))
+                }
                 AppCommand::PrepareLocale { request, .. } => {
                     next.extend(p.pump(vec![AppEvent::LocaleReady { request }], 1000))
                 }
@@ -1702,16 +1762,21 @@ fn window_mask_reveals_fetch_their_mask_once_and_hold_the_story_clock() {
             break;
         }
     }
-    let (request, withheld) =
-        mask_request.expect("the reveal mask is fetched by a top-up");
+    let (request, withheld) = mask_request.expect("the reveal mask is fetched by a top-up");
     assert!(
         p.paused(),
         "the story clock holds while the mask is outstanding"
     );
     let before = p.core().state().tick_us;
-    p.pump(vec![AppEvent::Tick { delta_us: 5_000_000 }], 1000);
+    p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 5_000_000,
+        }],
+        1000,
+    );
     assert_eq!(
-        p.core().state().tick_us, before,
+        p.core().state().tick_us,
+        before,
         "no story time passes before the media lands"
     );
     let commands = p.pump(
@@ -1727,7 +1792,8 @@ fn window_mask_reveals_fetch_their_mask_once_and_hold_the_story_clock() {
     let commands = p.pump(vec![AppEvent::Tick { delta_us: 500_000 }], 1000);
     ready(&mut p, commands);
     let m = p.model();
-    let w = m.window_transition
+    let w = m
+        .window_transition
         .as_ref()
         .expect("reveal resumed after the fetch");
     assert_eq!(w.style, style);
@@ -1770,7 +1836,10 @@ fn window_reveal_dissolve_folds_coverage_into_window_items_only() {
         }
     }
     assert!(faded_quads > 0, "the window box must fade");
-    assert!(faded_quads < before.quads.len(), "HUD quads keep their color");
+    assert!(
+        faded_quads < before.quads.len(),
+        "HUD quads keep their color"
+    );
     let mut faded_texts = 0;
     for (a, b) in before.texts.iter().zip(&after.texts) {
         assert_eq!(b.text, a.text);
@@ -1823,18 +1892,15 @@ fn window_reveal_wipe_diverts_window_layers_behind_a_sentinel() {
     assert_eq!(&before.quads[..at], &after.quads[..at]);
     assert_eq!(&layers.quads, &before.quads[at..at + diverted]);
     assert_eq!(&after.quads[at + 1..], &before.quads[at + diverted..]);
-    assert_eq!(
-        after.quads.len(),
-        before.quads.len() - diverted + 1
-    );
+    assert_eq!(after.quads.len(), before.quads.len() - diverted + 1);
     // Window texts stay in the packet for layout, routed to the window pass.
     assert_eq!(after.texts, before.texts);
     assert!(!layers.texts.is_empty());
+    assert!(layers.texts.windows(2).all(|pair| pair[0] + 1 == pair[1]));
     assert!(layers
         .texts
-        .windows(2)
-        .all(|pair| pair[0] + 1 == pair[1]));
-    assert!(layers.texts.iter().any(|&i| before.texts[i].region.is_some()));
+        .iter()
+        .any(|&i| before.texts[i].region.is_some()));
     assert!(after
         .semantics
         .iter()
@@ -2947,8 +3013,7 @@ fn invalid_slot_envelope_does_not_cancel_existing_story_preparation() {
 /// The story changes local state (affection) before activating the cue, and a
 /// second short cue follows so the chain is mid-flight across checkpoints.
 fn compose_program() -> Program {
-    let mut p: Program =
-        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    let mut p: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
     p.requires.push("tween.target.v1".into());
     p.requires.push("task.compose.v1".into());
     p.cues.insert(
@@ -3062,23 +3127,34 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
     let state = p.core().state();
     assert!(state.waiting.is_some());
     assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
-    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
-    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Running);
+    assert_eq!(
+        state.tasks[&state.handles["ring"]].state,
+        nir_core::TaskState::Running
+    );
+    assert_eq!(
+        state.tasks[&state.handles["fade"]].state,
+        nir_core::TaskState::Running
+    );
     // Local state changed and the chain is mid-flight.
-    p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 1000);
+    p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 1_000_000,
+        }],
+        1000,
+    );
     let state = p.core().state();
     assert_eq!(state.variables["affection"], Value::I32(5));
-    assert_eq!(state.tasks[&state.handles["fade"]].elapsed_us, Micros(1_000_000));
+    assert_eq!(
+        state.tasks[&state.handles["fade"]].elapsed_us,
+        Micros(1_000_000)
+    );
 
     // The save envelope freezes the mid-flight chain and the changed state.
     let commands = action(&mut p, UiAction::Save { slot: 0 });
     let (job, envelope) = commands
         .into_iter()
         .find_map(|c| {
-            if let AppCommand::Save {
-                job, envelope, ..
-            } = c
-            {
+            if let AppCommand::Save { job, envelope, .. } = c {
                 Some((job, envelope))
             } else {
                 None
@@ -3093,7 +3169,10 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
         Micros(1_000_000)
     );
     let saved_fade = &saved.tasks[&saved.handles["fade"]];
-    assert_eq!((saved_fade.elapsed_us, saved_fade.captured), (Micros(1_000_000), 1.));
+    assert_eq!(
+        (saved_fade.elapsed_us, saved_fade.captured),
+        (Micros(1_000_000), 1.)
+    );
     p.pump(
         vec![AppEvent::Saved {
             job,
@@ -3106,13 +3185,7 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
     // Loading the slot restores the composition and resumes it exactly once.
     let session = p.generation.session;
     let job = slot_load_job(&mut p, 0);
-    let commands = p.pump(
-        vec![AppEvent::SlotLoaded {
-            job,
-            envelope,
-        }],
-        1000,
-    );
+    let commands = p.pump(vec![AppEvent::SlotLoaded { job, envelope }], 1000);
     let commands = ready(&mut p, commands);
     assert!(p.generation.session > session);
     assert!(p.paused());
@@ -3127,7 +3200,10 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
     assert_eq!(state.variables["affection"], Value::I32(5));
     let fade = &state.tasks[&state.handles["fade"]];
     assert_eq!((fade.elapsed_us, fade.captured), (Micros(1_000_000), 1.));
-    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
+    assert_eq!(
+        state.tasks[&state.handles["ring"]].state,
+        nir_core::TaskState::Running
+    );
     assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
 
     // Release the restored pause; the chain finishes without any replay.
@@ -3142,10 +3218,18 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
     );
     let commands = ready(&mut p, commands);
     assert!(audio_starts(&commands).is_empty());
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 9_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 9_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
     let state = p.core().state();
-    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Finished);
+    assert_eq!(
+        state.tasks[&state.handles["fade"]].state,
+        nir_core::TaskState::Finished
+    );
     assert_eq!(
         state
             .scene
@@ -3163,11 +3247,21 @@ fn parallel_chain_mid_flight_save_and_load_resume_without_replay() {
     ready(&mut p, commands);
     let commands = action(&mut p, UiAction::Advance);
     ready(&mut p, commands);
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 9_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 9_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
     // The beat cue's activation stops the clock mid-tick; the next host frame
     // resumes it, exactly like a render loop would.
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 1_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
     assert_eq!(p.core().state().outcome.as_deref(), Some("done"));
 }
@@ -3179,7 +3273,12 @@ fn parallel_chain_rolls_back_mid_flight_without_replay() {
     ready(&mut p, commands);
     let commands = action(&mut p, UiAction::NewGame);
     ready(&mut p, commands);
-    p.pump(vec![AppEvent::Tick { delta_us: 2_000_000 }], 1000);
+    p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 2_000_000,
+        }],
+        1000,
+    );
     // Finish the dialogue so the beat cue activates and checkpoints a state
     // with the chain mid-flight at the two-second mark.
     let commands = action(&mut p, UiAction::Advance);
@@ -3192,7 +3291,12 @@ fn parallel_chain_rolls_back_mid_flight_without_replay() {
         Micros(2_000_000)
     );
     // Run past that checkpoint so the rollback really rewinds live progress.
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 4_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 4_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
     let commands = p.pump(vec![], 1000);
     ready(&mut p, commands);
@@ -3217,7 +3321,10 @@ fn parallel_chain_rolls_back_mid_flight_without_replay() {
     let state = p.core().state();
     let fade = &state.tasks[&state.handles["fade"]];
     assert_eq!((fade.elapsed_us, fade.captured), (Micros(2_000_000), 1.));
-    assert_eq!(state.tasks[&state.handles["ring"]].state, nir_core::TaskState::Running);
+    assert_eq!(
+        state.tasks[&state.handles["ring"]].state,
+        nir_core::TaskState::Running
+    );
     assert_eq!(state.tasks[&state.handles["chain"]].cursor, 2);
     assert_eq!(state.variables["affection"], Value::I32(5));
 
@@ -3233,12 +3340,25 @@ fn parallel_chain_rolls_back_mid_flight_without_replay() {
     );
     let commands = ready(&mut p, commands);
     assert!(audio_starts(&commands).is_empty());
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 8_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 8_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
-    let commands = p.pump(vec![AppEvent::Tick { delta_us: 10_000_000 }], 1000);
+    let commands = p.pump(
+        vec![AppEvent::Tick {
+            delta_us: 10_000_000,
+        }],
+        1000,
+    );
     ready(&mut p, commands);
     let state = p.core().state();
-    assert_eq!(state.tasks[&state.handles["fade"]].state, nir_core::TaskState::Finished);
+    assert_eq!(
+        state.tasks[&state.handles["fade"]].state,
+        nir_core::TaskState::Finished
+    );
     assert!(state.tasks[&state.handles["chain"]]
         .milestones
         .contains(&nir_format::Milestone::Finished));

@@ -896,10 +896,9 @@ impl Core {
                         self.state.last_input = sequence;
                         // The VM owns the typed write; the host only names an
                         // offered option and never supplies the value itself.
-                        let typed = c
-                            .result
-                            .as_ref()
-                            .and_then(|target| Some((target.clone(), c.values.get(&option)?.clone())));
+                        let typed = c.result.as_ref().and_then(|target| {
+                            Some((target.clone(), c.values.get(&option)?.clone()))
+                        });
                         let dest = c.branches[&option].clone();
                         if let Some((target, value)) = typed {
                             self.write(&target, value)?;
@@ -936,11 +935,11 @@ impl Core {
                 if sequence <= self.state.last_input {
                     return Ok(());
                 }
-                let dest = self
-                    .state
-                    .choice
-                    .as_ref()
-                    .and_then(|c| (c.interaction == interaction).then(|| c.on_cancel.clone()).flatten());
+                let dest = self.state.choice.as_ref().and_then(|c| {
+                    (c.interaction == interaction)
+                        .then(|| c.on_cancel.clone())
+                        .flatten()
+                });
                 if let Some(dest) = dest {
                     self.state.last_input = sequence;
                     self.trace("input:cancel");
@@ -1154,8 +1153,7 @@ impl Core {
                     .clone()
                     .filter(|style| duration_us.0 > 0 && style.valid())
                     .filter(|_| {
-                        self.state.window_reveal.is_some()
-                            || self.state.dialogue_hidden == *visible
+                        self.state.window_reveal.is_some() || self.state.dialogue_hidden == *visible
                     });
                 match reveal {
                     Some(style) => {
@@ -1639,8 +1637,7 @@ impl Core {
             }
             Effect::StagePresent { scene, .. } => {
                 if self.state.tasks.values().any(|t| {
-                    t.state == TaskState::Running
-                        && matches!(t.effect, Effect::StagePresent { .. })
+                    t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { .. })
                 }) {
                     return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
                 }
@@ -1723,9 +1720,12 @@ impl Core {
                             self.error("E_TASK_TYPE", "gain tween requires an audio instance")
                         );
                     }
-                    if self.state.tasks.values().any(|t| {
-                        t.state == TaskState::Running && t.target_task == Some(target_id)
-                    }) {
+                    if self
+                        .state
+                        .tasks
+                        .values()
+                        .any(|t| t.state == TaskState::Running && t.target_task == Some(target_id))
+                    {
                         return Err(self.error("E_OWNERSHIP", "audio envelope already owned"));
                     }
                     target_task = Some(target_id);
@@ -1890,9 +1890,12 @@ impl Core {
             _ => return Ok(false),
         };
         let spawned: Vec<u32> = self.state.tasks[&id].children.clone();
-        let running_child = spawned
-            .iter()
-            .any(|c| self.state.tasks.get(c).is_some_and(|t| t.state == TaskState::Running));
+        let running_child = spawned.iter().any(|c| {
+            self.state
+                .tasks
+                .get(c)
+                .is_some_and(|t| t.state == TaskState::Running)
+        });
         if matches!(self.state.tasks[&id].effect, Effect::Sequence { .. }) {
             if running_child {
                 return Ok(false);
@@ -1948,7 +1951,13 @@ impl Core {
     /// Spawn the next child of a composition; false when the step budget is
     /// spent and the spawn defers to the next step.
     fn spawn_child(&mut self, parent: u32, def: &EffectDef) -> Result<bool> {
-        if self.state.tasks.values().filter(|t| t.state == TaskState::Running).count() + 1
+        if self
+            .state
+            .tasks
+            .values()
+            .filter(|t| t.state == TaskState::Running)
+            .count()
+            + 1
             > MAX_TASKS
         {
             return Err(self.error("E_LIMIT", "active tasks"));
@@ -2401,9 +2410,7 @@ impl Core {
                     if let Some(option) = c.default {
                         // A timeout commits the default option, typed value
                         // included, exactly like an explicit choice.
-                        if let (Some(target), Some(value)) =
-                            (&c.result, c.values.get(&option))
-                        {
+                        if let (Some(target), Some(value)) = (&c.result, c.values.get(&option)) {
                             let target = target.clone();
                             let value = value.clone();
                             self.write(&target, value)?;
@@ -2547,9 +2554,9 @@ impl Core {
                 if let Some(task) = self.state.tasks.get(&envelope.owner).filter(|t| {
                     t.state == TaskState::Running && t.target_task == Some(position.task)
                 }) {
-                    if !envelope_owner_duration(task).is_some_and(|duration| {
-                        envelope.elapsed_us.0 <= duration.0
-                    }) {
+                    if !envelope_owner_duration(task)
+                        .is_some_and(|duration| envelope.elapsed_us.0 <= duration.0)
+                    {
                         return Err(
                             self.error("E_AUDIO_POSITION", "invalid device envelope progress")
                         );
@@ -2959,9 +2966,11 @@ impl Core {
             {
                 return Err(fail("invalid window reveal"));
             }
-            if reveal.style.asset().is_some_and(|asset| {
-                p.asset(asset).is_none_or(|a| a.kind != AssetKind::Image)
-            }) {
+            if reveal
+                .style
+                .asset()
+                .is_some_and(|asset| p.asset(asset).is_none_or(|a| a.kind != AssetKind::Image))
+            {
                 return Err(fail("invalid window reveal mask"));
             }
         }

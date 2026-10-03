@@ -749,9 +749,8 @@ impl Renderer {
     }
     pub fn retain(&mut self, ids: &BTreeSet<String>) {
         self.uploads.retain(|id, _| ids.contains(id));
-        self.textures.retain(|id, _| {
-            id.is_empty() || id == "@transparent" || ids.contains(id)
-        });
+        self.textures
+            .retain(|id, _| id.is_empty() || id == "@transparent" || ids.contains(id));
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
         let layout_start = self.profile_start();
@@ -864,17 +863,15 @@ impl Renderer {
         );
         let mut areas = vec![];
         let mut menu_areas: Vec<Vec<TextArea<'_>>> = menu_indices.iter().map(|_| vec![]).collect();
-        let mut window_areas: Vec<Vec<TextArea<'_>>> = window_indices.iter().map(|_| vec![]).collect();
+        let mut window_areas: Vec<Vec<TextArea<'_>>> =
+            window_indices.iter().map(|_| vec![]).collect();
         let mut page_areas: Vec<Vec<TextArea<'_>>> = page_indices.iter().map(|_| vec![]).collect();
         for (run_index, r) in paint_runs.iter().enumerate() {
-            let areas = if let Some(batch) = page_indices
-                .iter()
-                .position(|i| *i == owners[run_index])
+            let areas = if let Some(batch) =
+                page_indices.iter().position(|i| *i == owners[run_index])
             {
                 &mut page_areas[batch]
-            } else if let Some(batch) = window_indices
-                .iter()
-                .position(|i| *i == owners[run_index])
+            } else if let Some(batch) = window_indices.iter().position(|i| *i == owners[run_index])
             {
                 &mut window_areas[batch]
             } else if let Some(batch) = menu_indices.iter().position(|i| *i == owners[run_index]) {
@@ -1283,8 +1280,14 @@ impl Renderer {
             ))
         })();
         self.profile_end("vertex.build_write", vertex_start);
-        let (source_start, target_start, window_start, menu_under_start, menu_after_start, menu_page_start) =
-            vertex_result?;
+        let (
+            source_start,
+            target_start,
+            window_start,
+            menu_under_start,
+            menu_after_start,
+            menu_page_start,
+        ) = vertex_result?;
 
         let acquire_start = self.profile_start();
         let frame_result = self.acquire_frame();
@@ -1372,7 +1375,13 @@ impl Renderer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.paint(&mut pass, &p.quads[..layers.position], menu_under_start, p, [*w, *h])?;
+                    self.paint(
+                        &mut pass,
+                        &p.quads[..layers.position],
+                        menu_under_start,
+                        p,
+                        [*w, *h],
+                    )?;
                     self.paint(
                         &mut pass,
                         &p.quads[layers.position + 1..],

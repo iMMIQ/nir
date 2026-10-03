@@ -59,8 +59,12 @@ fn hide_op() -> serde_json::Value {
 }
 
 fn start(p: Program) -> Core {
-    let c = Core::new(ValidatedProgram::new(p).unwrap(), "reveal".into(), "zh-Hans".into())
-        .unwrap();
+    let c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "reveal".into(),
+        "zh-Hans".into(),
+    )
+    .unwrap();
     assert!(c.state().fault.is_none());
     c
 }
@@ -71,7 +75,10 @@ fn park(c: &mut Core) {
     let activation = c.state().pending.as_ref().unwrap().id;
     c.step(CoreInput::Prepared { activation }, 1000);
     assert!(c.state().fault.is_none(), "{:?}", c.state().fault);
-    assert!(c.dialogue().is_some(), "dialogue must be offered to park on");
+    assert!(
+        c.dialogue().is_some(),
+        "dialogue must be offered to park on"
+    );
 }
 
 /// One press completes a still-running text reveal, the second finishes the
@@ -113,7 +120,10 @@ fn styled_flip_defers_commit_and_completes_at_the_deadline() {
     // story clock's next-wakeup computation even though the VM is parked.
     c.step(CoreInput::Time { delta_us: 100_000 }, 1000);
     assert!(c.window_reveal().is_none(), "reveal completed");
-    assert!(c.state().dialogue_hidden, "hidden flag commits at the deadline");
+    assert!(
+        c.state().dialogue_hidden,
+        "hidden flag commits at the deadline"
+    );
     assert!(c.state().tick_us <= Micros(1_000_000));
 }
 
@@ -124,12 +134,7 @@ fn reversal_captures_interrupted_coverage() {
     let mut c = start(program(hide_op(), true));
     c.step(CoreInput::None, 1000);
     park(&mut c);
-    c.step(
-        CoreInput::Time {
-            delta_us: 500_000,
-        },
-        1000,
-    );
+    c.step(CoreInput::Time { delta_us: 500_000 }, 1000);
     let (_, _, progress) = c.window_reveal().unwrap();
     assert!((progress - 0.5).abs() < 0.0001);
     advance_dialogue(&mut c, 1);
@@ -181,16 +186,15 @@ fn instant_flip_interrupts_an_in_flight_reveal() {
         }))
         .unwrap(),
     );
-    let mut c = Core::new(ValidatedProgram::new(p).unwrap(), "reveal".into(), "zh-Hans".into())
-        .unwrap();
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "reveal".into(),
+        "zh-Hans".into(),
+    )
+    .unwrap();
     c.step(CoreInput::None, 1000);
     park(&mut c);
-    c.step(
-        CoreInput::Time {
-            delta_us: 500_000,
-        },
-        1000,
-    );
+    c.step(CoreInput::Time { delta_us: 500_000 }, 1000);
     assert!(c.window_reveal().is_some());
     advance_dialogue(&mut c, 1);
     assert!(
@@ -206,7 +210,9 @@ fn instant_flip_interrupts_an_in_flight_reveal() {
 fn validation_and_restore_gate_the_reveal() {
     // Capability is required for any styled op.
     assert_eq!(
-        ValidatedProgram::new(program(hide_op(), false)).unwrap_err().code,
+        ValidatedProgram::new(program(hide_op(), false))
+            .unwrap_err()
+            .code,
         "E_CAPABILITY"
     );
     for duration_us in ["0", "60000001"] {
@@ -234,10 +240,7 @@ fn validation_and_restore_gate_the_reveal() {
         "duration_us":"1000000"
     }))
     .unwrap();
-    assert_eq!(
-        ValidatedProgram::new(p).unwrap_err().code,
-        "E_ASSET"
-    );
+    assert_eq!(ValidatedProgram::new(p).unwrap_err().code, "E_ASSET");
 
     // A mid-flight mask reveal round trips through the snapshot; tampered
     // structure is refused at restore.
@@ -249,16 +252,15 @@ fn validation_and_restore_gate_the_reveal() {
         }),
         true,
     );
-    let mut c = Core::new(ValidatedProgram::new(p).unwrap(), "reveal".into(), "zh-Hans".into())
-        .unwrap();
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "reveal".into(),
+        "zh-Hans".into(),
+    )
+    .unwrap();
     c.step(CoreInput::None, 1000);
     park(&mut c);
-    c.step(
-        CoreInput::Time {
-            delta_us: 500_000,
-        },
-        1000,
-    );
+    c.step(CoreInput::Time { delta_us: 500_000 }, 1000);
     let snapshot = c.snapshot();
     let restored = Core::restore(c.validated_program().clone(), snapshot.clone(), "reveal")
         .expect("valid mid-flight reveal restores");
@@ -296,7 +298,10 @@ fn validation_and_restore_gate_the_reveal() {
             softness: 0.,
         };
     });
-    assert!(mask_err.contains("invalid window reveal mask"), "{mask_err}");
+    assert!(
+        mask_err.contains("invalid window reveal mask"),
+        "{mask_err}"
+    );
     // The capability must still be declared by the restoring program even
     // when its own ops never used a transition.
     let mut bare = program(json!({"type":"dialogue_visibility","visible":false}), false);

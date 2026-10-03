@@ -299,7 +299,8 @@ fn cancelling_a_gain_tween_commits_the_device_value_and_pins_the_ramp() {
         conditions[0].task = "timer".into();
         *next = "cancel-swell".into();
     }
-    f.blocks.insert("wait-rest".into(), f.blocks["hold"].clone());
+    f.blocks
+        .insert("wait-rest".into(), f.blocks["hold"].clone());
     f.blocks.insert("hold".into(), wait);
     let (mut c, _) = start(p);
     let sound = c.state().handles["sample"];
@@ -341,10 +342,7 @@ fn envelope_ownership_is_exclusive_across_tweens_and_stops() {
     p.cues.get_mut("audio-test").unwrap().effects.push(serde_json::from_value(json!({
         "id":"again","scope":"session","effect":{"type":"tween","target":{"type":"audio_instance","task":"sample","property":"gain"},"to":0.1,"duration_us":"500000"}
     })).unwrap());
-    assert_eq!(
-        ValidatedProgram::new(p).unwrap_err().code,
-        "E_OWNERSHIP"
-    );
+    assert_eq!(ValidatedProgram::new(p).unwrap_err().code, "E_OWNERSHIP");
     // A tween and a timed stop on one instance collide at commit time.
     let mut p = tween_program(0.5, 500_000, "linear");
     p.requires.push("audio.stop.v1".into());
@@ -394,7 +392,10 @@ fn gain_tween_validation_rejects_missing_capability_nonlinear_and_bad_targets() 
     let id = s.handles["swell"];
     s.tasks.get_mut(&id).unwrap().target_task = Some(id);
     assert!(Core::restore(
-        start(tween_program(0.5, 500_000, "linear")).0.validated_program().clone(),
+        start(tween_program(0.5, 500_000, "linear"))
+            .0
+            .validated_program()
+            .clone(),
         s,
         "audio-test"
     )
@@ -421,9 +422,10 @@ fn natural_end_completes_a_running_gain_tween_without_stopping_it_twice() {
             .count(),
         1
     );
-    assert!(!step.intents.iter().any(
-        |i| matches!(i, CoreIntent::AudioEnvelope { task, .. } if *task == sound)
-    ));
+    assert!(!step
+        .intents
+        .iter()
+        .any(|i| matches!(i, CoreIntent::AudioEnvelope { task, .. } if *task == sound)));
     Core::restore(c.validated_program().clone(), c.snapshot(), "audio-test").unwrap();
 }
 

@@ -253,7 +253,8 @@ impl Player {
         self.held_skip = false;
         self.image_menu = work.image_menu;
         self.overlay_menu = work.overlay_menu;
-        self.menu_session.unfreeze(work.menu, self.generation.session)?;
+        self.menu_session
+            .unfreeze(work.menu, self.generation.session)?;
         self.prepared_menu = None;
         self.auto_elapsed = 0;
         self.auto_wait_delay = None;
@@ -376,15 +377,18 @@ mod replay_tests {
             let mut next = vec![];
             for c in q {
                 match c {
-                    AppCommand::GetAssets { request, assets, .. } => {
+                    AppCommand::GetAssets {
+                        request, assets, ..
+                    } => {
                         for asset in assets {
                             next.extend(
                                 p.pump(vec![AppEvent::AssetReady { request, asset }], 1000),
                             );
                         }
                     }
-                    AppCommand::PreparePresentation { request } => next
-                        .extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000)),
+                    AppCommand::PreparePresentation { request } => {
+                        next.extend(p.pump(vec![AppEvent::PresentationReady { request }], 1000))
+                    }
                     _ => other.push(c),
                 }
             }
@@ -477,7 +481,12 @@ mod replay_tests {
         // The replay's checkpoint ledger starts over; the frozen one waits.
         assert!(p.checkpoints.len() <= 1);
 
-        p.pump(vec![AppEvent::Tick { delta_us: 2_000_000 }], 1000);
+        p.pump(
+            vec![AppEvent::Tick {
+                delta_us: 2_000_000,
+            }],
+            1000,
+        );
         // The outcome lands inside this pump and starts the return prepare;
         // the phase is observable as "returning" only before it commits.
         let c = action(&mut p, UiAction::Advance);
@@ -572,12 +581,18 @@ mod replay_tests {
         // Nested saves and loads die at dispatch even from the live replay's
         // own overlay, exactly as a stale projection would have offered them.
         let commands = action(&mut p, UiAction::Save { slot: 0 });
-        assert!(commands.iter().all(|c| !matches!(c, AppCommand::Save { .. })));
+        assert!(commands
+            .iter()
+            .all(|c| !matches!(c, AppCommand::Save { .. })));
         let commands = action(&mut p, UiAction::Load { slot: 0 });
-        assert!(commands.iter().all(|c| !matches!(c, AppCommand::Load { .. })));
+        assert!(commands
+            .iter()
+            .all(|c| !matches!(c, AppCommand::Load { .. })));
         assert!(p.slot_load.is_none());
         let commands = action(&mut p, UiAction::Export);
-        assert!(commands.iter().all(|c| !matches!(c, AppCommand::Export { .. })));
+        assert!(commands
+            .iter()
+            .all(|c| !matches!(c, AppCommand::Export { .. })));
         let commands = action(&mut p, UiAction::Import);
         assert!(commands.iter().all(|c| !matches!(c, AppCommand::Import)));
         assert_eq!(p.generation.session, session);

@@ -347,16 +347,15 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    for (sites, fade_sites, menu_sounds, menu_transitions) in
-        [(0, 0, 0, 0), (2, 0, 0, 0), (2, 3, 0, 0), (2, 3, 3, 0), (2, 3, 3, 1)]
-    {
-        let ledger = livenovel::mapping_ledger(
-            sites,
-            fade_sites,
-            menu_sounds,
-            menu_transitions,
-            128_000,
-        );
+    for (sites, fade_sites, menu_sounds, menu_transitions) in [
+        (0, 0, 0, 0),
+        (2, 0, 0, 0),
+        (2, 3, 0, 0),
+        (2, 3, 3, 0),
+        (2, 3, 3, 1),
+    ] {
+        let ledger =
+            livenovel::mapping_ledger(sites, fade_sites, menu_sounds, menu_transitions, 128_000);
         assert!(ledger.len() >= 12);
         let mut rules = std::collections::BTreeSet::new();
         for m in &ledger {
@@ -386,17 +385,18 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
                 // open verification items stay in the fidelity warnings.
                 assert_eq!(m.approximation, None, "{}", m.rule);
             }
-            assert!(!m.behavior.contains(source.to_string_lossy().as_ref()), "{}", m.rule);
+            assert!(
+                !m.behavior.contains(source.to_string_lossy().as_ref()),
+                "{}",
+                m.rule
+            );
         }
         let choice = ledger.iter().find(|m| m.rule == "livenovel.story.choice");
         assert_eq!(choice.is_some(), sites > 0);
         if let Some(m) = choice {
             assert_eq!(m.level, "adapted");
             assert_eq!(m.evidence, "decoded-source");
-            assert!(m
-                .capabilities
-                .iter()
-                .any(|c| c == "story.typed-result.v1"));
+            assert!(m.capabilities.iter().any(|c| c == "story.typed-result.v1"));
         }
         let fade = ledger
             .iter()
@@ -405,7 +405,9 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         assert_eq!(fade.level, "adapted");
         assert_eq!(fade.approximation, None);
         assert_eq!(
-            fade.capabilities.iter().any(|c| c == "text.window-transition.v1"),
+            fade.capabilities
+                .iter()
+                .any(|c| c == "text.window-transition.v1"),
             fade_sites > 0,
             "the window-transition capability follows actual fade sites"
         );
@@ -439,7 +441,10 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
             .find(|m| m.rule == "livenovel.menu-hover")
             .unwrap();
         assert_eq!(hover.level, "approximate");
-        assert!(hover.approximation.as_deref().is_some_and(|s| !s.is_empty()));
+        assert!(hover
+            .approximation
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
         let font = ledger
             .iter()
             .find(|m| m.rule == "livenovel.text.font")
@@ -472,7 +477,10 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         let mut opts = options(&source, &temp.path().join("nowhere"));
         opts.accept_approximate.clear();
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
-        assert!(denied.to_string().contains("E_IMPORT_APPROXIMATE"), "{denied}");
+        assert!(
+            denied.to_string().contains("E_IMPORT_APPROXIMATE"),
+            "{denied}"
+        );
         opts.accept_approximate = vec!["livenovel.menu-hover".into()];
         let denied = enforce_acceptance(&ledger, &opts).unwrap_err();
         assert!(
@@ -503,14 +511,9 @@ fn mapping_levels_carry_evidence_and_gate_approximate_acceptance() {
         capabilities: vec![],
         approximation: None,
     }];
+    assert_eq!(ImportReport::status_from_mappings(&exact_only), "converted");
     assert_eq!(
-        ImportReport::status_from_mappings(&exact_only),
-        "converted"
-    );
-    assert_eq!(
-        ImportReport::status_from_mappings(&livenovel::mapping_ledger(
-            0, 0, 0, 0, 128_000
-        )[..2]),
+        ImportReport::status_from_mappings(&livenovel::mapping_ledger(0, 0, 0, 0, 128_000)[..2]),
         "converted_with_adaptations"
     );
 }

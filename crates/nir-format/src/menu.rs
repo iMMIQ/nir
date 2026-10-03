@@ -601,9 +601,7 @@ impl MenuEffects {
             return Err(fail());
         }
         if let Some(music) = &self.music {
-            if !asset(&music.asset)
-                || !music.gain.is_finite()
-                || !(0. ..=4.).contains(&music.gain)
+            if !asset(&music.asset) || !music.gain.is_finite() || !(0. ..=4.).contains(&music.gain)
             {
                 return Err(fail());
             }
@@ -1382,7 +1380,10 @@ impl ImageMenu {
     }
     pub fn uses_replay(&self) -> bool {
         self.controls().any(|(_, a, _)| {
-            matches!(a, ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay)
+            matches!(
+                a,
+                ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay
+            )
         })
     }
 }
@@ -1398,7 +1399,9 @@ mod tests {
         let legacy: MenuTransition =
             serde_json::from_str(r#"{"sound":"audio.bell","fade_us":"400000"}"#).unwrap();
         assert!(legacy.style.is_none());
-        assert!(serde_json::to_string(&legacy).unwrap().contains(r#""fade_us":"400000""#));
+        assert!(serde_json::to_string(&legacy)
+            .unwrap()
+            .contains(r#""fade_us":"400000""#));
         let styled: MenuTransition = serde_json::from_value(serde_json::json!({
             "sound": "audio.bell", "fade_us": "400000",
             "style": {"type": "wipe", "direction": "left_to_right", "softness": 0.2}
@@ -1533,10 +1536,13 @@ mod tests {
             serde_json::to_value(&round).unwrap(),
             serde_json::to_value(&styled).unwrap()
         );
-        assert!(serde_json::from_value::<MenuElementTween>(serde_json::json!({
-            "element": "row", "property": "diagonal", "from": 0.0, "duration_us": "100000"
-        }))
-        .is_err(), "unknown properties stay denied");
+        assert!(
+            serde_json::from_value::<MenuElementTween>(serde_json::json!({
+                "element": "row", "property": "diagonal", "from": 0.0, "duration_us": "100000"
+            }))
+            .is_err(),
+            "unknown properties stay denied"
+        );
     }
 
     #[test]
@@ -1572,9 +1578,11 @@ mod tests {
             serde_json::json!({"element": "row", "property": property, "from": from,
                 "duration_us": duration_us.to_string()})
         };
-        assert!(menu(serde_json::Value::Array(vec![track("opacity", 0., 300_000)]))
-            .validate_elements()
-            .is_ok());
+        assert!(menu(serde_json::Value::Array(vec![track(
+            "opacity", 0., 300_000
+        )]))
+        .validate_elements()
+        .is_ok());
         for bad in [
             // Out-of-range from values per property.
             vec![track("opacity", 1.5, 300_000)],
@@ -1585,13 +1593,17 @@ mod tests {
             // Instant and over-ceiling durations, over-ceiling delay.
             vec![track("opacity", 0., 0)],
             vec![track("opacity", 0., 2_000_001)],
-            vec![serde_json::json!({"element": "row", "property": "opacity", "from": 0.0,
-                "duration_us": "100000", "delay_us": "2000001"})],
+            vec![
+                serde_json::json!({"element": "row", "property": "opacity", "from": 0.0,
+                "duration_us": "100000", "delay_us": "2000001"}),
+            ],
             // Duplicate (element, property) track.
             vec![track("opacity", 0., 300_000), track("opacity", 1., 300_000)],
             // A missing element id, even though the track itself is sound.
-            vec![serde_json::json!({"element": "ghost", "property": "opacity", "from": 0.0,
-                "duration_us": "300000"})],
+            vec![
+                serde_json::json!({"element": "ghost", "property": "opacity", "from": 0.0,
+                "duration_us": "300000"}),
+            ],
         ] {
             assert!(
                 menu(serde_json::Value::Array(bad))

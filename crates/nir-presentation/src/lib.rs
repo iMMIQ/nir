@@ -1155,14 +1155,10 @@ pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
         .into_iter()
         .flatten()
         .collect();
-    texts.extend(
-        p.menu_paint
-            .iter()
-            .filter_map(|paint| match paint {
-                MenuPaint::Text(i) => Some(*i),
-                _ => None,
-            }),
-    );
+    texts.extend(p.menu_paint.iter().filter_map(|paint| match paint {
+        MenuPaint::Text(i) => Some(*i),
+        _ => None,
+    }));
     let tail = p.quads.split_off(end);
     let quads = p.quads.split_off(start);
     p.quads.push(Quad {

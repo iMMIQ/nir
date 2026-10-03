@@ -1849,14 +1849,18 @@ fn validate_image_menus(
     for menu in theme.image_menus.values() {
         for id in menu.effect_assets() {
             if asset(&id) != Some(AssetKind::Audio) {
-                return Err(err("E_THEME_ASSET", &id, "menu effects require an audio asset"));
+                return Err(err(
+                    "E_THEME_ASSET",
+                    &id,
+                    "menu effects require an audio asset",
+                ));
             }
         }
     }
     for menu in theme.image_menus.values() {
         for (_, action, _) in menu.controls() {
-            if let ImageMenuAction::Entry { function: id } | ImageMenuAction::Replay { function: id } =
-                action
+            if let ImageMenuAction::Entry { function: id }
+            | ImageMenuAction::Replay { function: id } = action
             {
                 if function(id).is_none_or(|f| !f.params.is_empty() || f.returns.is_some()) {
                     return Err(err(
@@ -1872,11 +1876,7 @@ fn validate_image_menus(
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
-    if root
-        .theme
-        .image_menus
-        .values()
-        .any(ImageMenu::uses_effects)
+    if root.theme.image_menus.values().any(ImageMenu::uses_effects)
         && !root.requires.iter().any(|c| c == "ui.menu-effects.v1")
     {
         return Err(err(
@@ -1903,7 +1903,10 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
         .image_menus
         .values()
         .any(|m| m.effects.iter().any(MenuEffects::uses_element_tween))
-        && !root.requires.iter().any(|c| c == "ui.menu-element-tween.v1")
+        && !root
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-element-tween.v1")
     {
         return Err(err(
             "E_CAPABILITY",
@@ -1925,11 +1928,7 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "ui.menu-services.v1",
         ));
     }
-    if root
-        .theme
-        .image_menus
-        .values()
-        .any(ImageMenu::uses_replay)
+    if root.theme.image_menus.values().any(ImageMenu::uses_replay)
         && !root.requires.iter().any(|c| c == "ui.replay.v1")
     {
         return Err(err("E_CAPABILITY", "theme.image_menus", "ui.replay.v1"));
@@ -3114,9 +3113,9 @@ fn validate_runtime_function(
                     // as the awaited milestone.
                     if condition.milestone == Milestone::Finished
                         && definitions.iter().all(|effect| {
-                            effect
-                                .as_ref()
-                                .effect_tree_any(&|e| matches!(e, Effect::Audio { looped: true, .. }))
+                            effect.as_ref().effect_tree_any(&|e| {
+                                matches!(e, Effect::Audio { looped: true, .. })
+                            })
                         })
                     {
                         return Err(err("E_INFINITE_WAIT", &at, &condition.task));
@@ -3341,12 +3340,15 @@ fn check_compose_child<'a>(
             "composition children cannot present stages or dialogue",
         ));
     }
-    if matches!(def.effect, Effect::Tween { .. }) && !requires.iter().any(|c| c == "tween.target.v1")
+    if matches!(def.effect, Effect::Tween { .. })
+        && !requires.iter().any(|c| c == "tween.target.v1")
     {
         return Err(err("E_CAPABILITY", at, "tween.target.v1"));
     }
     match &def.effect {
-        Effect::Audio { gain, .. } if *gain != 1.0 && !requires.iter().any(|c| c == "audio.gain.v1") => {
+        Effect::Audio { gain, .. }
+            if *gain != 1.0 && !requires.iter().any(|c| c == "audio.gain.v1") =>
+        {
             return Err(err("E_CAPABILITY", at, "audio.gain.v1"));
         }
         Effect::Audio { gain, .. } if !valid_audio_gain(*gain) => {
@@ -3366,10 +3368,7 @@ fn check_compose_child<'a>(
             if !requires.iter().any(|cap| cap == "audio.stop.v1") {
                 return Err(err("E_CAPABILITY", at, "audio.stop.v1"));
             }
-            if duration_us.0 > 60_000_000
-                || target == &def.id
-                || !audio_task(target)
-            {
+            if duration_us.0 > 60_000_000 || target == &def.id || !audio_task(target) {
                 return Err(err(
                     "E_AUDIO_STOP",
                     at,
@@ -3423,7 +3422,11 @@ fn validate_composition<'a>(
     if !requires.iter().any(|c| c == "task.compose.v1") {
         return Err(err("E_CAPABILITY", id, "task.compose.v1"));
     }
-    let total: usize = cue.effects.iter().map(|def| def.effect.compose_leaves()).sum();
+    let total: usize = cue
+        .effects
+        .iter()
+        .map(|def| def.effect.compose_leaves())
+        .sum();
     if total > MAX_TASKS {
         return Err(err("E_LIMIT", id, "invalid cue size"));
     }
@@ -4251,7 +4254,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         ));
                     }
                     if style.asset().is_some_and(|asset| {
-                        p.assets.get(asset).is_none_or(|a| a.kind != AssetKind::Image)
+                        p.assets
+                            .get(asset)
+                            .is_none_or(|a| a.kind != AssetKind::Image)
                     }) {
                         return Err(err("E_ASSET", &op.id, "mask must reference an image"));
                     }
@@ -4333,7 +4338,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                             .ok_or_else(|| err("E_TASK", &at, &c.task))?;
                         if c.milestone == Milestone::Finished
                             && defs.iter().all(|e| {
-                                e.effect_tree_any(&|x| matches!(x, Effect::Audio { looped: true, .. }))
+                                e.effect_tree_any(&|x| {
+                                    matches!(x, Effect::Audio { looped: true, .. })
+                                })
                             })
                         {
                             return Err(err("E_INFINITE_WAIT", &at, &c.task));
