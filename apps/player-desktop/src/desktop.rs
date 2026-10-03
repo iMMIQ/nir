@@ -1272,19 +1272,16 @@ impl ApplicationHandler for App {
                             // it here instead of on every qualifying keypress.
                             let state: serde_json::Value =
                                 serde_json::from_str(&runtime.engine.state())?;
-                            runtime.input(
-                                if state["choice"]["on_cancel"].is_string() {
-                                    // A cancellable interaction owns Escape.
-                                    UiAction::CancelChoice
-                                } else if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0)
-                                {
-                                    UiAction::Close
-                                } else if state["screen"] == "Story" || state["screen"] == "Title" {
-                                    UiAction::Menu
-                                } else {
-                                    UiAction::Close
-                                },
-                            )?
+                            runtime.input(if state["choice"]["on_cancel"].is_string() {
+                                // A cancellable interaction owns Escape.
+                                UiAction::CancelChoice
+                            } else if state["menu_depth"].as_u64().is_some_and(|depth| depth > 0) {
+                                UiAction::Close
+                            } else if state["screen"] == "Story" || state["screen"] == "Title" {
+                                UiAction::Menu
+                            } else {
+                                UiAction::Close
+                            })?
                         }
                         Key::Character(ref c) if c.eq_ignore_ascii_case("h") => {
                             runtime.input(UiAction::ToggleInterface)?

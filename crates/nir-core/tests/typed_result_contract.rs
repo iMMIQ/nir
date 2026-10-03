@@ -39,10 +39,16 @@ fn program(mode: &str, values: Option<&[i64]>, timeout_us: Option<u64>) -> Progr
     f.entry = "test".into();
     f.blocks.insert(
         "test".into(),
-        serde_json::from_value(json!({"terminator": terminator(mode != "plain", mode == "cancel")}))
-            .unwrap(),
+        serde_json::from_value(
+            json!({"terminator": terminator(mode != "plain", mode == "cancel")}),
+        )
+        .unwrap(),
     );
-    for (block, outcome) in [("after_walk", "walk"), ("after_stay", "stay"), ("gave_up", "gave_up")] {
+    for (block, outcome) in [
+        ("after_walk", "walk"),
+        ("after_stay", "stay"),
+        ("gave_up", "gave_up"),
+    ] {
         f.blocks.insert(
             block.into(),
             serde_json::from_value(json!({"terminator":{"type":"end","outcome":outcome}})).unwrap(),
@@ -52,7 +58,12 @@ fn program(mode: &str, values: Option<&[i64]>, timeout_us: Option<u64>) -> Progr
 }
 
 fn start(p: Program) -> Core {
-    let mut c = Core::new(ValidatedProgram::new(p).unwrap(), "typed".into(), "en".into()).unwrap();
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "typed".into(),
+        "en".into(),
+    )
+    .unwrap();
     c.step(CoreInput::None, 1000);
     assert!(c.state().fault.is_none(), "{:?}", c.state().fault);
     c
@@ -105,7 +116,13 @@ fn plain_interaction_carries_no_result_state() {
         },
         1000,
     );
-    c.step(CoreInput::CancelChoice { interaction, sequence: 2 }, 1000);
+    c.step(
+        CoreInput::CancelChoice {
+            interaction,
+            sequence: 2,
+        },
+        1000,
+    );
     assert_eq!(c.state().outcome, None);
     assert_eq!(
         serde_json::to_string(c.state()).unwrap(),
@@ -131,12 +148,24 @@ fn cancel_jumps_without_a_typed_write() {
     let mut c = start(program("cancel", Some(&[1, 2]), None));
     let interaction = offered(&c).interaction;
     assert_eq!(offered(&c).on_cancel.as_deref(), Some("gave_up"));
-    c.step(CoreInput::CancelChoice { interaction, sequence: 1 }, 1000);
+    c.step(
+        CoreInput::CancelChoice {
+            interaction,
+            sequence: 1,
+        },
+        1000,
+    );
     assert_eq!(c.state().variables["picked"], Value::I32(0));
     assert_eq!(c.state().outcome.as_deref(), Some("gave_up"));
     assert_eq!(c.state().last_input, 1);
     // A stale cancel cannot fire twice.
-    c.step(CoreInput::CancelChoice { interaction, sequence: 1 }, 1000);
+    c.step(
+        CoreInput::CancelChoice {
+            interaction,
+            sequence: 1,
+        },
+        1000,
+    );
 }
 
 /// The cursor moves on observation inputs: no input identity, no progress, no
@@ -203,7 +232,12 @@ fn selection_moves_snapshot_and_restores_without_progress() {
 fn timeout_commits_the_default_typed_value() {
     let mut c = start(program("typed", Some(&[1, 2]), Some(1_000_000)));
     assert_eq!(offered(&c).selected.as_deref(), Some("stay"));
-    c.step(CoreInput::Time { delta_us: 1_100_000 }, 1000);
+    c.step(
+        CoreInput::Time {
+            delta_us: 1_100_000,
+        },
+        1000,
+    );
     assert!(c.state().choice.is_none());
     assert_eq!(c.state().variables["picked"], Value::I32(2));
     assert_eq!(c.state().outcome.as_deref(), Some("stay"));
@@ -216,16 +250,16 @@ fn timeout_commits_the_default_typed_value() {
 #[test]
 fn restore_rejects_tampered_typed_interactions() {
     let ok = |snapshot: Snapshot, p: &Program| {
-        Core::restore(ValidatedProgram::new(p.clone()).unwrap(), snapshot.clone(), "typed").is_ok()
+        Core::restore(
+            ValidatedProgram::new(p.clone()).unwrap(),
+            snapshot.clone(),
+            "typed",
+        )
+        .is_ok()
     };
     let c = start(program("typed", Some(&[1, 2]), None));
     let snapshot = c.snapshot();
-    assert!(Core::restore(
-        c.validated_program().clone(),
-        snapshot.clone(),
-        "typed"
-    )
-    .is_ok());
+    assert!(Core::restore(c.validated_program().clone(), snapshot.clone(), "typed").is_ok());
     // Tampered value.
     let mut bad = snapshot.clone();
     let choice = bad.choice.as_mut().unwrap();
@@ -290,7 +324,7 @@ fn typed_validation_rejects_invalid_interactions() {
             "type":"interact","choice":"route",
             "branches":{"walk":"after_walk","stay":"after_stay"},"on_empty":"failed",
             "result":"missing"}))
-        .unwrap();
+    .unwrap();
     assert_eq!(rejects(p), "E_VARIABLE");
     // A missing option value.
     assert_eq!(rejects(program("typed", Some(&[1]), None)), "E_TYPE");
@@ -311,7 +345,7 @@ fn typed_validation_rejects_invalid_interactions() {
         serde_json::from_value(json!({"terminator":{
             "type":"interact","choice":"route",
             "branches":{"walk":"done","stay":"done"},"on_empty":"done","result":"picked"}}))
-            .unwrap(),
+        .unwrap(),
     );
     f.blocks.insert(
         "done".into(),
@@ -330,7 +364,7 @@ fn typed_validation_rejects_invalid_interactions() {
             "type":"interact","choice":"route",
             "branches":{"walk":"after_walk","stay":"after_stay"},"on_empty":"failed",
             "on_cancel":"nowhere"}))
-        .unwrap();
+    .unwrap();
     assert_eq!(rejects(p), "E_BLOCK");
 }
 
@@ -400,8 +434,10 @@ fn infinite_wait_diagnoses_looped_audio_inside_compositions() {
     f.entry = "test".into();
     f.blocks.insert(
         "test".into(),
-        serde_json::from_value(json!({"terminator":{"type":"activate","cue":"test","next":"hold"}}))
-            .unwrap(),
+        serde_json::from_value(
+            json!({"terminator":{"type":"activate","cue":"test","next":"hold"}}),
+        )
+        .unwrap(),
     );
     f.blocks.insert("hold".into(), serde_json::from_value(json!({"terminator":{"type":"await","conditions":[{"task":"amb","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}})).unwrap());
     f.blocks.insert(

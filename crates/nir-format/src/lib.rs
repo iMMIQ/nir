@@ -991,11 +991,11 @@ impl Effect {
     /// whole tree, not only top-level definitions.
     pub fn effect_tree_any(&self, predicate: &impl Fn(&Self) -> bool) -> bool {
         predicate(self)
-            || self
-                .compose_children()
-                .is_some_and(|children| {
-                    children.iter().any(|def| def.effect.effect_tree_any(predicate))
-                })
+            || self.compose_children().is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|def| def.effect.effect_tree_any(predicate))
+            })
     }
     /// Every audio asset this effect subtree starts, compositions included.
     /// Stage present transitions are handled by the caller (scene nodes).
@@ -1013,12 +1013,20 @@ impl Effect {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TweenTarget {
-    SceneNode { node: String, property: Property },
-    DialogueRoot { property: DialogueProperty },
+    SceneNode {
+        node: String,
+        property: Property,
+    },
+    DialogueRoot {
+        property: DialogueProperty,
+    },
     /// A live audio instance's envelope, by task handle. The envelope is the
     /// 0..1 multiplier on top of the authored event gain; one envelope owner
     /// (a gain tween or a timed stop) may target an instance at a time.
-    AudioInstance { task: String, property: AudioProperty },
+    AudioInstance {
+        task: String,
+        property: AudioProperty,
+    },
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1396,26 +1404,49 @@ pub struct ImageButton {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageMenuAction {
-    PushMenu { menu: String },
+    PushMenu {
+        menu: String,
+    },
     Back,
-    Reading { mode: MenuReadingMode },
-    HistoryPage { window: String, delta: i32 },
-    SaveSlot { slot: MenuSlot },
-    LoadSlot { slot: MenuSlot },
+    Reading {
+        mode: MenuReadingMode,
+    },
+    HistoryPage {
+        window: String,
+        delta: i32,
+    },
+    SaveSlot {
+        slot: MenuSlot,
+    },
+    LoadSlot {
+        slot: MenuSlot,
+    },
     Close,
-    AdjustPreference { field: MenuPreference, delta: f32 },
+    AdjustPreference {
+        field: MenuPreference,
+        delta: f32,
+    },
     ToggleReducedMotion,
-    SetLocal { local: String, value: MenuValue },
+    SetLocal {
+        local: String,
+        value: MenuValue,
+    },
     NewGame,
     Saves,
     Settings,
     Title,
-    Menu { menu: String },
-    Entry { function: String },
+    Menu {
+        menu: String,
+    },
+    Entry {
+        function: String,
+    },
     /// Isolated replay: freeze the current session, run the function as a
     /// temporary one, and return to the frozen session afterwards. Unlike
     /// Entry this never destroys the launching session.
-    Replay { function: String },
+    Replay {
+        function: String,
+    },
     /// Manual return from an active replay to the frozen session. Only
     /// enabled while a replay session is live.
     ExitReplay,

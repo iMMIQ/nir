@@ -37,16 +37,11 @@ fn spatial_styles_are_gated_by_their_own_capability() {
         &["ui.menu-effects.v1", "ui.menu-transition.v1"],
     ))
     .expect("both capabilities admit the spatial reveal");
-    assert!(
-        validated
-            .program()
-            .theme
-            .image_menus["title"]
-            .effects
-            .as_ref()
-            .unwrap()
-            .uses_transition()
-    );
+    assert!(validated.program().theme.image_menus["title"]
+        .effects
+        .as_ref()
+        .unwrap()
+        .uses_transition());
 }
 
 #[test]
@@ -74,7 +69,10 @@ fn dissolve_and_unstyled_boundaries_need_no_reveal_capability() {
 
 #[test]
 fn the_reveal_window_keeps_its_authored_bounds() {
-    for (fade_us, why) in [("0", "a styled boundary cannot be instant"), ("2000001", "over the two-second page ceiling")] {
+    for (fade_us, why) in [
+        ("0", "a styled boundary cannot be instant"),
+        ("2000001", "over the two-second page ceiling"),
+    ] {
         let effects = json!({"enter": {"fade_us": fade_us,
             "style": {"type": "wipe", "direction": "left_to_right"}}});
         assert_eq!(
@@ -148,29 +146,41 @@ fn element_tweens_are_gated_by_their_own_capability() {
     ]});
     // The effects capability alone does not admit an element animation.
     assert_eq!(
-        ValidatedProgram::new(element_program(elements.clone(), &["ui.menu-effects.v1", "ui.menu-services.v1"]))
-            .unwrap_err()
-            .code,
+        ValidatedProgram::new(element_program(
+            elements.clone(),
+            &["ui.menu-effects.v1", "ui.menu-services.v1"]
+        ))
+        .unwrap_err()
+        .code,
         "E_CAPABILITY"
     );
     let validated = ValidatedProgram::new(element_program(
         elements,
-        &["ui.menu-effects.v1", "ui.menu-element-tween.v1", "ui.menu-services.v1", "ui.menu-text-button.v1", "ui.menu-elements.v1"],
+        &[
+            "ui.menu-effects.v1",
+            "ui.menu-element-tween.v1",
+            "ui.menu-services.v1",
+            "ui.menu-text-button.v1",
+            "ui.menu-elements.v1",
+        ],
     ))
     .expect("both capabilities admit the element animation");
-    assert!(
-        validated
-            .program()
-            .theme
-            .image_menus["title"]
-            .effects
-            .as_ref()
-            .unwrap()
-            .uses_element_tween()
-    );
+    assert!(validated.program().theme.image_menus["title"]
+        .effects
+        .as_ref()
+        .unwrap()
+        .uses_element_tween());
     // An unanimated effects block never claims the capability by usage.
-    let p = element_program(json!({"enter": {"fade_us": "400000"}}),
-        &["ui.menu-effects.v1", "ui.menu-element-tween.v1", "ui.menu-services.v1", "ui.menu-text-button.v1", "ui.menu-elements.v1"]);
+    let p = element_program(
+        json!({"enter": {"fade_us": "400000"}}),
+        &[
+            "ui.menu-effects.v1",
+            "ui.menu-element-tween.v1",
+            "ui.menu-services.v1",
+            "ui.menu-text-button.v1",
+            "ui.menu-elements.v1",
+        ],
+    );
     assert!(!p.theme.image_menus["title"]
         .effects
         .as_ref()

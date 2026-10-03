@@ -234,18 +234,23 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
         }
     });
     println!("Watching author files; valid changes reload the preview from its entry. Ctrl-C stops preview.");
-    serve_inner(&served, port, Some(status))
+    serve_inner(&served, "127.0.0.1", port, Some(status))
 }
 
-pub fn serve(directory: &Path, port: u16) -> Result<()> {
-    serve_inner(directory, port, None)
+pub fn serve(directory: &Path, host: &str, port: u16) -> Result<()> {
+    serve_inner(directory, host, port, None)
 }
-fn serve_inner(directory: &Path, port: u16, dev: Option<Arc<Mutex<DevStatus>>>) -> Result<()> {
+fn serve_inner(
+    directory: &Path,
+    host: &str,
+    port: u16,
+    dev: Option<Arc<Mutex<DevStatus>>>,
+) -> Result<()> {
     let root = fs::canonicalize(directory).context("E_SERVE: directory missing")?;
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| anyhow::anyhow!("E_LISTEN: {e}"))?;
+    let server =
+        tiny_http::Server::http((host, port)).map_err(|e| anyhow::anyhow!("E_LISTEN: {e}"))?;
     println!(
-        "NIR preview: http://127.0.0.1:{port}/\nServing {}",
+        "NIR preview: http://{host}:{port}/\nServing {}",
         root.display()
     );
     for request in server.incoming_requests() {

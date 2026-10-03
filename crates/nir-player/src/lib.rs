@@ -2043,13 +2043,7 @@ impl Player {
                 {
                     // Menu page effect voices are best effort; a failed one
                     // never faults the session or cancels the transition.
-                    self.observe_from(
-                        "ui_sound_failed",
-                        None,
-                        Some(session),
-                        Some(task),
-                        None,
-                    );
+                    self.observe_from("ui_sound_failed", None, Some(session), Some(task), None);
                 } else {
                     self.observe_from(
                         "stale_audio_discarded",
@@ -2380,7 +2374,11 @@ impl Player {
                     .candidate
                     .take()
                     .ok_or_else(|| Diagnostic::new("E_RESTORE", "commit", "no candidate"))?;
-                if purpose == Purpose::Restore && self.replay_work.as_ref().is_some_and(|w| w.phase == ReplayPhase::Returning)
+                if purpose == Purpose::Restore
+                    && self
+                        .replay_work
+                        .as_ref()
+                        .is_some_and(|w| w.phase == ReplayPhase::Returning)
                 {
                     // The frozen session returns whole: its checkpoints, menu
                     // page and navigation locals never noticed the replay.
@@ -2831,21 +2829,19 @@ impl Player {
                         .active_menu_id()
                         .and_then(|id| self.core.program().theme.image_menus.get(id))
                         .is_some_and(|menu| {
-                            menu.controls().any(
-                                |(id, action, requires)| {
-                                    (resolved_menu
-                                        || (!menu.uses_state()
-                                            && !menu.uses_services()
-                                            && menu.buttons.iter().any(|b| b.id == id)))
-                                        && matches!(
-                                            action,
-                                            nir_format::ImageMenuAction::Replay {
-                                                function: target
-                                            } if target == &function
-                                        )
-                                        && requires.is_none_or(|key| self.profile.contains(key))
-                                },
-                            )
+                            menu.controls().any(|(id, action, requires)| {
+                                (resolved_menu
+                                    || (!menu.uses_state()
+                                        && !menu.uses_services()
+                                        && menu.buttons.iter().any(|b| b.id == id)))
+                                    && matches!(
+                                        action,
+                                        nir_format::ImageMenuAction::Replay {
+                                            function: target
+                                        } if target == &function
+                                    )
+                                    && requires.is_none_or(|key| self.profile.contains(key))
+                            })
                         });
                 if !allowed {
                     return Ok(());
@@ -3490,10 +3486,9 @@ impl Player {
                 && c.dialogue().is_some()
                 && window_transition.is_none(),
             window_transition,
-            menu_transition: self.menu_effects.transition(
-                self.ui_clock_us.0,
-                self.preferences.reduced_motion,
-            ),
+            menu_transition: self
+                .menu_effects
+                .transition(self.ui_clock_us.0, self.preferences.reduced_motion),
             menu_element_animations: if self.preferences.reduced_motion {
                 Default::default()
             } else {

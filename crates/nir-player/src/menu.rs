@@ -850,10 +850,9 @@ impl Player {
     fn play_ui_sound(&mut self, asset: &str) {
         let session = self.generation.session;
         let task = self.menu_effects.alloc_task();
-        self.menu_effects.sounds.insert(
-            task,
-            effects::UiVoice { task, session },
-        );
+        self.menu_effects
+            .sounds
+            .insert(task, effects::UiVoice { task, session });
         self.commands.push(AppCommand::AudioStart {
             domain: TimeDomain::ForegroundUi,
             task,
@@ -905,9 +904,7 @@ impl Player {
             // by a device recovery), so readiness is simply "not loading":
             // the Preparing gap never sounds.
             Screen::Title => {
-                !self.is_loading()
-                    && self.failed_admission.is_none()
-                    && self.error.is_none()
+                !self.is_loading() && self.failed_admission.is_none() && self.error.is_none()
             }
             _ => false,
         }
@@ -977,9 +974,7 @@ impl Player {
         if self.menu_effects.closing.is_some() {
             return true;
         }
-        let close = self
-            .active_menu_effects()
-            .and_then(|effects| effects.close);
+        let close = self.active_menu_effects().and_then(|effects| effects.close);
         let Some(close) = close else { return false };
         if let Some(sound) = &close.sound {
             self.play_ui_sound(sound);
@@ -1076,7 +1071,9 @@ impl Player {
             self.menu_effects_clock = None;
         }
         self.menu_effects.settle_enter(self.ui_clock_us.0);
-        let drained = self.menu_effects.drain_finished_elements(self.ui_clock_us.0);
+        let drained = self
+            .menu_effects
+            .drain_finished_elements(self.ui_clock_us.0);
         if self.menu_effects.fade.is_none() && self.menu_effects.elements.is_empty() {
             self.menu_effects_clock = None;
         }
@@ -3451,7 +3448,9 @@ mod tests {
         // Old input is locked while the close fade runs: the repeat Close is
         // swallowed (beyond telemetry) and changes nothing.
         let locked = pump_action(&mut p, UiAction::Close);
-        assert!(locked.iter().all(|c| matches!(c, AppCommand::Observation { .. })));
+        assert!(locked
+            .iter()
+            .all(|c| matches!(c, AppCommand::Observation { .. })));
         assert_eq!(p.screen, Screen::Menu);
         assert!(p.menu_effects.closing.is_some());
         assert_eq!(p.screen, Screen::Menu);
@@ -3524,7 +3523,11 @@ mod tests {
         p.preferences.reduced_motion = true;
         let c = p.pump(vec![], 1000);
         let fired = settle(&mut p, c);
-        assert_eq!(ui_audio(&fired).len(), 2, "enter sound and music still play");
+        assert_eq!(
+            ui_audio(&fired).len(),
+            2,
+            "enter sound and music still play"
+        );
         assert!(p.menu_effects.fade.is_none());
         assert!(p.menu_effects_clock.is_none());
         assert_eq!(p.model().menu_opacity, 1.);
@@ -3620,10 +3623,11 @@ mod tests {
         assert_eq!(sentinel.rect, [0., 0., 1280., 720.]);
         let background = p.model().theme.image_menus["title"].background.clone();
         assert_eq!(layers.quads[0].asset.as_deref(), Some(background.as_str()));
-        assert!(packet.quads[..layers.position]
-            .iter()
-            .chain(&packet.quads[layers.position + 1..])
-            .all(|q| q.asset.as_deref() != Some(background.as_str())),
+        assert!(
+            packet.quads[..layers.position]
+                .iter()
+                .chain(&packet.quads[layers.position + 1..])
+                .all(|q| q.asset.as_deref() != Some(background.as_str())),
             "the underlying frame keeps no page quad"
         );
         assert!(packet.menu_paint.is_empty());
@@ -3656,7 +3660,10 @@ mod tests {
             &nir_presentation::Messages::default(),
         );
         assert!(settled.menu_layers.is_none());
-        assert!(settled.menu_quad_range.is_some(), "page returns to the surface");
+        assert!(
+            settled.menu_quad_range.is_some(),
+            "page returns to the surface"
+        );
     }
     /// The player with the overlay open and its enter reveal settled.
     fn spatial_player_at_overlay() -> (Player, u32) {
@@ -3699,7 +3706,11 @@ mod tests {
         let (_, to_visible, progress) = p.menu_transition().expect("close reveal in flight");
         assert!(!to_visible, "close erases the page back to the frame");
         assert_eq!(progress, 0.);
-        assert_eq!(p.model().menu_opacity, 1., "no alpha ramp under the composite");
+        assert_eq!(
+            p.model().menu_opacity,
+            1.,
+            "no alpha ramp under the composite"
+        );
         // Halfway: the packet carries the reversed composite, page still up.
         p.pump(
             vec![AppEvent::TickDomains {
@@ -3742,7 +3753,10 @@ mod tests {
     fn a_completed_reveal_pulses_the_view_before_the_clock_token_releases() {
         let (mut p, _music) = spatial_player_at_overlay();
         assert!(p.menu_transition().is_some(), "enter reveal in flight");
-        assert!(!p.take_ui_visual_pulse(), "nothing discrete while animating");
+        assert!(
+            !p.take_ui_visual_pulse(),
+            "nothing discrete while animating"
+        );
         // A foreground-only tick that keeps the reveal mid-flight is
         // clock-only from the engine's perspective: no work, no pulse.
         p.pump(
@@ -3752,7 +3766,10 @@ mod tests {
             }],
             1000,
         );
-        assert!(p.menu_transition().is_some(), "halfway tick keeps it in flight");
+        assert!(
+            p.menu_transition().is_some(),
+            "halfway tick keeps it in flight"
+        );
         assert!(!p.take_ui_visual_pulse());
         // The finishing tick settles the page in the foreground domain alone
         // and releases the clock token in the same breath. The engine's
@@ -3767,7 +3784,10 @@ mod tests {
         );
         assert!(p.menu_transition().is_none(), "reveal finished");
         assert!(p.menu_effects_clock.is_none(), "clock token released");
-        assert!(p.take_ui_visual_pulse(), "the settling tick pulses the view");
+        assert!(
+            p.take_ui_visual_pulse(),
+            "the settling tick pulses the view"
+        );
         assert!(!p.take_ui_visual_pulse(), "the pulse is one-shot");
     }
     #[test]
@@ -3816,8 +3836,8 @@ mod tests {
     fn element_tween_program() -> Program {
         let mut p = effects_program();
         p.requires.push("ui.menu-element-tween.v1".into());
-        p.theme.image_menus.get_mut("system").unwrap().effects =
-            Some(serde_json::from_value(serde_json::json!({
+        p.theme.image_menus.get_mut("system").unwrap().effects = Some(
+            serde_json::from_value(serde_json::json!({
                 "enter": {"sound": "audio.bell"},
                 "close": {"sound": "audio.bell", "fade_us": "300000"},
                 "elements": [
@@ -3829,17 +3849,20 @@ mod tests {
                      "duration_us": "200000"}
                 ]
             }))
-            .unwrap());
+            .unwrap(),
+        );
         // The child page animates one element, so navigation must restart the
         // track set rather than leak the parent page's.
         let child = p.theme.image_menus.get_mut("system.child").unwrap();
-        child.effects = Some(serde_json::from_value(serde_json::json!({
-            "elements": [
-                {"element": "close", "property": "offset_y", "from": 20.0,
-                 "duration_us": "200000"}
-            ]
-        }))
-        .unwrap());
+        child.effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "elements": [
+                    {"element": "close", "property": "offset_y", "from": 20.0,
+                     "duration_us": "200000"}
+                ]
+            }))
+            .unwrap(),
+        );
         p
     }
     fn element_player_at_overlay() -> Player {
@@ -3884,18 +3907,17 @@ mod tests {
         assert_eq!(model.menu_element_animations["motion"].scale, Some(0.5));
         // Projection carries the overrides through layout: the readout text
         // is displaced and fully transparent while the page behind it is not.
-        let packet = nir_presentation::project(
-            &model,
-            1280.,
-            720.,
-            &nir_presentation::Messages::default(),
-        );
+        let packet =
+            nir_presentation::project(&model, 1280., 720., &nir_presentation::Messages::default());
         let readout = packet
             .texts
             .iter()
             .find(|t| t.text == "1.00")
             .expect("speed readout projected");
-        assert!((readout.x - (20. - 40.)).abs() < 1e-3, "displaced by the track");
+        assert!(
+            (readout.x - (20. - 40.)).abs() < 1e-3,
+            "displaced by the track"
+        );
         assert_eq!(readout.color[3], 0.);
         // Halfway into the delay window the opacity has not moved yet.
         tick_foreground(&mut p, 50_000);
@@ -3905,12 +3927,24 @@ mod tests {
         tick_foreground(&mut p, 150_000);
         let model = p.model();
         let speed = &model.menu_element_animations["speed"];
-        assert!((speed.opacity.unwrap() - 1. / 3.).abs() < 1e-3, "delay shifts the ramp");
+        assert!(
+            (speed.opacity.unwrap() - 1. / 3.).abs() < 1e-3,
+            "delay shifts the ramp"
+        );
         assert!((speed.offset[0] + 20.).abs() < 1e-3);
-        assert!(!model.menu_element_animations.contains_key("motion"), "scale settled");
+        assert!(
+            !model.menu_element_animations.contains_key("motion"),
+            "scale settled"
+        );
         assert_eq!(p.menu_effects.elements.len(), 2);
-        assert!(p.take_ui_visual_pulse(), "a drain is a discrete view change");
-        assert!(p.menu_effects_clock.is_some(), "lease outlives remaining tracks");
+        assert!(
+            p.take_ui_visual_pulse(),
+            "a drain is a discrete view change"
+        );
+        assert!(
+            p.menu_effects_clock.is_some(),
+            "lease outlives remaining tracks"
+        );
         // At 400ms everything has settled: no overrides, authored projection,
         // lease released, and the final drain pulsed the view once more.
         tick_foreground(&mut p, 200_000);
@@ -3918,14 +3952,13 @@ mod tests {
         assert!(model.menu_element_animations.is_empty());
         assert!(p.menu_effects.elements.is_empty());
         assert!(p.menu_effects_clock.is_none());
-        assert!(p.take_ui_visual_pulse(), "the settling tick pulses the view");
-        assert!(!p.take_ui_visual_pulse(), "the pulse is one-shot");
-        let settled = nir_presentation::project(
-            &model,
-            1280.,
-            720.,
-            &nir_presentation::Messages::default(),
+        assert!(
+            p.take_ui_visual_pulse(),
+            "the settling tick pulses the view"
         );
+        assert!(!p.take_ui_visual_pulse(), "the pulse is one-shot");
+        let settled =
+            nir_presentation::project(&model, 1280., 720., &nir_presentation::Messages::default());
         let readout = settled
             .texts
             .iter()
@@ -3957,7 +3990,11 @@ mod tests {
         tick_foreground(&mut p, 50_000);
         let c = pump_action(&mut p, UiAction::Close);
         settle(&mut p, c);
-        assert_eq!(p.screen, Screen::Menu, "exit deferred behind the close fade");
+        assert_eq!(
+            p.screen,
+            Screen::Menu,
+            "exit deferred behind the close fade"
+        );
         tick_foreground(&mut p, 300_000);
         assert_eq!(p.screen, Screen::Story);
         assert!(p.menu_effects.elements.is_empty());
@@ -4021,18 +4058,25 @@ mod tests {
             }
             packet = reading.project(&p.model(), identity, 1280., 720., &messages, &mut text);
         }
-        let layers = packet.menu_layers.as_ref().expect("page diverted mid-reveal");
+        let layers = packet
+            .menu_layers
+            .as_ref()
+            .expect("page diverted mid-reveal");
         // The history bar's spliced quads ride the page root with the rest of
         // the page; the underlying frame keeps none of them.
         for asset in ["bar.track", "bar.thumb"] {
             assert!(
-                layers.quads.iter().any(|q| q.asset.as_deref() == Some(asset)),
+                layers
+                    .quads
+                    .iter()
+                    .any(|q| q.asset.as_deref() == Some(asset)),
                 "{asset} belongs to the page root"
             );
-            assert!(packet.quads[..layers.position]
-                .iter()
-                .chain(&packet.quads[layers.position + 1..])
-                .all(|q| q.asset.as_deref() != Some(asset)),
+            assert!(
+                packet.quads[..layers.position]
+                    .iter()
+                    .chain(&packet.quads[layers.position + 1..])
+                    .all(|q| q.asset.as_deref() != Some(asset)),
                 "{asset} must not stay in the underlying frame"
             );
         }
@@ -4085,30 +4129,22 @@ mod tests {
         assert_eq!(p.menu_effects.session, p.generation.session);
         assert!(p.menu_effects.entered.is_none(), "boot is still preparing");
         let fired = settle(&mut p, c);
-        assert!(ui_audio(&fired).iter().any(
-            |(_, asset, bus, looped, _)| *asset == "audio.bgm"
+        assert!(ui_audio(&fired)
+            .iter()
+            .any(|(_, asset, bus, looped, _)| *asset == "audio.bgm"
                 && *bus == AudioBus::Bgm
-                && *looped
-        ));
+                && *looped));
         assert_eq!(
             p.menu_effects.entered,
             Some(("title".into(), p.menu_session.instance))
         );
-        assert_eq!(
-            p.menu_effects.music.unwrap().session,
-            p.generation.session
-        );
+        assert_eq!(p.menu_effects.music.unwrap().session, p.generation.session);
     }
     #[test]
     fn reading_close_defers_the_toggle_behind_the_shared_close_fade() {
         let mut program = reading_program();
         program.requires.push("ui.menu-effects.v1".into());
-        program
-            .theme
-            .image_menus
-            .get_mut("system")
-            .unwrap()
-            .effects = Some(
+        program.theme.image_menus.get_mut("system").unwrap().effects = Some(
             serde_json::from_value(serde_json::json!({
                 "close": {"sound": "audio.bell", "fade_us": "300000"},
                 "click": "audio.bell"

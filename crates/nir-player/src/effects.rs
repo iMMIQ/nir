@@ -198,11 +198,9 @@ impl MenuEffectsState {
         self.elements.clear();
         self.elements.extend(authored.iter().filter_map(|t| {
             let base = match t.property {
-                nir_format::MenuElementProperty::Opacity => page?
-                    .elements
-                    .iter()
-                    .find(|e| e.id == t.element)?
-                    .opacity,
+                nir_format::MenuElementProperty::Opacity => {
+                    page?.elements.iter().find(|e| e.id == t.element)?.opacity
+                }
                 nir_format::MenuElementProperty::Scale => {
                     page?.elements.iter().find(|e| e.id == t.element)?.scale
                 }

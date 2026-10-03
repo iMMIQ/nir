@@ -99,8 +99,17 @@ fn started(program: &nir_format::Program) -> Player {
 /// revealed page: manual input or the automatic reader. Returns false when
 /// the program has finished (outcome set) or left the story screen.
 fn round(p: &mut Player, automatic: bool) -> bool {
-    assert!(p.diagnostic.is_none() && p.error.is_none(), "{:?}/{:?}", p.diagnostic, p.error);
-    assert!(p.core().state().fault.is_none(), "{:?}", p.core().state().fault);
+    assert!(
+        p.diagnostic.is_none() && p.error.is_none(),
+        "{:?}/{:?}",
+        p.diagnostic,
+        p.error
+    );
+    assert!(
+        p.core().state().fault.is_none(),
+        "{:?}",
+        p.core().state().fault
+    );
     if p.core().state().outcome.is_some() || p.screen != Screen::Story {
         return false;
     }
@@ -155,7 +164,12 @@ fn await_title(p: &mut Player, what: &str) {
         if p.screen == Screen::Title {
             return;
         }
-        let commands = p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 10_000);
+        let commands = p.pump(
+            vec![AppEvent::Tick {
+                delta_us: 1_000_000,
+            }],
+            10_000,
+        );
         settle(p, commands);
         assert!(
             p.diagnostic.is_none() && p.error.is_none(),
@@ -221,7 +235,10 @@ fn real_livenovel_player_certifies_full_routes() {
         .filter_map(|(_, _, requires)| requires.map(str::to_owned))
         .filter(|key| key.starts_with("lm.replay."))
         .collect();
-    assert!(!replay_entries.is_empty(), "corpus must expose replay entries");
+    assert!(
+        !replay_entries.is_empty(),
+        "corpus must expose replay entries"
+    );
 
     // A. Auto reading completes the main route and unlocks the replay set.
     let mut p = started(&program);
@@ -265,7 +282,10 @@ fn real_livenovel_player_certifies_full_routes() {
             .controls()
             .find_map(|(id, _, requires)| requires.map(|key| (id.to_string(), key.to_string())))
             .expect("replay menu has a guarded entry");
-        assert!(!fresh.profile.contains(&requires), "fresh profile is locked");
+        assert!(
+            !fresh.profile.contains(&requires),
+            "fresh profile is locked"
+        );
         let before = fresh.generation.session;
         let model = fresh.model();
         let commands = action(
@@ -278,8 +298,16 @@ fn real_livenovel_player_certifies_full_routes() {
         );
         settle(&mut fresh, commands);
         assert_eq!(fresh.generation.session, before, "locked entry refused");
-        assert_eq!(fresh.screen, Screen::Title, "locked entry stays on the title");
-        assert_eq!(fresh.model().image_menu, replay_menu, "locked entry stays on the menu");
+        assert_eq!(
+            fresh.screen,
+            Screen::Title,
+            "locked entry stays on the title"
+        );
+        assert_eq!(
+            fresh.model().image_menu,
+            replay_menu,
+            "locked entry stays on the menu"
+        );
     }
 
     // B. Every replay entry runs to its outcome and returns to the replay
@@ -293,9 +321,7 @@ fn real_livenovel_player_certifies_full_routes() {
     let model = p.model();
     let opener = program.theme.image_menus[&model.image_menu]
         .controls()
-        .find(|(_, action, _)| {
-            matches!(action, nir_format::ImageMenuAction::Menu { .. })
-        })
+        .find(|(_, action, _)| matches!(action, nir_format::ImageMenuAction::Menu { .. }))
         .expect("title menu links the replay menu")
         .0
         .to_string();
@@ -342,7 +368,11 @@ fn real_livenovel_player_certifies_full_routes() {
         assert_eq!(p.screen, Screen::Story, "{function} entered story");
         drive(&mut p, false, 200_000);
         await_title(&mut p, function);
-        assert_eq!(p.model().image_menu, replay_menu, "return reopens the replay menu");
+        assert_eq!(
+            p.model().image_menu,
+            replay_menu,
+            "return reopens the replay menu"
+        );
         assert!(p.core().state().fault.is_none());
     }
 
@@ -361,9 +391,15 @@ fn real_livenovel_player_certifies_full_routes() {
     let commands = action(&mut p, UiAction::HoldSkip { pressed: true });
     settle(&mut p, commands);
     tick(&mut p, 5_000_000);
-    assert!(p.current_interaction() > held, "held skip advanced read page");
+    assert!(
+        p.current_interaction() > held,
+        "held skip advanced read page"
+    );
     drive(&mut p, false, 200_000);
-    assert!(p.core().state().outcome.is_some(), "held skip completed route");
+    assert!(
+        p.core().state().outcome.is_some(),
+        "held skip completed route"
+    );
     let commands = action(&mut p, UiAction::HoldSkip { pressed: false });
     settle(&mut p, commands);
 
@@ -380,7 +416,10 @@ fn real_livenovel_player_certifies_full_routes() {
     assert!(p.interface_hidden());
     let story_us = p.core().state().tick_us;
     tick(&mut p, 1_000_000);
-    assert!(p.core().state().tick_us > story_us, "hidden story keeps running");
+    assert!(
+        p.core().state().tick_us > story_us,
+        "hidden story keeps running"
+    );
     let commands = action(&mut p, UiAction::RestoreInterface);
     settle(&mut p, commands);
     assert!(!p.interface_hidden());
@@ -403,7 +442,13 @@ fn real_livenovel_player_certifies_full_routes() {
     // flags included.
     let saved_position = {
         let (_, d) = p.core().dialogue().unwrap();
-        (d.text_id.clone(), d.span, d.cluster, d.at_gate, d.awaiting_advance)
+        (
+            d.text_id.clone(),
+            d.span,
+            d.cluster,
+            d.at_gate,
+            d.awaiting_advance,
+        )
     };
     let (job, envelope) = action(&mut p, UiAction::Save { slot: 0 })
         .into_iter()
@@ -413,13 +458,13 @@ fn real_livenovel_player_certifies_full_routes() {
         })
         .unwrap();
     let commands = p.pump(
-            vec![AppEvent::Saved {
-                job,
-                slot: 0,
-                revision: 1,
-            }],
-            10_000,
-        );
+        vec![AppEvent::Saved {
+            job,
+            slot: 0,
+            revision: 1,
+        }],
+        10_000,
+    );
     settle(&mut p, commands);
     let commands = action(&mut p, UiAction::Close);
     settle(&mut p, commands);
@@ -427,7 +472,10 @@ fn real_livenovel_player_certifies_full_routes() {
     let ahead = p.current_interaction();
     let commands = action(&mut p, UiAction::Rollback);
     settle(&mut p, commands);
-    assert!(p.current_interaction() < ahead, "rollback moved behind the last input");
+    assert!(
+        p.current_interaction() < ahead,
+        "rollback moved behind the last input"
+    );
     // Rollback restores under a "restored" pause; release it before storage.
     let commands = action(&mut p, UiAction::Continue);
     settle(&mut p, commands);
@@ -439,19 +487,25 @@ fn real_livenovel_player_certifies_full_routes() {
         })
         .unwrap();
     let commands = p.pump(
-            vec![AppEvent::SlotLoaded {
-                job,
-                envelope: envelope.clone(),
-            }],
-            10_000,
-        );
+        vec![AppEvent::SlotLoaded {
+            job,
+            envelope: envelope.clone(),
+        }],
+        10_000,
+    );
     settle(&mut p, commands);
     let (_, d) = p.core().dialogue().unwrap();
     // Restore re-mints the interaction identity by design (fresh tokens on
     // top of the session epoch carry stale-input rejection), so the
     // certificate pins the page and its exact reading position instead.
     assert_eq!(
-        (d.text_id.clone(), d.span, d.cluster, d.at_gate, d.awaiting_advance),
+        (
+            d.text_id.clone(),
+            d.span,
+            d.cluster,
+            d.at_gate,
+            d.awaiting_advance
+        ),
         saved_position,
         "slot restored the saved page at its reading position"
     );

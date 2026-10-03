@@ -29,17 +29,18 @@ fn program_waiting_on(wait: &str, effects: Json) -> Program {
     f.blocks.insert("hold".into(), serde_json::from_value(json!({"terminator":{"type":"await","conditions":[{"task":wait,"milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}})).unwrap());
     f.blocks.insert(
         "done".into(),
-        serde_json::from_value(
-            json!({"terminator":{"type":"end","outcome":"done"}}),
-        )
-        .unwrap(),
+        serde_json::from_value(json!({"terminator":{"type":"end","outcome":"done"}})).unwrap(),
     );
     p
 }
 
 fn start(p: Program) -> Core {
-    let mut c = Core::new(ValidatedProgram::new(p).unwrap(), "compose".into(), "en".into())
-        .unwrap();
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "compose".into(),
+        "en".into(),
+    )
+    .unwrap();
     c.step(CoreInput::None, 1000);
     prepare(&mut c);
     c
@@ -110,13 +111,21 @@ fn sequence_advances_while_the_vm_awaits_dialogue() {
     assert!(task(&c, "chain").milestones.contains(&Milestone::Finished));
     assert!(c.state().waiting.is_some());
     // The dialogue finishes on reader input and the wait resolves normally.
-    let interaction = task(&c, "line")
-        .dialogue
-        .as_ref()
-        .unwrap()
-        .interaction;
-    c.step(CoreInput::Advance { interaction, sequence: 1 }, 1000);
-    c.step(CoreInput::Advance { interaction, sequence: 2 }, 1000);
+    let interaction = task(&c, "line").dialogue.as_ref().unwrap().interaction;
+    c.step(
+        CoreInput::Advance {
+            interaction,
+            sequence: 1,
+        },
+        1000,
+    );
+    c.step(
+        CoreInput::Advance {
+            interaction,
+            sequence: 2,
+        },
+        1000,
+    );
     assert_eq!(c.state().outcome.as_deref(), Some("done"));
 }
 
@@ -129,11 +138,19 @@ fn sequence_advances_while_the_vm_awaits_dialogue() {
 fn zero_duration_chain_chases_within_one_commit_and_pays_budget() {
     let c = start(program(json!([
         stage(),
-        chain(&[move_x(10., 0), {
-            let mut m = move_x(20., 0); m["id"] = json!("step2"); m
-        }, {
-            let mut m = move_x(30., 0); m["id"] = json!("step3"); m
-        }]),
+        chain(&[
+            move_x(10., 0),
+            {
+                let mut m = move_x(20., 0);
+                m["id"] = json!("step2");
+                m
+            },
+            {
+                let mut m = move_x(30., 0);
+                m["id"] = json!("step3");
+                m
+            }
+        ]),
     ])));
     assert_eq!(node(&c, "background", Property::X), 30.);
     assert!(task(&c, "chain").milestones.contains(&Milestone::Finished));
@@ -142,11 +159,23 @@ fn zero_duration_chain_chases_within_one_commit_and_pays_budget() {
     // A two-unit budget commits the cue and the first two spawns only; the
     // third waits for the next step. Every spawn is visible in work_used.
     let mut c = Core::new(
-        ValidatedProgram::new(program(json!([stage(), chain(&[
-            move_x(10., 0),
-            { let mut m = move_x(20., 0); m["id"] = json!("step2"); m },
-            { let mut m = move_x(30., 0); m["id"] = json!("step3"); m },
-        ])]))).unwrap(),
+        ValidatedProgram::new(program(json!([
+            stage(),
+            chain(&[
+                move_x(10., 0),
+                {
+                    let mut m = move_x(20., 0);
+                    m["id"] = json!("step2");
+                    m
+                },
+                {
+                    let mut m = move_x(30., 0);
+                    m["id"] = json!("step3");
+                    m
+                },
+            ])
+        ])))
+        .unwrap(),
         "compose".into(),
         "en".into(),
     )
@@ -170,7 +199,8 @@ fn zero_duration_chain_chases_within_one_commit_and_pays_budget() {
 #[test]
 fn sequence_child_failure_fails_the_chain_and_keeps_completed_side_effects() {
     let mut c = start(program(json!([
-        stage(), chain(&[move_x(50., 1000), fade_scene(0.2, 2000)]),
+        stage(),
+        chain(&[move_x(50., 1000), fade_scene(0.2, 2000)]),
     ])));
     tick(&mut c, 1500);
     assert_eq!(node(&c, "background", Property::X), 50.);
@@ -202,7 +232,8 @@ fn sequence_child_failure_fails_the_chain_and_keeps_completed_side_effects() {
 #[test]
 fn parallel_all_merges_failure_first_and_finishes_when_all_finish() {
     let mut c = start(program(json!([
-        stage(), parallel(&[move_x(50., 1000), fade_scene(0.2, 1000)]),
+        stage(),
+        parallel(&[move_x(50., 1000), fade_scene(0.2, 1000)]),
     ])));
     assert_eq!(task(&c, "move").state, TaskState::Running);
     assert_eq!(task(&c, "fadeout").state, TaskState::Running);
@@ -212,7 +243,8 @@ fn parallel_all_merges_failure_first_and_finishes_when_all_finish() {
     assert_eq!(node(&c, "background", Property::Opacity), 0.2);
 
     let mut c = start(program(json!([
-        stage(), parallel(&[move_x(50., 5000), fade_scene(0.2, 5000)]),
+        stage(),
+        parallel(&[move_x(50., 5000), fade_scene(0.2, 5000)]),
     ])));
     c.step(
         CoreInput::TaskFailed {
@@ -242,17 +274,15 @@ fn task_control_finishes_or_cancels_the_whole_chain() {
         "control".into(),
         serde_json::from_value(json!({"ops":[{"id":"control","operation":{"type":"task_control","task":"chain","action":"finish"}}],"terminator":{"type":"await","conditions":[{"task":"chain","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}})).unwrap(),
     );
-    f.blocks
-        .get_mut("test")
-        .unwrap()
-        .terminator = serde_json::from_value(
-        json!({"type":"activate","cue":"test","next":"control"}),
-    )
-    .unwrap();
+    f.blocks.get_mut("test").unwrap().terminator =
+        serde_json::from_value(json!({"type":"activate","cue":"test","next":"control"})).unwrap();
     let mut c = start(p);
     assert!(task(&c, "chain").milestones.contains(&Milestone::Finished));
     assert_eq!(task(&c, "chain").cursor, 1);
-    assert_eq!(task(&c, "move").end_reason, Some(TaskEndReason::FinishedByControl));
+    assert_eq!(
+        task(&c, "move").end_reason,
+        Some(TaskEndReason::FinishedByControl)
+    );
     assert_eq!(node(&c, "background", Property::X), 50.);
     tick(&mut c, 20000);
     assert_eq!(node(&c, "background", Property::Opacity), 1.);
@@ -274,8 +304,7 @@ fn save_and_restore_mid_chain_resumes_without_replay() {
     assert_eq!(task(&c, "ring").state, TaskState::Running);
     assert_eq!(task(&c, "chain").cursor, 1);
     let snapshot = c.snapshot();
-    let mut restored =
-        Core::restore(c.validated_program().clone(), snapshot, "compose").unwrap();
+    let mut restored = Core::restore(c.validated_program().clone(), snapshot, "compose").unwrap();
     assert_eq!(task(&restored, "chain").cursor, 1);
     let mut starts = 0;
     let step = restored.step(
@@ -291,10 +320,15 @@ fn save_and_restore_mid_chain_resumes_without_replay() {
         .count();
     assert_eq!(task(&restored, "ring").state, TaskState::Finished);
     assert_eq!(task(&restored, "move").state, TaskState::Running);
-    let step = { tick(&mut restored, 4000); 0 };
+    let step = {
+        tick(&mut restored, 4000);
+        0
+    };
     starts += step;
     assert_eq!(starts, 0);
-    assert!(task(&restored, "chain").milestones.contains(&Milestone::Finished));
+    assert!(task(&restored, "chain")
+        .milestones
+        .contains(&Milestone::Finished));
     assert_eq!(node(&restored, "background", Property::X), 99.);
     assert_eq!(restored.state().outcome.as_deref(), Some("done"));
 }
@@ -305,9 +339,16 @@ fn save_and_restore_mid_chain_resumes_without_replay() {
 #[test]
 fn composition_validation_rejects_invalid_cues() {
     let valid = |effects: Json| ValidatedProgram::new(program(effects)).is_ok();
-    assert!(valid(json!([stage(), chain(&[move_x(10., 100), fade_scene(0.2, 100)])])));
+    assert!(valid(json!([
+        stage(),
+        chain(&[move_x(10., 100), fade_scene(0.2, 100)])
+    ])));
     // Same address twice in one sequence is the point of chaining.
-    let step2 = { let mut m = move_x(20., 100); m["id"] = json!("step2"); m };
+    let step2 = {
+        let mut m = move_x(20., 100);
+        m["id"] = json!("step2");
+        m
+    };
     assert!(valid(json!([chain(&[move_x(10., 100), step2])])));
     let rejects = |effects: Json, code: &str| {
         assert_eq!(
@@ -318,47 +359,58 @@ fn composition_validation_rejects_invalid_cues() {
     // Capability.
     let mut p = program(json!([chain(&[move_x(10., 100)])]));
     p.requires.retain(|cap| cap != "task.compose.v1");
-    assert_eq!(
-        ValidatedProgram::new(p).unwrap_err().code,
-        "E_CAPABILITY"
-    );
+    assert_eq!(ValidatedProgram::new(p).unwrap_err().code, "E_CAPABILITY");
     // Child scope must inherit the composition's scope.
     let mut wrong_scope = move_x(10., 100);
     wrong_scope["scope"] = json!("scene");
     rejects(json!([chain(&[wrong_scope])]), "E_SCOPE");
     // Stages and dialogue are not composition children.
     rejects(
-        json!([chain(&[json!({"id":"inner","scope":"session","effect":{"type":"stage_present","scene":"station","duration_us":"0"}})])]),
+        json!([chain(&[
+            json!({"id":"inner","scope":"session","effect":{"type":"stage_present","scene":"station","duration_us":"0"}})
+        ])]),
         "E_COMPOSE",
     );
     rejects(
-        json!([chain(&[json!({"id":"inner","scope":"session","effect":{"type":"dialogue","text":"intro","speaker":"","reveal_us":"1000"}})])]),
+        json!([chain(&[
+            json!({"id":"inner","scope":"session","effect":{"type":"dialogue","text":"intro","speaker":"","reveal_us":"1000"}})
+        ])]),
         "E_COMPOSE",
     );
     // Parallel children writing the same address conflict.
-    let step2 = { let mut m = move_x(20., 100); m["id"] = json!("step2"); m };
+    let step2 = {
+        let mut m = move_x(20., 100);
+        m["id"] = json!("step2");
+        m
+    };
     rejects(
         json!([parallel(&[move_x(10., 100), step2.clone()])]),
         "E_OWNERSHIP",
     );
     // A sequence child still conflicts with a concurrent top-level writer.
-    rejects(
-        json!([move_x(10., 100), chain(&[step2])]),
-        "E_OWNERSHIP",
-    );
+    rejects(json!([move_x(10., 100), chain(&[step2])]), "E_OWNERSHIP");
     // Ids are unique across the whole cue tree.
     rejects(
-        json!([chain(&[move_x(10., 100), {
-            let mut m = move_x(20., 100); m["id"] = json!("step2"); m
-        }, {
-            let mut m = move_x(30., 100); m["id"] = json!("move"); m
-        }])]),
+        json!([chain(&[
+            move_x(10., 100),
+            {
+                let mut m = move_x(20., 100);
+                m["id"] = json!("step2");
+                m
+            },
+            {
+                let mut m = move_x(30., 100);
+                m["id"] = json!("move");
+                m
+            }
+        ])]),
         "E_DUPLICATE",
     );
     // Nesting depth is bounded.
     let mut deep = move_x(10., 100);
     for _ in 0..9 {
-        deep = json!({"id":"chain","scope":"session","effect":{"type":"sequence","children":[deep]}});
+        deep =
+            json!({"id":"chain","scope":"session","effect":{"type":"sequence","children":[deep]}});
     }
     rejects(json!([deep]), "E_LIMIT");
     // Total leaves are bounded by the task cap.
@@ -372,7 +424,9 @@ fn composition_validation_rejects_invalid_cues() {
     rejects(json!([chain(&wide)]), "E_LIMIT");
     // A stop child still needs a real audio target.
     rejects(
-        json!([chain(&[json!({"id":"stop","scope":"session","effect":{"type":"audio_stop","target":"ring","duration_us":"1000"}})])]),
+        json!([chain(&[
+            json!({"id":"stop","scope":"session","effect":{"type":"audio_stop","target":"ring","duration_us":"1000"}})
+        ])]),
         "E_AUDIO_STOP",
     );
 }
@@ -382,7 +436,8 @@ fn composition_validation_rejects_invalid_cues() {
 #[test]
 fn restore_rejects_corrupted_compositions() {
     let mut c = start(program(json!([
-        stage(), chain(&[move_x(10., 0), fade_scene(0.2, 4000)]),
+        stage(),
+        chain(&[move_x(10., 0), fade_scene(0.2, 4000)]),
     ])));
     tick(&mut c, 0);
     assert_eq!(task(&c, "chain").cursor, 2);

@@ -627,10 +627,12 @@ pub(super) fn system_menu_fades(init: &Script, right_click: &Script) -> Result<O
                     })
             };
             let literal = |name: &str| -> Result<Option<i64>> {
-                Ok(match parameters.get(name).map(normalize).transpose()?.flatten() {
-                    Some(Term::Int { value }) => Some(i64::from(value)),
-                    _ => None,
-                })
+                Ok(
+                    match parameters.get(name).map(normalize).transpose()?.flatten() {
+                        Some(Term::Int { value }) => Some(i64::from(value)),
+                        _ => None,
+                    },
+                )
             };
             // The role signature is the part that identifies the flip as this
             // convention; anything else (including a dynamic signature) is
@@ -897,7 +899,9 @@ fn choice_chain(
     let mut options = vec![];
     let mut at = pc;
     while let Some(c) = script.commands.get(at) {
-        let Body::Jump(target, condition) = &c.body else { break };
+        let Body::Jump(target, condition) = &c.body else {
+            break;
+        };
         let Some(literal) = selection_dispatch(condition) else {
             break;
         };
@@ -1667,7 +1671,8 @@ impl Adapter {
             branches.insert(option, block);
             routes.queue.push((target, chain_path.clone()));
         }
-        self.choices.insert(choice.clone(), json!({"options": definitions}));
+        self.choices
+            .insert(choice.clone(), json!({"options": definitions}));
         self.variables
             .entry(CHOICE_RESULT.to_string())
             .or_insert_with(|| json!({"type":"string","value":""}));
@@ -1695,8 +1700,12 @@ impl Adapter {
         // and the right-click close Flip) feeds the draft preview's page
         // effects below; the spatial wipe pattern itself is approximated by
         // whole-layer fades.
-        let (_, menu_init) = self.source.read("ノベルシステム/システムメニュー/初期化.lsb")?;
-        let (_, menu_close) = self.source.read("ノベルシステム/システムメニュー/右クリック時.lsb")?;
+        let (_, menu_init) = self
+            .source
+            .read("ノベルシステム/システムメニュー/初期化.lsb")?;
+        let (_, menu_close) = self
+            .source
+            .read("ノベルシステム/システムメニュー/右クリック時.lsb")?;
         self.menu_fades = system_menu_fades(&menu_init, &menu_close)?;
         let (_, startup) = self.source.read(entry)?;
         let (_, bootstrap) = self.source.read(&last_jump(&startup)?)?;
@@ -1740,8 +1749,10 @@ impl Adapter {
             json!({"ops":[],"terminator":{"type":"end","outcome":"cancelled"}}),
         );
         routes.blocks.insert("failed".into(),json!({"ops":[],"terminator":{"type":"fault","code":"E_IMPORT_TASK","message":"Imported event failed"}}));
-        self.functions
-            .insert("main".into(), json!({"entry": main_entry, "blocks": routes.blocks}));
+        self.functions.insert(
+            "main".into(),
+            json!({"entry": main_entry, "blocks": routes.blocks}),
+        );
         self.choice_sites = routes.choice_sites;
         let episodes = routes.episodes;
         // Build replay wrappers from the original dispatcher, preserving its order.
@@ -1751,18 +1762,16 @@ impl Adapter {
         // grid's select SE and the screen's looping BGM through the BGM再生
         // helper. Missing conventions lower to no effects; recognized-but-
         // malformed ones fail the import.
-        let (_, mouse) =
-            self.source
-                .read("ノベルシステム/シーン回想/サムネイル・マウス処理.lsb")?;
+        let (_, mouse) = self
+            .source
+            .read("ノベルシステム/シーン回想/サムネイル・マウス処理.lsb")?;
         let (_, stock) = self.source.read("ノベルシステム/■関数.lsb")?;
         let replay_click = replay_select_sound(&mouse)?;
         let replay_music = replay_bgm(&replay_ui, &stock)?;
         let replay_effects = if replay_click.is_none() && replay_music.is_none() {
             None
         } else {
-            let click = replay_click
-                .map(|path| self.sound(&path, 1.))
-                .transpose()?;
+            let click = replay_click.map(|path| self.sound(&path, 1.)).transpose()?;
             let music = match replay_music {
                 Some(path) => {
                     let asset = self.sound(&path, 1.)?;
@@ -2856,11 +2865,7 @@ mod tests {
             Expression {
                 literal: None,
                 operations: vec![
-                    (
-                        1,
-                        "____0".into(),
-                        vec![Literal::String(literal.into())],
-                    ),
+                    (1, "____0".into(), vec![Literal::String(literal.into())]),
                     (
                         12,
                         "____2".into(),
@@ -3038,8 +3043,14 @@ mod tests {
         let options = definition["options"].as_array().unwrap();
         assert_eq!(options.len(), 2);
         assert_eq!(options[0]["id"], "o0");
-        assert_eq!(options[0]["value"], json!({"type":"string","value":"synthetic-alpha"}));
-        assert_eq!(options[1]["value"], json!({"type":"string","value":"synthetic-beta"}));
+        assert_eq!(
+            options[0]["value"],
+            json!({"type":"string","value":"synthetic-alpha"})
+        );
+        assert_eq!(
+            options[1]["value"],
+            json!({"type":"string","value":"synthetic-beta"})
+        );
         for option in options {
             let doc = &adapter.texts[option["text"].as_str().unwrap()];
             assert_eq!(doc.spans.len(), 1);
@@ -3051,9 +3062,10 @@ mod tests {
         assert_eq!(interact["result"], "選択値");
         assert_eq!(interact["on_empty"], "failed");
         // The interaction itself validates against the runtime schema.
-        let terminator: nir_format::Terminator =
-            serde_json::from_value(interact.clone()).unwrap();
-        assert!(matches!(terminator, nir_format::Terminator::Interact { result, .. } if result.as_deref() == Some("選択値")));
+        let terminator: nir_format::Terminator = serde_json::from_value(interact.clone()).unwrap();
+        assert!(
+            matches!(terminator, nir_format::Terminator::Interact { result, .. } if result.as_deref() == Some("選択値"))
+        );
         let def: nir_format::Choice = serde_json::from_value(definition.clone()).unwrap();
         assert!(def.options.iter().all(|o| o.value.is_some()));
         // Branch targets continue at each route's episode call, and every
@@ -3072,7 +3084,10 @@ mod tests {
             .iter()
             .all(|b| b["terminator"]["outcome"] == "completed"));
         // The unreachable dispatch fallthrough lowers to nothing.
-        assert!(!routes.blocks.values().any(|b| b["terminator"]["type"] == "fault"));
+        assert!(!routes
+            .blocks
+            .values()
+            .any(|b| b["terminator"]["type"] == "fault"));
     }
 
     /// Converging branch targets merge into one continuation instead of
@@ -3100,8 +3115,7 @@ mod tests {
             .unwrap()["terminator"]
             .clone();
         assert_eq!(
-            interact["branches"]["o0"],
-            interact["branches"]["o1"],
+            interact["branches"]["o0"], interact["branches"]["o1"],
             "both options continue at the merged route"
         );
     }
@@ -3242,7 +3256,11 @@ mod tests {
             )]),
             route::script(vec![
                 route::command(5, 143, call(preview, 0, vec![text(""); 6])),
-                route::command(5, 150, call("プレビューメニュー\\■選択実行.lsb", 0, vec![text(""); 6])),
+                route::command(
+                    5,
+                    150,
+                    call("プレビューメニュー\\■選択実行.lsb", 0, vec![text(""); 6]),
+                ),
             ]),
         ] {
             assert!(title_select_sound(&bad).is_err());
@@ -3396,11 +3414,7 @@ mod tests {
         };
         let enter = |time: i32| flip(stock(1, 0, 0, 0, time), vec![], 0);
         let close = |time: i32, indent: u32| {
-            flip(
-                stock(0, 1, 0, 1, time),
-                vec![text("メニュー背景")],
-                indent,
-            )
+            flip(stock(0, 1, 0, 1, time), vec![text("メニュー背景")], indent)
         };
         let empty = || route::script(vec![route::exit(1)]);
         // The stock pair: an enter Flip and nested close Flip in the
@@ -3447,33 +3461,53 @@ mod tests {
         assert!(system_menu_fades(&mixed, &empty()).unwrap().is_none());
         // A recognized role with malformed pinned shape or timing is refused.
         for (name, parameters, targets) in [
-            ("wipe", {
-                let mut p = stock(1, 0, 0, 0, 200);
-                p.insert("wipe".into(), int(4));
-                p
-            }, vec![] as Vec<Expression>),
-            ("parameter_0", {
-                let mut p = stock(1, 0, 0, 0, 200);
-                p.insert("parameter_0".into(), int(8));
-                p
-            }, vec![]),
-            ("dynamic parameter_1", {
-                let mut p = stock(1, 0, 0, 0, 200);
-                p.insert("parameter_1".into(), Expression::default());
-                p
-            }, vec![]),
-            ("nonempty source", {
-                let mut p = stock(1, 0, 0, 0, 200);
-                p.insert("source".into(), text("風"));
-                p
-            }, vec![]),
+            (
+                "wipe",
+                {
+                    let mut p = stock(1, 0, 0, 0, 200);
+                    p.insert("wipe".into(), int(4));
+                    p
+                },
+                vec![] as Vec<Expression>,
+            ),
+            (
+                "parameter_0",
+                {
+                    let mut p = stock(1, 0, 0, 0, 200);
+                    p.insert("parameter_0".into(), int(8));
+                    p
+                },
+                vec![],
+            ),
+            (
+                "dynamic parameter_1",
+                {
+                    let mut p = stock(1, 0, 0, 0, 200);
+                    p.insert("parameter_1".into(), Expression::default());
+                    p
+                },
+                vec![],
+            ),
+            (
+                "nonempty source",
+                {
+                    let mut p = stock(1, 0, 0, 0, 200);
+                    p.insert("source".into(), text("風"));
+                    p
+                },
+                vec![],
+            ),
             ("zero time", stock(1, 0, 0, 0, 0), vec![]),
             ("time beyond the NIR bound", stock(1, 0, 0, 0, 2500), vec![]),
-            ("dynamic time", {
-                let mut p = stock(1, 0, 0, 0, 200);
-                p.insert("time".into(), Expression::default());
-                p
-            }, vec![]),
+            (
+                "dynamic time",
+                {
+                    let mut p = stock(1, 0, 0, 0, 200);
+                    p.insert("time".into(), Expression::default());
+                    p
+                },
+                vec![],
+            ),
         ] {
             let script = route::script(vec![flip(parameters, targets, 0)]);
             assert!(

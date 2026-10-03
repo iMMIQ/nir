@@ -8,7 +8,9 @@ use nir_player::{AppCommand, AppEvent, Player};
 use nir_presentation::Screen;
 use std::path::{Path, PathBuf};
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
 }
 fn requires(root: &Path) -> Vec<String> {
     load_project(root).unwrap().program.requires.clone()
@@ -40,7 +42,10 @@ fn reading_lamp_checks_runs_scenarios_and_derives_dialogue_capabilities() {
         ],
     );
     // The authored fixed Auto policy survives into the program defaults.
-    assert_eq!(p.program.player.auto_delay_policy, nir_format::AutoDelayPolicy::Fixed);
+    assert_eq!(
+        p.program.player.auto_delay_policy,
+        nir_format::AutoDelayPolicy::Fixed
+    );
     assert_eq!(p.program.player.auto_delay_us.0, 2_500_000);
     // One explicit voice binding on the spoken page, sampled-remaining.
     let bindings: Vec<_> = p
@@ -91,7 +96,12 @@ fn replay_atlas_checks_runs_tour_and_derives_menu_capabilities() {
             }
         })
         .collect();
-    assert_eq!(unlocks, ["atlas.north".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>());
+    assert_eq!(
+        unlocks,
+        ["atlas.north".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
     let gallery = &p.program.theme.image_menus["gallery"];
     let guard = |id: &str| {
         gallery
@@ -176,7 +186,10 @@ fn voyage_log_player_drives_tabs_values_saves_and_history() {
         matches!(hit(&player, 530., 196.), Some(UiAction::MenuValue { control, .. }) if control == "speed"),
         "the settings rows are interactive on the default tab"
     );
-    assert!(hit(&player, 210., 392.).is_none(), "save is hidden on the settings tab");
+    assert!(
+        hit(&player, 210., 392.).is_none(),
+        "save is hidden on the settings tab"
+    );
     // Back returns to the title with the page state discarded.
     tap(&mut player, 1105., 658.).expect("back button");
     assert_eq!(player.screen, Screen::Title);
@@ -231,13 +244,25 @@ fn voyage_log_player_drives_tabs_values_saves_and_history() {
     let (job, slot, revision) = settle(&mut player, commands)
         .iter()
         .find_map(|c| match c {
-            AppCommand::Save { slot, expected_revision, job, .. } => Some((*job, *slot, *expected_revision)),
+            AppCommand::Save {
+                slot,
+                expected_revision,
+                job,
+                ..
+            } => Some((*job, *slot, *expected_revision)),
             _ => None,
         })
         .expect("save transaction for the selected slot");
     assert_eq!(slot, 2);
     // The host completes the save; the menu keeps its page afterwards.
-    let commands = player.pump(vec![AppEvent::Saved { job, slot, revision }], 10_000);
+    let commands = player.pump(
+        vec![AppEvent::Saved {
+            job,
+            slot,
+            revision,
+        }],
+        10_000,
+    );
     settle(&mut player, commands);
 
     // History tab: two visible rows over five recorded lines page away from
@@ -279,7 +304,6 @@ fn voyage_log_player_drives_tabs_values_saves_and_history() {
     assert!(player.core().state().outcome.is_none());
 }
 
-
 // --- player-level drive harness (same contracts as nir-player's suites) -------
 
 fn action(p: &mut Player, a: UiAction) -> Vec<AppCommand> {
@@ -304,7 +328,9 @@ fn settle(p: &mut Player, commands: Vec<AppCommand>) -> Vec<AppCommand> {
         let mut next = vec![];
         for c in q {
             match c {
-                AppCommand::GetAssets { request, assets, .. } => {
+                AppCommand::GetAssets {
+                    request, assets, ..
+                } => {
                     for asset in assets {
                         next.extend(p.pump(vec![AppEvent::AssetReady { request, asset }], 10_000));
                     }
@@ -336,10 +362,24 @@ fn offset(p: &Player) -> Option<nir_format::MenuValue> {
 /// Resolve and commit the control under (x, y), replacing its value the way a
 /// host does when a drag or key press picks a concrete number.
 fn commit_value(p: &mut Player, x: f32, y: f32, value: MenuValueInput) {
-    let Some(UiAction::MenuValue { instance, revision, control, .. }) = hit(p, x, y) else {
+    let Some(UiAction::MenuValue {
+        instance,
+        revision,
+        control,
+        ..
+    }) = hit(p, x, y)
+    else {
         panic!("no value control at ({x}, {y})");
     };
-    let commands = action(p, UiAction::MenuValue { instance, revision, control, value });
+    let commands = action(
+        p,
+        UiAction::MenuValue {
+            instance,
+            revision,
+            control,
+            value,
+        },
+    );
     settle(p, commands);
 }
 
@@ -363,7 +403,12 @@ fn advance_pages(p: &mut Player, pages: usize) {
             if p.core().state().outcome.is_some() || p.screen != Screen::Story {
                 break;
             }
-            let commands = p.pump(vec![AppEvent::Tick { delta_us: 1_000_000 }], 10_000);
+            let commands = p.pump(
+                vec![AppEvent::Tick {
+                    delta_us: 1_000_000,
+                }],
+                10_000,
+            );
             settle(p, commands);
         }
         let (_, d) = p.core().dialogue().expect("dialogue page");
@@ -376,13 +421,8 @@ fn advance_pages(p: &mut Player, pages: usize) {
 /// Advance/feed loop shared with the corpus harness: prepared activations,
 /// gate ticks, dialogue advances, and time for everything else.
 fn drive(validated: &nir_core::ValidatedProgram, entry: &str) -> String {
-    let mut core = nir_core::Core::new_at(
-        validated.clone(),
-        "p0".into(),
-        "zh-Hans".into(),
-        entry,
-    )
-    .unwrap();
+    let mut core =
+        nir_core::Core::new_at(validated.clone(), "p0".into(), "zh-Hans".into(), entry).unwrap();
     for sequence in 1..100_000 {
         let input = if let Some(pending) = &core.state().pending {
             nir_core::CoreInput::Prepared {
@@ -405,7 +445,11 @@ fn drive(validated: &nir_core::ValidatedProgram, entry: &str) -> String {
             }
         };
         core.step(input, 10_000);
-        assert!(core.state().fault.is_none(), "{entry}: {:?}", core.state().fault);
+        assert!(
+            core.state().fault.is_none(),
+            "{entry}: {:?}",
+            core.state().fault
+        );
         if let Some(outcome) = core.state().outcome.clone() {
             return outcome;
         }

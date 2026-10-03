@@ -791,14 +791,11 @@ fn reading_menu_actions_emit_only_their_used_capability() {
 fn menu_transition_capability_follows_spatial_style_usage() {
     let d = project();
     // The stock theme declares neither effects capability.
-    let requires = |path: &Path| {
-        load_project(path)
-            .unwrap()
-            .program
-            .requires
-    };
+    let requires = |path: &Path| load_project(path).unwrap().program.requires;
     assert!(!requires(d.path()).iter().any(|c| c == "ui.menu-effects.v1"));
-    assert!(!requires(d.path()).iter().any(|c| c == "ui.menu-transition.v1"));
+    assert!(!requires(d.path())
+        .iter()
+        .any(|c| c == "ui.menu-transition.v1"));
     let path = d.path().join("themes/rain/theme.toml");
     let mut text = fs::read_to_string(&path).unwrap();
     // A dissolve fade claims only the effects capability; the wipe close adds
@@ -813,12 +810,17 @@ fn menu_transition_capability_follows_spatial_style_usage() {
     // Dropping the spatial style trims the reveal capability but keeps the
     // fade on the legacy path.
     let path = d.path().join("themes/rain/theme.toml");
-    let text = fs::read_to_string(&path)
-        .unwrap()
-        .replace("style = {type = \"wipe\", direction = \"left_to_right\", softness = 0.2}\n", "");
+    let text = fs::read_to_string(&path).unwrap().replace(
+        "style = {type = \"wipe\", direction = \"left_to_right\", softness = 0.2}\n",
+        "",
+    );
     fs::write(path, text).unwrap();
     let trimmed = load_project(d.path()).unwrap();
-    assert!(trimmed.program.requires.iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(trimmed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-effects.v1"));
     assert!(!trimmed
         .program
         .requires
@@ -854,7 +856,11 @@ fn menu_element_tween_capability_follows_element_animation_usage() {
         .replace("\n[[image_menus.title.effects.elements]]\nelement = \"row\"\nproperty = \"offset_x\"\nfrom = -40.0\nduration_us = \"300000\"\n", "");
     fs::write(path, text).unwrap();
     let trimmed = load_project(d.path()).unwrap();
-    assert!(trimmed.program.requires.iter().any(|c| c == "ui.menu-effects.v1"));
+    assert!(trimmed
+        .program
+        .requires
+        .iter()
+        .any(|c| c == "ui.menu-effects.v1"));
     assert!(!trimmed
         .program
         .requires

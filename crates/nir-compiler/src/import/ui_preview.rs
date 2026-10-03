@@ -338,14 +338,12 @@ fn menu(
     // The certified stock fade timings enter as plain whole-layer fades; the
     // source wipe pattern has no certified NIR direction and stays out of the
     // claim (see the mapping ledger's menu-transition rule).
-    let effects = fades
-        .filter(|f| !f.is_empty())
-        .map(|f| {
-            json!({
-                "enter": f.enter.map(|us| json!({"fade_us": us.to_string()})),
-                "close": f.close.map(|us| json!({"fade_us": us.to_string()})),
-            })
-        });
+    let effects = fades.filter(|f| !f.is_empty()).map(|f| {
+        json!({
+            "enter": f.enter.map(|us| json!({"fade_us": us.to_string()})),
+            "close": f.close.map(|us| json!({"fade_us": us.to_string()})),
+        })
+    });
     Ok((
         serde_json::from_value(
             json!({"background":BACKDROP,"buttons":[],"story_exports":{"replay":REPLAY_VARIABLE},"elements":elements,"effects":effects}),
