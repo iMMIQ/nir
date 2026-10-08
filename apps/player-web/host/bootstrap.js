@@ -94,9 +94,8 @@ try {
     catch(error){controller.abort(error);await Promise.allSettled(tasks);throw error;}
     const [wasm,host,executable,wasmBytes]=components;
     // Instantiate only the verified bytes, including when HTTP cache supplied them.
-    await wasm.default({module_or_path:wasmBytes});
-    mark('wasm_initialized');
-    await host.start({wasm,release,releaseDigest,releaseRoot:base.href,entryUrl:location.href,executable:new TextDecoder().decode(executable),fetchObject,fail,startupTrace,sha256:hash});
+    // The Runtime Worker instantiates verified WASM; main instantiation is fallback-only.
+    await host.start({wasm,release,releaseDigest,releaseRoot:base.href,entryUrl:location.href,executable:new TextDecoder().decode(executable),fetchObject,fail,startupTrace,sha256:hash,wasmBytes});
     if(release.profile==='dev'){
         try{
             const probe=await fetch(new URL('__nir_dev/status',base),{cache:'no-store'});

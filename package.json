@@ -9,8 +9,13 @@
     "test:browser:headed": "playwright test --headed",
     "test:backends": "playwright test --config playwright.backends.config.js",
     "test:host": "bun test ./tests/host",
+    "test:network-transfer": "node scripts/verify_network_transfer.mjs",
     "test:nir-next": "playwright test --config playwright.nir-next.config.js",
     "test:performance": "node scripts/run-performance.mjs ci",
+    "test:reading-endurance": "playwright test --config playwright.reading-endurance.config.js",
+    "test:reading-modes": "playwright test --config playwright.reading-modes.config.js",
+    "test:storage": "playwright test --config playwright.metadata-write.config.js",
+    "test:audio-replacement": "playwright test --config playwright.audio-replacement.config.js",
     "test:performance:hardware": "node scripts/run-performance.mjs hardware",
     "test:performance:smoke": "node scripts/run-performance.mjs smoke"
   },

@@ -67,10 +67,20 @@ def verify_runtime(directory, release):
             for definition in body["effects"]:
                 assert project["task_owners"][definition["id"]] == module
                 effect = definition["effect"]
-                if effect["type"] == "audio":
-                    assets.add(effect["asset"])
-                elif effect["type"] == "stage_present":
-                    nodes = declarations["scenes"][effect["scene"]]
+                pending = [effect]
+                while pending:
+                    child = pending.pop()
+                    if child["type"] == "audio":
+                        assets.add(child["asset"])
+                    elif child["type"] in ("sequence", "parallel_all"):
+                        pending.extend(row["effect"] for row in child["children"])
+                if effect["type"] == "stage_present":
+                    transition = effect.get("transition", {})
+                    if transition.get("type") == "mask":
+                        assets.add(transition["asset"])
+                    owner = project["scene_owners"][effect["scene"]]
+                    scene_content = read(modules[owner]["static_content"])
+                    nodes = scene_content["scenes"][effect["scene"]]
                     assets.update(node["asset"] for node in nodes if node.get("asset"))
             assert set(recipes[cue]) == assets, f"recipe mismatch: {cue}"
     assert project["entry"] in functions

@@ -64,6 +64,9 @@ pub struct FrozenSpan {
 #[serde(deny_unknown_fields)]
 pub struct DialogueReading {
     pub voice: Option<u32>,
+    /// Live voices associated with this dialogue, independent of history's budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_voices: Vec<u32>,
     pub wait: VoiceWaitPolicy,
     pub revision: u32,
 }
@@ -77,6 +80,9 @@ pub struct Dialogue {
     pub locale: String,
     pub font_plan_digest: String,
     pub speaker: String,
+    /// Authored text reference, independent of the translated display name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub speaker_id: String,
     pub spans: Vec<FrozenSpan>,
     pub span: usize,
     pub cluster: usize,
@@ -126,6 +132,8 @@ pub struct Task {
     pub audio_position_us: Option<Micros>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_device_elapsed_us: Option<Micros>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice_character: String,
     pub started_us: Micros,
     pub elapsed_us: Micros,
     pub milestones: BTreeSet<Milestone>,
@@ -224,7 +232,78 @@ pub struct WindowReveal {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HistoryVoice {
+    /// Original instance identity is only a deduplication key, not a live
+    /// task reference. Old tasks and decoded media may be reclaimed.
+    pub instance: u32,
+    pub asset: String,
+    pub gain: f32,
+}
+pub const MAX_HISTORY_VOICES: usize = 64;
+
+/// Frozen, offered rows only. Hidden options and typed values are not exposed
+/// by history; revisiting it never re-evaluates predicates or commits a branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryChoiceOption {
+    pub id: String,
+    pub text_id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub meaning_revision: u32,
+    pub source_revision: u32,
+    pub contract_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryChoiceResolution {
+    Selected { option: String },
+    TimedOut { option: String },
+    Cancelled,
+}
+impl HistoryChoiceResolution {
+    pub fn selected(&self) -> Option<&str> {
+        match self {
+            Self::Selected { option } | Self::TimedOut { option } => Some(option),
+            Self::Cancelled => None,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryChoice {
+    pub id: String,
+    pub options: Vec<HistoryChoiceOption>,
+    pub resolution: HistoryChoiceResolution,
+}
+impl HistoryChoice {
+    fn display_option(&self) -> Option<&HistoryChoiceOption> {
+        match self.resolution.selected() {
+            Some(selected) => self.options.iter().find(|o| o.id == selected && o.enabled),
+            None => self.options.first(),
+        }
+    }
+    fn display_text(&self) -> String {
+        match self.resolution.selected() {
+            Some(_) => self
+                .display_option()
+                .map(|o| o.label.clone())
+                .unwrap_or_default(),
+            None => self
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
+    #[serde(default)]
+    pub interaction: u32,
     pub text_id: String,
     pub meaning_revision: u32,
     pub source_revision: u32,
@@ -232,7 +311,34 @@ pub struct HistoryEntry {
     pub locale: String,
     pub font_plan_digest: String,
     pub speaker: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub speaker_id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voices: Vec<HistoryVoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<HistoryChoice>,
+}
+fn history_bytes(entry: &HistoryEntry) -> usize {
+    entry.text.len()
+        + entry.speaker.len()
+        + entry.speaker_id.len()
+        + entry
+            .voices
+            .iter()
+            .map(|voice| voice.asset.len() + 32)
+            .sum::<usize>()
+        + entry.choice.as_ref().map_or(0, |choice| {
+            choice.id.len()
+                + choice.resolution.selected().map_or(0, str::len)
+                + choice
+                    .options
+                    .iter()
+                    .map(|o| {
+                        o.id.len() + o.text_id.len() + o.label.len() + o.contract_digest.len() + 32
+                    })
+                    .sum::<usize>()
+        })
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +381,12 @@ pub enum CoreInput {
     Advance {
         interaction: u32,
         sequence: u32,
+    },
+    /// Player reading policy; applies only when the dialogue actually completes.
+    AdvanceReading {
+        interaction: u32,
+        sequence: u32,
+        stop_voice: bool,
     },
     Choose {
         interaction: u32,
@@ -327,8 +439,13 @@ pub enum CoreIntent {
         asset: String,
         bus: AudioBus,
         looped: bool,
+        loop_region: Option<AudioLoopRegion>,
         position_us: Micros,
         gain: f32,
+    },
+    AudioCharacter {
+        task: u32,
+        character: String,
     },
     AudioEnvelope {
         owner: Option<u32>,
@@ -856,31 +973,12 @@ impl Core {
             CoreInput::Advance {
                 interaction,
                 sequence,
-            } => {
-                if sequence <= self.state.last_input {
-                    return Ok(());
-                }
-                let task = self
-                    .state
-                    .tasks
-                    .values()
-                    .find(|t| {
-                        t.state == TaskState::Running
-                            && t.dialogue
-                                .as_ref()
-                                .is_some_and(|d| d.interaction == interaction)
-                    })
-                    .map(|t| t.id);
-                if let Some(id) = task {
-                    self.state.last_input = sequence;
-                    let d = self.state.tasks[&id].dialogue.as_ref().unwrap();
-                    if d.awaiting_advance {
-                        self.finish_task(id, TaskState::Finished)?;
-                    } else if !d.at_gate {
-                        self.reveal(id, true)?;
-                    }
-                }
-            }
+            } => self.advance_reading(interaction, sequence, false)?,
+            CoreInput::AdvanceReading {
+                interaction,
+                sequence,
+                stop_voice,
+            } => self.advance_reading(interaction, sequence, stop_voice)?,
             CoreInput::Choose {
                 interaction,
                 option,
@@ -900,8 +998,17 @@ impl Core {
                             Some((target.clone(), c.values.get(&option)?.clone()))
                         });
                         let dest = c.branches[&option].clone();
+                        let history = self.choice_history(
+                            c,
+                            HistoryChoiceResolution::Selected {
+                                option: option.clone(),
+                            },
+                        );
                         if let Some((target, value)) = typed {
                             self.write(&target, value)?;
+                        }
+                        if let Some(history) = history {
+                            self.push_history(history);
                         }
                         self.trace(format!("choose:{option}"));
                         self.state.choice = None;
@@ -941,7 +1048,14 @@ impl Core {
                         .flatten()
                 });
                 if let Some(dest) = dest {
+                    let history = self.choice_history(
+                        self.state.choice.as_ref().unwrap(),
+                        HistoryChoiceResolution::Cancelled,
+                    );
                     self.state.last_input = sequence;
+                    if let Some(history) = history {
+                        self.push_history(history);
+                    }
                     self.trace("input:cancel");
                     self.state.choice = None;
                     self.jump(dest);
@@ -965,6 +1079,64 @@ impl Core {
             }
         }
         Ok(())
+    }
+    fn push_history(&mut self, entry: HistoryEntry) {
+        // This is derived reading data, not a gameplay limit. Oversized rows
+        // are discarded whole without evicting an otherwise valid backlog.
+        if history_bytes(&entry) > 4 * 1024 * 1024 {
+            return;
+        }
+        self.state.history.push(entry);
+        while self.state.history.len() > 1000
+            || self.state.history.iter().map(history_bytes).sum::<usize>() > 4 * 1024 * 1024
+        {
+            self.state.history.remove(0);
+        }
+    }
+    fn choice_history(
+        &self,
+        offered: &OfferedChoice,
+        resolution: HistoryChoiceResolution,
+    ) -> Option<HistoryEntry> {
+        let p = self.program();
+        let definition = p.choices.get(&offered.id)?;
+        let options = offered
+            .options
+            .iter()
+            .map(|row| {
+                let option = definition.options.iter().find(|o| o.id == row.id)?;
+                let identity = p.text_identity(&option.text)?;
+                Some(HistoryChoiceOption {
+                    id: row.id.clone(),
+                    text_id: option.text.clone(),
+                    label: row.label.clone(),
+                    enabled: row.enabled,
+                    meaning_revision: identity.meaning_revision,
+                    source_revision: identity.source_revision,
+                    contract_digest: identity.contract_digest.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let choice = HistoryChoice {
+            id: offered.id.clone(),
+            options,
+            resolution,
+        };
+        let option = choice.display_option()?;
+        Some(HistoryEntry {
+            interaction: offered.interaction,
+            text_id: option.text_id.clone(),
+            meaning_revision: option.meaning_revision,
+            source_revision: option.source_revision,
+            contract_digest: option.contract_digest.clone(),
+            locale: offered.locale.clone(),
+            font_plan_digest: offered.font_plan_digest.clone(),
+            speaker: String::new(),
+            speaker_id: String::new(),
+            text: choice.display_text(),
+            voices: vec![],
+            choice: Some(choice),
+        })
     }
     fn run(&mut self) -> Result<()> {
         // Compositions advance even while the VM itself is parked on a wait,
@@ -1219,6 +1391,31 @@ impl Core {
                         Ok(id)
                     })
                     .transpose()?;
+                let recorded_voice = voice_id.map(|instance| {
+                    let Effect::Audio { asset, gain, .. } = &self.state.tasks[&instance].effect
+                    else {
+                        unreachable!("validated reading voice");
+                    };
+                    HistoryVoice {
+                        instance,
+                        asset: asset.clone(),
+                        gain: *gain,
+                    }
+                });
+                let mut active_voices = self.state.tasks[&id]
+                    .dialogue
+                    .as_ref()
+                    .and_then(|d| d.reading.as_ref())
+                    .map(|r| {
+                        r.active_voices
+                            .iter()
+                            .copied()
+                            .chain(r.voice)
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                active_voices.extend(voice_id);
+                active_voices.retain(|id| self.state.tasks[id].state == TaskState::Running);
                 let at = self.location();
                 let t = self.state.tasks.get_mut(&id).unwrap();
                 if t.state != TaskState::Running {
@@ -1236,9 +1433,44 @@ impl Core {
                     .ok_or_else(|| Diagnostic::new("E_LIMIT", at, "reading binding revisions"))?;
                 d.reading = Some(DialogueReading {
                     voice: voice_id,
+                    active_voices: active_voices.into_iter().collect(),
                     wait: *wait,
                     revision,
                 });
+                let character = d.speaker_id.clone();
+                if let Some(voice) = recorded_voice {
+                    if let Some(entry) = self
+                        .state
+                        .history
+                        .iter_mut()
+                        .find(|h| h.interaction == d.interaction)
+                    {
+                        if !entry.voices.iter().any(|v| v.instance == voice.instance) {
+                            entry.voices.push(voice);
+                        }
+                    }
+                    while self.state.history.iter().map(history_bytes).sum::<usize>()
+                        > 4 * 1024 * 1024
+                    {
+                        self.state.history.remove(0);
+                    }
+                    // History is a bounded derived view, never a new reason
+                    // for valid authored dialogue to fault. Evict a record
+                    // exceeding its budget rather than publish partial audio.
+                    self.state
+                        .history
+                        .retain(|h| h.voices.len() <= MAX_HISTORY_VOICES);
+                }
+                if let Some(voice) = voice_id {
+                    let task = self.state.tasks.get_mut(&voice).unwrap();
+                    task.voice_character = character.clone();
+                    if task.state == TaskState::Running {
+                        self.intents.push(CoreIntent::AudioCharacter {
+                            task: voice,
+                            character,
+                        });
+                    }
+                }
             }
             Operation::DialogueContinue { task } => {
                 let id = *self
@@ -1369,6 +1601,11 @@ impl Core {
                                 String::new()
                             } else {
                                 self.text(speaker)?
+                            },
+                            speaker_id: if speaker.len() <= MAX_CHARACTER_ID_BYTES {
+                                speaker.clone()
+                            } else {
+                                String::new()
                             },
                             spans: self.freeze_text(text)?,
                             span: 0,
@@ -1781,7 +2018,8 @@ impl Core {
         }
         let dialogue = dialogues.get(&def.id).cloned();
         if let Some(d) = &dialogue {
-            self.state.history.push(HistoryEntry {
+            self.push_history(HistoryEntry {
+                interaction: d.interaction,
                 text_id: d.text_id.clone(),
                 meaning_revision: d.meaning_revision,
                 source_revision: d.source_revision,
@@ -1789,25 +2027,18 @@ impl Core {
                 locale: d.locale.clone(),
                 font_plan_digest: d.font_plan_digest.clone(),
                 speaker: d.speaker.clone(),
+                speaker_id: d.speaker_id.clone(),
                 text: d.full_text(),
+                voices: vec![],
+                choice: None,
             });
-            while self.state.history.len() > 1000
-                || self
-                    .state
-                    .history
-                    .iter()
-                    .map(|h| h.text.len() + h.speaker.len())
-                    .sum::<usize>()
-                    > 4 * 1024 * 1024
-            {
-                self.state.history.remove(0);
-            }
         }
         if let Effect::Audio {
             asset,
             bus,
             looped,
             gain,
+            loop_region,
         } = &def.effect
         {
             self.intents.push(CoreIntent::AudioStart {
@@ -1815,6 +2046,7 @@ impl Core {
                 asset: asset.clone(),
                 bus: *bus,
                 looped: *looped,
+                loop_region: *loop_region,
                 gain: *gain,
                 position_us: Micros(0),
             });
@@ -1832,6 +2064,7 @@ impl Core {
             audio_envelope: 1.,
             audio_position_us: None,
             audio_device_elapsed_us: None,
+            voice_character: String::new(),
             started_us: self.state.tick_us,
             elapsed_us: Micros(0),
             milestones: BTreeSet::from([Milestone::Started]),
@@ -2026,6 +2259,69 @@ impl Core {
             Ok(false)
         }
     }
+    fn advance_reading(&mut self, interaction: u32, sequence: u32, stop_voice: bool) -> Result<()> {
+        if sequence <= self.state.last_input {
+            return Ok(());
+        }
+        let Some(id) = self
+            .state
+            .tasks
+            .values()
+            .find(|t| {
+                t.state == TaskState::Running
+                    && t.dialogue
+                        .as_ref()
+                        .is_some_and(|d| d.interaction == interaction)
+            })
+            .map(|t| t.id)
+        else {
+            return Ok(());
+        };
+        self.state.last_input = sequence;
+        let d = self.state.tasks[&id].dialogue.as_ref().unwrap();
+        if d.awaiting_advance {
+            let voices: BTreeSet<_> = if !stop_voice {
+                BTreeSet::new()
+            } else if let Some(reading) = &d.reading {
+                // Older snapshots have only the latest binding. Never infer
+                // ownership from history, which may have been evicted.
+                reading
+                    .active_voices
+                    .iter()
+                    .copied()
+                    .chain(reading.voice)
+                    .collect()
+            } else {
+                // Legacy reading has no explicit association, as with its
+                // voice wait policy. Looped ambient Voice is not an utterance.
+                self.state
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.state == TaskState::Running
+                            && matches!(
+                                t.effect,
+                                Effect::Audio {
+                                    bus: AudioBus::Voice,
+                                    looped: false,
+                                    ..
+                                }
+                            )
+                    })
+                    .map(|t| t.id)
+                    .collect()
+            };
+            self.finish_task(id, TaskState::Finished)?;
+            for voice in voices {
+                // Same terminal semantics as an authored AudioStop; this is
+                // not a natural completion and must not forge that milestone.
+                self.end_task(voice, TaskEndReason::CancelledByControl)?;
+            }
+        } else if !d.at_gate {
+            self.reveal(id, true)?;
+        }
+        Ok(())
+    }
     fn finish_task(&mut self, id: u32, status: TaskState) -> Result<()> {
         let reason = match status {
             TaskState::Finished => TaskEndReason::Completed,
@@ -2101,6 +2397,11 @@ impl Core {
         }
         if matches!(t.effect, Effect::Audio { .. }) {
             self.intents.push(CoreIntent::AudioStop { task: id });
+            for task in self.state.tasks.values_mut() {
+                if let Some(reading) = task.dialogue.as_mut().and_then(|d| d.reading.as_mut()) {
+                    reading.active_voices.retain(|voice| *voice != id);
+                }
+            }
         }
         if status == TaskState::Finished {
             if let Some(d) = &t.dialogue {
@@ -2407,16 +2708,24 @@ impl Core {
             }
             if let Some(c) = self.state.choice.clone() {
                 if c.deadline_us.is_some_and(|v| v.0 <= next) {
-                    if let Some(option) = c.default {
+                    if let Some(option) = &c.default {
                         // A timeout commits the default option, typed value
                         // included, exactly like an explicit choice.
-                        if let (Some(target), Some(value)) = (&c.result, c.values.get(&option)) {
+                        if let (Some(target), Some(value)) = (&c.result, c.values.get(option)) {
                             let target = target.clone();
                             let value = value.clone();
                             self.write(&target, value)?;
                         }
+                        if let Some(history) = self.choice_history(
+                            &c,
+                            HistoryChoiceResolution::TimedOut {
+                                option: option.clone(),
+                            },
+                        ) {
+                            self.push_history(history);
+                        }
                         self.state.choice = None;
-                        self.jump(c.branches[&option].clone());
+                        self.jump(c.branches[option].clone());
                         self.trace(format!("timeout:{option}"));
                     }
                 }
@@ -2659,6 +2968,7 @@ impl Core {
             || s.scene.len() > MAX_NODES
             || s.draft.len() > MAX_NODES
             || s.history.len() > 1000
+            || s.history.iter().map(history_bytes).sum::<usize>() > 4 * 1024 * 1024
             || s.next_id == 0
         {
             return Err(fail("state limits/locale"));
@@ -2671,6 +2981,72 @@ impl Core {
             return Err(fail("variable layout"));
         }
         for h in &s.history {
+            if let Some(choice) = &h.choice {
+                // Completed history is passive metadata. The root declares
+                // choice and text identities even after the old module's
+                // bodies are evicted; do not fetch/re-run that old chapter.
+                if h.interaction == 0
+                    || !h.voices.is_empty()
+                    || !h.speaker.is_empty()
+                    || !p.choices.contains_key(&choice.id)
+                    || choice.options.is_empty()
+                    || (choice.resolution == HistoryChoiceResolution::Cancelled
+                        && !p.requires.iter().any(|c| c == "story.typed-result.v1"))
+                {
+                    return Err(fail("invalid history choice"));
+                }
+                let mut options = BTreeSet::new();
+                for option in &choice.options {
+                    let identity = p
+                        .text_identity(&option.text_id)
+                        .ok_or_else(|| fail("unknown history option text"))?;
+                    if option.id.is_empty()
+                        || !options.insert(&option.id)
+                        || option.meaning_revision != identity.meaning_revision
+                        || option.source_revision != identity.source_revision
+                        || option.contract_digest != identity.contract_digest
+                    {
+                        return Err(fail("history option identity"));
+                    }
+                }
+                let option = choice
+                    .display_option()
+                    .ok_or_else(|| fail("invalid history resolution"))?;
+                if h.text_id != option.text_id
+                    || h.text != choice.display_text()
+                    || h.source_revision != option.source_revision
+                    || h.meaning_revision != option.meaning_revision
+                    || h.contract_digest != option.contract_digest
+                {
+                    return Err(fail("history choice display"));
+                }
+            }
+            if h.interaction >= s.next_id
+                || (!h.speaker_id.is_empty()
+                    && (h.choice.is_some()
+                        || h.speaker_id.len() > MAX_CHARACTER_ID_BYTES
+                        || p.text_identity(&h.speaker_id).is_none()))
+                || h.voices.len() > MAX_HISTORY_VOICES
+                || (!h.voices.is_empty()
+                    && !p.requires.iter().any(|c| c == "text.voice-binding.v1"))
+            {
+                return Err(fail("history voice limits/identity"));
+            }
+            let mut voices = BTreeSet::new();
+            for voice in &h.voices {
+                if h.interaction == 0
+                    || voice.instance == 0
+                    || voice.instance >= s.next_id
+                    || !voices.insert(voice.instance)
+                    || !voice.gain.is_finite()
+                    || !(0. ..=4.).contains(&voice.gain)
+                    || !p
+                        .asset_kind(&voice.asset)
+                        .is_some_and(|kind| kind == AssetKind::Audio)
+                {
+                    return Err(fail("invalid history voice"));
+                }
+            }
             let c = p
                 .text_identity(&h.text_id)
                 .ok_or_else(|| fail("unknown history text"))?;
@@ -2730,6 +3106,25 @@ impl Core {
                     .is_some_and(|v| !valid_reveal_interval(*reveal_us, v))
                 {
                     return Err(fail("invalid frozen reveal interval"));
+                }
+            }
+            if !t.voice_character.is_empty()
+                && (t.voice_character.len() > MAX_CHARACTER_ID_BYTES
+                    || p.text_identity(&t.voice_character).is_none()
+                    || !matches!(
+                        t.effect,
+                        Effect::Audio {
+                            bus: AudioBus::Voice,
+                            looped: false,
+                            ..
+                        }
+                    ))
+            {
+                return Err(fail("invalid voice character"));
+            }
+            if let (Effect::Dialogue { speaker, .. }, Some(d)) = (&t.effect, &t.dialogue) {
+                if !d.speaker_id.is_empty() && &d.speaker_id != speaker {
+                    return Err(fail("invalid speaker identity"));
                 }
             }
             // Composition snapshots: the cursor counts spawned children, each
@@ -2985,6 +3380,15 @@ impl Core {
                                 matches!(&t.effect,Effect::Audio{asset,..} if p.asset(asset).is_none_or(|a|a.duration_us.0==0))
                             ))))
                     || reading.revision == 0
+                    || reading.active_voices.len() > MAX_TASKS
+                    || reading.active_voices.iter().copied().collect::<BTreeSet<_>>().len()
+                        != reading.active_voices.len()
+                    || reading.active_voices.iter().any(|id| {
+                        !s.tasks.get(id).is_some_and(|v| {
+                            v.state == TaskState::Running && matches!(v.effect,
+                                Effect::Audio { bus: AudioBus::Voice, looped: false, .. })
+                        })
+                    })
                     || reading.voice.is_some_and(|id| {
                         !s.tasks.get(&id).is_some_and(|v| {
                             matches!(
@@ -3167,6 +3571,48 @@ impl Core {
                 }
             }
         }
+        // Older snapshots froze display names only. Recover identity solely
+        // from validated authored references and unambiguous live bindings;
+        // never match a translated name or load past chapter bodies.
+        let mut s = s;
+        let mut voices: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+        let mut speakers = BTreeMap::new();
+        for task in s.tasks.values_mut() {
+            if let (Effect::Dialogue { speaker, .. }, Some(d)) = (&task.effect, &mut task.dialogue)
+            {
+                if d.speaker_id.is_empty() && speaker.len() <= MAX_CHARACTER_ID_BYTES {
+                    d.speaker_id = speaker.clone();
+                }
+                speakers.insert(d.interaction, d.speaker_id.clone());
+                if let Some(reading) = &d.reading {
+                    for voice in reading.active_voices.iter().copied().chain(reading.voice) {
+                        voices
+                            .entry(voice)
+                            .or_default()
+                            .insert(d.speaker_id.clone());
+                    }
+                }
+            }
+        }
+        for (voice, roles) in voices {
+            if roles.len() == 1 {
+                if let Some(task) = s.tasks.get_mut(&voice) {
+                    if task.voice_character.is_empty() {
+                        task.voice_character = roles.into_iter().next().unwrap();
+                    }
+                }
+            }
+        }
+        for entry in &mut s.history {
+            if entry.speaker_id.is_empty() && entry.choice.is_none() {
+                if let Some(id) = speakers.get(&entry.interaction) {
+                    entry.speaker_id.clone_from(id);
+                }
+            }
+        }
+        while s.history.iter().map(history_bytes).sum::<usize>() > 4 * 1024 * 1024 {
+            s.history.remove(0);
+        }
         let mut core = Self {
             program,
             state: s,
@@ -3186,14 +3632,21 @@ impl Core {
             .collect();
         for id in ids {
             let token = core.id()?;
-            core.state
+            let dialogue = core
+                .state
                 .tasks
                 .get_mut(&id)
                 .unwrap()
                 .dialogue
                 .as_mut()
-                .unwrap()
-                .interaction = token;
+                .unwrap();
+            let old_interaction = dialogue.interaction;
+            dialogue.interaction = token;
+            for entry in &mut core.state.history {
+                if entry.interaction == old_interaction {
+                    entry.interaction = token;
+                }
+            }
         }
         if core.state.choice.is_some() {
             let token = core.id()?;

@@ -1,7 +1,17 @@
 //! Native package and persistence contracts, independent of window/GPU setup.
 #![forbid(unsafe_code)]
 pub mod audio_envelope;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod audio_output;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod audio_output_state;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod audio_output_worker;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod audio_recovery_input;
 pub mod audio_source;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod close;
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod desktop;
 #[cfg(any(windows, target_os = "linux"))]
@@ -9,10 +19,12 @@ pub mod dialog;
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod io_worker;
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+mod lifecycle;
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub mod loader;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};
-use nir_player::SaveEnvelope;
+use nir_player::{AppEvent, PersistenceKind, SaveEnvelope};
 use std::{
     collections::BTreeSet,
     fs,
@@ -109,7 +121,24 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = fs::File::create(&temp)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    #[cfg(test)]
+    let sync_timing = std::env::var_os("NIR_STORAGE_TIMINGS").map(|_| {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        eprintln!("NIR_STORAGE_SYNC_BEGIN id={id} bytes={}", bytes.len());
+        (id, std::time::Instant::now())
+    });
+    let synced = file.sync_all();
+    #[cfg(test)]
+    if let Some((id, started)) = sync_timing {
+        eprintln!(
+            "NIR_STORAGE_SYNC_END id={id} seconds={:.6} ok={}",
+            started.elapsed().as_secs_f64(),
+            synced.is_ok()
+        );
+    }
+    synced?;
     drop(file);
     fs::rename(&temp, path)?;
     Ok(())
@@ -119,6 +148,11 @@ pub struct Storage {
     pub root: PathBuf,
     release: String,
     _lock: fs::File,
+}
+pub(crate) struct StartupStorage {
+    pub(crate) preferences: Option<Preferences>,
+    pub(crate) profile: BTreeSet<String>,
+    pub(crate) failures: Vec<AppEvent>,
 }
 impl Storage {
     pub fn open(base: &Path, game: &str, profile: &str, release: &str) -> Result<Self> {
@@ -191,6 +225,28 @@ impl Storage {
             Err(e) => Err(e.into()),
         }
     }
+    pub(crate) fn startup(&self) -> StartupStorage {
+        let mut failures = vec![];
+        let preferences = self.preferences().unwrap_or_else(|error| {
+            failures.push(AppEvent::PersistenceReadFailed {
+                kind: PersistenceKind::Preferences,
+                message: error.to_string(),
+            });
+            None
+        });
+        let profile = self.profile().unwrap_or_else(|error| {
+            failures.push(AppEvent::PersistenceReadFailed {
+                kind: PersistenceKind::Profile,
+                message: error.to_string(),
+            });
+            BTreeSet::new()
+        });
+        StartupStorage {
+            preferences,
+            profile,
+            failures,
+        }
+    }
     pub fn profile(&self) -> Result<BTreeSet<String>> {
         match fs::read(self.root.join("profile.json")) {
             Ok(bytes) => Ok(nir_content::parse(&bytes, "profile")?),
@@ -199,6 +255,9 @@ impl Storage {
         }
     }
     pub fn write_preferences(&self, value: &Preferences) -> Result<()> {
+        // A fallback may be used in memory, but must not overwrite an
+        // unreadable original. Explicit external repair permits later writes.
+        self.preferences()?;
         atomic_write(
             &self.root.join("preferences.json"),
             &serde_json::to_vec(value)?,
@@ -244,6 +303,106 @@ mod tests {
         let newer = Storage::open(temp.path(), "game", "release", &"b".repeat(64)).unwrap();
         assert!(newer.load(0).unwrap().is_none());
     }
+    #[test]
+    fn first_visit_has_no_metadata_fault_and_can_store_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Storage::open(temp.path(), "game", "dev", &"a".repeat(64)).unwrap();
+        let startup = store.startup();
+        assert!(startup.preferences.is_none());
+        assert!(startup.profile.is_empty());
+        assert!(startup.failures.is_empty());
+        store.write_preferences(&Preferences::default()).unwrap();
+        assert!(store.startup().preferences.is_some());
+    }
+
+    #[test]
+    fn corrupt_startup_metadata_is_isolated_preserved_and_recoverable_with_healthy_saves() {
+        for (bad_preferences, bad_profile) in [(true, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let release = "a".repeat(64);
+            let store = Storage::open(temp.path(), "game", "dev", &release).unwrap();
+            let preferences = Preferences {
+                font_scale: 1.4,
+                bgm_volume: 0.2,
+                ..Default::default()
+            };
+            let profile = BTreeSet::from(["previous".into()]);
+            store.write_preferences(&preferences).unwrap();
+            store.merge_profile(profile.clone()).unwrap();
+            store.save(0, 0, &envelope(&release, 1)).unwrap();
+            let prefs_path = store.root.join("preferences.json");
+            let profile_path = store.root.join("profile.json");
+            if bad_preferences {
+                fs::write(&prefs_path, b"{broken preferences").unwrap();
+            }
+            if bad_profile {
+                fs::write(&profile_path, b"[1]").unwrap();
+            }
+            // Exercise a real reopen rather than a cached startup result.
+            drop(store);
+            let store = Storage::open(temp.path(), "game", "dev", &release).unwrap();
+            let startup = store.startup();
+            assert_eq!(
+                startup.preferences,
+                (!bad_preferences).then_some(preferences.clone())
+            );
+            assert_eq!(
+                startup.profile,
+                if bad_profile {
+                    BTreeSet::new()
+                } else {
+                    profile.clone()
+                }
+            );
+            let faults: Vec<_> = startup
+                .failures
+                .into_iter()
+                .map(|event| match event {
+                    AppEvent::PersistenceReadFailed { kind, message } => {
+                        assert!(!message.is_empty());
+                        kind
+                    }
+                    _ => panic!("metadata read must have a typed, nonblocking failure"),
+                })
+                .collect();
+            assert_eq!(
+                faults.contains(&PersistenceKind::Preferences),
+                bad_preferences
+            );
+            assert_eq!(faults.contains(&PersistenceKind::Profile), bad_profile);
+            assert_eq!(
+                faults.len(),
+                usize::from(bad_preferences) + usize::from(bad_profile)
+            );
+            assert_eq!(store.load(0).unwrap().unwrap().revision, 1);
+            assert_eq!(
+                store.write_preferences(&Preferences::default()).is_err(),
+                bad_preferences
+            );
+            assert_eq!(
+                store.merge_profile(BTreeSet::from(["new".into()])).is_err(),
+                bad_profile
+            );
+            if bad_preferences {
+                assert_eq!(fs::read(&prefs_path).unwrap(), b"{broken preferences");
+            }
+            if bad_profile {
+                assert_eq!(fs::read(&profile_path).unwrap(), b"[1]");
+            }
+            // Fixture-only explicit repair; runtime never resets the originals.
+            fs::write(&prefs_path, serde_json::to_vec(&preferences).unwrap()).unwrap();
+            fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+            store.write_preferences(&Preferences::default()).unwrap();
+            store.merge_profile(BTreeSet::from(["new".into()])).unwrap();
+            assert_eq!(
+                store.profile().unwrap(),
+                BTreeSet::from(["new".into(), "previous".into()])
+            );
+            assert!(store.startup().failures.is_empty());
+            assert!(store.load(0).unwrap().is_some());
+        }
+    }
+
     #[test]
     fn native_graph_rejects_tampering_and_path_escape() {
         let temp = tempfile::tempdir().unwrap();
@@ -293,6 +452,15 @@ mod tests {
         store.merge_profile(BTreeSet::from(["two".into()])).unwrap();
         let preferences = Preferences {
             font_scale: 1.2,
+            auto_wait_voice: false,
+            voice_continue: false,
+            character_voices: std::collections::BTreeMap::from([(
+                "speaker.aki".into(),
+                nir_format::CharacterVoicePreference {
+                    volume: 0.4,
+                    muted: true,
+                },
+            )]),
             ..Default::default()
         };
         store.write_preferences(&preferences).unwrap();
@@ -300,5 +468,10 @@ mod tests {
         let store = Storage::open(temp.path(), "game", "dev", &release).unwrap();
         assert_eq!(store.profile().unwrap().len(), 2);
         assert_eq!(store.preferences().unwrap().unwrap().font_scale, 1.2);
+        assert!(!store.preferences().unwrap().unwrap().auto_wait_voice);
+        assert!(!store.preferences().unwrap().unwrap().voice_continue);
+        let voice = store.preferences().unwrap().unwrap().character_voices["speaker.aki"];
+        assert_eq!(voice.volume, 0.4);
+        assert!(voice.muted);
     }
 }

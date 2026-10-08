@@ -554,6 +554,109 @@ mod tests {
     }
 
     #[test]
+    fn mp3_region_mixed_output_keeps_resampler_phase_across_100_loops_and_restore() {
+        use crate::audio_envelope::{EnvelopeSamples, Ramp};
+        use nir_format::AudioLoopRegion;
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gapless-44100-mono.mp3");
+        let samples = decode_audio(&fs::read(path).unwrap(), 22_050);
+        let buffer =
+            crate::audio_source::AudioBuffer::from_parts(Arc::new(samples.clone()), 1, 44_100);
+        assert_eq!(buffer.rate(), 44_100);
+        // This body has 8821 frames: a 44.1 -> 48 kHz fractional phase cannot
+        // restart at its boundary without changing output timing and samples.
+        let region = AudioLoopRegion {
+            start_us: Micros(150_000),
+            end_us: Micros(350_023),
+        };
+        let (start, end) = (6615usize, 15436usize);
+        let map = |frame: usize| {
+            if frame < end {
+                frame
+            } else {
+                start + (frame - end) % (end - start)
+            }
+        };
+        for output_rate in [44_100u32, 48_000] {
+            for position_us in [0, 900_000, 1_400_000] {
+                let first = map((position_us * 44_100 + 500_000) as usize / 1_000_000);
+                let source = buffer
+                    .source_with_region(position_us, true, Some(region))
+                    .unwrap()
+                    .at_device_rate(output_rate);
+                let envelope = Arc::new(std::sync::Mutex::new(Ramp::default()));
+                let (controller, mut output) = rodio::mixer::mixer(2, output_rate);
+                let (sink, queue) = rodio::Sink::new();
+                sink.append(EnvelopeSamples::new(source, envelope, 1, output_rate));
+                controller.add(crate::audio_source::FixedVoiceQueue::new(
+                    queue,
+                    1,
+                    output_rate,
+                ));
+                let frames =
+                    ((end + (end - start) * 100) as u64 * output_rate as u64 / 44_100) as usize;
+                let mut max_error = 0f32;
+                for i in 0..frames {
+                    // Independent linear interpolation over the logically
+                    // concatenated intro/body, in the device's output clock.
+                    let phase = i as u64 * 44_100;
+                    let left = phase / output_rate as u64;
+                    let fraction = (phase % output_rate as u64) as f32 / output_rate as f32;
+                    let a = samples[map(first + left as usize)];
+                    let b = samples[map(first + left as usize + 1)];
+                    let expected = a + (b - a) * fraction;
+                    let actual = output.next().unwrap();
+                    assert_eq!(output.next().unwrap(), actual, "stereo frame split at {i}");
+                    assert!((actual - expected).abs() < 0.00001, "rate {output_rate}, position {position_us}, frame {i}, actual {actual}, expected {expected}");
+                    max_error = max_error.max((actual - expected).abs());
+                }
+                assert!(
+                    max_error < 0.00001,
+                    "rate {output_rate}, position {position_us}, error {max_error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finite_mp3_device_output_has_no_leading_padding_or_repeated_tail() {
+        use crate::audio_envelope::{EnvelopeSamples, Ramp};
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gapless-44100-mono.mp3");
+        let pcm = decode_audio(&fs::read(path).unwrap(), 22_050);
+        let buffer = crate::audio_source::AudioBuffer::from_parts(Arc::new(pcm.clone()), 1, 44_100);
+        for rate in [44_100u32, 48_000] {
+            let source = buffer.source(0, false).at_device_rate(rate);
+            let (controller, mut output) = rodio::mixer::mixer(2, rate);
+            let (sink, queue) = rodio::Sink::new();
+            sink.append(EnvelopeSamples::new(
+                source,
+                Arc::new(std::sync::Mutex::new(Ramp::default())),
+                1,
+                rate,
+            ));
+            controller.add(crate::audio_source::FixedVoiceQueue::new(queue, 1, rate));
+            for i in 0..rate as u64 / 2 {
+                let phase = i * 44_100;
+                let left = (phase / rate as u64) as usize;
+                let a = pcm[left];
+                let b = pcm[(left + 1).min(pcm.len() - 1)];
+                let expected = a + (b - a) * (phase % rate as u64) as f32 / rate as f32;
+                let actual = output.next().unwrap();
+                assert_eq!(output.next().unwrap(), actual);
+                assert!(
+                    (actual - expected).abs() < 0.00001,
+                    "rate {rate}, frame {i}: {actual} vs {expected}"
+                );
+            }
+            for _ in 0..1024 {
+                assert_eq!(output.next(), Some(0.));
+            }
+            assert!(sink.empty(), "finite sound must retire after its PCM ends");
+        }
+    }
+
+    #[test]
     fn decoded_mp3_loops_without_inserting_delay_or_padding() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gapless-44100-mono.mp3");

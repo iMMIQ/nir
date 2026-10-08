@@ -1,5 +1,53 @@
 import fs from 'node:fs/promises';
 
+// Page Performance.getMetrics only covers the page isolate. Runtime/Asset
+// Workers need their own CDP heap readings; keep them separate from process
+// PSS and decoded-media payloads. Use this opt-in probe for lifecycle studies,
+// without changing the timing overhead of existing endurance measurements.
+export function createWorkerHeapProbe(browserSession) {
+  const attached=new Map(),pending=new Map();let sequence=0,closed=false;
+  function receive({sessionId,message}) {
+    const result=JSON.parse(message),key=`${sessionId}:${result.id}`,request=pending.get(key);
+    if(!request)return;
+    pending.delete(key);clearTimeout(request.timer);
+    if(result.error)request.reject(new Error(JSON.stringify(result.error)));else request.resolve(result.result);
+  }
+  browserSession.on('Target.receivedMessageFromTarget',receive);
+  function call(sessionId,method,params={}) {
+    const id=++sequence,key=`${sessionId}:${id}`;
+    return new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>{pending.delete(key);reject(new Error(`Worker CDP ${method} timed out`));},5000);
+      pending.set(key,{resolve,reject,timer});
+      browserSession.send('Target.sendMessageToTarget',{sessionId,message:JSON.stringify({id,method,params})}).catch(error=>{
+        const request=pending.get(key);if(!request)return;
+        pending.delete(key);clearTimeout(timer);reject(error);
+      });
+    });
+  }
+  return {
+    async sample() {
+      if(closed)throw new Error('Worker heap probe closed');
+      const {targetInfos}=await browserSession.send('Target.getTargets');
+      const targets=targetInfos.filter(target=>target.type==='worker');
+      const results=await Promise.allSettled(targets.map(async target=>{
+        let sessionId=attached.get(target.targetId);
+        if(!sessionId){({sessionId}=await browserSession.send('Target.attachToTarget',{targetId:target.targetId,flatten:false}));attached.set(target.targetId,sessionId);}
+        const role=await call(sessionId,'Runtime.evaluate',{expression:'globalThis.__nirWorker?.role',returnByValue:true});
+        const heap=await call(sessionId,'Runtime.getHeapUsage');
+        return {targetId:target.targetId,role:role.result?.value??'unknown',url:target.url,...heap};
+      }));
+      return {scope:'per-Worker V8 heap; excludes native decoder/driver allocations; backing storage reported separately',
+        targets:targets.length,rows:results.filter(r=>r.status==='fulfilled').map(r=>r.value),
+        errors:results.filter(r=>r.status==='rejected').map(r=>String(r.reason))};
+    },
+    async close() {
+      closed=true;browserSession.off('Target.receivedMessageFromTarget',receive);
+      for(const request of pending.values()){clearTimeout(request.timer);request.reject(new Error('Worker heap probe closed'));}pending.clear();
+      await Promise.allSettled([...attached.values()].map(sessionId=>browserSession.send('Target.detachFromTarget',{sessionId})));attached.clear();
+    },
+  };
+}
+
 // Linux process RSS includes shared pages: report per process and an explicitly
 // labelled sum, never present it as uniquely owned application memory.
 export async function sampleProcessMemory(browserSession, pageSession) {

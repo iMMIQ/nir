@@ -10,7 +10,7 @@ const chapters = [
   { id: 'ch03', number: '第3章', english: 'Chapter three' },
 ];
 
-function chapterProgram(index) {
+function chapterProgram(index,withMusic=false) {
   const chapter = chapters[index];
   const next = chapters[index + 1];
   const increment = {
@@ -71,7 +71,7 @@ function chapterProgram(index) {
           id: 'line',
           scope: 'interaction',
           effect: { type: 'dialogue', text: 'line', speaker: '', reveal_us: '1000' },
-        }],
+        }, ...(withMusic && index===0 ? [{id:'music',scope:'session',effect:{type:'audio',asset:'audio.bgm',bus:'bgm',looped:true}}] : [])],
       },
     },
   };
@@ -140,7 +140,7 @@ modules = ["content/ch01/module.toml", "content/ch02/module.toml", "content/ch03
   await fs.writeFile(playerFile,configured);
 }
 
-export async function buildModulesFixture({prefetchContent=false,port=4191}={}) {
+export async function buildModulesFixture({prefetchContent=false,port=4191,withMusic=false}={}) {
   const cli = path.resolve(process.platform==='win32'?'dist/novelc.exe':'dist/novelc');
   await fs.mkdir(path.resolve('target/tmp'), { recursive: true });
   const temp = await fs.mkdtemp(path.resolve('target/tmp/nir-modules-'));
@@ -157,7 +157,7 @@ export async function buildModulesFixture({prefetchContent=false,port=4191}={}) 
     const base = path.join(project, 'content', chapter.id);
     await fs.mkdir(base, { recursive: true });
     await fs.writeFile(path.join(base, 'module.toml'), moduleToml(chapter.id));
-    await writeJson(path.join(base, 'story.nir.json'), chapterProgram(index));
+    await writeJson(path.join(base, 'story.nir.json'), chapterProgram(index,withMusic));
     await writeJson(path.join(base, 'texts/contracts.json'), {
       line: { source_revision: 1, contract_revision: 1, meaning_revision: 1, gates: [], params: {} },
     });
@@ -176,7 +176,7 @@ export async function buildModulesFixture({prefetchContent=false,port=4191}={}) 
     await run(cli, ['-p', project, 'text', 'update', '--id', id, '--meaning', 'preserve']);
     await run(cli, ['-p', project, 'text', 'review', '--id', id, '--locale', 'en']);
   }
-  await run(cli, ['-p', project, 'resolve']);
+  await run(cli, ['-p', project, 'resolve', ...(withMusic ? ['--sdk', path.resolve('dist/sdk')] : [])]);
   await run(cli, ['-p', project, 'check', '--locked']);
   await run(cli, ['-p', project, 'build', '--locked', '--out', web]);
   const release = await readRelease(web);
@@ -254,7 +254,7 @@ export function trackObjectRequests(page) {
   let objects=objectRequests.get(page);
   if(objects)return objects;
   objects=new Set();
-  page.on('request',request=>{
+  page.context().on('request',request=>{
     const match=new URL(request.url()).pathname.match(/\/objects\/([0-9a-f]{64})\./);
     if(match)objects.add(match[1]);
   });

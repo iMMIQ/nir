@@ -8,29 +8,56 @@
 //! cadence until the receiver yields exactly one outcome. The desktop
 //! gates input and pauses the story clock while a dialog is open so
 //! engine state cannot change behind the modal picker.
-use crate::atomic_write;
 use anyhow::{anyhow, Result};
-use nir_player::SaveEnvelope;
-use std::{fs, sync::mpsc, thread};
+use nir_player::{AppEvent, SaveEnvelope};
+use std::{fs, path::PathBuf, sync::mpsc, thread};
 
 pub(crate) enum DialogTask {
-    /// Export a save as JSON; the chosen path is written on this thread.
-    Export { json: String },
+    /// Select an export destination. The bounded storage worker writes it.
+    Export { job: u32, json: String },
     /// Import a save file; the picked bytes are parsed on this thread.
     Import,
 }
 pub(crate) enum DialogOutcome {
-    /// The export finished. A cancelled dialog reports success; write
-    /// errors were fatal via `?` before and stay fatal.
-    Exported(std::result::Result<(), String>),
+    ExportSelected {
+        job: u32,
+        path: Option<PathBuf>,
+        json: String,
+    },
     /// A cancelled import feeds no engine event, matching the synchronous
     /// behaviour.
     ImportCancelled,
     /// A picked import file, parsed on the dialog thread.
     Imported(std::result::Result<Box<SaveEnvelope>, String>),
 }
+#[derive(Clone, Copy)]
+pub(crate) enum DialogFailure {
+    Export(u32),
+    Import,
+}
+impl DialogFailure {
+    pub(crate) fn event(self, message: String) -> AppEvent {
+        match self {
+            Self::Export(job) => AppEvent::ExportFailed { job, message },
+            Self::Import => AppEvent::LoadFailed(message),
+        }
+    }
+}
+impl DialogTask {
+    pub(crate) fn failure(&self) -> DialogFailure {
+        match self {
+            Self::Export { job, .. } => DialogFailure::Export(*job),
+            Self::Import => DialogFailure::Import,
+        }
+    }
+}
+pub(crate) struct PendingDialog {
+    pub(crate) replies: mpsc::Receiver<DialogOutcome>,
+    pub(crate) failure: DialogFailure,
+}
 /// Runs `task` on a new thread; the returned receiver yields one outcome.
-pub(crate) fn open(task: DialogTask) -> Result<mpsc::Receiver<DialogOutcome>> {
+pub(crate) fn open(task: DialogTask) -> Result<PendingDialog> {
+    let failure = task.failure();
     let (done, replies) = mpsc::channel::<DialogOutcome>();
     thread::Builder::new()
         .name("nir-dialog".into())
@@ -39,21 +66,20 @@ pub(crate) fn open(task: DialogTask) -> Result<mpsc::Receiver<DialogOutcome>> {
             let _ = done.send(outcome);
         })
         .map_err(|_| anyhow!("E_DIALOG_THREAD"))?;
-    Ok(replies)
+    Ok(PendingDialog { replies, failure })
 }
 fn run(task: DialogTask) -> DialogOutcome {
     match task {
-        DialogTask::Export { json } => {
+        DialogTask::Export { job, json } => {
             let picked = pollster::block_on(
                 rfd::AsyncFileDialog::new()
                     .set_file_name("save.nir-save.json")
                     .save_file(),
             );
-            match picked {
-                Some(handle) => DialogOutcome::Exported(
-                    atomic_write(handle.path(), json.as_bytes()).map_err(|e| e.to_string()),
-                ),
-                None => DialogOutcome::Exported(Ok(())),
+            DialogOutcome::ExportSelected {
+                job,
+                path: picked.map(|handle| handle.path().to_owned()),
+                json,
             }
         }
         DialogTask::Import => {

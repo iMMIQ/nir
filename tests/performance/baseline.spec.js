@@ -9,7 +9,7 @@ async function ready(page){await page.waitForFunction(()=>window.__nir?.state().
 async function firstLine(page){await page.keyboard.press('Space');await page.waitForFunction(()=>window.__nir.state().dialogue&&!window.__nir.state().loading);}
 async function measure(page,cache){
   await ready(page);
-  if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nirActualAdapters]));
+  if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nir.actualAdapters()]));
   await page.evaluate(()=>{
     window.__activeIntervals=[];window.__measureActive=true;let last=null;
     function sample(now){if(!window.__measureActive)return;const active=window.__nir.needsClock();if(active&&last!==null&&window.__activeIntervals.length<512)window.__activeIntervals.push(now-last);last=active?now:null;requestAnimationFrame(sample);}
@@ -25,9 +25,9 @@ async function measure(page,cache){
     const input=rows.findLast(e=>e.stage==='input_received');
     const submit=input&&rows.find(e=>e.stage==='render_submitted'&&e.frames===api.state().frames&&BigInt(e.at_us)>=BigInt(input.at_us));
     const intervals=rows.filter(e=>e.stage==='render_submitted').map(e=>Number(e.at_us)/1000);
-    const resources=performance.getEntriesByType('resource').filter(e=>e.name.includes('/objects/'));
+    const resources=window.__nir.resourceTimings().filter(e=>e.name.includes('/objects/'));
     if(!input||!submit)throw Error('incomplete prepared-input trace');
-    return {cache,adapterProbe:window.__nirActualAdapters.at(-1),actualAdapters:window.__nirActualAdapters,release:report.release,engine:report.engine,adapter:api.state().adapter,navigationToFirstLineMs:api.metrics.navigationToFirstLineMs,
+    return {cache,adapterProbe:window.__nir.actualAdapters().at(-1),actualAdapters:window.__nir.actualAdapters(),release:report.release,engine:report.engine,adapter:api.state().adapter,navigationToFirstLineMs:api.metrics.navigationToFirstLineMs,
       preparedInput:'open_menu_on_prepared_scene',
       preparedInputToSubmitMs:(Number(submit.at_us)-Number(input.at_us))/1000,
       activeAnimationIntervalsMs:window.__activeIntervals,
@@ -66,7 +66,7 @@ for(const profile of networkProfiles)test(`navigation baseline with isolated bro
 test('repeated save restore and device recovery resource trend',async({page,context,browser})=>{
   await installAdapterProbe(context);
   await page.goto('/?test=1');await ready(page);await firstLine(page);
-  if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nirActualAdapters]));
+  if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nir.actualAdapters()]));
   const action=a=>page.evaluate(a=>window.__nir.action(a),a);
   await action({type:'saves'});await action({type:'save',slot:0});
   await page.waitForFunction(()=>/已保存|Saved/.test(window.__nir.state().status));
@@ -77,7 +77,7 @@ test('repeated save restore and device recovery resource trend',async({page,cont
     if(cycle%10===9){
       const device=await page.evaluate(()=>{const d=window.__nir.state().device;window.__nir.loseDevice();return d;});
       await page.waitForFunction(d=>window.__nir.state().device>d&&window.__nir.state().ready&&!window.__nir.state().loading,device);
-      if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nirActualAdapters]));
+      if(hardware)assertHardwareAdapter(...await page.evaluate(()=>[window.__nir.state().adapter,window.__nir.actualAdapters()]));
     }
     await action({type:'title'});await ready(page);
     await page.waitForFunction(()=>window.__nir.metrics.activeRequests===0);

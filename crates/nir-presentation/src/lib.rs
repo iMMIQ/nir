@@ -4,10 +4,13 @@ pub use cosmic_text;
 use fluent_bundle::{FluentBundle, FluentResource};
 use nir_format::*;
 use serde::Serialize;
+pub mod audio_recovery;
 pub mod history;
+mod history_controls;
 mod input;
 mod reading;
 mod scrollbar;
+pub mod storage_recovery;
 pub use input::{
     control_value_action, pointer_action, primary_action, value_action, KeyboardFocus,
 };
@@ -50,11 +53,51 @@ pub struct ChoiceView {
 }
 #[derive(Debug, Clone)]
 pub struct HistoryView {
+    pub key: usize,
+    pub voice_count: usize,
+    pub choice: Option<HistoryChoiceKind>,
     pub speaker: String,
     pub text: String,
     pub locale: String,
     pub font_plan_digest: String,
     pub font_assets: Vec<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryChoiceKind {
+    Selected,
+    TimedOut,
+    Cancelled,
+}
+impl HistoryChoiceKind {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Selected => "history-choice",
+            Self::TimedOut => "history-choice-timeout",
+            Self::Cancelled => "history-choice-cancelled",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Selected => 0,
+            Self::TimedOut => 1,
+            Self::Cancelled => 2,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryVoiceView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    pub entry: usize,
+    pub failed: bool,
+    pub preparing: bool,
+}
+#[derive(Debug, Clone)]
+pub struct CharacterVoiceView {
+    pub id: String,
+    pub name: String,
+    pub locale: String,
+    pub fonts: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct MenuHistoryRow {
@@ -66,6 +109,9 @@ pub struct SlotView {
     pub slot: u32,
     pub label: String,
     pub exists: bool,
+    /// A read failure is distinct from an empty slot. Keep its file intact
+    /// and block writes until a subsequent listing can establish its revision.
+    pub error: Option<String>,
 }
 /// In-flight overrides for one menu element's enter animation. `None`
 /// properties keep the authored value; `offset` is added displacement that
@@ -84,6 +130,7 @@ pub struct UiModel {
     pub menu_instance: u32,
     pub menu_revision: u32,
     pub menu_depth: usize,
+    pub menu_navigation_pending: bool,
     pub menu_locals: std::collections::BTreeMap<String, MenuValue>,
     pub hovered_image: Option<String>,
     pub profile: std::collections::BTreeSet<String>,
@@ -125,6 +172,8 @@ pub struct UiModel {
     pub theme: Theme,
     pub history: Vec<HistoryView>,
     pub history_total: usize,
+    pub history_voice: Option<HistoryVoiceView>,
+    pub character_voices: Vec<CharacterVoiceView>,
     pub menu_history: std::collections::BTreeMap<String, Vec<MenuHistoryRow>>,
     pub menu_history_flow: Option<std::sync::Arc<[MenuHistoryRow]>>,
     /// Authored menu page opacity from finite enter/close fades; 1 when no
@@ -141,9 +190,12 @@ pub struct UiModel {
     pub menu_story: std::collections::BTreeMap<String, MenuValue>,
     pub menu_reading_modes: std::collections::BTreeSet<MenuReadingMode>,
     pub paused: bool,
+    /// Continue can release the restore pause only when no other owner blocks Story.
+    pub can_continue: bool,
     pub loading: bool,
     pub status: String,
     pub fault: Option<String>,
+    pub retrying: bool,
     pub fault_recovery: Vec<Recovery>,
     pub auto: bool,
     pub skip: bool,
@@ -284,6 +336,8 @@ pub struct DrawPacket {
     pub transition_style: StageTransition,
     pub menu_paint: Vec<MenuPaint>,
     pub menu_controls: std::collections::BTreeMap<u32, String>,
+    /// Projection authority for responsive fixed history pages, not story state.
+    pub menu_history_capacity: std::collections::BTreeMap<String, (u32, usize)>,
     pub menu_quad_range: Option<(usize, usize)>,
     pub(crate) menu_page_range: Option<(usize, usize)>,
     pub(crate) menu_page_texts: Option<(usize, usize)>,
@@ -334,6 +388,7 @@ impl Messages {
             "close",
             "settings",
             "history",
+            "history-compact",
             "saves",
             "save",
             "load",
@@ -356,6 +411,9 @@ impl Messages {
             "font-size",
             "text-speed",
             "auto-wait",
+            "auto-wait-voice",
+            "voice-continue",
+            "voice-continue-hint",
             "reading-preferences-hint",
             "music",
             "voice",
@@ -364,12 +422,21 @@ impl Messages {
             "export",
             "import",
             "retry",
+            "sound-unavailable",
+            "sound-reconnecting",
+            "sound-recovery-hint",
+            "storage-unavailable",
+            "storage-recovery-hint",
+            "storage-retrying",
+            "storage-save-unconfirmed",
             "loading",
             "paused",
             "ending",
             "empty-slot",
+            "unavailable-slot",
             "saved",
             "saving",
+            "save-pending",
             "read-failed",
             "error-prepare",
             "error-storage",
@@ -378,18 +445,30 @@ impl Messages {
             "error-host",
             "scroll-back",
             "scroll-forward",
+            "scroll-back-compact",
+            "scroll-forward-compact",
             "title-hint",
             "gate-hint",
             "advance-hint",
             "reveal-hint",
             "history-back",
             "history-forward",
+            "history-voice",
+            "history-voice-stop",
+            "history-voice-failed",
+            "history-voice-stop-compact",
+            "history-choice",
+            "history-choice-timeout",
+            "history-choice-cancelled",
         ]
         .into_iter()
         .map(|id| self.text(locale, id))
         .collect()
     }
     pub fn diagnostic(&self, diagnostic: &Diagnostic, locale: &str) -> String {
+        if diagnostic.code == "E_STORAGE_UNCERTAIN" && diagnostic.location == "save" {
+            return self.text(locale, "save-pending");
+        }
         let key = match diagnostic.details.as_ref().map(|d| &d.domain) {
             Some(ErrorDomain::Prepare) => "error-prepare",
             Some(ErrorDomain::Storage) => "error-storage",
@@ -616,7 +695,14 @@ fn scene(packet: &mut DrawPacket, nodes: &[Node], stage: [f32; 2], alpha: f32) {
     let quads = scene_layout(packet, nodes, stage, alpha);
     packet.quads.extend(quads.into_iter().map(|(_, quad)| quad));
 }
-fn menu_service_enabled(action: &ImageMenuAction, m: &UiModel) -> bool {
+fn menu_service_enabled(
+    action: &ImageMenuAction,
+    m: &UiModel,
+    capacities: &std::collections::BTreeMap<String, (u32, usize)>,
+) -> bool {
+    if m.menu_navigation_pending {
+        return false;
+    }
     match action {
         ImageMenuAction::Back => m.menu_depth > 0,
         ImageMenuAction::PushMenu { .. } => m.menu_depth < nir_format::MAX_MENU_PARENTS,
@@ -632,21 +718,33 @@ fn menu_service_enabled(action: &ImageMenuAction, m: &UiModel) -> bool {
                     m.history_total > 0,
                 )
                 .0 && menu
-                    .history_page(window, *delta, &m.menu_locals, m.history_total)
+                    .history_page_with_capacity(
+                        window,
+                        *delta,
+                        &m.menu_locals,
+                        m.history_total,
+                        capacities.get(window).map(|(_, limit)| *limit),
+                    )
                     .is_some()
             })
         }
         ImageMenuAction::SaveSlot { slot } => {
             m.can_save
                 && !m.replay_active
-                && slot
-                    .resolve(&m.menu_locals)
-                    .is_some_and(|slot| !m.busy_slots.contains(&slot))
+                && slot.resolve(&m.menu_locals).is_some_and(|slot| {
+                    !m.busy_slots.contains(&slot)
+                        && !m
+                            .slots
+                            .iter()
+                            .any(|row| row.slot == slot && row.error.is_some())
+                })
         }
         ImageMenuAction::LoadSlot { slot } => {
             !m.replay_active
                 && slot.resolve(&m.menu_locals).is_some_and(|slot| {
-                    m.slots.iter().any(|row| row.slot == slot && row.exists)
+                    m.slots
+                        .iter()
+                        .any(|row| row.slot == slot && (row.exists || row.error.is_some()))
                         && !m.busy_slots.contains(&slot)
                 })
         }
@@ -785,7 +883,35 @@ fn menu_value_visual(
         run.font_plan_digest = m.text_font_plan_digest.clone();
     }
 }
-fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
+fn menu_node(
+    e: &MenuElement,
+    position: [f32; 2],
+    m: &UiModel,
+    asset: Option<String>,
+    color: [f32; 4],
+) -> Node {
+    let anim = m
+        .menu_element_animations
+        .get(&e.id)
+        .copied()
+        .unwrap_or_default();
+    Node {
+        id: e.id.clone(),
+        parent: e.parent.clone(),
+        asset,
+        x: position[0] + anim.offset[0],
+        y: position[1] + anim.offset[1],
+        width: if e.content.is_group() { 0. } else { e.rect[2] },
+        height: if e.content.is_group() { 0. } else { e.rect[3] },
+        scale: anim.scale.unwrap_or(e.scale),
+        opacity: anim.opacity.unwrap_or(e.opacity),
+        color,
+        order: 0,
+        clip: e.clip,
+    }
+}
+fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel, messages: &Messages) {
+    let capacities = packet.menu_history_capacity.clone();
     let positions = menu.element_positions(
         &m.menu_locals,
         &m.profile,
@@ -804,7 +930,7 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
         )
         .1 && e
             .control()
-            .is_none_or(|(_, action, _)| menu_service_enabled(action, m))
+            .is_none_or(|(_, action, _)| menu_service_enabled(action, m, &capacities))
     };
     let nodes: Vec<_> = menu
         .elements
@@ -869,27 +995,7 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                 }
                 _ => None,
             };
-            let anim = m
-                .menu_element_animations
-                .get(&e.id)
-                .copied()
-                .unwrap_or_default();
-            Node {
-                id: e.id.clone(),
-                parent: e.parent.clone(),
-                asset,
-                // Enter animations override before layout so the parent
-                // transform chain propagates the displaced, scaled row.
-                x: positions[&e.id][0] + anim.offset[0],
-                y: positions[&e.id][1] + anim.offset[1],
-                width: if e.content.is_group() { 0. } else { e.rect[2] },
-                height: if e.content.is_group() { 0. } else { e.rect[3] },
-                scale: anim.scale.unwrap_or(e.scale),
-                opacity: anim.opacity.unwrap_or(e.opacity),
-                color,
-                order: 0,
-                clip: e.clip,
-            }
+            menu_node(e, positions[&e.id], m, asset, color)
         })
         .collect();
     let start = packet.quads.len();
@@ -919,6 +1025,7 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                 });
             }
             MenuContent::HistoryFlow {
+                voice_controls,
                 size,
                 line_height,
                 gap,
@@ -945,27 +1052,86 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                     page_step: page_step * scale,
                     max_visible: *max_visible as usize,
                     paint_index: packet.menu_paint.len(),
+                    semantic_index: packet.semantics.len(),
                     enabled: enabled(e),
+                    voice_controls: *voice_controls,
+                    voice_base: 131072
+                        + menu.elements.iter().position(|v| v.id == e.id).unwrap() as u32 * 1024,
                 });
             }
             MenuContent::HistoryWindow {
-                row_height, size, ..
+                row_height,
+                size,
+                voice_controls,
+                limit,
+                ..
             } => {
                 let scale = w / e.rect[2];
                 let viewport = [x, y, w, h];
                 let parent = quad.clip.unwrap_or(viewport);
-                let left = x.max(parent[0]);
-                let top = y.max(parent[1]);
-                let right = (x + w).min(parent[0] + parent[2]);
-                let bottom = (y + h).min(parent[1] + parent[3]);
+                let left = x.max(parent[0]).max(0.);
+                let top = y.max(parent[1]).max(0.);
+                let right = (x + w).min(parent[0] + parent[2]).min(packet.width);
+                let bottom = (y + h).min(parent[1] + parent[3]).min(packet.height);
                 if let Some(rows) = m.menu_history.get(&e.id) {
-                    for (index, row) in rows.iter().enumerate() {
-                        let ry = y + index as f32 * row_height * scale;
-                        let rh = (row_height * scale).min(bottom - ry);
+                    let row_height = (row_height * scale).max(if *voice_controls {
+                        if w >= 280. {
+                            52.
+                        } else {
+                            76.
+                        }
+                    } else {
+                        0.
+                    });
+                    let capacity = if *voice_controls {
+                        (((bottom - top).max(0.) / row_height).floor() as usize)
+                            .clamp(1, *limit as usize)
+                    } else {
+                        *limit as usize
+                    };
+                    if *voice_controls {
+                        packet
+                            .menu_history_capacity
+                            .insert(e.id.clone(), (m.menu_instance, capacity));
+                    }
+                    let skip = if *voice_controls {
+                        rows.len().saturating_sub(capacity)
+                    } else {
+                        0
+                    };
+                    for (index, row) in rows.iter().skip(skip).enumerate() {
+                        let ry =
+                            (if *voice_controls { top } else { y }) + index as f32 * row_height;
+                        let rh = row_height.min(bottom - ry);
                         if right <= left || rh <= 0. || ry + rh <= top {
                             continue;
                         }
                         let entry = &row.entry;
+                        let (text_width, voice_top, voice_rect) =
+                            history_controls::voice_layout(w, *voice_controls, entry.voice_count);
+                        let heading_height = if let Some(choice) = entry.choice {
+                            packet.menu_paint.push(MenuPaint::Text(packet.texts.len()));
+                            packet.text(
+                                messages.text(&m.ui_locale, choice.message()),
+                                x,
+                                ry + voice_top,
+                                text_width,
+                                size * scale * m.prefs.font_scale * 0.8,
+                                quad.color,
+                            );
+                            let heading = packet.texts.last_mut().unwrap();
+                            let heading_height = heading.line_height.min(rh);
+                            heading.height = heading_height;
+                            heading.clip = Some([
+                                left,
+                                top.max(ry),
+                                right - left,
+                                (ry + heading_height - top.max(ry)).max(0.),
+                            ]);
+                            heading_height
+                        } else {
+                            0.
+                        };
                         let text = if entry.speaker.is_empty() {
                             entry.text.clone()
                         } else {
@@ -975,22 +1141,45 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                         packet.text(
                             text,
                             x,
-                            ry,
-                            w,
+                            ry + voice_top + heading_height,
+                            text_width,
                             size * scale * m.prefs.font_scale,
                             quad.color,
                         );
                         let run = packet.texts.last_mut().unwrap();
-                        run.height = rh;
+                        run.height = (rh - voice_top - heading_height).max(1.);
                         run.clip = Some([
                             left,
-                            top.max(ry),
-                            right - left,
-                            (ry + rh - top.max(ry)).max(0.),
+                            top.max(ry + voice_top + heading_height),
+                            ((x + text_width).min(right) - left).max(0.),
+                            (ry + rh - top.max(ry + voice_top + heading_height)).max(0.),
                         ]);
                         run.locale = entry.locale.clone();
                         run.font_assets = entry.font_assets.clone();
                         run.font_plan_digest = entry.font_plan_digest.clone();
+                        if let Some(mut rect) = voice_rect {
+                            rect[0] += x;
+                            rect[1] += ry;
+                            history_controls::button(
+                                packet,
+                                m,
+                                messages,
+                                history_controls::VoiceButton {
+                                    window: &e.id,
+                                    layout: None,
+                                    key: row.key,
+                                    id: 131072
+                                        + menu.elements.iter().position(|v| v.id == e.id).unwrap()
+                                            as u32
+                                            * 1024
+                                        + row.key as u32,
+                                    rect,
+                                    clip: [left, top, right - left, (bottom - top).max(0.)],
+                                    enabled: enabled(e),
+                                    alpha: quad.color[3],
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -1018,8 +1207,14 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                             .as_ref()
                             .and_then(|slot| slot.resolve(&m.menu_locals))
                             .and_then(|slot| m.slots.iter().find(|row| row.slot == slot))
-                            .filter(|row| row.exists)
-                            .map(|row| row.label.clone())
+                            .filter(|row| row.exists || row.error.is_some())
+                            .map(|row| {
+                                if row.error.is_some() {
+                                    messages.text(&m.ui_locale, "unavailable-slot")
+                                } else {
+                                    row.label.clone()
+                                }
+                            })
                     });
                 packet.text(
                     bound.as_deref().unwrap_or(text),
@@ -1032,9 +1227,26 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
                 let run = packet.texts.last_mut().unwrap();
                 run.height = h;
                 run.clip = quad.clip;
-                run.locale = m.text_locale.clone();
-                run.font_assets = m.text_fonts.clone();
-                run.font_plan_digest = m.text_font_plan_digest.clone();
+                let unavailable_slot = e
+                    .text_local
+                    .as_ref()
+                    .and_then(|name| m.menu_locals.get(name))
+                    .is_none()
+                    && e.text_preference.is_none()
+                    && e.text_slot
+                        .as_ref()
+                        .and_then(|slot| slot.resolve(&m.menu_locals))
+                        .and_then(|slot| m.slots.iter().find(|row| row.slot == slot))
+                        .is_some_and(|row| row.error.is_some());
+                if unavailable_slot {
+                    run.locale = m.ui_locale.clone();
+                    run.font_assets = m.ui_fonts.clone();
+                    run.font_plan_digest = m.ui_font_plan_digest.clone();
+                } else {
+                    run.locale = m.text_locale.clone();
+                    run.font_assets = m.text_fonts.clone();
+                    run.font_plan_digest = m.text_font_plan_digest.clone();
+                }
             }
             _ => {}
         }
@@ -1131,7 +1343,15 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel) {
 }
 
 pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> DrawPacket {
-    let mut p = project_measured(m, width, height, messages, &[], 0., 0.);
+    let mut p = project_measured(
+        m,
+        width,
+        height,
+        messages,
+        &[],
+        0.,
+        &PanelOffsets::default(),
+    );
     divert_menu_page(&mut p, m);
     p
 }
@@ -1159,6 +1379,10 @@ pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
         MenuPaint::Text(i) => Some(*i),
         _ => None,
     }));
+    // Authored texts are already in the branch range; dynamic flow texts
+    // arrive through menu_paint. Preserve order without painting either twice.
+    let mut seen = std::collections::BTreeSet::new();
+    texts.retain(|i| seen.insert(*i));
     let tail = p.quads.split_off(end);
     let quads = p.quads.split_off(start);
     p.quads.push(Quad {
@@ -1190,6 +1414,99 @@ pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
         position,
     });
 }
+#[derive(Debug, Default)]
+struct PanelOffsets {
+    menu: f32,
+    saves: f32,
+    settings: f32,
+}
+
+// Paint and hit testing share the viewport. Partially visible controls may be
+// painted as context, but cannot be activated until their whole target fits.
+// A narrow settings row puts its value above the controls so neither the
+// value nor the hit target is squeezed to make room for the other.
+fn setting_range(
+    p: &mut DrawPacket,
+    label: String,
+    actions: [UiAction; 2],
+    labels: [String; 2],
+    [x, y, w]: [f32; 3],
+    theme: &Theme,
+) -> f32 {
+    let stacked = w < 360.;
+    p.text(
+        label,
+        x,
+        y,
+        if stacked { w } else { w - 145. },
+        18.,
+        theme.text,
+    );
+    let button_width = if stacked { (w - 12.) / 2. } else { 58. };
+    let button_y = y + if stacked { 36. } else { -7. };
+    let button_x = if stacked { x } else { x + w - 128. };
+    for (i, (action, label)) in actions.into_iter().zip(labels).enumerate() {
+        p.button(
+            label,
+            action,
+            [
+                button_x + i as f32 * (button_width + 12.),
+                button_y,
+                button_width,
+                44.,
+            ],
+            false,
+            theme,
+        );
+    }
+    if stacked {
+        92.
+    } else {
+        56.
+    }
+}
+
+fn scroll_panel(
+    p: &mut DrawPacket,
+    first: [usize; 3],
+    view: ScrollView,
+    m: &UiModel,
+    messages: &Messages,
+) {
+    let [x, y, w, h] = view.rect;
+    for q in &mut p.quads[first[0]..] {
+        q.rect[1] -= view.offset;
+        q.clip = Some(view.rect);
+    }
+    for r in &mut p.texts[first[1]..] {
+        r.y -= view.offset;
+        r.clip = r
+            .clip
+            .map(|[rx, ry, rw, rh]| {
+                let top = (ry - view.offset).max(y);
+                let bottom = (ry - view.offset + rh).min(y + h);
+                [
+                    rx.max(x),
+                    top,
+                    ((rx + rw).min(x + w) - rx.max(x)).max(0.),
+                    (bottom - top).max(0.),
+                ]
+            })
+            .or(Some(view.rect));
+    }
+    for n in &mut p.semantics[first[2]..] {
+        let top = n.rect[1] - view.offset;
+        let bottom = top + n.rect[3];
+        n.enabled &=
+            top >= y && bottom <= y + h && n.rect[0] >= x && n.rect[0] + n.rect[2] <= x + w;
+        n.rect[1] = top.clamp(y, y + h);
+        n.rect[3] = (bottom.min(y + h) - n.rect[1]).max(0.);
+    }
+    if view.max > 0. {
+        reading::controls(p, view, m, messages);
+    }
+}
+
 fn project_measured(
     m: &UiModel,
     width: f32,
@@ -1197,7 +1514,7 @@ fn project_measured(
     messages: &Messages,
     choice_heights: &[f32],
     choice_offset: f32,
-    settings_offset: f32,
+    panels: &PanelOffsets,
 ) -> DrawPacket {
     let mut p = DrawPacket {
         width,
@@ -1240,6 +1557,7 @@ fn project_measured(
     match m.screen {
         Screen::Title | Screen::Menu if m.authored_menu => {
             let menu = &m.theme.image_menus[&m.image_menu];
+            p.menu_history_capacity = history_controls::window_capacities(&p, menu, m);
             let scale = (width / m.stage[0]).min(height / m.stage[1]);
             let ox = (width - m.stage[0] * scale) / 2.;
             let oy = (height - m.stage[1] * scale) / 2.;
@@ -1260,7 +1578,7 @@ fn project_measured(
                     .requires
                     .as_ref()
                     .is_none_or(|key| m.profile.contains(key))
-                    && menu_service_enabled(&button.action, m);
+                    && menu_service_enabled(&button.action, m, &p.menu_history_capacity);
                 let selected = m.hovered_image.as_deref() == Some(button.id.as_str());
                 let asset = if !enabled {
                     button.locked_asset.as_ref()
@@ -1317,7 +1635,7 @@ fn project_measured(
                     locale: m.text_locale.clone(),
                 });
             }
-            menu_elements(&mut p, menu, m);
+            menu_elements(&mut p, menu, m, messages);
             if menu.builtin_navigation {
                 p.button(
                     msg(if m.menu_depth > 0 {
@@ -1368,72 +1686,90 @@ fn project_measured(
         }
         Screen::Title => {
             p.rect([0., 0., width, height], [0.015, 0.035, 0.04, 0.57]);
-            p.rect([margin, 32., 28., 2.], t.accent);
-            p.text(
-                "N I R   /   I N T E R A C T I V E   S T O R I E S",
-                margin + 42.,
-                22.,
-                width - margin * 2. - 42.,
-                11.,
-                t.muted,
-            );
-            let y = (height * 0.36).max(120.);
+            let w = width - 2. * margin;
+            let stacked = w < 280.;
+            let tiny = stacked && height < 280.;
+            if !tiny {
+                p.rect([margin, 32., 28., 2.], t.accent);
+                p.text(
+                    if w < 360. {
+                        "N I R / STORIES"
+                    } else {
+                        "N I R   /   I N T E R A C T I V E   S T O R I E S"
+                    },
+                    margin + 42.,
+                    22.,
+                    width - margin * 2. - 42.,
+                    11.,
+                    t.muted,
+                );
+            }
+            let short = height < 400.;
+            let y = if tiny {
+                8.
+            } else if short {
+                50.
+            } else {
+                (height * 0.36).max(120.)
+            };
+            let controls_height = if stacked { 162. } else { 110. };
+            let by = (y + 184.).min(height - controls_height - if tiny { 12. } else { 42. });
             let title = if m.ui_locale == "zh-Hans" {
                 m.title.split('·').next().unwrap_or(&m.title).trim()
             } else {
                 m.title.split('·').nth(1).unwrap_or(&m.title).trim()
             };
-            p.text(
-                title,
-                margin,
-                y,
-                width - margin * 2.,
-                if narrow { 48. } else { 76. },
-                t.text,
-            );
-            p.text(
-                "NIR / VISUAL NOVEL",
-                margin,
-                y + 110.,
-                width - margin * 2.,
-                13.,
-                t.accent,
-            );
-            let by = (y + 184.).min(height - 155.);
+            let title_height = (by - y - 12.).clamp(0., 114.);
+            let size = (if short {
+                32_f32
+            } else if narrow {
+                48.
+            } else {
+                76.
+            })
+            .min((title_height / 1.5).max(1.));
+            p.text(title, margin, y, w, size, t.text);
+            p.texts.last_mut().unwrap().height = title_height;
+            p.texts.last_mut().unwrap().clip = Some([margin, y, w, title_height]);
+            if !short && y + 132. <= by - 12. {
+                p.text("NIR / VISUAL NOVEL", margin, y + 110., w, 13., t.accent);
+            }
             p.button(
                 msg("new-game"),
                 UiAction::NewGame,
-                [
-                    margin,
-                    by,
-                    if narrow { width - margin * 2. } else { 240. },
-                    54.,
-                ],
+                [margin, by, if narrow { w } else { 240. }, 54.],
                 true,
                 t,
             );
             p.button(
                 msg("saves"),
                 UiAction::Saves,
-                [margin, by + 66., 150., 42.],
+                [margin, by + 66., if stacked { w } else { 150. }, 44.],
                 false,
                 t,
             );
             p.button(
                 msg("settings"),
                 UiAction::Settings,
-                [margin + 162., by + 66., 110., 42.],
+                [
+                    if stacked { margin } else { margin + 162. },
+                    by + if stacked { 118. } else { 66. },
+                    if stacked { w } else { 110. },
+                    44.,
+                ],
                 false,
                 t,
             );
-            p.text(
-                "01   /   WEB EDITION",
-                margin,
-                height - 34.,
-                250.,
-                11.,
-                t.muted,
-            );
+            if !tiny {
+                p.text(
+                    "01   /   WEB EDITION",
+                    margin,
+                    height - 34.,
+                    w.min(250.),
+                    11.,
+                    t.muted,
+                );
+            }
             if !narrow {
                 p.text(
                     msg("title-hint"),
@@ -1458,6 +1794,7 @@ fn project_measured(
             });
         }
         Screen::Story => {
+            let toolbar_bottom = 16. + if narrow { 52. } else { 0. } + 44.;
             if m.hidden_dialogue {
                 p.semantics.push(SemanticNode {
                     value: None,
@@ -1478,9 +1815,18 @@ fn project_measured(
                     t.dialogue.height
                 }
                 .min((height - 88.).max(80.));
+                // Builtin windows share the viewport with the fixed reader
+                // toolbar. Compact layouts keep a name, one text line and an
+                // overflow-control row visible without reducing the font.
+                let compact = height < 320. && t.dialogue.rect.is_none();
+                let minimum_top = toolbar_bottom + if narrow && !compact { 8. } else { 4. };
+                let bottom = height - if compact { 4. } else { margin * 0.6 };
+                if t.dialogue.rect.is_none() {
+                    h = h.min((bottom - minimum_top).max(0.));
+                }
                 let mut top = match t.slots.dialogue {
-                    DialogueComponent::Bottom => height - h - margin * 0.6,
-                    DialogueComponent::Top => 64.,
+                    DialogueComponent::Bottom => bottom - h,
+                    DialogueComponent::Top => minimum_top,
                 };
                 let mut left = margin;
                 let mut box_width = width - margin * 2.;
@@ -1508,7 +1854,7 @@ fn project_measured(
                     p.text(
                         &d.speaker,
                         left + padding,
-                        top + 18.,
+                        top + if compact { 4. } else { 18. },
                         box_width - padding * 2.,
                         16.,
                         t.accent,
@@ -1517,6 +1863,12 @@ fn project_measured(
                 let ty = top
                     + if t.dialogue.rect.is_some() {
                         padding
+                    } else if compact {
+                        if d.speaker.is_empty() {
+                            6.
+                        } else {
+                            30.
+                        }
                     } else if d.speaker.is_empty() {
                         24.
                     } else {
@@ -1737,24 +2089,46 @@ fn project_measured(
             }
             let items = [
                 ("menu", UiAction::Menu),
+                ("history", UiAction::History),
                 ("auto", UiAction::ToggleAuto),
                 ("skip", UiAction::ToggleSkip),
                 ("hide-interface", UiAction::ToggleInterface),
             ];
+            let item_count = items.len();
+            let columns = if narrow { 3 } else { item_count };
             for (i, (label, action)) in items.into_iter().enumerate() {
-                let w = ((width - margin * 2. - 24.) / 4.).min(115.);
+                let row = i / columns;
+                let column = i % columns;
+                let row_count = (item_count - row * columns).min(columns);
+                let w = ((width - margin * 2. - (row_count - 1) as f32 * 8.) / row_count as f32)
+                    .min(115.);
+                let full_label = msg(label);
+                let painted_label = if label == "history" && w < 90. {
+                    msg("history-compact")
+                } else {
+                    full_label.clone()
+                };
                 p.button(
-                    msg(label),
+                    painted_label,
                     action,
                     [
-                        width - margin - (4 - i) as f32 * w - (3 - i) as f32 * 8.,
-                        16.,
+                        width
+                            - margin
+                            - (row_count - column) as f32 * w
+                            - (row_count - column - 1) as f32 * 8.,
+                        16. + row as f32 * 52.,
                         w,
-                        36.,
+                        44.,
                     ],
                     (label == "auto" && m.auto) || (label == "skip" && m.skip),
                     t,
                 );
+                p.semantics.last_mut().unwrap().label = full_label;
+                if w < 90. {
+                    let run = p.texts.last_mut().unwrap();
+                    run.x -= 8.;
+                    run.width = w - 16.;
+                }
                 if label == "hide-interface"
                     && (m.loading
                         || m.paused
@@ -1765,7 +2139,7 @@ fn project_measured(
                     p.texts.last_mut().unwrap().color = t.muted;
                 }
             }
-            if m.paused && !m.loading {
+            if m.can_continue && !m.loading {
                 p.button(
                     msg("continue"),
                     UiAction::Continue,
@@ -1815,7 +2189,18 @@ fn project_measured(
             p.rect([0., 0., width, height], [0.015, 0.035, 0.04, 0.83]);
             let w = (width - 2. * margin).min(680.);
             let x = (width - w) / 2.;
-            let y = if height < 600. { 24. } else { 60. };
+            let short_panel =
+                height < 400. && matches!(screen, Screen::Menu | Screen::Saves | Screen::Settings);
+            let tiny_settings = screen == Screen::Settings && height < 280.;
+            let y = if tiny_settings {
+                8.
+            } else if short_panel {
+                12.
+            } else if height < 600. {
+                24.
+            } else {
+                60.
+            };
             let heading = match screen {
                 Screen::Menu => "menu",
                 Screen::Settings => "settings",
@@ -1823,12 +2208,40 @@ fn project_measured(
                 Screen::Saves => "saves",
                 _ => "menu",
             };
-            p.text(msg(heading), x, y, w, 30., t.text);
-            p.rect([x, y + 53., w, 1.], t.accent);
+            p.text(
+                msg(heading),
+                x,
+                y,
+                w,
+                if tiny_settings {
+                    20.
+                } else if short_panel {
+                    24.
+                } else {
+                    30.
+                },
+                t.text,
+            );
+            p.rect(
+                [
+                    x,
+                    y + if tiny_settings {
+                        32.
+                    } else if short_panel {
+                        35.
+                    } else {
+                        53.
+                    },
+                    w,
+                    1.,
+                ],
+                t.accent,
+            );
             match screen {
                 Screen::Menu => {
+                    let first = [p.quads.len(), p.texts.len(), p.semantics.len()];
+                    let yy = y + if short_panel { 48. } else { 76. };
                     for (i, (k, a)) in [
-                        ("close", UiAction::Close),
                         ("saves", UiAction::Saves),
                         ("settings", UiAction::Settings),
                         ("history", UiAction::History),
@@ -1838,31 +2251,59 @@ fn project_measured(
                     .into_iter()
                     .enumerate()
                     {
-                        p.button(msg(k), a, [x, y + 76. + i as f32 * 59., w, 46.], i == 0, t);
+                        p.button(msg(k), a, [x, yy + i as f32 * 59., w, 46.], false, t);
                     }
+                    let view_height = (height - 128. - yy).max(1.);
+                    let max = (4. * 59. + 46. - view_height).max(0.);
+                    scroll_panel(
+                        &mut p,
+                        first,
+                        ScrollView {
+                            menu: None,
+                            region: ScrollRegion::Menu,
+                            rect: [x, yy, w, view_height],
+                            offset: panels.menu.clamp(0., max),
+                            max,
+                            step: (view_height - 46.).max(1.),
+                        },
+                        m,
+                        messages,
+                    );
                 }
                 Screen::Settings => {
-                    let first_quad = p.quads.len();
-                    let first_text = p.texts.len();
-                    let first_node = p.semantics.len();
-                    let compact = height < 600.;
-                    let yy = y + 74.;
-                    let gap = if compact { 52. } else { 66. };
-                    p.text(msg("ui-language"), x, yy, w, 16., t.muted);
-                    for (row, locales, active, is_ui) in [
-                        (yy, &m.available_ui_locales, &m.prefs.ui_locale, true),
+                    let first = [p.quads.len(), p.texts.len(), p.semantics.len()];
+                    let yy = y + if tiny_settings {
+                        40.
+                    } else if short_panel {
+                        48.
+                    } else {
+                        74.
+                    };
+                    let stacked = w < 360.;
+                    let mut cursor = yy;
+                    for (key, locales, active, is_ui) in [
                         (
-                            yy + gap,
+                            "ui-language",
+                            &m.available_ui_locales,
+                            &m.prefs.ui_locale,
+                            true,
+                        ),
+                        (
+                            "text-language",
                             &m.available_text_locales,
                             &m.prefs.text_locale,
                             false,
                         ),
                     ] {
-                        if !is_ui {
-                            p.text(msg("text-language"), x, row, w, 16., t.muted);
-                        }
-                        let count = locales.len().max(1) as f32;
-                        let button_width = (w - 12. * (count - 1.)) / count;
+                        p.text(msg(key), x, cursor, w, 16., t.muted);
+                        let columns = if stacked {
+                            1
+                        } else {
+                            (((w + 12.) / 108.).floor() as usize)
+                                .max(1)
+                                .min(locales.len().max(1))
+                        };
+                        let button_width = (w - 12. * (columns - 1) as f32) / columns as f32;
                         for (i, locale) in locales.iter().enumerate() {
                             let label = match locale.as_str() {
                                 "zh-Hans" => msg("language-zh"),
@@ -1882,18 +2323,17 @@ fn project_measured(
                                 label,
                                 action,
                                 [
-                                    x + i as f32 * (button_width + 12.),
-                                    row + 20.,
+                                    x + (i % columns) as f32 * (button_width + 12.),
+                                    cursor + 28. + (i / columns) as f32 * 52.,
                                     button_width,
-                                    if compact { 34. } else { 40. },
+                                    44.,
                                 ],
                                 active == locale,
                                 t,
                             );
                         }
+                        cursor += 28. + locales.len().div_ceil(columns) as f32 * 52.;
                     }
-                    let ty = yy + gap;
-                    let status_y = ty + gap;
                     let state_message = if let Some(error) = &m.locale_error {
                         format!("{}: {error}", msg("language-failed"))
                     } else if m.locale_pending {
@@ -1906,13 +2346,18 @@ fn project_measured(
                             m.text_locale
                         )
                     };
-                    p.text(state_message, x, status_y, w, 13., t.muted);
+                    let status_height = if m.locale_error.is_some() { 60. } else { 40. };
+                    p.text(state_message, x, cursor, w, 13., t.muted);
+                    p.texts.last_mut().unwrap().height = status_height;
+                    p.texts.last_mut().unwrap().clip = Some([x, cursor, w, status_height]);
+                    cursor += status_height + 8.;
                     if m.locale_error.is_some() || m.locale_pending {
-                        if m.locale_error.is_some() {
+                        let has_retry = m.locale_error.is_some();
+                        if has_retry {
                             p.button(
                                 msg("retry"),
                                 UiAction::LocaleRetry,
-                                [x, status_y + 18., (w - 12.) / 2., 34.],
+                                [x, cursor, if stacked { w } else { (w - 12.) / 2. }, 44.],
                                 true,
                                 t,
                             );
@@ -1921,87 +2366,74 @@ fn project_measured(
                             msg("language-cancel"),
                             UiAction::LocaleCancel,
                             [
-                                if m.locale_error.is_some() {
+                                if has_retry && !stacked {
                                     x + (w + 12.) / 2.
                                 } else {
                                     x
                                 },
-                                status_y + 18.,
-                                if m.locale_error.is_some() {
+                                cursor + if has_retry && stacked { 52. } else { 0. },
+                                if has_retry && !stacked {
                                     (w - 12.) / 2.
                                 } else {
                                     w
                                 },
-                                34.,
+                                44.,
                             ],
                             false,
                             t,
                         );
+                        cursor += if has_retry && stacked { 104. } else { 52. };
                     }
-                    let controls_y = status_y + if compact { 45. } else { 58. };
-                    p.text(
-                        format!("{}   {:.0}%", msg("font-size"), m.prefs.font_scale * 100.),
-                        x,
-                        controls_y,
-                        w - 145.,
-                        18.,
-                        t.text,
-                    );
-                    p.button(
-                        msg("decrease"),
-                        UiAction::FontSize { delta: -0.1 },
-                        [
-                            x + w - 128.,
-                            controls_y - 8.,
-                            58.,
-                            if compact { 32. } else { 38. },
-                        ],
-                        false,
-                        t,
-                    );
-                    p.button(
-                        msg("increase"),
-                        UiAction::FontSize { delta: 0.1 },
-                        [
-                            x + w - 58.,
-                            controls_y - 8.,
-                            58.,
-                            if compact { 32. } else { 38. },
-                        ],
-                        false,
-                        t,
-                    );
-                    for (i, (key, bus, v)) in [
-                        ("music", AudioBus::Bgm, m.prefs.bgm_volume),
-                        ("voice", AudioBus::Voice, m.prefs.voice_volume),
-                        ("sfx", AudioBus::Sfx, m.prefs.sfx_volume),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let ry = controls_y
-                            + if compact { 43. } else { 61. }
-                            + i as f32 * if compact { 37. } else { 52. };
-                        p.text(
-                            format!("{}   {:.0}%", msg(key), v * 100.),
-                            x,
-                            ry,
-                            w - 145.,
-                            18.,
-                            t.text,
-                        );
-                        p.button(
-                            msg("decrease"),
-                            UiAction::Volume { bus, delta: -0.1 },
-                            [x + w - 128., ry - 7., 58., if compact { 32. } else { 38. }],
-                            false,
-                            t,
-                        );
-                        p.button(
-                            msg("increase"),
-                            UiAction::Volume { bus, delta: 0.1 },
-                            [x + w - 58., ry - 7., 58., if compact { 32. } else { 38. }],
-                            false,
+                    for (key, value, down, up) in [
+                        (
+                            "font-size",
+                            m.prefs.font_scale,
+                            UiAction::FontSize { delta: -0.1 },
+                            UiAction::FontSize { delta: 0.1 },
+                        ),
+                        (
+                            "music",
+                            m.prefs.bgm_volume,
+                            UiAction::Volume {
+                                bus: AudioBus::Bgm,
+                                delta: -0.1,
+                            },
+                            UiAction::Volume {
+                                bus: AudioBus::Bgm,
+                                delta: 0.1,
+                            },
+                        ),
+                        (
+                            "voice",
+                            m.prefs.voice_volume,
+                            UiAction::Volume {
+                                bus: AudioBus::Voice,
+                                delta: -0.1,
+                            },
+                            UiAction::Volume {
+                                bus: AudioBus::Voice,
+                                delta: 0.1,
+                            },
+                        ),
+                        (
+                            "sfx",
+                            m.prefs.sfx_volume,
+                            UiAction::Volume {
+                                bus: AudioBus::Sfx,
+                                delta: -0.1,
+                            },
+                            UiAction::Volume {
+                                bus: AudioBus::Sfx,
+                                delta: 0.1,
+                            },
+                        ),
+                    ] {
+                        cursor += setting_range(
+                            &mut p,
+                            format!("{}   {:.0}%", msg(key), value * 100.),
+                            [down, up],
+                            [msg("decrease"), msg("increase")],
+                            [x, cursor, w],
                             t,
                         );
                     }
@@ -2012,17 +2444,12 @@ fn project_measured(
                             if m.prefs.reduced_motion { "ON" } else { "OFF" }
                         ),
                         UiAction::ReducedMotion,
-                        [
-                            x,
-                            controls_y + if compact { 160. } else { 214. },
-                            w,
-                            if compact { 34. } else { 42. },
-                        ],
+                        [x, cursor, w, 44.],
                         m.prefs.reduced_motion,
                         t,
                     );
-                    let reading_y = controls_y + if compact { 215. } else { 278. };
-                    for (i, (key, value, down, up)) in [
+                    cursor += 52.;
+                    for (key, value, down, up) in [
                         (
                             "text-speed",
                             m.prefs.text_speed,
@@ -2035,90 +2462,162 @@ fn project_measured(
                             UiAction::AutoWait { delta: -0.25 },
                             UiAction::AutoWait { delta: 0.25 },
                         ),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let ry = reading_y + i as f32 * 52.;
-                        p.text(
-                            format!("{}   {:.0}%", msg(key), value * 100.),
-                            x,
-                            ry,
-                            w - 145.,
-                            18.,
-                            t.text,
-                        );
-                        p.button(
-                            msg("decrease"),
-                            down,
-                            [x + w - 128., ry - 7., 58., 38.],
-                            false,
-                            t,
-                        );
-                        p.button(
-                            msg("increase"),
-                            up,
-                            [x + w - 58., ry - 7., 58., 38.],
-                            false,
-                            t,
-                        );
-                    }
-                    p.text(
-                        msg("reading-preferences-hint"),
-                        x,
-                        reading_y + 104.,
-                        w,
-                        13.,
-                        t.muted,
-                    );
-                    let view_height = (height - 122. - yy).max(1.);
-                    let viewport = [x, yy, w, view_height];
-                    let max = (reading_y + 150. - yy - view_height).max(0.);
-                    let offset = settings_offset.clamp(0., max);
-                    for q in &mut p.quads[first_quad..] {
-                        q.rect[1] -= offset;
-                        q.clip = Some(viewport);
-                    }
-                    for r in &mut p.texts[first_text..] {
-                        r.y -= offset;
-                        r.clip = Some(viewport);
-                    }
-                    for n in &mut p.semantics[first_node..] {
-                        let top = n.rect[1] - offset;
-                        let bottom = (top + n.rect[3]).min(yy + view_height);
-                        n.rect[1] = top.max(yy);
-                        n.rect[3] = (bottom - n.rect[1]).max(0.);
-                    }
-                    let mut index = 0;
-                    p.semantics.retain(|n| {
-                        let keep = index < first_node || n.rect[3] > 0.;
-                        index += 1;
-                        keep
-                    });
-                    if max > 0. {
-                        reading::controls(
+                    ] {
+                        cursor += setting_range(
                             &mut p,
-                            ScrollView {
-                                menu: None,
-                                region: ScrollRegion::Settings,
-                                rect: viewport,
-                                offset,
-                                max,
-                                step: (view_height - 40.).max(40.),
-                            },
-                            m,
-                            messages,
+                            format!("{}   {:.0}%", msg(key), value * 100.),
+                            [down, up],
+                            [msg("decrease"), msg("increase")],
+                            [x, cursor, w],
+                            t,
                         );
                     }
+                    let toggle_height = if stacked { 60. } else { 44. };
+                    p.button(
+                        format!(
+                            "{}   {}",
+                            msg("auto-wait-voice"),
+                            if m.prefs.auto_wait_voice { "ON" } else { "OFF" }
+                        ),
+                        UiAction::AutoWaitVoice {
+                            enabled: !m.prefs.auto_wait_voice,
+                        },
+                        [x, cursor, w, toggle_height],
+                        m.prefs.auto_wait_voice,
+                        t,
+                    );
+                    cursor += toggle_height + 8.;
+                    p.button(
+                        format!(
+                            "{}   {}",
+                            msg("voice-continue"),
+                            if m.prefs.voice_continue { "ON" } else { "OFF" }
+                        ),
+                        UiAction::VoiceContinue {
+                            enabled: !m.prefs.voice_continue,
+                        },
+                        [x, cursor, w, toggle_height],
+                        m.prefs.voice_continue,
+                        t,
+                    );
+                    cursor += toggle_height + 14.;
+                    p.text(msg("voice-continue-hint"), x, cursor, w, 13., t.muted);
+                    p.texts.last_mut().unwrap().height = if stacked { 100. } else { 60. };
+                    cursor += if stacked { 108. } else { 68. };
+                    p.text(msg("reading-preferences-hint"), x, cursor, w, 13., t.muted);
+                    p.texts.last_mut().unwrap().height = if stacked { 100. } else { 60. };
+                    cursor += if stacked { 118. } else { 78. };
+                    let view_height = (height - 128. - yy).max(1.);
+                    let viewport = [x, yy, w, view_height];
+                    let roles_y = cursor;
+                    let roles_height = if m.character_voices.is_empty() {
+                        0.
+                    } else {
+                        48. + m.character_voices.len() as f32 * 116.
+                    };
+                    let max = (roles_y + roles_height - yy - view_height).max(0.);
+                    let offset = panels.settings.clamp(0., max);
+                    if !m.character_voices.is_empty() {
+                        p.text(msg("character-voices"), x, roles_y, w, 20., t.text);
+                        for (i, role) in m.character_voices.iter().enumerate() {
+                            let ry = roles_y + 48. + i as f32 * 116.;
+                            // Project only visible role rows; long casts do
+                            // not create hundreds of hidden controls/glyphs.
+                            if ry + 104. - offset < yy || ry - offset > yy + view_height {
+                                continue;
+                            }
+                            let value = m
+                                .prefs
+                                .character_voices
+                                .get(&role.id)
+                                .copied()
+                                .unwrap_or_default();
+                            let first_role_control = p.semantics.len();
+                            let editable = m.prefs.character_voices.contains_key(&role.id)
+                                || m.prefs.character_voices.len() < MAX_CHARACTER_VOICES;
+                            p.text(
+                                format!("{}   {:.0}%", role.name, value.volume * 100.),
+                                x,
+                                ry,
+                                w,
+                                20.,
+                                t.text,
+                            );
+                            let text = p.texts.last_mut().unwrap();
+                            text.locale = role.locale.clone();
+                            text.font_assets = role.fonts.clone();
+                            text.height = 44.;
+                            p.button(
+                                msg("decrease"),
+                                UiAction::CharacterVolume {
+                                    character: role.id.clone(),
+                                    delta: -0.1,
+                                },
+                                [x, ry + 52., 44., 44.],
+                                false,
+                                t,
+                            );
+                            p.button(
+                                msg(if value.muted {
+                                    "character-unmute"
+                                } else {
+                                    "character-mute"
+                                }),
+                                UiAction::CharacterMute {
+                                    character: role.id.clone(),
+                                    muted: !value.muted,
+                                },
+                                [x + 56., ry + 52., w - 112., 44.],
+                                value.muted,
+                                t,
+                            );
+                            p.semantics.last_mut().unwrap().value = Some(SemanticValue::Toggle {
+                                checked: value.muted,
+                            });
+                            p.button(
+                                msg("increase"),
+                                UiAction::CharacterVolume {
+                                    character: role.id.clone(),
+                                    delta: 0.1,
+                                },
+                                [x + w - 44., ry + 52., 44., 44.],
+                                false,
+                                t,
+                            );
+                            for control in &mut p.semantics[first_role_control..] {
+                                control.label = format!("{} · {}", role.name, control.label);
+                                control.enabled &= editable;
+                            }
+                        }
+                    }
+                    scroll_panel(
+                        &mut p,
+                        first,
+                        ScrollView {
+                            menu: None,
+                            region: ScrollRegion::Settings,
+                            rect: viewport,
+                            offset,
+                            max,
+                            step: (view_height - toggle_height).max(1.),
+                        },
+                        m,
+                        messages,
+                    );
                 }
                 Screen::Saves => {
+                    let first = [p.quads.len(), p.texts.len(), p.semantics.len()];
+                    let yy = y + if short_panel { 48. } else { 74. };
+                    let stacked = w < 360.;
                     for (i, slot) in m.slots.iter().enumerate().take(3) {
-                        let sy = y + 78. + i as f32 * 85.;
+                        let sy = yy + i as f32 * if stacked { 112. } else { 85. };
                         p.text(
                             format!(
                                 "0{}   {}",
                                 slot.slot + 1,
-                                if slot.exists {
+                                if slot.error.is_some() {
+                                    msg("unavailable-slot")
+                                } else if slot.exists {
                                     slot.label.clone()
                                 } else {
                                     msg("empty-slot")
@@ -2126,50 +2625,113 @@ fn project_measured(
                             ),
                             x,
                             sy,
-                            w - 190.,
+                            if stacked { w } else { w - 190. },
                             16.,
                             t.text,
                         );
+                        if stacked {
+                            p.texts.last_mut().unwrap().height = 48.;
+                        }
+                        let button_y = sy + if stacked { 52. } else { 0. };
+                        let save_rect = if stacked {
+                            [x, button_y, (w - 12.) / 2., 44.]
+                        } else {
+                            [x + w - 176., button_y, 82., 44.]
+                        };
+                        let load_rect = if stacked {
+                            [x + (w + 12.) / 2., button_y, (w - 12.) / 2., 44.]
+                        } else {
+                            [x + w - 86., button_y, 86., 44.]
+                        };
                         p.button(
                             msg("save"),
                             UiAction::Save { slot: slot.slot },
-                            [x + w - 176., sy - 6., 82., 40.],
+                            save_rect,
                             false,
                             t,
                         );
+                        p.semantics.last_mut().unwrap().enabled =
+                            slot.error.is_none() && !m.busy_slots.contains(&slot.slot);
                         p.button(
-                            msg("load"),
+                            msg(if slot.error.is_some() {
+                                "retry"
+                            } else {
+                                "load"
+                            }),
                             UiAction::Load { slot: slot.slot },
-                            [x + w - 86., sy - 6., 86., 40.],
+                            load_rect,
                             false,
                             t,
                         );
-                        p.semantics.last_mut().unwrap().enabled = slot.exists;
+                        p.semantics.last_mut().unwrap().enabled = (slot.exists
+                            || slot.error.is_some())
+                            && !m.busy_slots.contains(&slot.slot);
                     }
+                    let transfer_y = yy + if stacked { 336. } else { 273. };
                     p.button(
                         msg("export"),
                         UiAction::Export,
-                        [x, y + 347., (w - 12.) / 2., 42.],
+                        [x, transfer_y, if stacked { w } else { (w - 12.) / 2. }, 44.],
                         false,
                         t,
                     );
                     p.button(
                         msg("import"),
                         UiAction::Import,
-                        [x + (w + 12.) / 2., y + 347., (w - 12.) / 2., 42.],
+                        [
+                            if stacked { x } else { x + (w + 12.) / 2. },
+                            transfer_y + if stacked { 52. } else { 0. },
+                            if stacked { w } else { (w - 12.) / 2. },
+                            44.,
+                        ],
                         false,
                         t,
                     );
+                    let view_height = (height - 128. - yy).max(1.);
+                    let content_height = transfer_y - yy + if stacked { 96. } else { 44. };
+                    let max = (content_height - view_height).max(0.);
+                    scroll_panel(
+                        &mut p,
+                        first,
+                        ScrollView {
+                            menu: None,
+                            region: ScrollRegion::Saves,
+                            rect: [x, yy, w, view_height],
+                            offset: panels.saves.clamp(0., max),
+                            max,
+                            step: (view_height - 44.).max(1.),
+                        },
+                        m,
+                        messages,
+                    );
                 }
                 Screen::History => {
+                    if !m.status.is_empty() {
+                        p.text(&m.status, x, y + 55., w, 13., t.accent);
+                        p.texts.last_mut().unwrap().clip = Some([x, y + 55., w, 21.]);
+                    }
                     let entries = &m.history;
                     let scrollable_entry = entries
                         .iter()
                         .enumerate()
                         .max_by_key(|(_, entry)| entry.text.len())
                         .map(|(index, _)| index);
-                    let row_height = ((height - y - 276.).max(60.) / 3.).max(40.);
+                    let row_height = ((height - y - 276.).max(60.) / 3.).max(48.);
                     for (i, entry) in entries.iter().enumerate() {
+                        let has_voice = entry.voice_count > 0;
+                        let playback = m
+                            .history_voice
+                            .as_ref()
+                            .filter(|voice| voice.entry == entry.key);
+                        let active = playback.is_some_and(|voice| !voice.failed);
+                        let text_width = if has_voice { (w - 126.).max(32.) } else { w };
+                        let row_y = y + 76. + i as f32 * row_height;
+                        let heading_height = if let Some(choice) = entry.choice {
+                            p.text(msg(choice.message()), x, row_y, text_width, 13., t.muted);
+                            22.
+                        } else {
+                            0.
+                        };
                         let text = if entry.speaker.is_empty() {
                             entry.text.clone()
                         } else {
@@ -2179,9 +2741,9 @@ fn project_measured(
                             text,
                             visible: None,
                             x,
-                            y: y + 76. + i as f32 * row_height,
-                            width: w,
-                            height: row_height - 8.,
+                            y: row_y + heading_height,
+                            width: text_width,
+                            height: (row_height - heading_height - 8.).max(1.),
                             size: if narrow { 16. } else { 18. },
                             line_height: if narrow { 24. } else { 27. },
                             color: t.text,
@@ -2189,9 +2751,9 @@ fn project_measured(
                             scroll: 0.,
                             clip: (scrollable_entry == Some(i)).then_some([
                                 x,
-                                y + 76. + i as f32 * row_height,
-                                w,
-                                row_height - 8.,
+                                row_y + heading_height,
+                                text_width,
+                                (row_height - heading_height - 8.).max(1.),
                             ]),
                             region: (scrollable_entry == Some(i)).then_some(ScrollRegion::History),
                             locale: entry.locale.clone(),
@@ -2201,6 +2763,26 @@ fn project_measured(
                             shadow: None,
                             monochrome: false,
                         });
+                        if has_voice {
+                            let label = if playback.is_some_and(|voice| voice.failed) {
+                                msg("history-voice-failed")
+                            } else if active {
+                                msg("history-voice-stop")
+                            } else {
+                                msg("history-voice")
+                            };
+                            p.button(
+                                label,
+                                if active {
+                                    UiAction::StopHistoryVoice
+                                } else {
+                                    UiAction::HistoryVoice { entry: entry.key }
+                                },
+                                [x + w - 118., y + 76. + i as f32 * row_height, 118., 44.],
+                                active,
+                                t,
+                            );
+                        }
                     }
                     p.button(
                         msg("history-back"),
@@ -2219,7 +2801,7 @@ fn project_measured(
                 }
                 _ => {}
             }
-            if screen != Screen::Menu {
+            {
                 p.button(
                     msg("close"),
                     UiAction::Close,
@@ -2230,22 +2812,54 @@ fn project_measured(
             }
         }
     }
-    if m.loading {
-        p.rect([0., height - 38., width, 38.], t.background);
+    if m.loading && (m.fault.is_none() || m.retrying) {
+        let footer_height = if matches!(m.screen, Screen::Saves | Screen::Settings)
+            || m.screen == Screen::Menu && !m.authored_menu
+        {
+            32.
+        } else {
+            38.
+        };
+        p.rect(
+            [0., height - footer_height, width, footer_height],
+            t.background,
+        );
         p.text(
             msg("loading"),
             margin,
-            height - 29.,
+            height - footer_height + 7.,
             width - 2. * margin,
             13.,
             t.accent,
         );
     }
-    if !m.status.is_empty() && !matches!(m.screen, Screen::Settings) {
-        p.text(&m.status, margin, 65., width - 2. * margin, 13., t.accent);
+    let builtin_panel = m.screen == Screen::Saves || m.screen == Screen::Menu && !m.authored_menu;
+    if !m.status.is_empty()
+        && m.fault.is_none()
+        && !matches!(m.screen, Screen::Settings | Screen::History)
+        && (!builtin_panel || !m.loading)
+    {
+        let status_y = if builtin_panel {
+            // Keep feedback below the fixed Close button. Short panel headers
+            // reserve the remaining height for content and scroll controls.
+            height - 25.
+        } else if m.screen == Screen::Story && narrow {
+            120.
+        } else {
+            65.
+        };
+        p.text(
+            &m.status,
+            margin,
+            status_y,
+            width - 2. * margin,
+            13.,
+            t.accent,
+        );
     }
     if let Some(error) = &m.fault {
-        p.rect([margin, height * 0.3, width - 2. * margin, 140.], t.panel);
+        let button_width = ((width - 2. * margin - 54.) / 2.).clamp(0., 140.);
+        p.rect([margin, height * 0.3, width - 2. * margin, 152.], t.panel);
         p.texts.push(TextRun {
             text: error.clone(),
             visible: None,
@@ -2269,18 +2883,40 @@ fn project_measured(
         });
         if m.fault_recovery.contains(&Recovery::Retry) {
             p.button(
-                msg("retry"),
+                msg(if m.retrying { "retrying" } else { "retry" }),
                 UiAction::Retry,
-                [margin + 20., height * 0.3 + 90., 140., 38.],
-                true,
+                [margin + 20., height * 0.3 + 90., button_width, 44.],
+                !m.retrying,
                 t,
             );
+            p.semantics.last_mut().unwrap().enabled = !m.retrying;
         }
         p.button(
             msg("exit"),
             UiAction::Title,
-            [margin + 174., height * 0.3 + 90., 140., 38.],
+            [
+                margin + 34. + button_width,
+                height * 0.3 + 90.,
+                button_width,
+                44.,
+            ],
             false,
+            t,
+        );
+    }
+    if m.menu_navigation_pending {
+        // Keep the previous page visible, but its controls no longer accept
+        // work until navigation commits or is explicitly abandoned.
+        for node in &mut p.semantics {
+            if !matches!(node.action, UiAction::Retry | UiAction::Title) {
+                node.enabled = false;
+            }
+        }
+        p.button(
+            msg("cancel-navigation"),
+            UiAction::Close,
+            [(width - margin - 140.).max(margin), height - 92., 140., 44.],
+            true,
             t,
         );
     }
@@ -3042,3 +3678,6 @@ mod scene_tests {
         assert_eq!(p.quads[0].clip, Some([16., 0., 10., 16.]));
     }
 }
+
+#[cfg(test)]
+mod story_layout;

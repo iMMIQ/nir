@@ -36,6 +36,7 @@ pub const CAPABILITIES: &[&str] = &[
     "audio.gain.v1",
     "audio.stop.v1",
     "audio.gain-tween.v1",
+    "audio.loop-region.v1",
     "ui.image-menu.v1",
     "text.visibility.v1",
     "text.window-transition.v1",
@@ -59,6 +60,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui.menu-storage.v1",
     "ui.menu-history.v1",
     "ui.menu-history-flow.v1",
+    "ui.menu-history-voice.v1",
     "ui.menu-history-scrollbar.v1",
     "ui.menu-values.v1",
     "ui.menu-effects.v1",
@@ -931,6 +933,8 @@ pub enum Effect {
         gain: f32,
         #[serde(default)]
         looped: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loop_region: Option<AudioLoopRegion>,
     },
     /// A finite stop operation; completion is separate from natural playback end.
     AudioStop {
@@ -1128,6 +1132,42 @@ fn unit_gain() -> f32 {
 fn is_unit_gain(value: &f32) -> bool {
     *value == 1.0
 }
+/// Play from the beginning to `end_us` once, then repeat [start_us, end_us).
+/// Each backend resolves boundaries at its decoded buffer's sample rate,
+/// choosing the nearest sample frame without trimming unrelated samples.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AudioLoopRegion {
+    pub start_us: Micros,
+    pub end_us: Micros,
+}
+impl AudioLoopRegion {
+    pub fn valid(&self, duration_us: u64) -> bool {
+        self.start_us.0 < self.end_us.0 && self.end_us.0 <= duration_us
+    }
+    pub fn frame_bounds(&self, rate: u32, frames: u64) -> Option<(u64, u64)> {
+        if rate == 0 || self.start_us.0 >= self.end_us.0 {
+            return None;
+        }
+        let frame = |us: u64| (us as u128 * rate as u128 + 500_000) / 1_000_000;
+        let start = frame(self.start_us.0);
+        let end = frame(self.end_us.0);
+        (start < end && end <= frames as u128).then_some((start as u64, end as u64))
+    }
+    /// A cumulative device position includes the one-time intro. Wrap only
+    /// after the first end boundary; restoration must not replay that intro.
+    pub fn playback_frame(&self, position_us: u64, rate: u32, frames: u64) -> Option<u64> {
+        let (start, end) = self.frame_bounds(rate, frames)?;
+        let position = (position_us as u128 * rate as u128 + 500_000) / 1_000_000;
+        Some(if position < end as u128 {
+            position as u64
+        } else {
+            start + ((position - end as u128) % (end - start) as u128) as u64
+        })
+    }
+}
+
 /// Event gain is separate from the player's mixer preferences.
 pub fn valid_audio_gain(value: f32) -> bool {
     value.is_finite() && (0.0..=4.0).contains(&value)
@@ -1306,6 +1346,50 @@ pub struct Asset {
     pub duration_us: Micros,
     #[serde(default)]
     pub decoded_bytes: u64,
+}
+impl Asset {
+    /// Conservative stereo f32 payload at a platform decoder's sample rate.
+    /// Authored duration is rounded down to microseconds; reserve one extra
+    /// output frame for that loss of precision and resampling rounding. The
+    /// source payload remains a floor, and impossible costs saturate instead
+    /// of wrapping into an apparently small admission request.
+    pub fn resampled_pcm_budget(&self, sample_rate: u32) -> u64 {
+        let frames = (self.duration_us.0 as u128 * sample_rate as u128).div_ceil(1_000_000);
+        let bytes = ((frames + 1) * 2 * 4).min(u64::MAX as u128) as u64;
+        self.decoded_bytes.max(bytes)
+    }
+}
+#[cfg(test)]
+mod audio_budget_tests {
+    use super::*;
+    fn asset(duration: u64, source_bytes: u64) -> Asset {
+        Asset {
+            kind: AssetKind::Audio,
+            object: String::new(),
+            bytes: 0,
+            width: 0,
+            height: 0,
+            duration_us: Micros(duration),
+            decoded_bytes: source_bytes,
+        }
+    }
+    #[test]
+    fn context_rate_stereo_budget_includes_resampling_and_rounding() {
+        assert_eq!(
+            asset(8_000_000, 768_000).resampled_pcm_budget(48_000),
+            3_072_008
+        );
+        assert_eq!(asset(1, 4).resampled_pcm_budget(48_000), 16);
+        assert_eq!(asset(22, 4).resampled_pcm_budget(48_000), 24);
+    }
+    #[test]
+    fn source_payload_remains_a_floor_and_overflow_cannot_wrap() {
+        assert_eq!(
+            asset(1_000_000, 768_000).resampled_pcm_budget(24_000),
+            768_000
+        );
+        assert_eq!(asset(u64::MAX, 4).resampled_pcm_budget(u32::MAX), u64::MAX);
+    }
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1650,6 +1734,9 @@ impl PlayerDefaults {
             font_scale: self.font_scale,
             text_speed: 1.,
             auto_wait_scale: 1.,
+            auto_wait_voice: true,
+            voice_continue: true,
+            character_voices: BTreeMap::new(),
             bgm_volume: self.bgm_volume,
             voice_volume: self.voice_volume,
             sfx_volume: self.sfx_volume,
@@ -1947,6 +2034,10 @@ pub struct EngineFiles {
     pub js: String,
     pub wasm: String,
     pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_worker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_worker: Option<String>,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1967,6 +2058,13 @@ pub struct Preferences {
     pub text_speed: f32,
     #[serde(default = "one", skip_serializing_if = "is_unit_gain")]
     pub auto_wait_scale: f32,
+    #[serde(default = "wait_voice_by_default")]
+    pub auto_wait_voice: bool,
+    /// Allow authored voice lifetimes across a completed reading interaction.
+    #[serde(default = "wait_voice_by_default")]
+    pub voice_continue: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub character_voices: BTreeMap<String, CharacterVoicePreference>,
     pub bgm_volume: f32,
     pub voice_volume: f32,
     pub sfx_volume: f32,
@@ -1980,10 +2078,58 @@ impl Default for Preferences {
             font_scale: 1.,
             text_speed: 1.,
             auto_wait_scale: 1.,
+            auto_wait_voice: true,
+            voice_continue: true,
+            character_voices: BTreeMap::new(),
             bgm_volume: 0.3,
             voice_volume: 0.8,
             sfx_volume: 0.5,
             reduced_motion: false,
+        }
+    }
+}
+fn wait_voice_by_default() -> bool {
+    true
+}
+
+pub const MAX_CHARACTER_VOICES: usize = 128;
+pub const MAX_CHARACTER_ID_BYTES: usize = 256;
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CharacterVoicePreference {
+    pub volume: f32,
+    pub muted: bool,
+}
+impl Default for CharacterVoicePreference {
+    fn default() -> Self {
+        Self {
+            volume: 1.,
+            muted: false,
+        }
+    }
+}
+impl Preferences {
+    pub fn character_voice_gain(&self, character: &str) -> f32 {
+        self.character_voices.get(character).map_or(1., |voice| {
+            if voice.muted {
+                0.
+            } else if voice.volume.is_finite() {
+                voice.volume.clamp(0., 1.)
+            } else {
+                1.
+            }
+        })
+    }
+    pub fn normalize_character_voices(&mut self) {
+        self.character_voices.retain(|id, value| {
+            !id.is_empty() && id.len() <= MAX_CHARACTER_ID_BYTES && value.volume.is_finite()
+        });
+        for value in self.character_voices.values_mut() {
+            value.volume = value.volume.clamp(0., 1.);
+        }
+        while self.character_voices.len() > MAX_CHARACTER_VOICES {
+            self.character_voices.pop_last();
         }
     }
 }
@@ -1992,6 +2138,16 @@ impl Default for Preferences {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiAction {
+    MenuHistoryVoice {
+        instance: u32,
+        revision: u32,
+        window: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layout: Option<u32>,
+        entry: usize,
+        #[serde(default)]
+        stop: bool,
+    },
     MenuHistoryScroll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control: Option<String>,
@@ -2082,6 +2238,20 @@ pub enum UiAction {
     AutoWait {
         delta: f32,
     },
+    AutoWaitVoice {
+        enabled: bool,
+    },
+    VoiceContinue {
+        enabled: bool,
+    },
+    CharacterVolume {
+        character: String,
+        delta: f32,
+    },
+    CharacterMute {
+        character: String,
+        muted: bool,
+    },
     Volume {
         bus: AudioBus,
         delta: f32,
@@ -2097,6 +2267,10 @@ pub enum UiAction {
     Export,
     Import,
     Retry,
+    HistoryVoice {
+        entry: usize,
+    },
+    StopHistoryVoice,
 }
 
 impl UiAction {
@@ -2122,6 +2296,20 @@ impl UiAction {
     }
     pub fn same_focus_target(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::MenuHistoryVoice {
+                    instance: a,
+                    window: b,
+                    entry: c,
+                    ..
+                },
+                Self::MenuHistoryVoice {
+                    instance: d,
+                    window: e,
+                    entry: f,
+                    ..
+                },
+            ) => a == d && b == e && c == f,
             (
                 Self::MenuHistoryScroll {
                     instance: a,
@@ -2198,6 +2386,8 @@ pub enum HistoryScrollInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrollRegion {
+    Menu,
+    Saves,
     Settings,
     Dialogue,
     Choices,

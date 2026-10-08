@@ -60,6 +60,8 @@ mod tests {
             player.content[&41].purpose,
             ContentPurpose::Execution
         ));
+        assert!(player.paused());
+        assert!(!player.domain_paused(TimeDomain::Story));
 
         player.commands.clear();
         player
@@ -261,6 +263,7 @@ mod tests {
             "release".into(),
             "Test".into(),
             Some(preferences),
+            None,
         )
         .unwrap();
         let commands = player.pump(vec![], 100);
@@ -348,6 +351,7 @@ pub(super) enum ContentPurpose {
     /// Text objects a replay candidate's entry block crossed before its
     /// first media barrier; completed only while the entry is preparing.
     ReplayEntry,
+    HistoryVoice,
 }
 #[derive(Clone)]
 pub(super) struct ContentPreparation {
@@ -522,6 +526,12 @@ impl Player {
                 batches.push_back(std::mem::take(&mut current));
             }
             current.extend(required);
+        }
+        for request in self.requests_for_keys(self.snapshot_voice_timer_catalogs(snapshot))? {
+            if current.len() == 128 {
+                batches.push_back(std::mem::take(&mut current));
+            }
+            current.push(request);
         }
         if !current.is_empty() {
             batches.push_back(current);
@@ -741,7 +751,28 @@ impl Player {
                 .into_iter()
                 .map(|module| ContentKey::Static { module }),
         );
+        keys.extend(self.snapshot_voice_timer_catalogs(snapshot));
         keys
+    }
+    fn snapshot_voice_timer_catalogs(&self, snapshot: &Snapshot) -> BTreeSet<ContentKey> {
+        let Some(root) = self.validated.runtime_root() else {
+            return BTreeSet::new();
+        };
+        // Sampled voice timers validate canonical duration even when the
+        // referenced instance has ended and no media decode is needed. A cold
+        // restore must prepare those catalogs before constructing the core.
+        // Historical audition metadata deliberately does not pin catalogs.
+        let timer_assets = snapshot.tasks.values().filter_map(|task| {
+            let reading = task.dialogue.as_ref()?.reading.as_ref()?;
+            if reading.wait != VoiceWaitPolicy::SampledRemaining {
+                return None;
+            }
+            match &snapshot.tasks.get(&reading.voice?)?.effect {
+                Effect::Audio { asset, .. } => Some(asset.as_str()),
+                _ => None,
+            }
+        });
+        root.asset_catalogs(timer_assets)
     }
     pub(super) fn touch_snapshot_content(&self, snapshot: &Snapshot) -> Result<()> {
         if self.validated.runtime_root().is_none() {
@@ -846,6 +877,7 @@ impl Player {
         objects: Vec<ContentRequest>,
     ) -> Result<()> {
         let locale = matches!(purpose, ContentPurpose::Locale);
+        let history = matches!(purpose, ContentPurpose::HistoryVoice);
         if objects.len() > 128 {
             return Err(Diagnostic::new(
                 "E_LIMIT",
@@ -860,7 +892,7 @@ impl Player {
                 "empty content barrier",
             ));
         }
-        if !matches!(purpose, ContentPurpose::Prefetch) {
+        if !matches!(purpose, ContentPurpose::Prefetch) && !history {
             let matching_prefetch = self.content.iter().find_map(|(request, preparation)| {
                 (matches!(preparation.purpose, ContentPurpose::Prefetch)
                     && same_content_objects(&preparation.objects, &objects))
@@ -872,7 +904,7 @@ impl Player {
                     preparation.purpose = purpose;
                 }
                 self.pauses
-                    .insert(if locale { "locale" } else { "content" }.into());
+                    .insert_barrier(if locale { "locale" } else { "content" }.into());
                 self.commands.push(AppCommand::PromoteContent {
                     request,
                     session: self.generation.session,
@@ -881,7 +913,7 @@ impl Player {
                 return Ok(());
             }
             self.cancel_content(locale);
-        } else {
+        } else if !history {
             let old_prefetches: Vec<_> = self
                 .content
                 .iter()
@@ -922,11 +954,12 @@ impl Player {
                 max_bytes,
             },
         );
-        if !is_prefetch {
+        if !is_prefetch && !history {
             self.pauses
-                .insert(if locale { "locale" } else { "content" }.into());
+                .insert_barrier(if locale { "locale" } else { "content" }.into());
         }
-        if !locale && !is_prefetch {
+        if !locale && !is_prefetch && !history {
+            self.clear_fault_status();
             self.error = None;
             self.diagnostic = None;
         }
@@ -956,6 +989,10 @@ impl Player {
             return;
         }
         let purpose = self.content[&request].purpose.clone();
+        if matches!(purpose, ContentPurpose::HistoryVoice) {
+            self.fail_history_voice();
+            return;
+        }
         self.content.get_mut(&request).unwrap().failed = true;
         self.commands.push(AppCommand::CancelContent { request });
         if matches!(purpose, ContentPurpose::Prefetch) {
@@ -1016,7 +1053,7 @@ impl Player {
         self.pauses.remove("content");
         self.observe("restore_unit_verified", Some(request));
         if let Err(error) = self.resume_restore_work() {
-            self.pauses.insert("content".into());
+            self.pauses.insert_barrier("content".into());
             self.report(error, true);
         }
         Ok(())
@@ -1040,7 +1077,7 @@ impl Player {
             Some(rollback)
         );
         if let Err(error) = self.resume_restore_work() {
-            self.pauses.insert("content".into());
+            self.pauses.insert_barrier("content".into());
             self.report(error, true);
         }
         Ok(())
@@ -1275,15 +1312,18 @@ impl Player {
             self.admit_live_program(validated)?;
         }
         self.content.remove(&request);
-        self.pauses
-            .remove(if matches!(job.purpose, ContentPurpose::Locale) {
-                "locale"
-            } else {
-                "content"
-            });
+        if !matches!(job.purpose, ContentPurpose::HistoryVoice) {
+            self.pauses
+                .remove(if matches!(job.purpose, ContentPurpose::Locale) {
+                    "locale"
+                } else {
+                    "content"
+                });
+        }
         self.observe("content_ready", Some(request));
         let continuation = match job.purpose.clone() {
             ContentPurpose::Execution => {
+                self.clear_fault_status();
                 self.error = None;
                 self.diagnostic = None;
                 Ok(())
@@ -1301,11 +1341,16 @@ impl Player {
                 self.continue_replay_entry()?;
                 Ok(())
             }
+            ContentPurpose::HistoryVoice => self.prepare_history_voice(),
             ContentPurpose::RestoreValidation => unreachable!(),
             ContentPurpose::RestoreBodies(_) => unreachable!(),
             ContentPurpose::Prefetch => unreachable!(),
         };
         if let Err(error) = continuation {
+            if matches!(job.purpose, ContentPurpose::HistoryVoice) {
+                self.fail_history_voice();
+                return Ok(());
+            }
             // Bytes are already verified, but admitting the following media or
             // locale preparation can still fail. Keep a retryable request so
             // this error cannot disappear after removal of the download job.
@@ -1315,7 +1360,7 @@ impl Player {
             }
             self.content.insert(request, job);
             self.pauses
-                .insert(if locale { "locale" } else { "content" }.into());
+                .insert_barrier(if locale { "locale" } else { "content" }.into());
             self.fail_content(request, error.to_string());
         }
         Ok(())

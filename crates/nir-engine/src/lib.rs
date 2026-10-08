@@ -1,10 +1,11 @@
 //! Shared rendered player, used by browser and native hosts.
 #![forbid(unsafe_code)]
 use nir_format::*;
-use nir_player::{AppCommand, AppEvent, Player, SaveEnvelope};
-use nir_presentation::{DrawPacket, Messages, ReadingState, SlotView};
+use nir_player::{AppCommand, AppEvent, PersistenceKind, Player, SaveEnvelope};
+use nir_presentation::{DrawPacket, Messages, ReadingState, Screen, SlotView};
 use nir_render_wgpu::Renderer;
 use std::collections::{BTreeSet, VecDeque};
+mod story_clock;
 fn js(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -15,6 +16,15 @@ pub struct Engine {
     packet: DrawPacket,
     keyboard_focus: nir_presentation::KeyboardFocus,
     reading: ReadingState,
+    audio_output_wait: Option<nir_player::PauseToken>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_audio_recovery: Option<nir_presentation::audio_recovery::Status>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_storage_recovery: Option<nir_presentation::storage_recovery::Status>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_storage_focus_wait: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_audio_recovery_focus: Option<nir_presentation::audio_recovery::Action>,
     view_sequence: (u32, u32),
     fonts: BTreeSet<String>,
     pending_locale: Option<u32>,
@@ -40,6 +50,7 @@ pub struct Engine {
     cached_draws: u32,
     profiling: bool,
     profile_records: VecDeque<HostProfile>,
+    story_clock: story_clock::StoryClock,
 }
 #[derive(Clone, Copy)]
 struct HostProfile {
@@ -54,7 +65,20 @@ const REPROJECT_SAFETY_FRAMES: u32 = 16;
 fn profile_clock_us() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
-        (web_sys::window().unwrap().performance().unwrap().now() * 1000.) as u64
+        let performance = js_sys::Reflect::get(
+            &js_sys::global(),
+            &wasm_bindgen::JsValue::from_str("performance"),
+        )
+        .unwrap();
+        let now =
+            js_sys::Reflect::get(&performance, &wasm_bindgen::JsValue::from_str("now")).unwrap();
+        use wasm_bindgen::JsCast;
+        (now.unchecked_into::<js_sys::Function>()
+            .call0(&performance)
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            * 1000.) as u64
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -73,11 +97,27 @@ impl Engine {
         preferences: Option<Preferences>,
         renderer: Renderer,
     ) -> std::result::Result<Self, String> {
+        Self::new_with_audio_sample_rate(executable, release, title, preferences, renderer, None)
+    }
+    pub fn new_with_audio_sample_rate(
+        executable: RuntimeExecutable,
+        release: String,
+        title: String,
+        preferences: Option<Preferences>,
+        renderer: Renderer,
+        audio_decode_sample_rate: Option<u32>,
+    ) -> std::result::Result<Self, String> {
         if executable.format != 2 {
             return Err(js("E_RUNTIME_VERSION: expected RuntimeExecutable v2"));
         }
-        let player =
-            Player::new_runtime(executable.program, release, title, preferences).map_err(js)?;
+        let player = Player::new_runtime_with_audio_sample_rate(
+            executable.program,
+            release,
+            title,
+            preferences,
+            audio_decode_sample_rate,
+        )
+        .map_err(js)?;
         let mut e = Self {
             player,
             renderer,
@@ -85,6 +125,15 @@ impl Engine {
             packet: DrawPacket::default(),
             keyboard_focus: Default::default(),
             reading: ReadingState::default(),
+            audio_output_wait: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_audio_recovery: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_storage_recovery: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_storage_focus_wait: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_audio_recovery_focus: None,
             view_sequence: (0, 0),
             fonts: BTreeSet::new(),
             pending_locale: None,
@@ -102,6 +151,7 @@ impl Engine {
             cached_draws: 0,
             profiling: false,
             profile_records: VecDeque::new(),
+            story_clock: story_clock::StoryClock::default(),
         };
         e.pump(vec![])?;
         Ok(e)
@@ -235,6 +285,12 @@ impl Engine {
         nir_presentation::pointer_action(&self.packet, &self.player.model(), x, y, button)
     }
     pub fn primary_action(&self) -> Option<UiAction> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.native_storage_focus_wait && self.native_storage_recovery_layout().is_some() {
+            // Disabling the focused service button cannot transfer Enter to
+            // a default title action while the original request is pending.
+            return None;
+        }
         if let Some(node) =
             self.keyboard_focus
                 .node(&self.packet, self.input_identity(), self.player.screen)
@@ -258,6 +314,10 @@ impl Engine {
         nir_presentation::control_value_action(&self.packet, id, expected, direction)
     }
     pub fn focus_control(&mut self, id: Option<u32>) -> std::result::Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.native_storage_focus_wait = false;
+        }
         self.keyboard_focus
             .select(&self.packet, self.input_identity(), self.player.screen, id);
         self.visual_invalidated = true;
@@ -295,6 +355,10 @@ impl Engine {
         }])
     }
     pub fn navigate_focus(&mut self, direction: u8) -> std::result::Result<Option<u32>, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.native_storage_focus_wait = false;
+        }
         let identity = self.input_identity();
         let screen = self.player.screen;
         let current = self
@@ -352,6 +416,10 @@ impl Engine {
                             if backwards { -1 } else { 1 },
                             &self.packet,
                         );
+                        if let Some(owner) = &view.menu {
+                            self.player.stop_menu_history_voice(&owner.window);
+                            self.pump(vec![])?;
+                        }
                         let projected = self.reading.project(
                             &self.player.model(),
                             identity,
@@ -360,6 +428,14 @@ impl Engine {
                             &self.messages,
                             &mut self.renderer.text,
                         );
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let projected = {
+                            let mut projected = projected;
+                            if let Some(layout) = self.native_storage_recovery_layout() {
+                                layout.paint(&mut projected, &self.player.model(), &self.messages);
+                            }
+                            projected
+                        };
                         let candidates: Vec<_> = projected
                             .semantics
                             .iter()
@@ -447,6 +523,17 @@ impl Engine {
         let consumed = self
             .reading
             .history_bar_gesture(phase, x, y, button, identity, &packet);
+        if consumed {
+            if let Some(window) = packet
+                .history_bar
+                .as_ref()
+                .and_then(|bar| bar.authority.as_ref())
+                .map(|id| id.window.clone())
+            {
+                self.player.stop_menu_history_voice(&window);
+                self.pump(vec![])?;
+            }
+        }
         self.visual_invalidated |= consumed;
         Ok(consumed)
     }
@@ -613,7 +700,11 @@ impl Engine {
             && interaction == identity.1
             && matches!(
                 action,
-                UiAction::Advance | UiAction::Scroll { .. } | UiAction::MenuHistoryScroll { .. }
+                UiAction::Advance
+                    | UiAction::Scroll { .. }
+                    | UiAction::MenuHistoryScroll { .. }
+                    | UiAction::MenuHistoryVoice { .. }
+                    | UiAction::MenuControl { .. }
             ) {
             // Earlier inputs in this same owner turn may have revealed more text.
             // Navigation must use current layout, not the previous submitted frame.
@@ -640,12 +731,38 @@ impl Engine {
             && sequence > self.player.core().state().last_input
             && self.reading.matches(identity)
             && !self.player.is_loading();
+        if matches!(action, UiAction::MenuControl { .. }) && valid {
+            self.player
+                .set_menu_history_capacity(navigation_packet.as_ref().unwrap_or(&self.packet));
+        }
+        if matches!(action, UiAction::MenuHistoryVoice { .. }) {
+            if valid
+                && navigation_packet
+                    .as_ref()
+                    .unwrap_or(&self.packet)
+                    .semantics
+                    .iter()
+                    .any(|node| node.enabled && node.action == action)
+            {
+                self.player.audition_menu_history(&action);
+                self.view_sequence = (session, sequence);
+                self.visual_invalidated = true;
+                self.pump(vec![])?;
+            }
+            return Ok(());
+        }
         if matches!(action, UiAction::MenuHistoryScroll { .. }) {
             if valid {
-                self.reading.scroll_menu_history(
+                let changed = self.reading.scroll_menu_history(
                     &action,
                     navigation_packet.as_ref().unwrap_or(&self.packet),
                 );
+                if changed {
+                    if let UiAction::MenuHistoryScroll { window, .. } = &action {
+                        self.player.stop_menu_history_voice(window);
+                        self.pump(vec![])?;
+                    }
+                }
                 self.view_sequence = (session, sequence);
                 self.visual_invalidated = true;
             }
@@ -660,6 +777,19 @@ impl Engine {
                 delta,
                 navigation_packet.as_ref().unwrap_or(&self.packet),
             );
+            if region == ScrollRegion::History {
+                if let Some(window) = navigation_packet
+                    .as_ref()
+                    .unwrap_or(&self.packet)
+                    .scrolls
+                    .iter()
+                    .find(|view| view.region == region)
+                    .and_then(|view| view.menu.as_ref())
+                    .map(|id| id.window.clone())
+                {
+                    self.player.stop_menu_history_voice(&window);
+                }
+            }
             self.view_sequence = (session, sequence);
         } else if action == UiAction::Advance
             && valid
@@ -735,6 +865,89 @@ impl Engine {
     pub fn hidden(&mut self, value: bool) -> std::result::Result<(), String> {
         self.pump(vec![AppEvent::Hidden(value)])
     }
+    pub fn audio_blocked(&mut self, value: bool) -> std::result::Result<(), String> {
+        // This host-owned token can change without admitting a Player event.
+        // Invalidate paused affordances even when no Story clock remains.
+        self.state_dirty |= value != self.audio_output_wait.is_some();
+        if value {
+            if self.audio_output_wait.is_none() {
+                self.audio_output_wait = Some(self.player.acquire_audio_output_wait());
+            }
+        } else {
+            self.audio_output_wait = None;
+        }
+        self.pump(vec![])
+    }
+    /// Presentation-only host feedback; retry never enters the story VM.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_native_audio_recovery(
+        &mut self,
+        status: Option<nir_presentation::audio_recovery::Status>,
+    ) {
+        if self.native_audio_recovery != status {
+            self.native_audio_recovery = status;
+            self.visual_invalidated = true;
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_native_audio_recovery_focus(
+        &mut self,
+        focus: Option<nir_presentation::audio_recovery::Action>,
+    ) {
+        if self.native_audio_recovery_focus != focus {
+            self.native_audio_recovery_focus = focus;
+            self.visual_invalidated = true;
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native_audio_recovery_layout(&self) -> Option<nir_presentation::audio_recovery::Layout> {
+        nir_presentation::audio_recovery::Layout::new(
+            self.native_audio_recovery?,
+            self.player.presentation_screen(),
+            self.width,
+            self.height,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native_metadata_failure_kinds(&self) -> std::collections::BTreeSet<PersistenceKind> {
+        self.player.metadata_failure_kinds()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_native_storage_recovery(
+        &mut self,
+        status: Option<nir_presentation::storage_recovery::Status>,
+    ) {
+        if status.is_none() {
+            self.native_storage_focus_wait = false;
+        } else if status.is_some_and(|s| !s.retry_enabled) && self.native_storage_recovery_focused()
+        {
+            self.native_storage_focus_wait = true;
+        }
+        if self.native_storage_recovery != status {
+            self.native_storage_recovery = status;
+            self.visual_invalidated = true;
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native_storage_recovery_layout(
+        &self,
+    ) -> Option<nir_presentation::storage_recovery::Layout> {
+        nir_presentation::storage_recovery::Layout::new(
+            self.native_storage_recovery?,
+            self.player.presentation_screen(),
+            self.width,
+            self.height,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native_storage_recovery_focused(&self) -> bool {
+        self.native_storage_recovery_layout().is_some()
+            && (self.native_storage_focus_wait
+                || self
+                    .keyboard_focus
+                    .node(&self.packet, self.input_identity(), self.player.screen)
+                    .is_some_and(|node| node.id == nir_presentation::storage_recovery::CONTROL_ID))
+    }
     pub fn audio_ended(&mut self, task: u32, session: u32) -> std::result::Result<(), String> {
         self.audio_ended_in(TimeDomain::Story, task, session)
     }
@@ -789,6 +1002,43 @@ impl Engine {
             "profile" => {
                 AppEvent::Profile(nir_content::parse(json.as_bytes(), "profile").map_err(js)?)
             }
+            "preferences_recovered" => AppEvent::PreferencesRecovered(
+                nir_content::parse(json.as_bytes(), "preferences_recovered").map_err(js)?,
+            ),
+            "profile_recovered" => AppEvent::ProfileRecovered(
+                nir_content::parse(json.as_bytes(), "profile_recovered").map_err(js)?,
+            ),
+            "persistence_failed" | "persistence_read_failed" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    kind: PersistenceKind,
+                    message: String,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "persistence_failed").map_err(js)?;
+                if kind == "persistence_read_failed" {
+                    AppEvent::PersistenceReadFailed {
+                        kind: reply.kind,
+                        message: reply.message,
+                    }
+                } else {
+                    AppEvent::PersistenceFailed {
+                        kind: reply.kind,
+                        message: reply.message,
+                    }
+                }
+            }
+            "persistence_stored" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    kind: PersistenceKind,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "persistence_stored").map_err(js)?;
+                AppEvent::PersistenceStored(reply.kind)
+            }
             "slot_loaded" => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -823,6 +1073,34 @@ impl Engine {
                 ),
             },
             "load_failed" => AppEvent::LoadFailed(json),
+            "export_failed" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    job: u32,
+                    message: String,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "export_failed").map_err(js)?;
+                AppEvent::ExportFailed {
+                    job: reply.job,
+                    message: reply.message,
+                }
+            }
+            "exported" | "export_cancelled" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Reply {
+                    job: u32,
+                }
+                let reply: Reply =
+                    nir_content::parse(json.as_bytes(), "export_reply").map_err(js)?;
+                if kind == "exported" {
+                    AppEvent::Exported { job: reply.job }
+                } else {
+                    AppEvent::ExportCancelled { job: reply.job }
+                }
+            }
             "host_failed" => AppEvent::HostFailed(json),
             "slots" => {
                 let rows: Vec<serde_json::Value> =
@@ -838,7 +1116,8 @@ impl Engine {
                                 .and_then(|r| r["label"].as_str())
                                 .unwrap_or_default()
                                 .to_owned(),
-                            exists: row.is_some(),
+                            exists: row.is_some_and(|r| !r["error"].is_string()),
+                            error: row.and_then(|r| r["error"].as_str()).map(str::to_owned),
                         }
                     })
                     .collect();
@@ -857,6 +1136,17 @@ impl Engine {
                     job: v["job"].as_u64().unwrap_or(0) as u32,
                     slot: v["slot"].as_u64().unwrap_or(0) as u32,
                     revision: v["revision"].as_u64().unwrap_or(0) as u32,
+                }
+            }
+            "save_pending" => {
+                let v: serde_json::Value =
+                    nir_content::parse(json.as_bytes(), "save_pending").map_err(js)?;
+                AppEvent::SavePending {
+                    job: v["job"].as_u64().unwrap_or(0) as u32,
+                    message: v["message"]
+                        .as_str()
+                        .unwrap_or("E_STORAGE_UNCERTAIN")
+                        .into(),
                 }
             }
             "save_failed" => {
@@ -903,12 +1193,13 @@ impl Engine {
             self.player.viewport_changed().map_err(js)?;
             self.pump(vec![])?;
         }
-        // Title changes immediately, before its replacement media is ready.
-        // Other screens still need layout updates while a cue is preparing
-        // (history, scrolling and a dialogue paused at an authored gate).
+        // Boot and an unprepared overlay must not address missing media.
+        // A staged page navigation retains a prepared committed surface, so
+        // it can project the loading state and its explicit Cancel control.
         let waiting_for_title = (self.player.screen == nir_presentation::Screen::Title
             || (self.player.active_menu_id().is_some() && self.player.error.is_none()))
-            && self.player.is_loading();
+            && self.player.is_loading()
+            && !self.player.can_project_menu_navigation();
         if self.ready && !waiting_for_title {
             // The projection is a pure function of the player model and the
             // reading state, so it only needs rebuilding when something could
@@ -932,6 +1223,22 @@ impl Engine {
                     &self.messages,
                     &mut self.renderer.text,
                 );
+                if self.player.validate_history_voice_controls(&projected) {
+                    self.pump(vec![])?;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(layout) = self.native_storage_recovery_layout() {
+                    layout.paint(&mut projected, &self.player.model(), &self.messages);
+                    if self.native_storage_focus_wait && layout.status.retry_enabled {
+                        self.keyboard_focus.select(
+                            &projected,
+                            self.input_identity(),
+                            self.player.screen,
+                            Some(nir_presentation::storage_recovery::CONTROL_ID),
+                        );
+                        self.native_storage_focus_wait = false;
+                    }
+                }
                 if let Some(node) =
                     self.keyboard_focus
                         .node(&projected, self.input_identity(), self.player.screen)
@@ -952,6 +1259,15 @@ impl Engine {
                     }
                 } else {
                     self.keyboard_focus.clear();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(layout) = self.native_audio_recovery_layout() {
+                    layout.paint(
+                        &mut projected,
+                        &self.player.model(),
+                        &self.messages,
+                        self.native_audio_recovery_focus,
+                    );
                 }
                 self.profile_end("projection", projection_start);
                 let draw_start = self.profile_start();
@@ -985,17 +1301,44 @@ impl Engine {
     pub fn needs_clock(&self) -> bool {
         self.ready && (self.player.needs_clock() || self.reading.history_pending())
     }
+    fn renderer_memory(&self) -> serde_json::Value {
+        if !self.profiling {
+            return serde_json::Value::Null;
+        }
+        let m = self.renderer.resource_memory();
+        serde_json::json!({
+            "image_texture_bytes": m.image_texture_bytes,
+            "image_upload_texture_bytes": m.image_upload_texture_bytes,
+            "image_upload_pixel_bytes": m.image_upload_pixel_bytes,
+            "transition_texture_bytes": m.transition_texture_bytes,
+            "window_texture_bytes": m.window_texture_bytes,
+            "menu_texture_bytes": m.menu_texture_bytes,
+            "vertex_buffer_bytes": m.vertex_buffer_bytes,
+            "image_texture_count": m.image_texture_count,
+            "image_upload_count": m.image_upload_count,
+            "accounted_gpu_bytes": m.accounted_gpu_bytes(),
+            "scope": "logical compositor allocations; excludes glyph atlases, swapchain and driver overhead"
+        })
+    }
     pub fn state(&self) -> String {
         let c = self.player.core();
         let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
         let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
         let residency = self.player.content_residency();
         let mut state = serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.presentation_screen()),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()});
+        state["auto"] = serde_json::json!(self.player.auto);
+        state["skip"] = serde_json::json!(self.player.skipping());
         state["history_scrollbar"] = serde_json::json!(self.packet.history_bar);
         state["window"] = serde_json::json!(c.window_reveal().map(|(_, _, p)| p));
         state["menu_depth"] = serde_json::json!(self.player.menu_depth());
         state["history_pending"] = serde_json::json!(self.reading.history_pending());
         state["history_error"] = serde_json::json!(self.reading.history_error());
+        state["history_voice"] = serde_json::json!(self.player.history_voice_model());
+        state["story_clock"] = serde_json::json!(self.story_clock);
+        state["retrying"] = serde_json::json!(self.player.retrying());
+        state["renderer_memory"] = self.renderer_memory();
+        state["audio_decode_sample_rate"] =
+            serde_json::json!(self.player.audio_decode_sample_rate());
         state["interface_hidden"] = serde_json::json!(self.player.interface_hidden());
         state["foreground_clock_us"] = serde_json::json!(self.player.foreground_clock());
         state["menu_opacity"] = serde_json::json!(self.player.menu_opacity());
@@ -1006,6 +1349,17 @@ impl Engine {
         state["foreground_paused"] =
             serde_json::json!(self.player.domain_paused(TimeDomain::ForegroundUi));
         state["dialogue_appearance"] = serde_json::json!(c.sample_dialogue_appearance());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            state["native_audio_recovery"] = serde_json::json!(self.native_audio_recovery_layout());
+            state["native_storage_recovery"] =
+                serde_json::json!(self.native_storage_recovery_layout());
+            state["native_storage_recovery_focused"] =
+                serde_json::json!(self.native_storage_recovery_focused());
+            state["native_audio_recovery_focus"] = serde_json::json!(self
+                .native_audio_recovery_layout()
+                .and(self.native_audio_recovery_focus));
+        }
         state.to_string()
     }
     pub fn host_state(&mut self) -> String {
@@ -1020,7 +1374,9 @@ impl Engine {
             "screen": format!("{:?}", self.player.presentation_screen()),
             "locale": self.player.effective_ui_locale,
             "paused": self.player.paused(),
+            "story_clock": self.story_clock,
             "loading": self.player.is_loading(),
+            "retrying": self.player.retrying(),
             "has_dialogue": c.dialogue().is_some(),
             "choice_cancellable": c
                 .state()
@@ -1030,6 +1386,8 @@ impl Engine {
             "frames": self.renderer.submitted,
             "backend": self.renderer.backend.as_str(),
             "resident_bytes": self.player.memory_used(),
+            "renderer_memory": self.renderer_memory(),
+            "audio_decode_sample_rate": self.player.audio_decode_sample_rate(),
             "upload_steps": self.renderer.upload_steps,
             "turn_upload_bytes": 2 * 1024 * 1024 - self.upload_remaining,
             "scrolls": self.packet.scrolls,
@@ -1164,7 +1522,21 @@ impl Engine {
         }
         Ok(true)
     }
+    fn observe_story_clock(&mut self) {
+        self.story_clock.observe(
+            story_clock::Sample {
+                session: self.player.generation.session,
+                runnable: !self.player.paused()
+                    && self.player.presentation_screen() == Screen::Story,
+                tick_us: self.player.core().state().tick_us.0,
+            },
+            profile_clock_us,
+        );
+    }
     fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), String> {
+        // Include host-owned pause token changes made immediately before
+        // pump, and inspect every VM pump rather than delayed host snapshots.
+        self.observe_story_clock();
         // Bare clock events cost one admission unit each inside the player
         // and only dirty the view when the turn did work beyond admission;
         // every other event changes evaluation state unconditionally.
@@ -1179,6 +1551,7 @@ impl Engine {
         let admitted = events.len() as u32;
         let mut work = 0u32;
         let mut commands = self.player.pump(events, self.work_remaining);
+        self.observe_story_clock();
         let used = self.player.work_used();
         work += used;
         self.work_remaining -= used;
@@ -1230,6 +1603,7 @@ impl Engine {
                 break;
             }
             commands = self.player.pump(events, self.work_remaining);
+            self.observe_story_clock();
             let used = self.player.work_used();
             work += used;
             self.work_remaining -= used;

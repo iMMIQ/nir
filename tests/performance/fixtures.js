@@ -566,3 +566,68 @@ export async function closeScaleFixture(fixture) {
   }
   await fs.rm(fixture.temp, { recursive: true, force: true });
 }
+
+export async function buildReadingEnduranceFixture({port=4268}={}) {
+  const cli=path.resolve(process.env.NIR_PERF_CLI||'dist/novelc');
+  await fs.mkdir(path.resolve('target/tmp'),{recursive:true});
+  const temp=await fs.mkdtemp(path.resolve('target/tmp/nir-reading-endurance-'));
+  const project=path.join(temp,'story'),web=path.join(temp,'web');let server;
+  try {
+    await copyProject(project);
+    const source=path.join(project,'content/ch01/story.nir.json'),content=JSON.parse(await fs.readFile(source,'utf8'));
+    content.variables.line_count={type:'i32',value:0};
+    content.cues={opening:content.cues.opening};
+    const blocks={
+      start:{ops:[],terminator:{type:'activate',cue:'opening',next:'read0'}},
+      choose:{ops:[],terminator:{type:'interact',choice:'route',branches:{walk:'read0',stay:'read0'},on_empty:'failed'}},
+      failed:{ops:[],terminator:{type:'end',outcome:'endurance-failed'}},
+      cancelled:{ops:[],terminator:{type:'end',outcome:'endurance-cancelled'}},
+    };
+    // Read indefinitely inside one Story, preserving the session BGM. Distinct
+    // cues alternate authored scenes, bind actual MP3 voices and offer a choice
+    // every six lines; a VM-owned counter detects duplicate/skipped input.
+    for(let i=0;i<6;i++){
+      const cue=`read${i}`,wait=`wait${i}`;
+      content.cues[cue]={effects:[
+        {id:'stage',scope:'scene',effect:{type:'stage_present',scene:i%2?'together':'station',duration_us:'0'}},
+        {id:'line',scope:'interaction',effect:{type:'dialogue',text:i%2?'arrival':'intro',speaker:'speaker.aki',reveal_us:'0'}},
+        {id:'spoken',scope:'interaction',effect:{type:'audio',asset:'audio.voice',bus:'voice',looped:false}},
+      ]};
+      blocks[cue]={ops:[{id:`count-${i}`,operation:{type:'assign',target:'line_count',value:{type:'binary',op:'add',left:{type:'var',name:'line_count'},right:{type:'const',value:{type:'i32',value:1}}}}}],terminator:{type:'activate',cue,next:wait}};
+      blocks[wait]={ops:[{id:`bind-${i}`,operation:{type:'dialogue_voice',task:'line',voice:'spoken',wait:'parallel'}}],terminator:{type:'await',conditions:[{task:'line',milestone:{type:'finished'}}],next:i<5?`read${i+1}`:'choose',on_cancelled:'cancelled',on_failed:'failed'}};
+    }
+    content.functions.main={entry:'start',blocks};await writeJson(source,content);
+    await run(cli,['-p',project,'resolve','--sdk',path.resolve('dist/sdk')],{maxBuffer:8*1024*1024});
+    await run(cli,['-p',project,'build','--locked','--out',web],{maxBuffer:16*1024*1024});
+    await validateCompiledRelease(cli,project,web);
+    const release=await readRelease(web),manifest=release.manifest;
+    const audio=Object.values(manifest.objects).filter(o=>o.media_type.startsWith('audio/'));
+    if(audio.length!==2||audio.some(o=>o.media_type!=='audio/mpeg'))throw new Error('reading endurance needs MP3 BGM and voice');
+    const sdkFiles={js:'player_web.js',wasm:'player_web_bg.wasm',host:'host.js',runtime_worker:'runtime-worker.js',asset_worker:'asset-worker.js'};
+    for(const [key,name] of Object.entries(sdkFiles)){
+      if(digest(await fs.readFile(path.resolve('dist/sdk',name)))!==manifest.engine[key])throw new Error(`endurance fixture SDK mismatch: ${key}`);
+    }
+    server=spawn(cli,['serve',web,'--port',String(port)],{stdio:'ignore'});
+    const origin=`http://127.0.0.1:${port}`;let ready=false;
+    for(let i=0;i<100;i++){
+      try {
+        const response=await fetch(`${origin}/channels/stable.json`);
+        if(response.ok){
+          const channel=await response.json();
+          if(channel.release!==release.channel.release)throw new Error('different endurance release served');
+          ready=true;break;
+        }
+      }catch(error){if(error.message.includes('different endurance release'))throw error;}
+      if(server.exitCode!==null)throw new Error('endurance server exited before ready');
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    if(!ready)throw new Error('endurance server did not become ready');
+    return {temp,project,web,server,origin,release:release.channel.release,
+      verification:{objects:Object.keys(manifest.objects).length,engine:manifest.engine,
+        audio:audio.map(o=>({mediaType:o.media_type,bytes:o.bytes,path:o.path})),
+        manifestSha256:digest(Buffer.from(await fs.readFile(path.join(web,`releases/${release.channel.release}.json`)))),
+        sourceSha256:digest(await fs.readFile(source)),compilerCheck:true,releaseVerifier:true}};
+  }catch(error){
+    await closeScaleFixture({temp,server});throw error;
+  }
+}

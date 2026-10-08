@@ -7,7 +7,7 @@
 | 逻辑 | Bool/I32/String、局部槽、纯表达式、checked 算术、函数/返回、Branch/Switch/Goto | 无浮点剧情变量、脚本扩展或任意 JS |
 | 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、DialogueVisibility、ProfileMerge | Profile 为布尔事实的单调集合 |
 | 终结 | Call/Return、Activate/Await/Interact、End/Fault | 单剧情流；跨模块通过具名导出调用 |
-| 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All、Sequence/ParallelAll 有限组合 | 无 Runtime Worker |
+| 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All、Sequence/ParallelAll 有限组合 | 确定性逻辑并行，不是共享 WASM 多线程 |
 | 模块 | 多模块命名空间、导出链接、共享变量、函数体/正文哈希分包、执行与恢复前准备 | 静态目录与媒体按需准备、有界预取、租约保护及驱逐；无 Edition 或跨发行存档转换 |
 | 图像 | Group/Sprite、层次顺序、裁切、cut/dissolve、方向擦除/Alpha 阈值遮罩、x/y/scale/opacity 动画 | 来源 PNG，打包默认转有损 WebP（质量 92，alpha 通道无损保留）；无旋转、滤镜、视频和独立 Group 混合模式 |
 | 正文 | 注册字体、样式强调、参数隔离、换行、字素簇揭示、span Marker/Gate、已揭示长文翻阅 | 无 Ruby、NVL、富网页标记 |
@@ -23,7 +23,9 @@
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告、打包媒体优化 | 无 PWA、签名/CDN 调度 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
 | 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单（含选择音／回想 BGM／系统菜单进出渐隐页面效果）、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
-| 平台 | WebGPU/WebGL2 自动选择、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
+| 平台 | Runtime/Asset Worker、OffscreenCanvas 双后端、主线程启动回退、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
+
+Web Worker 的执行边界、协议、回退及验证见 [Web 执行域](WEB-EXECUTION.md)。
 
 资源账本、准备配方和缓存提供首版所需的分层准备与有界准入；已加入函数体与正文的跨模块按需获取；没有实现附件中完整的通用 DAG 调度、任意资源类型与高级缓存策略。静态声明目录已分包按需加载，字体仍为逐语言计划。v0.1.0 的实际测试列在 TEST-REPORT.md，后续有界事件队列、共享预算、独立暂停令牌、取消和分块上传的验证见 [引擎稳定性进展](ENGINE-STABILITY.md)；逐请求终态预留、迟到存读档回执及交错压力测试见 [请求生命周期进展](REQUEST-LIFECYCLE.md)。
 
@@ -137,6 +139,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | audio.gain.v1 | crates/nir-core/tests/audio_contract.rs（gain 为播放元数据+范围门） | 同文件（取消观测淡出提交设备值） | tests/nir-next/audio.spec.js（事件 gain×总线音量） | 待验证 | 事件音量与总线相乘，不预乘 PCM |
 | audio.stop.v1 | crates/nir-core/tests/audio_contract.rs（淡出停止后取消、剩余段恢复） | 同文件（拒绝无效目标/伪造所有权） | tests/nir-next/audio.spec.js（跨存读档停止包络） | 待验证 | 淡出走故事时钟 |
 | audio.gain-tween.v1 | crates/nir-core/tests/audio_contract.rs（线性 ramp/取消提交设备值/与停止互斥所有权） | 同文件（飞行中存读档剩余段、拒绝伪造 owner） | tests/nir-next/audio-gain-tween.spec.js | 待验证 | 批次 58；包络 0–1 乘子，只允许 linear |
+| audio.loop-region.v1 | crates/nir-core/tests/audio_contract.rs（能力、区间、循环及素材时长门）；apps/player-desktop/src/audio_source.rs（PCM 前奏/主体/尾部与声道边界）；apps/player-desktop/src/loader.rs（实际 MP3 mixer 输出、连续重采样） | 同文件；crates/nir-player/tests/coordination.rs（累计设备位置及区间恢复） | tests/nir-next/audio-loop-region.spec.js（MP3 输出采样、100 次循环、Worker/主线程读档）；tests/host/audio-loop-region.test.js | 待验证 | 前奏一次，随后重复作者指定区间；无自动裁剪或交叉淡化 |
 | ui.image-menu.v1 | crates/nir-player/src/lib.rs（media_tests 缩放/悬停/回想解锁门） | crates/nir-player/src/replay.rs（冻结菜单页随回想恢复） | tests/nir-next/menu-elements.spec.js；menu-* 规格均经图片菜单页 | 待验证 | v0.1.0 基线 |
 | text.visibility.v1 | crates/nir-player/tests/coordination.rs（临时隐藏不推进、不覆写脚本可见性） | 同测试（隐藏跨恢复/回退保持） | tests/nir-next/interface-hide.spec.js、tests/nir-next/reading.spec.js | 待验证 | 与 player.hide-policy.v1 分开声明 |
 | text.window-transition.v1 | crates/nir-core/tests/window_reveal_contract.rs（样式/时长门、截止提交、打断捕获覆盖度）；crates/nir-player/tests/coordination.rs（时钟冻结、遮罩只取一次、dissolve 只折叠窗口项、空间样式剥离窗口根） | crates/nir-core/tests/window_reveal_contract.rs（结构校验、伪造被拒）；crates/nir-player/tests/coordination.rs（飞行中存读档续播） | tests/nir-next/window.spec.js（边缘像素、暂停冻结、存读档进度） | 待验证 | 消息根复用舞台转场样式；HUD 不参与 |
@@ -160,6 +163,7 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | ui.menu-storage.v1 | crates/nir-player/src/menu.rs（空槽保存/覆盖确认一次性令牌） | 同文件（确认随版本回退过期）；crates/nir-player/tests/coordination.rs（底层存读档服务） | tests/nir-next/menu-storage.spec.js | 待验证 | 语义见 STORAGE-SERVICE-SEMANTICS.md |
 | ui.menu-history.v1 | crates/nir-player/src/menu.rs（千行有界窗口/模板校验门） | 无运行态（仅校验）：窗口偏移为页面态，经 Replay 冻结恢复 | tests/nir-next/menu-history.spec.js | 待验证 | 语义见 MENU-HISTORY-SEMANTICS.md |
 | ui.menu-history-flow.v1 | crates/nir-player/src/menu.rs（单页快照/滚动版本门） | 同测试（历史快照复用+恢复守卫） | tests/nir-next/history-flow.spec.js | 待验证 | 批次 44 |
+| ui.menu-history-voice.v1 | crates/nir-player/tests/coordination.rs（独立通道/显隐/裁切/关闭） | crates/nir-compiler/tests/project.rs（Source/Runtime 能力门）；tests/nir-next/authored-history-voice.spec.js（冷恢复） | tests/nir-next/authored-history-voice.spec.js（MP3/Worker/主线程） | 待验证 | 作者历史显式开启；设备体验待验收 |
 | ui.menu-history-scrollbar.v1 | crates/nir-player/src/menu.rs（拖动状态/输入权威/裁切序） | 无运行态（仅校验）：拖动瞬态，位置归流程窗口版本 | tests/nir-next/history-scrollbar.spec.js | 待验证 | 批次 45 |
 | ui.menu-values.v1 | crates/nir-player/src/menu.rs（单次提交/过期拒绝/边界校验） | crates/nir-player/src/replay.rs（绑定局部值冻结恢复） | tests/nir-next/menu-values.spec.js | 待验证 | 语义见 MENU-VALUES-SEMANTICS.md |
 | ui.menu-effects.v1 | crates/nir-player/src/menu.rs（进入效果等待准备、关闭延迟退出） | 无运行态（不入故事快照）：会话重置终止（同文件） | tests/nir-next/menu-effects.spec.js | 待验证 | 批次 48；瞬态不入快照 |

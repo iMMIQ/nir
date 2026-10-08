@@ -405,6 +405,8 @@ pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
         &r.launch.bootstrap,
     ]
     .into_iter()
+    .chain(r.engine.runtime_worker.iter())
+    .chain(r.engine.asset_worker.iter())
     .chain(r.notices.iter())
     {
         if !r.objects.contains_key(id) {

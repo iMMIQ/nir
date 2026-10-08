@@ -5,8 +5,8 @@ import { spawn } from 'node:child_process';
 
 const state = page => page.evaluate(() => window.__nir.state());
 const act = (page, action) => page.evaluate(a => window.__nir.action(a), action);
-async function boot(page) {
-  await page.goto('/?test=1');
+async function boot(page,options='') {
+  await page.goto('/?test=1&'+options);
   await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
   await expect(page.locator('#shell')).toBeHidden();
 }
@@ -45,7 +45,9 @@ test('WebGPU canvas, Chinese layout, static sleep and both endings', async ({ pa
   expect((await state(page)).frames).toBe(first.frames);
   expectPainted(await page.screenshot({ path: 'reports/title.png' }));
   await start(page);
-  await page.keyboard.press('Space');
+  // Independent Runtime may finish revealing before the driver returns.
+  // Advancing then would leave the first line entirely.
+  await page.waitForFunction(()=>window.__nir.state().dialogue?.ready);
   expectPainted(await page.screenshot({ path: 'reports/dialogue.png' }));
   expect((await state(page)).dialogue.visible).toContain('末班电车');
   for (const [route, outcome, affection] of [['walk','walk_home',1],['stay','read_letter',0]]) {
@@ -178,7 +180,7 @@ test('independent pauses, viewport changes, touch and actual device recovery', a
 test('required resource failure keeps scene and retry succeeds', async ({ page }) => {
   await boot(page);
   let failed=false;
-  await page.route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/, async route => {
+  await page.context().route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/, async route => {
     if(!failed){failed=true;await route.abort('failed');}else await route.continue();
   });
   await page.keyboard.press('Space');
@@ -272,7 +274,7 @@ test('actual device loss during a dissolve preserves progress', async ({ page })
 test('startup downloads WASM and program while verified script imports are blocked', async ({ page }) => {
   let unblock;
   const blocked=new Promise(resolve=>{unblock=resolve;});
-  await page.route('**/objects/*.js',async route=>{await blocked;await route.continue();});
+  await page.context().route('**/objects/*.js',async route=>{await blocked;await route.continue();});
   const wasm=page.waitForRequest(request=>new URL(request.url()).pathname.endsWith('.wasm'));
   const program=page.waitForRequest(request=>/\/objects\/.*\.json$/.test(new URL(request.url()).pathname));
   try {
@@ -284,7 +286,7 @@ test('startup downloads WASM and program while verified script imports are block
 });
 
 test('corrupt WASM is rejected before instantiation', async ({ page }) => {
-  await page.route('**/objects/*.wasm',async route=>{
+  await page.context().route('**/objects/*.wasm',async route=>{
     const response=await route.fetch();const bytes=await response.body();bytes[bytes.length-1]^=1;
     await route.fulfill({response,body:bytes});
   });
@@ -302,7 +304,7 @@ test('gzip transport verifies decoded bytes and identity fallback still starts',
   expect((await response.body()).subarray(0,4)).toEqual(Buffer.from([0,97,115,109]));
   // Chromium owns Accept-Encoding and may replace a continue() override.
   // Negotiate identity through the HTTP client, then deliver that response.
-  await page.route('**/objects/*',async route=>{
+  await page.context().route('**/objects/*',async route=>{
     const response=await route.fetch({headers:{...route.request().headers(),'accept-encoding':'identity'}});
     expect(response.headers()['content-encoding']).toBeUndefined();
     await route.fulfill({response});
@@ -320,7 +322,7 @@ test('save export/import and tamper rejection preserve independent preferences',
   const envelope=JSON.parse(bytes.toString());expect(envelope.snapshot.release).toHaveLength(64);
   await act(page,{type:'settings'});
   let releaseFont;const fontGate=new Promise(resolve=>releaseFont=resolve);
-  await page.route(/\/objects\/[^/]+\.(?:otf|ttf|woff2?)$/,async route=>{await fontGate;await route.continue().catch(()=>{});});
+  await page.context().route(/\/objects\/[^/]+\.(?:otf|ttf|woff2?)$/,async route=>{await fontGate;await route.continue().catch(()=>{});});
   await act(page,{type:'text_locale',locale:'en'});
   await page.waitForFunction(()=>window.__nir.state().locale_pending);
   let chosen=page.waitForEvent('filechooser');await act(page,{type:'import'});
@@ -415,8 +417,8 @@ test('leaving preparation cancels its fetch and a new request still succeeds', a
   await boot(page);
   let intercepted=false,release;
   const gate=new Promise(resolve=>release=resolve);
-  const cancelled=[];page.on('requestfailed',request=>{if(/\.(wav|mp3)$/.test(request.url()))cancelled.push(request.url());});
-  await page.route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/,async route=>{
+  const cancelled=[];page.context().on('requestfailed',request=>{if(/\.(wav|mp3)$/.test(request.url()))cancelled.push(request.url());});
+  await page.context().route(/\/objects\/[0-9a-f]{64}\.(wav|mp3)$/,async route=>{
     if(!intercepted){intercepted=true;await gate;}
     await route.continue().catch(()=>{});
   });
@@ -517,7 +519,7 @@ test('an owner turn detects device loss before the idle watchdog',async({page})=
     const destroy=GPUDevice.prototype.destroy;
     GPUDevice.prototype.destroy=function(){window.__deviceLoss=this.lost;return destroy.call(this);};
   });
-  await boot(page);await start(page);await act(page,{type:'menu'});
+  await boot(page,'worker=main&backend=webgpu');await start(page);await act(page,{type:'menu'});
   const before=await state(page);
   await page.evaluate(async()=>{
     window.__nir.loseDevice();

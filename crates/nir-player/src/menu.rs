@@ -15,6 +15,21 @@ struct MenuFrame {
     menu: String,
     locals: BTreeMap<String, MenuValue>,
 }
+enum MenuMove {
+    Replace,
+    Push(MenuFrame),
+    Pop(MenuFrame),
+}
+/// The displayed page remains committed until all target media is ready.
+/// Frames are semantic locals only; hidden parents never retain media.
+pub(super) struct MenuNavigation {
+    target: String,
+    source: String,
+    screen: Screen,
+    session: u32,
+    instance: u32,
+    movement: MenuMove,
+}
 #[derive(Clone)]
 struct SuspendedTitle {
     page: MenuFrame,
@@ -54,6 +69,7 @@ pub(super) struct MenuSession {
     pub revision: u32,
     pub locals: BTreeMap<String, MenuValue>,
     flow: Arc<[nir_presentation::MenuHistoryRow]>,
+    history_capacity: BTreeMap<String, (u32, usize)>,
 }
 impl MenuSession {
     pub fn new(menu: Option<&ImageMenu>, preferences: &Preferences) -> Self {
@@ -80,6 +96,7 @@ impl MenuSession {
             restore: None,
             reading: BTreeSet::new(),
             flow: Arc::from([]),
+            history_capacity: BTreeMap::new(),
             story: BTreeMap::new(),
             instance: 1,
             revision: 0,
@@ -123,49 +140,163 @@ impl MenuSession {
 }
 impl Player {
     fn push_menu(&mut self, target: &str) -> Result<()> {
-        if !matches!(self.screen, Screen::Title | Screen::Menu)
-            || self.menu_session.depth() >= nir_format::MAX_MENU_PARENTS
+        if self.menu_session.depth() >= nir_format::MAX_MENU_PARENTS {
+            return Ok(());
+        }
+        let Some(current) = self.active_menu_id().map(str::to_owned) else {
+            return Ok(());
+        };
+        self.stage_menu_page(
+            target,
+            MenuMove::Push(MenuFrame {
+                menu: current,
+                locals: self.menu_session.locals.clone(),
+            }),
+        )
+    }
+    pub(super) fn pop_menu(&mut self) -> Result<bool> {
+        let Some(frame) = self.menu_session.parents.last().cloned() else {
+            return Ok(false);
+        };
+        if !matches!(self.screen, Screen::Title | Screen::Menu) {
+            return Ok(false);
+        }
+        self.stage_menu_page(&frame.menu.clone(), MenuMove::Pop(frame))?;
+        Ok(true)
+    }
+    pub(super) fn select_menu_page(&mut self, target: &str) -> Result<()> {
+        self.stage_menu_page(target, MenuMove::Replace)
+    }
+    fn stage_menu_page(&mut self, target: &str, movement: MenuMove) -> Result<()> {
+        if self.is_loading()
+            || self.pending_menu.is_some()
+            || !matches!(self.screen, Screen::Title | Screen::Menu)
             || !self.core.program().theme.image_menus.contains_key(target)
         {
             return Ok(());
         }
-        // Frames hold only bounded semantic locals, never media leases or
-        // history text. Returning creates new authority and prepares its page.
-        let Some(current) = self.active_menu_id().map(str::to_owned) else {
+        let Some(source) = self.active_menu_id().map(str::to_owned) else {
             return Ok(());
         };
-        let frame = MenuFrame {
-            menu: current,
-            locals: self.menu_session.locals.clone(),
-        };
-        self.menu_session.parents.push(frame);
-        self.select_menu_page(target);
-        self.sync_menu_state()
+        MenuSession::next(self.menu_session.instance)?;
+        self.pending_menu = Some(MenuNavigation {
+            target: target.into(),
+            source,
+            screen: self.screen,
+            session: self.generation.session,
+            instance: self.menu_session.instance,
+            movement,
+        });
+        self.hovered_image = None;
+        self.prepare_active_menu()
     }
-    pub(super) fn pop_menu(&mut self) -> Result<bool> {
-        if !matches!(self.screen, Screen::Title | Screen::Menu) {
-            return Ok(false);
+    fn menu_navigation_current(&self) -> bool {
+        self.pending_menu.as_ref().is_some_and(|n| {
+            n.screen == self.screen
+                && n.session == self.generation.session
+                && n.instance == self.menu_session.instance
+                && self.active_menu_id() == Some(n.source.as_str())
+        })
+    }
+    pub(super) fn pending_menu_assets(&self) -> BTreeSet<String> {
+        self.pending_menu
+            .as_ref()
+            .and_then(|n| self.core.program().theme.image_menus.get(&n.target))
+            .map(ImageMenu::prepared_assets)
+            .unwrap_or_default()
+    }
+    /// During ordinary navigation the committed page already owns its media.
+    /// Boot and device rebuilds still wait for a valid current-generation page.
+    pub fn can_project_menu_navigation(&self) -> bool {
+        self.pending_menu.is_some()
+            && self
+                .active_menu_id()
+                .is_some_and(|id| self.menu_page_ready(id))
+    }
+    pub(super) fn menu_navigation_preview(&self) -> Option<UiModel> {
+        if !self.menu_navigation_current() {
+            return None;
         }
-        let Some(frame) = self.menu_session.parents.pop() else {
-            return Ok(false);
+        let next = self.pending_menu.as_ref()?;
+        let menu = &self.core.program().theme.image_menus[&next.target];
+        let mut model = self.model();
+        model.image_menu = next.target.clone();
+        model.authored_menu = true;
+        model.menu_navigation_pending = false;
+        model.menu_instance = self.menu_session.instance.saturating_add(1);
+        model.menu_revision = 0;
+        model.menu_locals = match &next.movement {
+            MenuMove::Pop(frame) => frame.locals.clone(),
+            _ => menu.initial_locals(),
         };
-        self.select_menu_page(&frame.menu);
-        self.menu_session.restore = Some(frame);
-        self.sync_menu_state()?;
-        Ok(true)
+        model.menu_depth = match next.movement {
+            MenuMove::Push(_) => self.menu_session.depth() + 1,
+            MenuMove::Pop(_) => self.menu_session.depth().saturating_sub(1),
+            MenuMove::Replace => self.menu_session.depth(),
+        };
+        model.menu_story = menu.story_values(&self.core.state().variables);
+        model.hovered_image = None;
+        model.menu_transition = None;
+        model.menu_element_animations.clear();
+        model.menu_opacity = 1.;
+        Some(model)
     }
-    fn select_menu_page(&mut self, target: &str) {
-        self.cancel_menu_preparation();
+    pub(super) fn commit_menu_navigation(&mut self) -> Result<()> {
+        if !self.menu_navigation_current() {
+            self.pending_menu = None;
+            return Ok(());
+        }
+        let next = self.pending_menu.take().unwrap();
+        match next.movement {
+            MenuMove::Replace => {}
+            MenuMove::Push(frame) => self.menu_session.parents.push(frame),
+            MenuMove::Pop(frame) => {
+                self.menu_session.parents.pop();
+                self.menu_session.restore = Some(frame);
+            }
+        }
         if self.screen == Screen::Title {
-            self.image_menu = target.into();
+            self.image_menu = next.target;
         } else {
-            self.overlay_menu = Some(target.into());
+            self.overlay_menu = Some(next.target);
         }
         self.menu_session.menu.clear();
         self.hovered_image = None;
-        if self.core.program().theme.image_menus[target].uses_storage() {
+        if self.core.program().theme.image_menus[self.active_menu_id().unwrap()].uses_storage() {
             self.commands.push(AppCommand::ListSaves);
         }
+        self.sync_menu_state()
+    }
+    pub(super) fn abandon_menu_navigation(&mut self) -> Result<()> {
+        let rebuilding = self.pending_menu.is_some()
+            && (self
+                .prepare
+                .as_ref()
+                .is_some_and(|p| p.purpose == Purpose::Device)
+                || self
+                    .failed_admission
+                    .as_ref()
+                    .is_some_and(|(p, _, _)| *p == Purpose::Device)
+                || self
+                    .deferred_prepare
+                    .as_ref()
+                    .is_some_and(|(_, p, _, _)| *p == Purpose::Device)
+                || self.content.values().any(|p| {
+                    matches!(
+                        p.purpose,
+                        ContentPurpose::Media {
+                            purpose: Purpose::Device,
+                            ..
+                        }
+                    )
+                }));
+        let prepared = self.prepared_menu.clone();
+        self.cancel_menu_preparation();
+        self.prepared_menu = prepared;
+        if rebuilding {
+            self.begin_prepare(Purpose::Device, 0, self.retained_assets())?;
+        }
+        Ok(())
     }
     pub(super) fn menu_story_values(&self) -> BTreeMap<String, MenuValue> {
         self.active_menu_id()
@@ -252,6 +383,19 @@ impl Player {
             .map(|(key, h)| nir_presentation::MenuHistoryRow {
                 key,
                 entry: nir_presentation::HistoryView {
+                    key,
+                    voice_count: h.voices.len(),
+                    choice: h.choice.as_ref().map(|c| match c.resolution {
+                        nir_core::HistoryChoiceResolution::Selected { .. } => {
+                            nir_presentation::HistoryChoiceKind::Selected
+                        }
+                        nir_core::HistoryChoiceResolution::TimedOut { .. } => {
+                            nir_presentation::HistoryChoiceKind::TimedOut
+                        }
+                        nir_core::HistoryChoiceResolution::Cancelled => {
+                            nir_presentation::HistoryChoiceKind::Cancelled
+                        }
+                    }),
                     speaker: h.speaker.clone(),
                     text: h.text.clone(),
                     locale: h.locale.clone(),
@@ -283,6 +427,7 @@ impl Player {
                 let MenuContent::HistoryWindow {
                     offset_local,
                     limit,
+                    voice_controls,
                     ..
                 } = &e.content
                 else {
@@ -309,13 +454,22 @@ impl Player {
                     e.id.clone(),
                     Self::history_rows(
                         core,
-                        ((*offset).max(0) as usize)
-                            .min(core.state().history.len().saturating_sub(*limit as usize)),
+                        ((*offset).max(0) as usize).min(
+                            core.state()
+                                .history
+                                .len()
+                                .saturating_sub(if *voice_controls { 1 } else { *limit as usize }),
+                        ),
                         *limit as usize,
                     ),
                 ))
             })
             .collect()
+    }
+    /// Engine supplies capacities from a fresh projection before scoped menu
+    /// controls run. The page instance prevents reuse across navigation.
+    pub fn set_menu_history_capacity(&mut self, packet: &nir_presentation::DrawPacket) {
+        self.menu_session.history_capacity = packet.menu_history_capacity.clone();
     }
     pub(super) fn menu_asset_stamp(&self, id: &str) -> (String, u32, u32, u32, u32) {
         (
@@ -327,43 +481,43 @@ impl Player {
         )
     }
     pub(super) fn cancel_menu_preparation(&mut self) {
+        let navigation_device = self.pending_menu.is_some();
+        let owns = |purpose: Purpose| {
+            purpose == Purpose::Menu || (navigation_device && purpose == Purpose::Device)
+        };
+        self.pending_menu = None;
         self.prepared_menu = None;
-        let owns_error =
-            self.diagnostic
-                .as_ref()
-                .and_then(|d| d.details.as_ref())
-                .is_some_and(|d| {
-                    d.request.is_some_and(|request| {
-                        self.prepare.as_ref().is_some_and(|p| {
-                            p.request == request && matches!(p.purpose, Purpose::Menu)
-                        }) || self.content.get(&request).is_some_and(|p| {
+        let owns_error = self
+            .diagnostic
+            .as_ref()
+            .and_then(|d| d.details.as_ref())
+            .is_some_and(|d| {
+                d.request.is_some_and(|request| {
+                    self.prepare
+                        .as_ref()
+                        .is_some_and(|p| p.request == request && owns(p.purpose))
+                        || self.content.get(&request).is_some_and(|p| {
                             matches!(
                                 p.purpose,
-                                ContentPurpose::Media {
-                                    purpose: Purpose::Menu,
-                                    ..
-                                }
+                                ContentPurpose::Media { purpose, .. } if owns(purpose)
                             )
                         })
-                    }) || (d.request.is_none()
-                        && self
-                            .failed_admission
-                            .as_ref()
-                            .is_some_and(|(p, _, _)| matches!(p, Purpose::Menu)))
-                });
+                }) || (d.request.is_none()
+                    && self
+                        .failed_admission
+                        .as_ref()
+                        .is_some_and(|(p, _, _)| owns(*p)))
+            });
         if owns_error {
             self.error = None;
             self.diagnostic = None;
             self.status.clear();
         }
-        if self
-            .prepare
-            .as_ref()
-            .is_some_and(|p| matches!(p.purpose, Purpose::Menu))
+        if self.prepare.as_ref().is_some_and(|p| owns(p.purpose))
             || self
                 .failed_admission
                 .as_ref()
-                .is_some_and(|(p, _, _)| matches!(p, Purpose::Menu))
+                .is_some_and(|(p, _, _)| owns(*p))
         {
             self.cancel_preparation();
             self.pauses.remove("prepare");
@@ -371,7 +525,7 @@ impl Player {
         if self
             .deferred_prepare
             .as_ref()
-            .is_some_and(|(_, p, _, _)| matches!(p, Purpose::Menu))
+            .is_some_and(|(_, p, _, _)| owns(*p))
         {
             self.deferred_prepare = None;
             self.pauses.remove("prepare");
@@ -382,10 +536,7 @@ impl Player {
             .filter(|(_, p)| {
                 matches!(
                     p.purpose,
-                    ContentPurpose::Media {
-                        purpose: Purpose::Menu,
-                        ..
-                    }
+                    ContentPurpose::Media { purpose, .. } if owns(purpose)
                 )
             })
             .map(|(id, _)| *id)
@@ -403,15 +554,26 @@ impl Player {
         }
     }
     pub(super) fn prepare_active_menu(&mut self) -> Result<()> {
-        if self.screen != Screen::Menu {
+        if !matches!(self.screen, Screen::Title | Screen::Menu) {
             self.cancel_menu_preparation();
             return Ok(());
         }
-        let Some(id) = self.active_menu_id() else {
+        if self.pauses.contains("device") {
+            return Ok(());
+        }
+        if self.pending_menu.is_some() && !self.menu_navigation_current() {
+            self.abandon_menu_navigation()?;
+        }
+        let Some(id) = self
+            .pending_menu
+            .as_ref()
+            .map(|n| n.target.as_str())
+            .or_else(|| self.active_menu_id())
+        else {
             return Ok(());
         };
         let stamp = self.menu_asset_stamp(id);
-        if self.prepared_menu.as_ref() == Some(&stamp)
+        if (self.pending_menu.is_none() && self.prepared_menu.as_ref() == Some(&stamp))
             || self.is_loading()
             || self.failed_admission.is_some()
         {
@@ -495,6 +657,19 @@ impl Player {
                     .map(|(key, h)| nir_presentation::MenuHistoryRow {
                         key,
                         entry: nir_presentation::HistoryView {
+                            key,
+                            voice_count: h.voices.len(),
+                            choice: h.choice.as_ref().map(|c| match c.resolution {
+                                nir_core::HistoryChoiceResolution::Selected { .. } => {
+                                    nir_presentation::HistoryChoiceKind::Selected
+                                }
+                                nir_core::HistoryChoiceResolution::TimedOut { .. } => {
+                                    nir_presentation::HistoryChoiceKind::TimedOut
+                                }
+                                nir_core::HistoryChoiceResolution::Cancelled => {
+                                    nir_presentation::HistoryChoiceKind::Cancelled
+                                }
+                            }),
                             speaker: h.speaker.clone(),
                             text: h.text.clone(),
                             locale: h.locale.clone(),
@@ -719,6 +894,17 @@ impl Player {
                 return Ok(None);
             }
         }
+        if let ImageMenuAction::SaveSlot { slot } = &action {
+            if slot.resolve(&self.menu_session.locals).is_some_and(|slot| {
+                self.slots
+                    .iter()
+                    .any(|row| row.slot == slot && row.error.is_some())
+            }) {
+                // Reject before acceptance feedback or menu revision changes.
+                // The other controls in this displayed packet remain valid.
+                return Ok(None);
+            }
+        }
         let next = MenuSession::next(self.menu_session.revision)?;
         // The click effect is acceptance feedback: it plays only on this
         // verified commit, never on rejected input or restore projections.
@@ -788,13 +974,21 @@ impl Player {
                     )
                     .0
                 {
-                    if let Some((name, value)) = menu.history_page(
+                    let capacity = self
+                        .menu_session
+                        .history_capacity
+                        .get(window)
+                        .filter(|(instance, _)| *instance == self.menu_session.instance)
+                        .map(|(_, limit)| *limit);
+                    if let Some((name, value)) = menu.history_page_with_capacity(
                         window,
                         *delta,
                         &self.menu_session.locals,
                         self.core.state().history.len(),
+                        capacity,
                     ) {
                         self.menu_session.locals.insert(name, MenuValue::Int(value));
+                        self.stop_menu_history_voice(window);
                     }
                 }
                 Ok(None)
@@ -810,12 +1004,16 @@ impl Player {
                     return Ok(self
                         .slots
                         .iter()
-                        .any(|row| row.slot == slot && row.exists)
+                        .any(|row| row.slot == slot && (row.exists || row.error.is_some()))
                         .then_some(UiAction::Load { slot }));
                 }
                 if self.screen == Screen::Title
                     || self.return_screen == Screen::Title
                     || self.slot_load.is_some()
+                    || self
+                        .slots
+                        .iter()
+                        .any(|row| row.slot == slot && row.error.is_some())
                 {
                     return Ok(None);
                 }
@@ -859,9 +1057,11 @@ impl Player {
             asset: asset.into(),
             bus: AudioBus::Sfx,
             looped: false,
+            loop_region: None,
             position_us: Micros(0),
             gain: 1.,
             envelope: 1.,
+            character: String::new(),
             session,
         });
     }
@@ -876,9 +1076,11 @@ impl Player {
             asset: music.asset.clone(),
             bus: music.bus,
             looped: true,
+            loop_region: music.loop_region,
             position_us: Micros(0),
             gain: music.gain,
             envelope: 1.,
+            character: String::new(),
             session,
         });
     }
@@ -896,18 +1098,8 @@ impl Player {
     }
 
     fn menu_page_ready(&self, id: &str) -> bool {
-        match self.screen {
-            // Overlay pages play only once their own media is resident; the
-            // stamp carries page identity and the full generation.
-            Screen::Menu => self.prepared_menu.as_ref() == Some(&self.menu_asset_stamp(id)),
-            // Title closure pages are all prepared at boot (and re-prepared
-            // by a device recovery), so readiness is simply "not loading":
-            // the Preparing gap never sounds.
-            Screen::Title => {
-                !self.is_loading() && self.failed_admission.is_none() && self.error.is_none()
-            }
-            _ => false,
-        }
+        matches!(self.screen, Screen::Title | Screen::Menu)
+            && self.prepared_menu.as_ref() == Some(&self.menu_asset_stamp(id))
     }
 
     fn fire_menu_enter(&mut self, id: &str, instance: u32) {
@@ -1208,6 +1400,13 @@ mod tests {
         );
         let stale = control(&p, "slot");
         click(&mut p, "other");
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert_eq!(
+            p.menu_session.locals["tab"],
+            MenuValue::Text("third".into())
+        );
+        let commands = p.pump(vec![], 1000);
+        settle(&mut p, commands);
         assert_eq!(
             p.menu_session.locals["tab"],
             MenuValue::Text("first".into())
@@ -1440,6 +1639,229 @@ mod tests {
             packet.semantics.iter().find(|n| n.label == label).unwrap()
         }
     }
+    fn lazy_title_player() -> Player {
+        let mut program = navigation_program();
+        program.requires.push("ui.menu-effects.v1".into());
+        let mut root = program.theme.image_menus.remove("system").unwrap();
+        root.effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "music": {"asset": "audio.bgm"}
+            }))
+            .unwrap(),
+        );
+        program.theme.image_menus.insert("title".into(), root);
+        program.theme.menu_overlay = None;
+        program
+            .theme
+            .image_menus
+            .get_mut("system.child")
+            .unwrap()
+            .effects = Some(
+            serde_json::from_value(serde_json::json!({
+                "music": {"asset": "audio.voice", "bus": "voice"}
+            }))
+            .unwrap(),
+        );
+        Player::new(program, "r".into(), "lazy title".into()).unwrap()
+    }
+    fn request_of(commands: &[AppCommand]) -> u32 {
+        commands
+            .iter()
+            .find_map(|c| match c {
+                AppCommand::GetAssets { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap()
+    }
+    #[test]
+    fn title_navigation_prepares_on_demand_and_failure_preserves_page_music_and_locals() {
+        let mut p = lazy_title_player();
+        assert!(!p.retained_assets().contains("menu.child"));
+        assert!(!p.retained_assets().contains("audio.voice"));
+        let commands = p.pump(vec![], 1000);
+        assert!(commands
+            .iter()
+            .filter_map(|c| match c {
+                AppCommand::GetAssets { assets, .. } => Some(assets),
+                _ => None,
+            })
+            .all(|assets| !assets.contains(&"audio.voice".into())
+                && !assets.contains(&"menu.child".into())));
+        settle(&mut p, commands);
+        let music = p.menu_effects.music.unwrap();
+        let select = control(&p, "select");
+        pump_action(&mut p, select);
+        let instance = p.menu_session.instance;
+        let child = control(&p, "child");
+        let commands = pump_action(&mut p, child);
+        let failed = request_of(&commands);
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert_eq!(p.menu_depth(), 0);
+        assert_eq!(p.menu_session.locals["selected"], MenuValue::Int(2));
+        let preview = p.preview();
+        assert_eq!(preview.image_menu, "system.child");
+        assert_eq!(preview.menu_locals["selected"], MenuValue::Int(0));
+        assert_eq!(preview.menu_depth, 1);
+        assert!(!preview.menu_navigation_pending);
+        assert!(p.can_project_menu_navigation());
+        assert_eq!(p.menu_effects.music.unwrap().task, music.task);
+        assert!(p.retained_assets().contains("menu.only"));
+        assert!(p.retained_assets().contains("audio.voice"));
+        assert!(p.retained_assets().contains("menu.child"));
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(packet
+            .semantics
+            .iter()
+            .any(|node| node.action == UiAction::Close && node.enabled));
+        assert!(packet
+            .semantics
+            .iter()
+            .filter(|node| matches!(
+                node.action,
+                UiAction::MenuControl { .. } | UiAction::NewGame | UiAction::Menu
+            ))
+            .all(|node| !node.enabled));
+        let late_select = control(&p, "select");
+        pump_action(&mut p, late_select);
+        assert_eq!(p.menu_session.instance, instance);
+        let commands = p.pump(
+            vec![AppEvent::AssetFailed {
+                request: failed,
+                message: "delayed child music failed".into(),
+            }],
+            1000,
+        );
+        assert!(p.error.is_some());
+        assert!(p.model().authored_menu);
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::AudioStop { task, .. } if *task == music.task)));
+        assert_eq!(p.active_menu_id(), Some("title"));
+        let commands = pump_action(&mut p, UiAction::Retry);
+        let retry = request_of(&commands);
+        assert_ne!(retry, failed);
+        let stale = p.pump(vec![AppEvent::PresentationReady { request: failed }], 1000);
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert!(!stale
+            .iter()
+            .any(|c| matches!(c, AppCommand::AudioStop { .. })));
+        let commands = settle(&mut p, commands);
+        assert_eq!(p.active_menu_id(), Some("system.child"));
+        assert_eq!(p.menu_depth(), 1);
+        assert_eq!(p.menu_session.locals["selected"], MenuValue::Int(0));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::AudioStop { task, .. } if *task == music.task)));
+        assert!(!p.retained_assets().contains("menu.only"));
+        assert!(!p.retained_assets().contains("audio.bgm"));
+        assert!(p.retained_assets().contains("audio.voice"));
+        let child_music = p.menu_effects.music.unwrap();
+        let commands = pump_action(&mut p, UiAction::Close);
+        let abandoned = request_of(&commands);
+        assert_eq!(p.active_menu_id(), Some("system.child"));
+        assert_eq!(p.menu_depth(), 1);
+        let commands = pump_action(&mut p, UiAction::Close);
+        assert!(p.pending_menu.is_none());
+        assert_eq!(p.active_menu_id(), Some("system.child"));
+        assert_eq!(p.menu_depth(), 1);
+        assert_eq!(p.menu_effects.music.unwrap().task, child_music.task);
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, AppCommand::AudioStop { .. })));
+        assert!(!p.retained_assets().contains("audio.bgm"));
+        p.pump(
+            vec![
+                AppEvent::AssetReady {
+                    request: abandoned,
+                    asset: "audio.bgm".into(),
+                },
+                AppEvent::PresentationReady { request: abandoned },
+            ],
+            1000,
+        );
+        assert_eq!(p.active_menu_id(), Some("system.child"));
+        let commands = pump_action(&mut p, UiAction::Close);
+        settle(&mut p, commands);
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert_eq!(p.menu_depth(), 0);
+        assert_eq!(p.menu_session.locals["selected"], MenuValue::Int(2));
+        assert!(!p.retained_assets().contains("audio.voice"));
+    }
+    #[test]
+    fn title_navigation_device_recovery_rejects_old_completion_and_commits_new_lease() {
+        let mut p = lazy_title_player();
+        let commands = p.pump(vec![], 1000);
+        settle(&mut p, commands);
+        let child = control(&p, "child");
+        let commands = pump_action(&mut p, child);
+        let old = request_of(&commands);
+        p.pump(vec![AppEvent::DeviceLost], 1000);
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert!(!p.can_project_menu_navigation());
+        p.pump(vec![AppEvent::PresentationReady { request: old }], 1000);
+        assert_eq!(p.active_menu_id(), Some("title"));
+        let commands = p.pump(vec![AppEvent::DeviceReady], 1000);
+        assert_ne!(request_of(&commands), old);
+        settle(&mut p, commands);
+        assert_eq!(p.active_menu_id(), Some("system.child"));
+        assert_eq!(p.menu_depth(), 1);
+        assert!(p.error.is_none());
+        assert!(p.menu_page_ready("system.child"));
+    }
+    #[test]
+    fn cancelling_menu_navigation_during_device_rebuild_keeps_only_the_committed_page() {
+        for fail in [false, true] {
+            let mut p = lazy_title_player();
+            let commands = p.pump(vec![], 1000);
+            settle(&mut p, commands);
+            let child = control(&p, "child");
+            pump_action(&mut p, child);
+            let commands = p.pump(vec![AppEvent::DeviceLost], 1000);
+            assert!(!commands
+                .iter()
+                .any(|c| matches!(c, AppCommand::GetAssets { .. })));
+            let commands = p.pump(vec![AppEvent::DeviceReady], 1000);
+            let discarded = request_of(&commands);
+            if fail {
+                p.pump(
+                    vec![AppEvent::AssetFailed {
+                        request: discarded,
+                        message: "device rebuild child failed".into(),
+                    }],
+                    1000,
+                );
+                assert!(p.error.is_some());
+            }
+            let commands = pump_action(&mut p, UiAction::Close);
+            assert!(p.pending_menu.is_none());
+            assert_eq!(p.active_menu_id(), Some("title"));
+            assert_eq!(p.menu_depth(), 0);
+            let retry = request_of(&commands);
+            assert_ne!(retry, discarded);
+            assert!(commands
+                .iter()
+                .filter_map(|c| match c {
+                    AppCommand::GetAssets { assets, .. } => Some(assets),
+                    _ => None,
+                })
+                .all(|assets| !assets.contains(&"audio.voice".into())));
+            p.pump(
+                vec![AppEvent::PresentationReady { request: discarded }],
+                1000,
+            );
+            settle(&mut p, commands);
+            assert!(p.menu_page_ready("title"));
+            assert!(p.error.is_none());
+            assert!(!p.is_loading());
+            assert!(!p.domain_paused(TimeDomain::ForegroundUi));
+            assert!(!p.retained_assets().contains("audio.voice"));
+        }
+    }
     #[test]
     fn navigation_preserves_bounded_parent_locals_releases_media_and_rejects_old_input() {
         let mut p = Player::new(navigation_program(), "r".into(), "t".into()).unwrap();
@@ -1567,7 +1989,8 @@ mod tests {
             })
             .unwrap();
         assert!(p.is_loading());
-        assert_eq!(p.menu_session.depth(), 1);
+        assert_eq!(p.menu_session.depth(), 0);
+        assert_eq!(p.active_menu_id(), Some("system"));
         let commands = pump_action(&mut p, UiAction::Close);
         assert!(commands
             .iter()
@@ -1608,7 +2031,8 @@ mod tests {
             1000,
         );
         assert!(p.error.is_some());
-        assert!(!p.model().authored_menu);
+        assert!(p.model().authored_menu);
+        assert_eq!(p.active_menu_id(), Some("system"));
         let commands = pump_action(&mut p, UiAction::Close);
         settle(&mut p, commands);
         assert_eq!(p.active_menu_id(), Some("system"));
@@ -2365,6 +2789,7 @@ mod tests {
                     slot: 0,
                     label: "Saved scene".into(),
                     exists: true,
+                    ..Default::default()
                 }],
                 BTreeMap::from([(0, revision)]),
             )],
@@ -2613,6 +3038,96 @@ mod tests {
             "content":{"type":"history_flow","size":16,"line_height":24,"gap":12,"wheel_step":48,"page_step":200,"max_visible":32,"color":[1,1,1,1]}
         })).unwrap()];
         p
+    }
+    #[test]
+    fn authored_history_window_and_flow_show_choice_labels_with_independent_ui_fonts() {
+        for flow in [false, true] {
+            let mut program = if flow {
+                history_flow_program()
+            } else {
+                history_program()
+            };
+            program.functions.get_mut("main").unwrap().entry = "choose".into();
+            let mut p = Player::new(program, "r".into(), "Test".into()).unwrap();
+            let commands = p.pump(vec![], 1000);
+            settle(&mut p, commands);
+            let commands = pump_action(&mut p, UiAction::NewGame);
+            settle(&mut p, commands);
+            let selected = p.core.state().choice.as_ref().unwrap().options[0]
+                .label
+                .clone();
+            let commands = pump_action(
+                &mut p,
+                UiAction::Choose {
+                    option: "walk".into(),
+                },
+            );
+            settle(&mut p, commands);
+            let before = serde_json::to_value(p.core.snapshot()).unwrap();
+            let commands = pump_action(&mut p, UiAction::Menu);
+            settle(&mut p, commands);
+            let mut model = p.model();
+            let rows = if flow {
+                model.menu_history_flow.as_ref().unwrap().as_ref()
+            } else {
+                model.menu_history.values().next().unwrap().as_slice()
+            };
+            let entry = rows
+                .iter()
+                .find(|r| r.entry.choice.is_some())
+                .unwrap()
+                .entry
+                .clone();
+            assert_eq!(entry.text, selected);
+            assert_eq!(
+                entry.choice,
+                Some(nir_presentation::HistoryChoiceKind::Selected)
+            );
+            model.ui_locale = "en".into();
+            model.ui_fonts = vec!["font.ui".into(), "font.reader".into()];
+            model.ui_font_plan_digest = "ui-plan".into();
+            let mut text = nir_presentation::TextEngine::default();
+            for id in ["font.reader", "font.ui"] {
+                let bytes = if id == "font.ui" {
+                    include_bytes!(
+                        "../../../examples/rain-letters/assets/fonts/ABeeZee-Regular.ttf"
+                    )
+                    .as_slice()
+                } else {
+                    include_bytes!("../../../examples/rain-letters/assets/source/reader.otf")
+                        .as_slice()
+                };
+                text.add_font_asset(id, bytes.to_vec()).unwrap();
+            }
+            let mut reading = nir_presentation::ReadingState::default();
+            let messages = nir_presentation::Messages::default();
+            let identity = (p.generation.session, p.current_interaction());
+            let mut packet = reading.project(&model, identity, 1280., 720., &messages, &mut text);
+            for _ in 0..100 {
+                if !reading.history_pending() {
+                    break;
+                }
+                packet = reading.project(&model, identity, 1280., 720., &messages, &mut text);
+            }
+            assert!(
+                reading.history_error().is_none(),
+                "{:?}",
+                reading.history_error()
+            );
+            assert!(!reading.history_pending());
+            let heading = packet.texts.iter().find(|r| r.text == "Choice").unwrap();
+            let body = packet.texts.iter().find(|r| r.text == selected).unwrap();
+            assert_eq!(heading.locale, "en");
+            assert_eq!(heading.font_assets, ["font.ui", "font.reader"]);
+            assert_eq!(heading.font_plan_digest, "ui-plan");
+            assert_eq!(body.locale, entry.locale);
+            assert_eq!(body.font_assets, entry.font_assets);
+            assert_eq!(body.font_plan_digest, entry.font_plan_digest);
+            assert!(body.y > heading.y);
+            assert!(body.clip.is_some());
+            assert!(heading.clip.is_some());
+            assert_eq!(serde_json::to_value(p.core.snapshot()).unwrap(), before);
+        }
     }
     fn history_scrollbar_program() -> Program {
         let mut p = history_flow_program();
@@ -3162,6 +3677,96 @@ mod tests {
         }
     }
     #[test]
+    fn opt_in_history_window_pages_use_visible_capacity_and_keep_oldest_reachable() {
+        let mut program = history_program();
+        program.requires.push("ui.menu-history-voice.v1".into());
+        if let MenuContent::HistoryWindow { voice_controls, .. } = &mut program
+            .theme
+            .image_menus
+            .get_mut("system")
+            .unwrap()
+            .elements[0]
+            .content
+        {
+            *voice_controls = true;
+        }
+        let mut p = Player::new(program, "r".into(), "Test".into()).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::NewGame);
+        settle(&mut p, c);
+        let mut snapshot = p.core.snapshot();
+        snapshot.history = vec![snapshot.history[0].clone(); 18];
+        p.restore(snapshot).unwrap();
+        let c = p.pump(vec![], 1000);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        let before = serde_json::to_value(p.core.snapshot()).unwrap();
+        let mut visited = BTreeSet::new();
+        for page in 0..9 {
+            let model = p.model();
+            let packet = nir_presentation::project(
+                &model,
+                390.,
+                844.,
+                &nir_presentation::Messages::default(),
+            );
+            let (_, capacity) = packet.menu_history_capacity["records"];
+            assert_eq!(capacity, 2);
+            assert_eq!(
+                packet
+                    .semantics
+                    .iter()
+                    .find(|n| n.label == "Older")
+                    .unwrap()
+                    .enabled,
+                page < 8
+            );
+            let rows = &model.menu_history["records"];
+            visited.extend(rows.iter().rev().take(capacity).map(|r| r.key));
+            p.set_menu_history_capacity(&packet);
+            let c = pump_action(
+                &mut p,
+                UiAction::MenuControl {
+                    instance: model.menu_instance,
+                    revision: model.menu_revision,
+                    control: "older".into(),
+                },
+            );
+            settle(&mut p, c);
+        }
+        assert_eq!(visited, (0..18).collect());
+        assert_eq!(p.menu_session.locals["offset"], MenuValue::Int(16));
+        let stale = nir_presentation::project(
+            &p.model(),
+            390.,
+            844.,
+            &nir_presentation::Messages::default(),
+        );
+        let c = pump_action(&mut p, UiAction::Close);
+        settle(&mut p, c);
+        let c = pump_action(&mut p, UiAction::Menu);
+        settle(&mut p, c);
+        p.set_menu_history_capacity(&stale);
+        let model = p.model();
+        let c = pump_action(
+            &mut p,
+            UiAction::MenuControl {
+                instance: model.menu_instance,
+                revision: model.menu_revision,
+                control: "older".into(),
+            },
+        );
+        settle(&mut p, c);
+        assert_eq!(
+            p.menu_session.locals["offset"],
+            MenuValue::Int(2),
+            "old-page capacity has no authority"
+        );
+        assert_eq!(serde_json::to_value(p.core.snapshot()).unwrap(), before);
+    }
+    #[test]
     fn thousand_history_rows_only_project_a_bounded_stable_window() {
         let mut p = Player::new(history_program(), "release".into(), "Test".into()).unwrap();
         let c = p.pump(vec![], 1000);
@@ -3317,6 +3922,53 @@ mod tests {
         p
     }
     #[test]
+    fn menu_music_loop_region_requires_valid_metadata_and_reaches_foreground_audio() {
+        let mut program = effects_program();
+        program.requires.push("audio.loop-region.v1".into());
+        let region = AudioLoopRegion {
+            start_us: Micros(200_000),
+            end_us: Micros(600_000),
+        };
+        program.assets.get_mut("audio.bgm").unwrap().duration_us = Micros(800_000);
+        program
+            .theme
+            .image_menus
+            .get_mut("title")
+            .unwrap()
+            .effects
+            .as_mut()
+            .unwrap()
+            .music
+            .as_mut()
+            .unwrap()
+            .loop_region = Some(region);
+        let mut missing = program.clone();
+        missing.requires.retain(|cap| cap != "audio.loop-region.v1");
+        assert_eq!(
+            Player::new(missing, "r".into(), "t".into())
+                .err()
+                .unwrap()
+                .code,
+            "E_CAPABILITY"
+        );
+        let mut invalid = program.clone();
+        invalid.assets.get_mut("audio.bgm").unwrap().duration_us = Micros(500_000);
+        assert_eq!(
+            Player::new(invalid, "r".into(), "t".into())
+                .err()
+                .unwrap()
+                .code,
+            "E_AUDIO_LOOP"
+        );
+        let mut p = Player::new(program, "r".into(), "t".into()).unwrap();
+        let commands = p.pump(vec![], 1000);
+        let commands = settle(&mut p, commands);
+        assert!(commands.iter().any(|command| matches!(command,
+            AppCommand::AudioStart { domain: TimeDomain::ForegroundUi, looped: true, loop_region: Some(actual), position_us: Micros(0), .. }
+            if *actual == region)));
+    }
+
+    #[test]
     fn effects_require_their_capability() {
         let mut p = effects_program();
         p.requires.retain(|c| c != "ui.menu-effects.v1");
@@ -3375,10 +4027,14 @@ mod tests {
         assert_eq!(p.model().menu_opacity, 1.);
         assert!(p.menu_effects.fade.is_none());
         assert!(p.menu_effects_clock.is_none());
-        // A new title page stops the old music and plays its own enter.
+        // The old music continues until the target page preparation commits.
         let title_music = p.menu_effects.music.unwrap().task;
         let navigate = control(&p, "other");
         let commands = pump_action(&mut p, navigate);
+        assert!(!ui_stops(&commands).contains(&title_music));
+        assert_eq!(p.active_menu_id(), Some("title"));
+        assert_eq!(p.menu_effects.music.unwrap().task, title_music);
+        let commands = settle(&mut p, commands);
         assert!(ui_stops(&commands).contains(&title_music));
         let starts = ui_audio(&commands);
         assert_eq!(starts.len(), 2);
@@ -4086,6 +4742,49 @@ mod tests {
         );
     }
     #[test]
+    fn failed_menu_music_releases_only_its_replacement_ownership() {
+        let (mut p, _, task) = effects_player_at_overlay();
+        assert!(p.bus_paused(TimeDomain::Story, AudioBus::Bgm));
+        let session = p.generation.session;
+        p.pump(vec![AppEvent::Hidden(true)], 1000);
+        let commands = p.pump(
+            vec![AppEvent::AudioFailed {
+                domain: TimeDomain::ForegroundUi,
+                task,
+                session,
+                message: "device start rejected".into(),
+            }],
+            1000,
+        );
+        assert!(p.menu_effects.music.is_none());
+        assert!(p.bus_paused(TimeDomain::Story, AudioBus::Bgm));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            AppCommand::AudioBusPause {
+                domain: TimeDomain::Story,
+                bus: AudioBus::Bgm,
+                paused: false,
+            }
+        )));
+        p.pump(vec![AppEvent::Hidden(false)], 1000);
+        assert!(!p.bus_paused(TimeDomain::Story, AudioBus::Bgm));
+        assert!(p.bus_paused(TimeDomain::Story, AudioBus::Voice));
+        assert!(p.paused());
+        assert!(p.error.is_none());
+        // A late failure from the previous owner cannot affect the resumed song.
+        p.pump(
+            vec![AppEvent::AudioFailed {
+                domain: TimeDomain::ForegroundUi,
+                task,
+                session,
+                message: "duplicate".into(),
+            }],
+            1000,
+        );
+        assert!(!p.bus_paused(TimeDomain::Story, AudioBus::Bgm));
+    }
+
+    #[test]
     fn ui_sound_events_are_accepted_by_task_and_session_and_reset_with_sessions() {
         let (mut p, bell, music) = effects_player_at_overlay();
         assert!(
@@ -4184,5 +4883,49 @@ mod tests {
         assert!(p.auto, "the deferred reading action resumed exactly once");
         assert_eq!(p.current_interaction(), interaction);
         assert!(!p.paused());
+    }
+
+    #[test]
+    fn authored_menu_marks_bad_slot_and_blocks_stale_save_controls_but_allows_retry() {
+        let mut p = storage_player();
+        p.pump(
+            vec![AppEvent::Slots(
+                vec![SlotView {
+                    slot: 0,
+                    error: Some("E_SAVE_PARSE".into()),
+                    ..Default::default()
+                }],
+                BTreeMap::new(),
+            )],
+            1000,
+        );
+        let packet = nir_presentation::project(
+            &p.model(),
+            1280.,
+            720.,
+            &nir_presentation::Messages::default(),
+        );
+        assert!(packet.texts.iter().any(|t| t.text == "存储操作失败"));
+        let save = packet
+            .semantics
+            .iter()
+            .find(|node| node.label == "Save selected")
+            .unwrap();
+        let load = packet
+            .semantics
+            .iter()
+            .find(|node| node.label == "Load selected")
+            .unwrap();
+        assert!(!save.enabled);
+        assert!(load.enabled);
+        let revision = p.menu_session.revision;
+        assert!(!pump_action(&mut p, save.action.clone())
+            .iter()
+            .any(|c| matches!(c, AppCommand::Save { .. })));
+        assert!(p.save_confirmation.is_none());
+        assert_eq!(p.menu_session.revision, revision);
+        assert!(pump_action(&mut p, load.action.clone())
+            .iter()
+            .any(|c| matches!(c, AppCommand::Load { slot: 0, .. })));
     }
 }

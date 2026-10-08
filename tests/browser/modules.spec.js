@@ -165,7 +165,7 @@ test('a failed prefetch promoted by demand reports failure and retries cleanly',
     let attempts=0,seeFirst,releaseFirst;
     const firstStarted=new Promise(resolve=>{seeFirst=resolve;});
     const firstGate=new Promise(resolve=>{releaseFirst=resolve;});
-    await page.route(`**/objects/${ch02Code}.json`,async route=>{
+    await page.context().route(`**/objects/${ch02Code}.json`,async route=>{
       attempts++;
       if(attempts===1){seeFirst();await firstGate;await route.fulfill({status:503,body:'temporary prefetch failure'});}
       else await route.continue();
@@ -199,7 +199,7 @@ test('startup and module calls fetch only the selected chapter and language; cha
   for(const chapter of chapters)expect(hashes[chapter.id].static).toMatch(/^[0-9a-f]{64}$/);
   const sharedImage = fixture.program.assets['bg.station'].object;
   let imageRequests = 0;
-  page.on('request', request => { if (request.url().includes(sharedImage)) imageRequests++; });
+  page.context().on('request', request => { if (request.url().includes(sharedImage)) imageRequests++; });
   await boot(page);
   await start(page);
   expect((await state(page)).dialogue.visible).toBe(expectedText(chapters[0], 'zh-Hans'));
@@ -303,7 +303,7 @@ test('module fetch failure keeps the active scene and retries; cancelled work ca
   const firstAttemptGate = new Promise(resolve => { rejectFirstAttempt = resolve; });
   let firstAttemptSeen;
   const firstAttemptStarted = new Promise(resolve => { firstAttemptSeen = resolve; });
-  await page.route(`**/objects/${ch02Code}.json`, async route => {
+  await page.context().route(`**/objects/${ch02Code}.json`, async route => {
     ch02Attempts++;
     if (ch02Attempts === 1) {
       firstAttemptSeen();
@@ -340,7 +340,7 @@ test('module fetch failure keeps the active scene and retries; cancelled work ca
   const routeStarted = new Promise(resolve => { routeSeen = resolve; });
   let releaseRoute;
   const waitForRoute = new Promise(resolve => { releaseRoute = resolve; });
-  await page.route(`**/objects/${ch03Code}.json`, async route => {
+  await page.context().route(`**/objects/${ch03Code}.json`, async route => {
     routeSeen();
     await waitForRoute;
     try { await route.continue(); } catch {}

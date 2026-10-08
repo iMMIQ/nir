@@ -22,3 +22,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 serde_json.workspace = true
 console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+workspace = true
+features = ["OffscreenCanvas", "Performance"]

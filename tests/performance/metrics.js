@@ -3,6 +3,8 @@ const ACCOUNTING = Object.freeze({
   contentStaging: 'diagnostics.content_staging.encoded_bytes and budget_encoded_bytes; encoded bytes held while preparing content',
   mediaResourceTimings: 'PerformanceResourceTiming transferSize, encodedBodySize, and decodedBodySize; browser network estimates, not decoded media residency',
   wasmMemoryCapacity: 'state.wasm_memory_bytes; WASM linear-memory buffer capacity',
+  mediaPayloads: 'diagnostics.resource_memory.media; host referenced encoded buffers and actual decoded PCM frames; excludes browser decoder internals',
+  compositorAllocations: 'diagnostics.resource_memory.renderer; logical image/offscreen texture and vertex allocations; excludes glyph atlases, swapchain and driver overhead',
   physicalMemory: 'unmeasured',
   gpuTime: 'unmeasured',
 });
@@ -102,7 +104,7 @@ export async function startCapture(page) {
     const clone = value => { try { return JSON.parse(JSON.stringify(value)); } catch { return null; } };
     const capture = {
       active: true, startedAtMs: performance.now(), events: [], checkpoints: [], samples: [], activeFrameIntervalsMs: [],
-      violations: [], captureErrors: [], peaks: { playerResidentBytes: null, encodedResidencyBytes: null, encodedResidencyBudgetBytes: null, wasmMemoryCapacityBytes: null, stagingEncodedBytes: null, stagingPeakEncodedBytes: null, stagingBudgetEncodedBytes: null },
+      violations: [], captureErrors: [], peaks: { playerResidentBytes: null, encodedResidencyBytes: null, encodedResidencyBudgetBytes: null, wasmMemoryCapacityBytes: null, stagingEncodedBytes: null, stagingPeakEncodedBytes: null, stagingBudgetEncodedBytes: null, encodedMediaCacheBytes: null, decodedAudioBytes: null, imageStagingBytes: null, compositorGpuBytes: null, imageUploadPixelBytes: null, transitionTextureBytes: null, windowTextureBytes: null, menuTextureBytes: null },
       prefetchStats: { requested: 0, delivered: 0, skipped: 0, failed: 0 },
       trace: { enabled: false, capacity: null, droppedAtStart: 0, droppedDuringCapture: 0, missingEvents: 0, snapshots: 0, incomplete: false, reasons: [] },
       lastTotal: null, lastTraceAtMs: -Infinity, lastSampleAtMs: -Infinity, lastActiveAtMs: null, lastWasActive: false,
@@ -164,10 +166,23 @@ export async function startCapture(page) {
         }
         const staging = snapshot.content_staging;
         if (staging && typeof staging === 'object') this.updateStaging(staging);
+        this.updateMediaMemory(snapshot.resource_memory);
         return snapshot;
       },
       updatePeak(name, value) {
         if (valid(value)) this.peaks[name] = this.peaks[name] === null ? value : Math.max(this.peaks[name], value);
+      },
+      updateRendererMemory(m) {
+        if (!m || typeof m !== 'object') return;
+        for (const [name, field] of [['compositorGpuBytes', 'accounted_gpu_bytes'], ['imageUploadPixelBytes', 'image_upload_pixel_bytes'], ['transitionTextureBytes', 'transition_texture_bytes'], ['windowTextureBytes', 'window_texture_bytes'], ['menuTextureBytes', 'menu_texture_bytes']]) this.updatePeak(name, m[field]);
+      },
+      updateMediaMemory(m) {
+        if (!m || typeof m !== 'object') return;
+        this.updateRendererMemory(m.renderer);
+        for (const [name, field] of [['encodedMediaCacheBytes', 'encoded_cache_bytes'], ['decodedAudioBytes', 'decoded_audio_bytes'], ['imageStagingBytes', 'image_staging_bytes']]) {
+          this.updatePeak(name, m.media?.[field]);
+          this.updatePeak(name, m.media?.peaks?.[field]);
+        }
       },
       checkBudget(name, type, value, budget, atMs) {
         if (!valid(value) || !valid(budget)) return;
@@ -192,6 +207,7 @@ export async function startCapture(page) {
         const residency = s.content_residency && typeof s.content_residency === 'object' ? s.content_residency : {};
         this.updatePeak('playerResidentBytes', s.resident_bytes);
         this.updatePeak('wasmMemoryCapacityBytes', s.wasm_memory_bytes);
+        this.updateRendererMemory(s.renderer_memory);
         this.checkBudget({ peak: 'encodedResidencyBytes', budget: 'encodedResidencyBudgetBytes' }, 'encoded-residency-budget', residency.resident_bytes, residency.budget_bytes, now);
         if (includeSample && this.samples.length < maxSamples) {
           this.samples.push({ atMs: now, frames: valid(s.frames) ? s.frames : null, active: this.lastWasActive,
@@ -336,7 +352,7 @@ export async function stopCapture(page) {
     const stopAtMs = performance.now();
     const resourceRows = [];
     try {
-      for (const entry of performance.getEntriesByType('resource')) {
+      for (const entry of window.__nir.resourceTimings()) {
         if (entry.startTime < capture.startedAtMs || resourceRows.length >= 20000) continue;
         let name = entry.name;
         try {
@@ -358,7 +374,9 @@ export async function stopCapture(page) {
     const api = window.__nir;
     const state = api?.state?.() || {};
     const diagnostics = (() => { try { return api?.diagnostics?.() || null; } catch { return null; } })();
-    const probes = Array.isArray(window.__nirActualAdapters) ? window.__nirActualAdapters : [];
+    const probes = api?.actualAdapters?.() || [];
+    const workerTiming = diagnostics?.worker_resource_timing;
+    if(workerTiming?.incomplete || workerTiming?.dropped)capture.resourceTimingsIncomplete=true;
     const violations = [...capture.violations, ...capture.captureErrors.map(error => ({ type: error.type, message: error.message }))];
     return {
       format: 1, startedAtMs: capture.startedAtMs, stoppedAtMs: stopAtMs,
@@ -371,7 +389,7 @@ export async function stopCapture(page) {
       peaks: { ...capture.peaks }, violations, traceIncomplete: capture.trace.incomplete,
       trace: { ...capture.trace, reasons: [...capture.trace.reasons] },
       finalState: { playerResidentBytes: state.resident_bytes ?? null, contentResidency: state.content_residency ?? null, wasmMemoryCapacityBytes: state.wasm_memory_bytes ?? null,
-        activeRequests: api?.metrics?.activeRequests ?? null, contentStaging: diagnostics?.content_staging ?? null },
+        activeRequests: api?.metrics?.activeRequests ?? null, contentStaging: diagnostics?.content_staging ?? null, resourceMemory: diagnostics?.resource_memory ?? null },
       accounting,
     };
   }, { ...ACCOUNTING });

@@ -15,7 +15,10 @@ pub(crate) struct HistoryFlowView {
     pub page_step: f32,
     pub max_visible: usize,
     pub paint_index: usize,
+    pub semantic_index: usize,
     pub enabled: bool,
+    pub voice_controls: bool,
+    pub voice_base: u32,
 }
 #[derive(Debug)]
 pub(super) struct State {
@@ -89,9 +92,42 @@ impl ReadingState {
             });
         }
         let state = self.flow.as_mut().unwrap();
+        let mut voice_buttons = vec![];
         state.page_step = view.page_step;
         let result = (|| -> Result<Option<Vec<TextRun>>, String> {
             let layout = state.layout.as_mut().map_err(|error| error.clone())?;
+            let labels = [
+                HistoryChoiceKind::Selected,
+                HistoryChoiceKind::TimedOut,
+                HistoryChoiceKind::Cancelled,
+            ]
+            .map(|kind| TextRun {
+                text: messages.text(&m.ui_locale, kind.message()),
+                visible: None,
+                x: 0.,
+                y: 0.,
+                width: view.style.width,
+                height: view.style.height,
+                size: view.style.size * 0.8,
+                line_height: view.style.line_height,
+                color: view.color,
+                emphasis: vec![],
+                scroll: 0.,
+                clip: None,
+                region: None,
+                locale: m.ui_locale.clone(),
+                font_assets: m.ui_fonts.clone(),
+                font_plan_digest: m.ui_font_plan_digest.clone(),
+                preflight_only: false,
+                shadow: None,
+                monochrome: false,
+            });
+            if layout.choice_labels(labels, text)? {
+                state.epoch = next(state.epoch)?;
+            }
+            if layout.voice_controls(view.voice_controls, text)? {
+                state.epoch = next(state.epoch)?;
+            }
             if layout.reflow(view.style, text)? {
                 state.epoch = next(state.epoch)?;
             }
@@ -102,7 +138,8 @@ impl ReadingState {
                 return Ok(None);
             }
             let runs = layout.visible_runs([view.rect[0], view.rect[1]], Some(rect), view.color)?;
-            if runs.len() > view.max_visible {
+            voice_buttons = layout.visible_voices([view.rect[0], view.rect[1]], rect)?;
+            if runs.len() + voice_buttons.len() > view.max_visible {
                 return Err("E_HISTORY_LAYOUT: declared visible budget exceeded".into());
             }
             if view.enabled
@@ -158,6 +195,71 @@ impl ReadingState {
             view.paint_index..view.paint_index,
             (start..p.texts.len()).map(MenuPaint::Text),
         );
+        if !voice_buttons.is_empty() {
+            let mut layer = DrawPacket {
+                locale: m.ui_locale.clone(),
+                font_assets: m.ui_fonts.clone(),
+                font_plan_digest: m.ui_font_plan_digest.clone(),
+                ..Default::default()
+            };
+            for (key, button) in voice_buttons {
+                history_controls::button(
+                    &mut layer,
+                    m,
+                    messages,
+                    history_controls::VoiceButton {
+                        window: &view.id,
+                        layout: Some(state.epoch),
+                        key,
+                        id: view.voice_base + key as u32,
+                        rect: button,
+                        clip: rect,
+                        enabled: view.enabled,
+                        alpha: view.color[3],
+                    },
+                );
+            }
+            let texts = p.texts.len();
+            let Some((from, end)) = p.menu_quad_range else {
+                return;
+            };
+            let quads = layer.quads.len();
+            for paint in &mut p.menu_paint {
+                if let MenuPaint::Quad(i) = paint {
+                    if *i >= end {
+                        *i += quads;
+                    }
+                }
+            }
+            if let Some(i) = &mut p.dialogue_hint_quad {
+                if *i >= end {
+                    *i += quads;
+                }
+            }
+            p.quads.splice(end..end, layer.quads);
+            p.menu_quad_range = Some((from, end + quads));
+            if let Some((from, to)) = p.menu_page_range {
+                p.menu_page_range = Some((from, to + quads));
+            }
+            let paints = layer.menu_paint.into_iter().map(|paint| match paint {
+                MenuPaint::Quad(i) => MenuPaint::Quad(end + i),
+                MenuPaint::Text(i) => MenuPaint::Text(texts + i),
+            });
+            p.menu_paint.splice(
+                view.paint_index + (p.texts.len() - start)
+                    ..view.paint_index + (p.texts.len() - start),
+                paints,
+            );
+            p.texts.extend(layer.texts);
+            let count = layer.semantics.len();
+            if let Some(bar) = &mut p.history_bar_view {
+                if bar.order > view.order {
+                    bar.semantic_index += count;
+                }
+            }
+            p.semantics
+                .splice(view.semantic_index..view.semantic_index, layer.semantics);
+        }
     }
     pub fn scroll_menu_history(&mut self, action: &UiAction, packet: &DrawPacket) -> bool {
         let UiAction::MenuHistoryScroll {

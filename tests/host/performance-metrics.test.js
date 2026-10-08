@@ -39,7 +39,7 @@ test('action correlation selects the submission for the exact expected dialogue 
   assert.equal(correlateRenderSubmitted({ stage: 'input_received', at_us: 'bad' }, events, 12), null);
 });
 
-function makeBrowserPage({ capacity = 32 } = {}) {
+function makeBrowserPage({ capacity = 32, resourceMemory = null } = {}) {
   let now = 1;
   const trace = new TraceRecorder({ enabled: true, capacity, now: () => now++ / 1000 });
   const state = {
@@ -53,7 +53,7 @@ function makeBrowserPage({ capacity = 32 } = {}) {
     state: () => structuredClone(state),
     metrics,
     needsClock: () => false,
-    diagnostics: () => ({ ...trace.snapshot(), content_staging: { encoded_bytes: 0, peak_encoded_bytes: 0, budget_encoded_bytes: 100, reservations: 0, waiting_demands: 0 } }),
+    diagnostics: () => ({ ...trace.snapshot(), resource_memory: resourceMemory, content_staging: { encoded_bytes: 0, peak_encoded_bytes: 0, budget_encoded_bytes: 100, reservations: 0, waiting_demands: 0 } }),
     action: () => {
       trace.record('input_received', { sequence: 1 });
       trace.record('render_submitted', { frames: 11 });
@@ -116,4 +116,23 @@ test('incremental trace draining detects only events lost since the previous sna
   assert.equal(capture.traceIncomplete, true);
   assert.equal(capture.trace.missingEvents, 1);
   assert.deepEqual(capture.events.map(event => event.stage), ['two', 'three']);
+});
+
+test('performance capture keeps actual media peaks separate from admission and logical GPU allocations', async () => {
+  const resourceMemory = {
+    media: { encoded_cache_bytes: 100, decoded_audio_bytes: 200, image_staging_bytes: 0,
+      peaks: { encoded_cache_bytes: 150, decoded_audio_bytes: 500, image_staging_bytes: 400 } },
+    renderer: { accounted_gpu_bytes: 800, image_upload_pixel_bytes: 300, transition_texture_bytes: 600, window_texture_bytes: 0, menu_texture_bytes: 0 },
+  };
+  const { page } = makeBrowserPage({ resourceMemory });
+  await startCapture(page);
+  const capture = await stopCapture(page);
+  assert.equal(capture.peaks.playerResidentBytes, 20);
+  assert.equal(capture.peaks.encodedMediaCacheBytes, 150);
+  assert.equal(capture.peaks.decodedAudioBytes, 500);
+  assert.equal(capture.peaks.imageStagingBytes, 400);
+  assert.equal(capture.peaks.compositorGpuBytes, 800);
+  assert.deepEqual(capture.finalState.resourceMemory, resourceMemory);
+  assert.equal(capture.accounting.physicalMemory, 'unmeasured');
+  assert.match(capture.accounting.compositorAllocations, /excludes glyph atlases/);
 });

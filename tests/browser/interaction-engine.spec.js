@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 async function bootAndProbe(page, trace = true) {
-  await page.goto(`/?test=1${trace ? '' : '&trace=0'}`);
+  await page.goto(`/?test=1&worker=main${trace ? '' : '&trace=0'}`);
   await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
   await page.evaluate(async () => {
     const root=new URL('../../',location.href);

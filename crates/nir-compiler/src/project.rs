@@ -744,6 +744,30 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         .values()
         .flat_map(|cue| &cue.effects)
         .any(|def| {
+            def.effect.effect_tree_any(&|e| {
+                matches!(
+                    e,
+                    Effect::Audio {
+                        loop_region: Some(_),
+                        ..
+                    }
+                )
+            })
+        })
+        && !program.theme.image_menus.values().any(|menu| {
+            menu.effects
+                .as_ref()
+                .and_then(|e| e.music.as_ref())
+                .is_some_and(|music| music.loop_region.is_some())
+        })
+    {
+        program.requires.retain(|cap| cap != "audio.loop-region.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
             def.effect
                 .effect_tree_any(&|e| matches!(e, Effect::Audio { gain, .. } if *gain != 1.0))
         })
@@ -983,6 +1007,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         program
             .requires
             .retain(|c| c != "ui.menu-history-availability.v1");
+    }
+    if !program
+        .theme
+        .image_menus
+        .values()
+        .any(nir_format::ImageMenu::uses_history_voice)
+    {
+        program.requires.retain(|c| c != "ui.menu-history-voice.v1");
     }
     if !program
         .theme

@@ -30,6 +30,8 @@ pub fn sdk_manifest(sdk: &Path) -> Result<SdkManifest> {
         "player_web.js",
         "player_web_bg.wasm",
         "host.js",
+        "runtime-worker.js",
+        "asset-worker.js",
         "index.html",
         "bootstrap.js",
         "THIRD-PARTY.txt",
@@ -1036,6 +1038,12 @@ fn dependency_report(
             ] {
                 boot_builder.add_object(objects, hash, "engine", name.into())?;
             }
+            for hash in [&engine.runtime_worker, &engine.asset_worker]
+                .into_iter()
+                .flatten()
+            {
+                boot_builder.add_object(objects, hash, "engine", "worker adapter".into())?;
+            }
             for consumer in [
                 "bootstrap".to_owned(),
                 format!("locale:ui:{ui_locale}"),
@@ -1238,6 +1246,20 @@ pub fn build_profile(
         "js",
         "text/javascript",
     )?;
+    let runtime_worker = object(
+        out,
+        &mut objects,
+        &fs::read(sdk.join("runtime-worker.js"))?,
+        "js",
+        "text/javascript",
+    )?;
+    let asset_worker = object(
+        out,
+        &mut objects,
+        &fs::read(sdk.join("asset-worker.js"))?,
+        "js",
+        "text/javascript",
+    )?;
     let mut notices = fs::read_to_string(sdk.join("THIRD-PARTY.txt"))?;
     for name in &p.manifest.inputs.notices {
         let path = crate::relative(&p.root, &p.root, name)?;
@@ -1284,6 +1306,8 @@ pub fn build_profile(
             js: js.clone(),
             wasm: wasm.clone(),
             host: host.clone(),
+            runtime_worker: Some(runtime_worker),
+            asset_worker: Some(asset_worker),
         },
         launch: LaunchFiles {
             html: html.clone(),
@@ -1632,6 +1656,12 @@ fn native_release(
         &web.launch.html,
         &web.launch.bootstrap,
     ] {
+        objects.remove(id);
+    }
+    for id in [&web.engine.runtime_worker, &web.engine.asset_worker]
+        .into_iter()
+        .flatten()
+    {
         objects.remove(id);
     }
     let manifest = NativeRelease {

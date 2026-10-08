@@ -21,7 +21,7 @@ async function boot(page,fixture) {
 
 async function chapter(page) {
   await page.keyboard.press('Space');
-  await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='driver.lead'&&!window.__nir.state().loading);
+  await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='driver.lead'&&window.__nir.state().dialogue.ready&&!window.__nir.state().loading);
   await page.keyboard.press('Space');
   await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='ch01.line'&&window.__nir.state().dialogue.ready&&!window.__nir.state().loading);
   const current=await state(page);
@@ -89,7 +89,7 @@ test('media lookahead sends real image and audio requests before demand without 
   for(const fixture of [disabled,enabled]){
     const requested=[];
     const observe=request=>requested.push(new URL(request.url()).pathname.slice(1));
-    page.on('request',observe);
+    page.context().on('request',observe);
     try{
       await boot(page,fixture);
       await chapter(page);
@@ -111,13 +111,13 @@ test('media lookahead sends real image and audio requests before demand without 
       expect(paths.every(path=>requested.includes(path))).toBe(true);
       await action(page,{type:'title'});
       await clean(page);
-    }finally{page.off('request',observe);}
+    }finally{page.context().off('request',observe);}
   }
 });
 
 test('speculative media fetch failure is silent and a later demand retries',async({page})=>{
   const path=mediaPaths(enabled)[0];let attempts=0;
-  await page.route(`**/${path}`,async route=>{
+  await page.context().route(`**/${path}`,async route=>{
     attempts++;
     if(attempts===1)await route.fulfill({status:503,body:'temporary media failure'});
     else await route.continue();
@@ -137,7 +137,7 @@ test('speculative media fetch failure is silent and a later demand retries',asyn
 
 test('lookahead skips an unavailable catalog and demand still prepares media',async({page})=>{
   const requested=[];
-  page.on('request',request=>requested.push(new URL(request.url()).pathname.slice(1)));
+  page.context().on('request',request=>requested.push(new URL(request.url()).pathname.slice(1)));
   await boot(page,unavailable);
   await chapter(page);
   await page.waitForTimeout(250);
@@ -155,7 +155,7 @@ test('a pending speculative fetch promoted by demand reports a required failure'
   const path=mediaPaths(enabled)[0];let first,release,attempts=0;
   const started=new Promise(resolve=>{first=resolve;});
   const gate=new Promise(resolve=>{release=resolve;});
-  await page.route(`**/${path}`,async route=>{
+  await page.context().route(`**/${path}`,async route=>{
     attempts++;
     if(attempts===1){first();await gate;await route.fulfill({status:503,body:'promoted media failure'});}
     else await route.continue();
@@ -189,7 +189,7 @@ test('title, locale, and device cancellation discard late decode results and rel
       await boot(page,enabled);
       const titleBytes=(await state(page)).resident_bytes;
       await page.keyboard.press('Space');
-      await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='driver.lead'&&!window.__nir.state().loading);
+      await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='driver.lead'&&window.__nir.state().dialogue.ready&&!window.__nir.state().loading);
       await page.evaluate(()=>window.__holdMediaDecode=true);
       await page.keyboard.press('Space');
       await page.waitForFunction(()=>window.__nir.state().dialogue?.id==='ch01.line'&&window.__nir.state().dialogue.ready);

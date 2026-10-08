@@ -1089,13 +1089,21 @@ impl Adapter {
             duration > 0,
         );
     }
-    fn stop(&mut self, blocks: &mut Vec<Value>, bus: &str) {
-        if self.audio.remove(bus).is_some() {
-            self.op(
-                blocks,
-                json!({"type":"task_control","task":bus,"action":"cancel"}),
-            );
+    fn play_sound(&mut self, blocks: &mut Vec<Value>, bus: &str, effect: Value) {
+        let mut effects = vec![];
+        if self.audio.contains_key(bus) {
+            // PLAYSND replaces the channel, rather than declaring an earlier
+            // stop. Prepare the new media before committing either effect.
+            // AudioStop captures the old concrete task before Audio rebinds
+            // the channel handle, so the old source survives failed loading.
+            effects.push(json!({"id":format!("{bus}_stop"),"scope":"session",
+                "effect":{"type":"audio_stop","target":bus,"duration_us":"0"}}));
         }
+        effects.push(json!({"id":bus,"scope":"session","effect":effect.clone()}));
+        let cue = self.id("cue");
+        self.cues.insert(cue.clone(), json!({"effects":effects}));
+        blocks.push(json!({"ops":[],"terminator":{"type":"activate","cue":cue,"next":"NEXT"}}));
+        self.audio.insert(bus.into(), effect);
     }
     fn fade_stop(&mut self, blocks: &mut Vec<Value>, bus: &str, duration_us: u64) {
         if self.audio.remove(bus).is_some() {
@@ -1181,11 +1189,9 @@ impl Adapter {
                     "E_IMPORT_EVENT: invalid sound gain"
                 );
                 let asset = self.sound(&format!("サウンド/{}", arg(0)?), 1.)?;
-                self.stop(blocks, bus);
                 let effect =
                     json!({"type":"audio","asset":asset,"bus":bus,"looped":looped,"gain":gain});
-                self.effect(blocks, bus, "session", effect.clone(), false);
-                self.audio.insert(bus.into(), effect);
+                self.play_sound(blocks, bus, effect);
             }
             "STOPSND" => {
                 ensure!(
@@ -1778,6 +1784,7 @@ impl Adapter {
                     self.menu_sounds += 1;
                     Some(MenuMusic {
                         asset,
+                        loop_region: None,
                         bus: AudioBus::Bgm,
                         gain: 1.,
                     })
@@ -2661,6 +2668,49 @@ mod tests {
         }
         assert_eq!(adapter.assets.len(), 1);
         assert_eq!(adapter.assets.values().next().unwrap().gain, Some(1.));
+    }
+    #[test]
+    fn playsnd_replacement_stops_only_when_the_new_media_cue_commits() {
+        for (bus, mode) in [("BGM", "REPEAT"), ("VOICE", "NORMAL")] {
+            for next in ["first.mp3", "second.mp3"] {
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::create_dir(temp.path().join("サウンド")).unwrap();
+                for file in ["first.mp3", "second.mp3"] {
+                    std::fs::write(temp.path().join("サウンド").join(file), b"fixture").unwrap();
+                }
+                let mut adapter = Adapter::new(Source::new(temp.path()).unwrap());
+                let mut blocks = vec![];
+                for file in ["first.mp3", next] {
+                    adapter
+                        .event(
+                            &["PLAYSND", file, bus, mode, "800", "0"].map(str::to_owned),
+                            &mut blocks,
+                        )
+                        .unwrap();
+                }
+                // No cancellation operation runs before the replacement's
+                // preparation barrier, even for an explicit same-track play.
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks
+                    .iter()
+                    .all(|b| b["ops"].as_array().unwrap().is_empty()));
+                let first = blocks[0]["terminator"]["cue"].as_str().unwrap();
+                let replacement = blocks[1]["terminator"]["cue"].as_str().unwrap();
+                assert_eq!(adapter.cues[first]["effects"].as_array().unwrap().len(), 1);
+                let effects = adapter.cues[replacement]["effects"].as_array().unwrap();
+                assert_eq!(effects.len(), 2);
+                let task = bus.to_lowercase();
+                assert_eq!(
+                    effects[0]["effect"],
+                    json!({"type":"audio_stop",
+                    "target":task,"duration_us":"0"})
+                );
+                assert_eq!(effects[1]["id"], task);
+                assert_eq!(effects[1]["effect"]["type"], "audio");
+                assert_eq!(effects[1]["effect"]["looped"], mode == "REPEAT");
+                assert_eq!(effects[1]["effect"]["gain"], json!(0.8_f32));
+            }
+        }
     }
     #[test]
     fn bgm_stop_preserves_duration_without_blocking_pass_event() {

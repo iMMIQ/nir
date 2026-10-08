@@ -191,6 +191,7 @@ def history_lines(content, count=4):
         blocks[f"history{i}"]={"ops":[],"terminator":{"type":"activate","cue":f"history{i}","next":f"history-wait{i}"}}
         blocks[f"history-wait{i}"]={"ops":[],"terminator":{"type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],"next":f"history{i+1}" if i<count-1 else "enter","on_cancelled":"cancelled","on_failed":"failed"}}
 
+
 def menu_history_assets(project):
     menu_service_assets(project)
     theme=project/"themes/rain/theme.toml"
@@ -233,6 +234,84 @@ def sampled_settings(project):
 sampled_project=build("browser-sampled-reading",sampled_reading,setup=sampled_settings)
 sampled_server=ThreadingHTTPServer(("127.0.0.1",4210),partial(SimpleHTTPRequestHandler,directory=str(sampled_project)))
 Thread(target=sampled_server.serve_forever,daemon=True).start()
+
+def voice_preference(content):
+    sampled_reading(content)
+    content["cues"]["intro"]["effects"][0]["effect"]["reveal_us"] = "0"
+    for definition in content["cues"]["intro"]["effects"]:
+        if definition["id"] == "spoken":
+            # Original neutral music (8 s) is also a long non-looping voice
+            # here, leaving enough time to verify a real auto advance.
+            definition["effect"]["asset"] = "audio.bgm"
+
+def voice_preference_settings(project):
+    sampled_settings(project)
+    config = project / "config/player.toml"
+    config.write_text(config.read_text().replace('auto_delay_us = "500000"', 'auto_delay_us = "100000"'))
+
+voice_pref_project = build("browser-voice-preference", voice_preference, setup=voice_preference_settings)
+voice_pref_server = ThreadingHTTPServer(("127.0.0.1", 4252), partial(SimpleHTTPRequestHandler, directory=str(voice_pref_project)))
+Thread(target=voice_pref_server.serve_forever, daemon=True).start()
+
+def voice_pagination_settings(project):
+    voice_preference_settings(project)
+    for path in (project / "content/ch01/texts").glob("*.json"):
+        texts = json.loads(path.read_text())
+        if "spans" not in texts.get("intro", {}):
+            continue
+        for span in texts["intro"].get("spans", []):
+            if span["type"] == "text":
+                span["text"] = (span["text"] + " ") * 12
+        path.write_text(json.dumps(texts, ensure_ascii=False, indent=2) + "\n")
+    subprocess.run([str(cli), "-p", str(project), "text", "update", "--id", "intro", "--meaning", "bump"], check=True)
+    subprocess.run([str(cli), "-p", str(project), "text", "review", "--id", "intro", "--locale", "en"], check=True)
+    # Extend original neutral fixture audio so viewport assertions measure
+    # player stops before natural completion even on software rendering.
+    import wave
+    path = project / "assets/source/bgm.wav"
+    with wave.open(str(path), "rb") as source:
+        params, frames = source.getparams(), source.readframes(source.getnframes())
+    with wave.open(str(path), "wb") as target:
+        target.setparams(params)
+        target.writeframes(frames * 3)
+
+voice_paging_project = build("browser-voice-pagination", voice_preference, setup=voice_pagination_settings)
+voice_paging_server = ThreadingHTTPServer(("127.0.0.1", 4257), partial(SimpleHTTPRequestHandler, directory=str(voice_paging_project)))
+Thread(target=voice_paging_server.serve_forever, daemon=True).start()
+
+def legacy_loop_voice(content):
+    content["cues"]["intro"]["effects"][0]["effect"]["reveal_us"] = "0"
+    # No DialogueVoice binding: exercise the compatibility scan with real,
+    # finite 8-second MP3 speech and a separate persistent looping Voice.
+    for name, looped in [("spoken", False), ("ambient-voice", True)]:
+        content["cues"]["intro"]["effects"].append({
+            "id": name, "scope": "session", "effect": {
+                "type": "audio", "asset": "audio.bgm", "bus": "voice", "looped": looped}})
+
+legacy_voice_project = build("browser-legacy-loop-voice", legacy_loop_voice, setup=voice_preference_settings)
+legacy_voice_server = ThreadingHTTPServer(("127.0.0.1", 4258), partial(SimpleHTTPRequestHandler, directory=str(legacy_voice_project)))
+Thread(target=legacy_voice_server.serve_forever, daemon=True).start()
+
+def character_voice_settings(project):
+    voice_preference_settings(project)
+    import wave
+    path = project / "assets/source/bgm.wav"
+    with wave.open(str(path), "rb") as source:
+        params, frames = source.getparams(), source.readframes(source.getnframes())
+    with wave.open(str(path), "wb") as target:
+        target.setparams(params)
+        target.writeframes(frames * 3)
+
+def character_voice(content):
+    voice_preference(content)
+    content["cues"]["intro"]["effects"][0]["effect"]["speaker"] = "speaker.aki"
+    content["cues"]["intro"]["effects"].append({
+        "id": "unrelated-voice", "scope": "session", "effect": {
+            "type": "audio", "asset": "audio.bgm", "bus": "voice", "looped": False}})
+
+character_voice_project = build("browser-character-voice", character_voice, setup=character_voice_settings)
+character_voice_server = ThreadingHTTPServer(("127.0.0.1", 4259), partial(SimpleHTTPRequestHandler, directory=str(character_voice_project)))
+Thread(target=character_voice_server.serve_forever, daemon=True).start()
 
 def menu_reading_assets(project):
     menu_service_assets(project)
@@ -325,6 +404,32 @@ history_flow_project=build("browser-history-flow",lambda c:history_lines(c,40),s
 history_flow_server=ThreadingHTTPServer(("127.0.0.1",4218),partial(SimpleHTTPRequestHandler,directory=str(history_flow_project)))
 Thread(target=history_flow_server.serve_forever,daemon=True).start()
 
+def authored_history_voices(content):
+    history_lines(content, 6)
+    for i in range(6):
+        content["cues"][f"history{i}"]["effects"].append({"id":"spoken", "scope":"interaction", "effect":{"type":"audio", "asset":"audio.bgm", "bus":"voice", "looped":False, "gain":1.}})
+        content["functions"]["main"]["blocks"][f"history-wait{i}"]["ops"].append({"id":f"bind-history-voice-{i}", "operation":{"type":"dialogue_voice", "task":"line", "voice":"spoken", "wait":"parallel"}})
+
+def authored_history_voice_assets(project, flow):
+    if flow:
+        history_flow_assets(project)
+    else:
+        menu_history_assets(project)
+    theme=project/"themes/rain/theme.toml"
+    source=theme.read_text().replace('type = "history_flow",','type = "history_flow", voice_controls = true,').replace('type = "history_window",','type = "history_window", voice_controls = true,')
+    if not flow:
+        source=source.replace('rect = [80,120,1120,360]','rect = [80,120,600,360]').replace('row_height = 180','row_height = 160')
+        source += '\n[[image_menus.system.elements]]\nid = "close"\nrect = [80,650,300,60]\ncontent = {type = "button", label = "Close history", asset = "menu.blue", action = {type = "close"}}\n'
+    source += '\n[image_menus.system.locals.shown]\ntype = "bool"\ninitial = true\n'
+    source=source.replace('id = "records"','id = "records"\nvisible_when = [{type = "local", name = "shown", equals = true}]')
+    source += '\n[[image_menus.system.elements]]\nid = "hide-records"\nrect = [800,560,350,80]\ncontent = {type = "hit_region", label = "Hide records", action = {type = "set_local", local = "shown", value = false}}\n'
+    theme.write_text(source)
+
+for name, port, flow in [("window",4254,False),("flow",4255,True)]:
+    project=build(f"browser-authored-history-{name}", authored_history_voices, setup=lambda project,flow=flow:authored_history_voice_assets(project,flow))
+    server=ThreadingHTTPServer(("127.0.0.1",port),partial(SimpleHTTPRequestHandler,directory=str(project)))
+    Thread(target=server.serve_forever,daemon=True).start()
+
 def navigation_assets(project):
     menu_service_assets(project)
     theme=project/"themes/rain/theme.toml"
@@ -364,6 +469,7 @@ def menu_effects_assets(project):
     source += '\n[image_menus.title.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
     source += '\n[image_menus.title.effects.music]\nasset = "audio.bgm"\n'
     source += '\n[[image_menus.title.elements]]\nid = "start"\nrect = [80,100,400,80]\ncontent = { type = "button", label = "Start", asset = "menu.blue", action = {type = "new_game"} }\n'
+    source += '\n[[image_menus.title.elements]]\nid = "open-page"\nrect = [80,240,400,80]\ncontent = { type = "button", label = "Open subpage", asset = "menu.blue", action = {type = "menu", menu = "system"} }\n'
     source += '\n[image_menus.system]\nbackground = "menu.black"\nbuttons = []\n'
     source += '\n[image_menus.system.effects]\nclick = "audio.bell"\n'
     source += '\n[image_menus.system.effects.enter]\nsound = "audio.bell"\nfade_us = "400000"\n'
@@ -513,6 +619,15 @@ typed_project=build("browser-typed-result",typed_result)
 typed_server=ThreadingHTTPServer(("127.0.0.1",4223),partial(SimpleHTTPRequestHandler,directory=str(typed_project)))
 Thread(target=typed_server.serve_forever,daemon=True).start()
 
+def timed_history_choice(content):
+    typed_result(content)
+    content["choices"]["route"]["timeout_us"] = "1000000"
+    content["choices"]["route"]["default"] = "stay"
+
+timed_history_project=build("browser-history-choice-timeout",timed_history_choice)
+timed_history_server=ThreadingHTTPServer(("127.0.0.1",4253),partial(SimpleHTTPRequestHandler,directory=str(timed_history_project)))
+Thread(target=timed_history_server.serve_forever,daemon=True).start()
+
 window_project=build("browser-window-reveal",window_reveal,setup=window_assets)
 window_server=ThreadingHTTPServer(("127.0.0.1",4216),partial(SimpleHTTPRequestHandler,directory=str(window_project)))
 Thread(target=window_server.serve_forever,daemon=True).start()
@@ -520,7 +635,61 @@ Thread(target=window_server.serve_forever,daemon=True).start()
 wipe_project=build("browser-wipe-project",wipe)
 wipe_server=ThreadingHTTPServer(("127.0.0.1",4201),partial(SimpleHTTPRequestHandler,directory=str(wipe_project)))
 Thread(target=wipe_server.serve_forever,daemon=True).start()
+def weak_network(content):
+    # Distinct stable colors make an early scene switch observable in actual
+    # pixels, while the next scene still requires a separately fetched image.
+    content["scenes"]["station"] = [{"id": "red", "x": 0, "y": 0, "width": 1280, "height": 720, "color": [1., 0., 0., 1.]}]
+    content["scenes"]["together"].insert(0, {"id": "blue", "x": 0, "y": 0, "width": 1280, "height": 720, "color": [0., 0., 1., 1.]})
+    content["scenes"]["together"] = [n for n in content["scenes"]["together"] if n["id"] != "background"]
+    content["cues"]["intro"]["effects"][0]["effect"]["reveal_us"] = "0"
+    content["cues"]["enter"]["effects"][0]["effect"]["duration_us"] = "0"
+    content["cues"]["opening"]["effects"].append({"id": "ambience", "scope": "session", "effect": {
+        "type": "audio", "asset": "audio.bell", "bus": "sfx", "looped": True}})
+
+weak_network_project = build("browser-weak-network", weak_network)
+weak_network_server = ThreadingHTTPServer(("127.0.0.1", 4260), partial(SimpleHTTPRequestHandler, directory=str(weak_network_project)))
+Thread(target=weak_network_server.serve_forever, daemon=True).start()
+
+# The resource accounting specs use the same canonical effect fixtures at
+# dedicated ports, without rebuilding duplicate projects in the full suite.
+for memory_port, memory_web in [(4262, wipe_project), (4263, window_project), (4264, wipe_menu_project), (4265, weak_network_project)]:
+    memory_server = ThreadingHTTPServer(("127.0.0.1", memory_port), partial(SimpleHTTPRequestHandler, directory=str(memory_web)))
+    Thread(target=memory_server.serve_forever, daemon=True).start()
+
+def budget_audio(content):
+    weak_network(content)
+    # Audio and picture must be in one activation to test an atomic failure.
+    # The ordinary example's voice starts in the *following* arrival cue.
+    voice = next(d for d in content["cues"]["arrival"]["effects"] if d["effect"]["type"] == "audio")
+    content["cues"]["arrival"]["effects"].remove(voice)
+    voice["scope"] = "scene"
+    content["cues"]["enter"]["effects"].append(voice)
+
+budget_audio_project = build("browser-budget-audio", budget_audio)
+budget_audio_server = ThreadingHTTPServer(("127.0.0.1", 4266), partial(SimpleHTTPRequestHandler, directory=str(budget_audio_project)))
+Thread(target=budget_audio_server.serve_forever, daemon=True).start()
+
+def loop_endpoint(content):
+    weak_network(content)
+    music = next(d for d in content["cues"]["opening"]["effects"] if d["effect"].get("asset") == "audio.bgm")
+    music["effect"]["loop_region"] = {"start_us": "7800000", "end_us": "8000000"}
+
+loop_endpoint_project = build("browser-loop-endpoint", loop_endpoint)
+loop_endpoint_server = ThreadingHTTPServer(("127.0.0.1", 4267), partial(SimpleHTTPRequestHandler, directory=str(loop_endpoint_project)))
+Thread(target=loop_endpoint_server.serve_forever, daemon=True).start()
+
 main = build("browser-project", effects)
+
+def loop_region(content):
+    for cue in content["cues"].values():
+        for definition in cue["effects"]:
+            effect = definition["effect"]
+            if effect["type"] == "audio" and effect.get("looped"):
+                effect["loop_region"] = {"start_us": "200000", "end_us": "600000"}
+
+loop_project = build("browser-loop-region", loop_region)
+loop_server = ThreadingHTTPServer(("127.0.0.1", 4250), partial(SimpleHTTPRequestHandler, directory=str(loop_project)))
+Thread(target=loop_server.serve_forever, daemon=True).start()
 reader = build("browser-reading-project", reading)
 paused_reader = build("browser-hide-project", reading, "pause_story")
 hide_server = ThreadingHTTPServer(("127.0.0.1", 4200), partial(SimpleHTTPRequestHandler, directory=str(paused_reader)))

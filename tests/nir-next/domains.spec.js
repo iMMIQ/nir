@@ -15,7 +15,7 @@ test('real device clocks isolate menu playback from Story and background suspens
   await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
   await page.keyboard.press('Enter');
   await page.waitForFunction(()=>window.__nir.state().dialogue && window.deviceClocks.every(c=>c.state==='running'));
-  expect(await page.evaluate(()=>window.deviceClocks.length)).toBe(2);
+  expect(await page.evaluate(()=>window.deviceClocks.length)).toBe(4);
   // Exercise the real foreground sample clock with an original silent buffer.
   // Declarative menu-media binding is a later phase; this checks the host route.
   await page.evaluate(()=>{
@@ -25,17 +25,16 @@ test('real device clocks isolate menu playback from Story and background suspens
     window.foregroundProbe=source;
   });
   await page.evaluate(()=>window.__nir.action({type:'menu'}));
-  await page.waitForFunction(()=>window.deviceClocks[0].state==='suspended'&&window.deviceClocks[1].state==='running');
-  const logical=await page.evaluate(()=>({story:window.__nir.state().tick_us,ui:Number(window.__nir.state().foreground_clock_us)}));
+  await page.waitForFunction(()=>window.deviceClocks[0].state==='running'&&window.deviceClocks[1].state==='running'&&window.deviceClocks[2].state==='suspended'&&window.deviceClocks[3].state==='suspended');
+  const logical=await page.evaluate(()=>({story:window.__nir.state().tick_us}));
   const menu=await page.evaluate(()=>window.deviceClocks.map(c=>c.currentTime));
   await page.waitForTimeout(250);
   const later=await page.evaluate(()=>window.deviceClocks.map(c=>c.currentTime));
-  // Request an owner turn while staying in the menu. The host must dispatch UI
-  // elapsed even though the Story route is paused; no test-only clock API.
-  await page.evaluate(()=>window.__nir.action({type:'menu'}));
-  await page.waitForFunction(ui=>Number(window.__nir.state().foreground_clock_us)>ui+100000,logical.ui);
+  // The foreground device clock advances even when no authored UI animation
+  // holds a logical foreground clock lease. Page fades are tested separately.
   expect(await page.evaluate(()=>window.__nir.state().tick_us)).toBe(logical.story);
-  expect(later[0]).toBe(menu[0]);
+  expect(later[0]-menu[0]).toBeGreaterThan(.1);
+  expect(later[2]).toBe(menu[2]);expect(later[3]).toBe(menu[3]);
   expect(later[1]-menu[1]).toBeGreaterThan(.1);
   await page.evaluate(()=>window.__nir.hidden(true));
   await page.waitForFunction(()=>window.deviceClocks.every(c=>c.state==='suspended'));
@@ -44,7 +43,8 @@ test('real device clocks isolate menu playback from Story and background suspens
   expect(await page.evaluate(()=>window.deviceClocks.map(c=>c.currentTime))).toEqual(hidden);
   await page.evaluate(()=>window.__nir.hidden(false));
   await page.waitForFunction(()=>window.deviceClocks[1].state==='running');
-  expect(await page.evaluate(()=>window.deviceClocks[0].state)).toBe('suspended');
+  expect(await page.evaluate(()=>window.deviceClocks[0].state)).toBe('running');
+  expect(await page.evaluate(()=>window.deviceClocks[2].state)).toBe('suspended');
   await page.evaluate(()=>{window.foregroundProbe.stop();window.foregroundProbe.disconnect();window.__nir.action({type:'close'});});
   await page.waitForFunction(()=>window.deviceClocks.every(c=>c.state==='running'));
   expect(errors).toEqual([]);

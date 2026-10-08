@@ -67,7 +67,9 @@ test('device loss recovers on the selected backend', async ({ page }, info) => {
   await page.waitForFunction(() => window.__nir.state().dialogue && !window.__nir.state().loading);
   const before=await state(page);
   if(backend==='webgl2') {
-    await page.evaluate(() => {
+    if((await state(page)).execution.runtime==='worker'){
+      for(const worker of page.workers())if(await worker.evaluate(()=>self.__nirWorker?.role)==='runtime')await worker.evaluate(()=>__nirWorker.loseContext());
+    }else await page.evaluate(() => {
       const gl=document.querySelector('#stage').getContext('webgl2');
       const extension=gl.getExtension('WEBGL_lose_context');
       if(!extension) throw Error('WEBGL_lose_context unavailable');
@@ -93,10 +95,10 @@ test('auto falls back when WebGPU initialization fails; forced WebGPU fails expl
       };
     }
   });
-  await page.goto('/?test=1'); await ready(page);
+  await page.goto('/?test=1&worker=main'); await ready(page);
   expect((await state(page)).backend).toBe('webgl2');
   expectPainted(await page.locator('#stage').screenshot());
-  await page.goto('/?test=1&backend=webgpu');
+  await page.goto('/?test=1&worker=main&backend=webgpu');
   await expect(page.locator('#shell-message')).toContainText(/GPU|adapter|backend/i);
   expect(await page.evaluate(() => Boolean(window.__nir))).toBe(false);
 });

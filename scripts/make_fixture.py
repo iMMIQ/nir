@@ -167,9 +167,12 @@ for name,secs in [('bgm',8),('bell',.8),('voice',1.2)]:
   buf.append(struct.pack('<h',int(v*32767)))
  with wave.open(str(out/f'assets/source/{name}.wav'),'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(rate);w.writeframes(b''.join(buf))
 # Subset a licensed SC face; preserve shaping closure. Include all UI strings from the source.
-ui='开始阅读继续阅读返回设置存档读档回看历史回退保存读取导出导入语言正文界面字号声音音乐语音音效减少动态自动已读快进暂停恢复重试返回标题加载中下一段生效浏览器已保存没有存档读取失败存档冲突正在保存已完成结局雨后书简返回故事关闭选择确认第章首版阅读体验测试合成配音新的开始走回家读完信画面加载失败资源准备中作品测试简体中文英文阅读进度菜单无障碍大字小字当前静音键盘空格推进方向选择取消打开按继续任务文字恢复成功失败删除确认错误准备完成设备丢失正在恢复本地存档存储容量不足最近保存尚未阅读重玩夜雨车站沿河同行留下读信创建属于自己的故事'
+ui='角色语音静音取消静音开始阅读继续阅读返回设置存档读档回看历史回退保存读取导出导入语言正文界面字号声音音乐语音音效减少动态自动已读快进暂停恢复重试返回标题加载中下一段生效浏览器已保存没有存档读取失败存档冲突正在保存已完成结局雨后书简返回故事关闭选择确认第章首版阅读体验测试合成配音新的开始走回家读完信画面加载失败资源准备中作品测试简体中文英文阅读进度菜单无障碍大字小字当前静音键盘空格推进方向选择取消打开按继续任务文字恢复成功失败删除确认错误准备完成设备丢失正在恢复本地存档存储容量不足最近保存尚未阅读重玩夜雨车站沿河同行留下读信创建属于自己的故事'
 ui += ''.join(p.read_text() for p in (ROOT/'crates/nir-presentation').rglob('*.ftl')) + ''.join(p.read_text() for p in (ROOT/'crates/nir-presentation/src').rglob('*.rs'))
-font=TTFont('/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',fontNumber=2)
+ui += '翻页语音续播关闭后翻页停止本句语音；快进总会停止。作者设置的停止仍然生效。'
+# Keep source glyph coverage aligned with the player's localized UI copy.
+ui += ''.join(p.read_text() for p in (ROOT/'crates/nir-presentation/messages').glob('*.ftl'))
+font=TTFont(ROOT/'templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf',recalcTimestamp=False)
 options=subset.Options();options.layout_features=['*'];sub=subset.Subsetter(options=options);sub.populate(text=''.join(t for pair in lines.values() for t in pair)+ui+'你愿意收下吗？Will you take it?'+''.join(chr(i) for i in range(32,127))+' →←↗•—…–·％１２３４５６７８９０');sub.subset(font);font.save(out/'assets/source/reader.otf')
 shutil.copy('/usr/share/licenses/noto-fonts-cjk/LICENSE',out/'credits/FONT-LICENSE.txt')
 (out/'credits/README.md').write_text('# 素材来源\n\n背景、角色、音乐和测试提示音由 scripts/make_fixture.py 原创生成，以 CC0-1.0 提供。voice.wav 是合成测试音，不是真人配音。\n\n字体来自 Noto Sans CJK SC，按 SIL Open Font License 1.1 分发；附完整许可。示例字体为保留 OpenType 塑形闭包的子集。新增文字时必须补充字体覆盖。\n')

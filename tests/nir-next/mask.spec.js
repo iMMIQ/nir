@@ -38,7 +38,7 @@ for(const [port,invert] of [[4202,false],[4203,true]])test(`alpha texture mask r
     expect(before[i][1]).toBeLessThan(5);
   }
   await page.evaluate(()=>window.__nir.action({type:'save',slot:2}));
-  await page.waitForFunction(()=>/Saved in this browser|浏览器已保存/.test(window.__nir.state().status));
+  await page.waitForFunction(()=>/Saved|已保存/.test(window.__nir.state().status));
   await page.evaluate(()=>window.__nir.hidden(false));
   await page.waitForFunction(()=>window.__nir.state().transition===null);
   const session=await page.evaluate(()=>window.__nir.state().session);

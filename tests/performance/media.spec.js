@@ -26,7 +26,7 @@ test('M3 bounded media lookahead paired transitions', async ({ browser }) => {
           await page.goto(`${fixture.origin}/?test=1`);
           await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
           if (process.env.NIR_PERF_MODE === 'hardware')
-            assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nirActualAdapters]));
+            assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nir.actualAdapters()]));
           await startCapture(page);
           const transitions = [], story = [];
           for (const [index, step] of fixture.steps.entries()) {
@@ -57,7 +57,7 @@ test('M3 bounded media lookahead paired transitions', async ({ browser }) => {
           else expect(predictions).toEqual([]);
           const d = await page.evaluate(() => window.__nir.diagnostics());
           report.runs.push({ repetition, enabled: fixture.prefetchMedia, release: d.release, engine: d.engine,
-            actualAdapters: await page.evaluate(() => window.__nirActualAdapters), story, transitions, capture });
+            actualAdapters: await page.evaluate(() => window.__nir.actualAdapters()), story, transitions, capture });
         } finally { await context.close(); }
       }
     }

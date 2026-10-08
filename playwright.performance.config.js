@@ -2,6 +2,7 @@ import base from './playwright.config.js';
 export default {
   ...base,
   testDir: './tests/performance',
+  testIgnore: 'reading-endurance.spec.js',
   timeout: 900000,
   expect: { ...base.expect, timeout: 30000 },
   use: {

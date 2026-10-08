@@ -1,4 +1,5 @@
 import {test,expect} from '@playwright/test';
+import {recoverAudioOutput} from './audio-output-helper.js';
 
 test('sampled Auto retains the device remainder after early voice completion',async({page})=>{
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
@@ -18,11 +19,16 @@ test('sampled Auto retains the device remainder after early voice completion',as
   await page.waitForFunction(()=>window.__nir?.state().ready&&!window.__nir.state().loading);
   await page.keyboard.press('Enter');
   await page.waitForFunction(()=>window.__nir.state().dialogue&&!window.__nir.state().loading&&window.voiceAudit.length);
-  const before=await page.evaluate(async()=>{
-    await window.__nir.action({type:'advance'});
+  await recoverAudioOutput(page);
+  await page.evaluate(()=>window.__nir.action({type:'advance'}));
+  await page.waitForFunction(()=>__nir.state().dialogue?.ready&&!__nir.state().paused);
+  await page.evaluate(()=>window.__nir.action({type:'toggle_auto'}));
+  // A debug action can return false while it recovers output. Observe the
+  // committed Auto state before injecting the device completion.
+  await page.waitForFunction(()=>__nir.state().auto&&!__nir.state().paused);
+  const before=await page.evaluate(()=>{
     const s=window.__nir.state(),v=window.voiceAudit.at(-1);
     const remaining=Math.max(0,v.duration-(v.context.currentTime-v.started+v.offset));
-    await window.__nir.action({type:'toggle_auto'});
     v.source.stop();
     return {interaction:s.interaction,tick:Number(s.tick_us),remaining};
   });

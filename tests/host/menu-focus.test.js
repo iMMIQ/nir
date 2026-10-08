@@ -1,6 +1,14 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {focusIdentity,samePointerTarget} from '../../crates/nir-platform-web/host.js';
+
+test('history voice focus follows the row while pointer release rechecks playback and layout',()=>{
+  const a={type:'menu_history_voice',instance:1,revision:2,window:'records',layout:3,entry:7,stop:false};
+  const identity=a=>focusIdentity(JSON.stringify(a));
+  assert.equal(identity(a),identity({...a,revision:3,layout:4,stop:true}));
+  for(const changed of [{instance:2},{window:'other'},{entry:8}])assert.notEqual(identity(a),identity({...a,...changed}));
+  for(const changed of [{revision:3},{layout:4},{stop:true}])assert.ok(!samePointerTarget(a,{...a,...changed}));
+});
 test('menu focus identity excludes only revision, retaining instance and control identity',()=>{
   const action=(instance,revision,control)=>JSON.stringify({type:'menu_control',instance,revision,control});
   assert.equal(focusIdentity(action(1,0,'tab')),focusIdentity(action(1,1,'tab')));

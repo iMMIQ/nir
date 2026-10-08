@@ -50,6 +50,32 @@ pub struct RenderProfile {
     pub end_us: u64,
 }
 
+/// Logical allocations owned by this compositor, excluding glyph atlases,
+/// swapchain images and driver overhead. This is not physical GPU residency.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResourceMemory {
+    pub image_texture_bytes: u64,
+    pub image_upload_texture_bytes: u64,
+    pub image_upload_pixel_bytes: u64,
+    pub transition_texture_bytes: u64,
+    pub window_texture_bytes: u64,
+    pub menu_texture_bytes: u64,
+    pub vertex_buffer_bytes: u64,
+    pub image_texture_count: usize,
+    pub image_upload_count: usize,
+}
+
+impl ResourceMemory {
+    pub fn accounted_gpu_bytes(&self) -> u64 {
+        self.image_texture_bytes
+            + self.image_upload_texture_bytes
+            + self.transition_texture_bytes
+            + self.window_texture_bytes
+            + self.menu_texture_bytes
+            + self.vertex_buffer_bytes
+    }
+}
+
 #[derive(Default)]
 struct ProfileCollector {
     clock: Option<fn() -> u64>,
@@ -556,6 +582,30 @@ impl Renderer {
     pub fn has_image(&self, id: &str) -> bool {
         self.textures.contains_key(id)
     }
+    pub fn resource_memory(&self) -> ResourceMemory {
+        let bytes = |t: &Texture| {
+            u64::from(t._texture.width())
+                * u64::from(t._texture.height())
+                * u64::from(t._texture.format().block_copy_size(None).unwrap_or(0))
+        };
+        ResourceMemory {
+            image_texture_bytes: self.textures.values().map(bytes).sum(),
+            image_upload_texture_bytes: self.uploads.values().map(|u| bytes(&u.texture)).sum(),
+            image_upload_pixel_bytes: self.uploads.values().map(|u| u.pixels.len() as u64).sum(),
+            transition_texture_bytes: self
+                .scratch
+                .as_ref()
+                .map_or(0, |(a, b, _, _)| bytes(a) + bytes(b)),
+            window_texture_bytes: self.window_root.as_ref().map_or(0, |(t, _, _)| bytes(t)),
+            menu_texture_bytes: self
+                .menu_roots
+                .as_ref()
+                .map_or(0, |(a, b, _, _)| bytes(a) + bytes(b)),
+            vertex_buffer_bytes: self.vertices.size(),
+            image_texture_count: self.textures.len(),
+            image_upload_count: self.uploads.len(),
+        }
+    }
     pub fn image_started(&self, request: u32, id: &str) -> bool {
         self.has_image(id) || self.uploads.get(id).is_some_and(|u| u.request == request)
     }
@@ -753,6 +803,11 @@ impl Renderer {
             .retain(|id, _| id.is_empty() || id == "@transparent" || ids.contains(id));
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
+        // Reprepare every text layer together. The previous preparation may
+        // have been a cancelled preview or a failed pass without a present.
+        // Its pins must not prevent this complete preparation from evicting
+        // glyphs; keep the new pins until all layers have been submitted.
+        self.atlas.trim();
         let layout_start = self.profile_start();
         let paint_runs: std::borrow::Cow<'_, [nir_presentation::TextRun]> =
             if p.texts.iter().any(|r| r.shadow.is_some()) {
@@ -1159,6 +1214,19 @@ impl Renderer {
         }
     }
     pub fn render(&mut self, p: &DrawPacket, dpr: f32) -> Result<()> {
+        // Effect targets belong to the currently projected effect. Keeping a
+        // finished transition's full-size textures would retain its peak cost
+        // for the rest of the session. Submitted commands own their resources
+        // until GPU settlement; dropping our handles does not cancel a frame.
+        if p.transition_layers.is_none() {
+            self.scratch = None;
+        }
+        if p.window_layers.is_none() {
+            self.window_root = None;
+        }
+        if p.menu_layers.is_none() {
+            self.menu_roots = None;
+        }
         if self.surface.is_none() {
             // Released for window destruction (Android suspend): drop the
             // frame instead of presenting; the rebind repaints.
@@ -1478,6 +1546,9 @@ impl Renderer {
         let present_start = self.profile_start();
         frame.present();
         self.profile_end("present", present_start);
+        // All text layers for this frame are submitted; retire their pins
+        // together so no current-frame layer can evict another layer.
+        self.atlas.trim();
         self.submitted += 1;
         Ok(())
     }

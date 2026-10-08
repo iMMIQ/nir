@@ -59,6 +59,472 @@ fn start(p: Program) -> Core {
     assert!(c.state().fault.is_none(), "{:?}", c.state().fault);
     c
 }
+
+fn plain_reading(mut p: Program) -> Core {
+    p.cues.get_mut("test").unwrap().effects.push(EffectDef {
+        id: "hold-clock".into(),
+        scope: Scope::Session,
+        effect: Effect::Delay {
+            duration_us: Micros(10_000_000),
+        },
+    });
+    let Effect::Dialogue { text, .. } = &mut p.cues.get_mut("test").unwrap().effects[0].effect
+    else {
+        unreachable!()
+    };
+    *text = "intro".into();
+    let blocks = &mut p.functions.get_mut("main").unwrap().blocks;
+    blocks.get_mut("test").unwrap().terminator =
+        serde_json::from_value(json!({"type":"activate","cue":"test","next":"bind"})).unwrap();
+    blocks.get_mut("bind").unwrap().terminator = serde_json::from_value(
+        json!({"type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],"next":"hold","on_cancelled":"done","on_failed":"done"}),
+    ).unwrap();
+    blocks.insert("hold".into(), serde_json::from_value(
+        json!({"terminator":{"type":"await","conditions":[{"task":"hold-clock","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}}),
+    ).unwrap());
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "reading".into(),
+        "en".into(),
+    )
+    .unwrap();
+    c.step(CoreInput::None, 1000);
+    let activation = c.state().pending.as_ref().unwrap().id;
+    c.step(CoreInput::Prepared { activation }, 1000);
+    assert!(c.state().fault.is_none(), "{:?}", c.state().fault);
+    c
+}
+
+fn stop_on_advance(c: &mut Core, interaction: u32, sequence: u32) -> CoreStep {
+    c.step(
+        CoreInput::AdvanceReading {
+            interaction,
+            sequence,
+            stop_voice: true,
+        },
+        1000,
+    )
+}
+
+#[test]
+fn voice_stop_is_atomic_with_real_completion_and_ignores_reveal_gate_and_stale_inputs() {
+    let mut c = plain_reading(program());
+    let interaction = c.dialogue().unwrap().1.interaction;
+    let voice = c.state().handles["voice"];
+    let other = c.state().handles["other"];
+    let rejected = stop_on_advance(&mut c, interaction + 1, 1);
+    assert!(rejected.intents.is_empty());
+    assert_eq!(c.state().last_input, 0);
+    let reveal = stop_on_advance(&mut c, interaction, 1);
+    assert!(c.dialogue().unwrap().1.awaiting_advance);
+    assert!(!reveal
+        .intents
+        .iter()
+        .any(|i| matches!(i, CoreIntent::AudioStop { .. })));
+    assert!(stop_on_advance(&mut c, interaction, 1).intents.is_empty());
+    let complete = stop_on_advance(&mut c, interaction, 2);
+    assert_eq!(
+        c.state().tasks[&voice].end_reason,
+        Some(TaskEndReason::CancelledByControl)
+    );
+    assert_eq!(c.state().tasks[&other].state, TaskState::Running);
+    assert_eq!(
+        complete
+            .intents
+            .iter()
+            .filter(|i| matches!(i, CoreIntent::AudioStop { task } if *task == voice))
+            .count(),
+        1
+    );
+    assert!(!c.state().tasks[&voice]
+        .milestones
+        .contains(&Milestone::Finished));
+    let late = c.step(CoreInput::AudioEnded { task: voice }, 1000);
+    assert!(!late
+        .intents
+        .iter()
+        .any(|i| matches!(i, CoreIntent::AudioStop { .. })));
+    assert_eq!(
+        c.state().tasks[&voice].end_reason,
+        Some(TaskEndReason::CancelledByControl)
+    );
+
+    let mut gated = start(program());
+    let interaction = gated.dialogue().unwrap().1.interaction;
+    assert!(gated.dialogue().unwrap().1.at_gate);
+    assert!(!stop_on_advance(&mut gated, interaction, 2)
+        .intents
+        .iter()
+        .any(|i| matches!(i, CoreIntent::AudioStop { .. })));
+    assert!(gated.dialogue().unwrap().1.at_gate);
+    assert_eq!(
+        gated.state().tasks[&gated.state().handles["voice"]].state,
+        TaskState::Running
+    );
+}
+
+#[test]
+fn stopping_multiple_bound_phrases_survives_restore_and_history_eviction() {
+    let mut p = program();
+    let asset = match &p.cues["test"].effects[1].effect {
+        Effect::Audio { asset, .. } => asset.clone(),
+        _ => unreachable!(),
+    };
+    for i in 0..MAX_HISTORY_VOICES {
+        let name = format!("phrase-{i}");
+        p.cues.get_mut("test").unwrap().effects.push(EffectDef {
+            id: name.clone(),
+            scope: Scope::Session,
+            effect: Effect::Audio {
+                asset: asset.clone(),
+                bus: AudioBus::Voice,
+                looped: false,
+                loop_region: None,
+                gain: 1.,
+            },
+        });
+        p.functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("bind")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: format!("bind-{i}"),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: Some(name),
+                    wait: VoiceWaitPolicy::Parallel,
+                },
+            });
+    }
+    let original = plain_reading(p);
+    assert!(original.state().history.is_empty());
+    assert_eq!(
+        original
+            .dialogue()
+            .unwrap()
+            .1
+            .reading
+            .as_ref()
+            .unwrap()
+            .active_voices
+            .len(),
+        MAX_HISTORY_VOICES + 1
+    );
+    let mut c = Core::restore(
+        original.validated_program().clone(),
+        original.snapshot(),
+        "reading",
+    )
+    .unwrap();
+    let interaction = c.dialogue().unwrap().1.interaction;
+    stop_on_advance(&mut c, interaction, 1);
+    let complete = stop_on_advance(&mut c, interaction, 2);
+    assert_eq!(
+        complete
+            .intents
+            .iter()
+            .filter(|i| matches!(i, CoreIntent::AudioStop { .. }))
+            .count(),
+        MAX_HISTORY_VOICES + 1
+    );
+    assert_eq!(
+        c.state().tasks[&c.state().handles["other"]].state,
+        TaskState::Running
+    );
+    assert!(c.state().fault.is_none());
+    Core::restore(c.validated_program().clone(), c.snapshot(), "reading").unwrap();
+}
+
+#[test]
+fn voice_associations_validate_identity_and_live_state_and_migrate_old_snapshots() {
+    let mut c = plain_reading(program());
+    let line = c.state().handles["line"];
+    let voice = c.state().handles["voice"];
+    for invalid in [vec![line], vec![u32::MAX], vec![voice, voice]] {
+        let mut snapshot = c.snapshot();
+        snapshot
+            .tasks
+            .get_mut(&line)
+            .unwrap()
+            .dialogue
+            .as_mut()
+            .unwrap()
+            .reading
+            .as_mut()
+            .unwrap()
+            .active_voices = invalid;
+        assert!(Core::restore(c.validated_program().clone(), snapshot, "reading").is_err());
+    }
+    let mut old = serde_json::to_value(c.snapshot()).unwrap();
+    old["tasks"][line.to_string()]["dialogue"]["reading"]
+        .as_object_mut()
+        .unwrap()
+        .remove("active_voices");
+    let mut restored = Core::restore(
+        c.validated_program().clone(),
+        serde_json::from_value(old).unwrap(),
+        "reading",
+    )
+    .unwrap();
+    let interaction = restored.dialogue().unwrap().1.interaction;
+    stop_on_advance(&mut restored, interaction, 1);
+    stop_on_advance(&mut restored, interaction, 2);
+    assert_eq!(
+        restored.state().tasks[&voice].end_reason,
+        Some(TaskEndReason::CancelledByControl)
+    );
+
+    c.step(CoreInput::AudioEnded { task: voice }, 1000);
+    assert!(c
+        .dialogue()
+        .unwrap()
+        .1
+        .reading
+        .as_ref()
+        .unwrap()
+        .active_voices
+        .is_empty());
+    let mut bad = c.snapshot();
+    bad.tasks
+        .get_mut(&line)
+        .unwrap()
+        .dialogue
+        .as_mut()
+        .unwrap()
+        .reading
+        .as_mut()
+        .unwrap()
+        .active_voices = vec![voice];
+    assert!(Core::restore(c.validated_program().clone(), bad, "reading").is_err());
+    Core::restore(c.validated_program().clone(), c.snapshot(), "reading").unwrap();
+}
+
+#[test]
+fn explicit_unvoiced_reading_and_looped_voice_are_not_stopped_by_legacy_policy() {
+    for explicit_none in [false, true] {
+        let mut p = program();
+        let Effect::Audio { looped, .. } = &mut p.cues.get_mut("test").unwrap().effects[2].effect
+        else {
+            unreachable!()
+        };
+        *looped = true;
+        let ops = &mut p
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("bind")
+            .unwrap()
+            .ops;
+        if explicit_none {
+            let Operation::DialogueVoice { voice, .. } = &mut ops[0].operation else {
+                unreachable!()
+            };
+            *voice = None;
+        } else {
+            ops.clear();
+        }
+        let mut c = plain_reading(p);
+        let interaction = c.dialogue().unwrap().1.interaction;
+        stop_on_advance(&mut c, interaction, 1);
+        stop_on_advance(&mut c, interaction, 2);
+        assert_eq!(
+            c.state().tasks[&c.state().handles["voice"]].state,
+            if explicit_none {
+                TaskState::Running
+            } else {
+                TaskState::Cancelled
+            }
+        );
+        assert_eq!(
+            c.state().tasks[&c.state().handles["other"]].state,
+            TaskState::Running
+        );
+        assert!(c.state().fault.is_none());
+    }
+}
+#[test]
+fn history_records_only_bound_instances_in_order_and_deduplicates_rebinding() {
+    let mut p = program();
+    let ops = &mut p
+        .functions
+        .get_mut("main")
+        .unwrap()
+        .blocks
+        .get_mut("bind")
+        .unwrap()
+        .ops;
+    for (id, voice) in [
+        ("same-again", "voice"),
+        ("second-phrase", "other"),
+        ("same-second", "other"),
+    ] {
+        ops.push(Op {
+            id: id.into(),
+            operation: Operation::DialogueVoice {
+                task: "line".into(),
+                voice: Some(voice.into()),
+                wait: VoiceWaitPolicy::Parallel,
+            },
+        });
+    }
+    let c = start(p);
+    let record = c.state().history.last().unwrap();
+    assert_eq!(record.interaction, c.dialogue().unwrap().1.interaction);
+    assert_eq!(
+        record.voices.iter().map(|v| v.instance).collect::<Vec<_>>(),
+        [c.state().handles["voice"], c.state().handles["other"]]
+    );
+    assert!(record
+        .voices
+        .iter()
+        .all(|v| v.gain == 1. && c.program().asset_kind(&v.asset) == Some(AssetKind::Audio)));
+    Core::restore(c.validated_program().clone(), c.snapshot(), "reading").unwrap();
+}
+
+#[test]
+fn restored_dialogue_keeps_its_history_voice_association_at_the_next_gate_binding() {
+    let mut p = program();
+    p.functions
+        .get_mut("main")
+        .unwrap()
+        .blocks
+        .get_mut("continue")
+        .unwrap()
+        .ops
+        .insert(
+            0,
+            Op {
+                id: "bind-second-phrase".into(),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: Some("other".into()),
+                    wait: VoiceWaitPolicy::Parallel,
+                },
+            },
+        );
+    let original = start(p);
+    let interaction = original.dialogue().unwrap().1.interaction;
+    let voice = original.state().handles["voice"];
+    let other = original.state().handles["other"];
+    let mut restored = Core::restore(
+        original.validated_program().clone(),
+        original.snapshot(),
+        "reading",
+    )
+    .unwrap();
+    let fresh = restored.dialogue().unwrap().1.interaction;
+    assert_ne!(
+        fresh, interaction,
+        "old host input must remain stale after restore"
+    );
+    assert_eq!(restored.state().history.last().unwrap().interaction, fresh);
+    restored.step(CoreInput::AudioEnded { task: voice }, 1000);
+    assert!(restored.state().fault.is_none());
+    assert_eq!(
+        restored
+            .state()
+            .history
+            .last()
+            .unwrap()
+            .voices
+            .iter()
+            .map(|v| v.instance)
+            .collect::<Vec<_>>(),
+        [voice, other]
+    );
+}
+
+#[test]
+fn a_history_voice_budget_evicts_the_record_without_faulting_authored_reading() {
+    let mut p = program();
+    let Effect::Audio { asset, .. } = &p.cues["test"].effects[1].effect else {
+        unreachable!()
+    };
+    let asset = asset.clone();
+    for i in 0..MAX_HISTORY_VOICES {
+        let name = format!("voice-{i}");
+        p.cues.get_mut("test").unwrap().effects.push(EffectDef {
+            id: name.clone(),
+            scope: Scope::Session,
+            effect: Effect::Audio {
+                asset: asset.clone(),
+                bus: AudioBus::Voice,
+                looped: false,
+                loop_region: None,
+                gain: 1.,
+            },
+        });
+        p.functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("bind")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: format!("bind-{i}"),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: Some(name),
+                    wait: VoiceWaitPolicy::Parallel,
+                },
+            });
+    }
+    let core = start(p);
+    assert!(core.state().fault.is_none());
+    assert!(
+        core.state().history.is_empty(),
+        "oversized rows are evicted whole"
+    );
+    assert_eq!(
+        core.dialogue().unwrap().1.reading.as_ref().unwrap().voice,
+        Some(core.state().handles[&format!("voice-{}", MAX_HISTORY_VOICES - 1)])
+    );
+}
+
+#[test]
+fn history_voice_restore_rejects_forged_resources_identities_gains_and_limits() {
+    let c = start(program());
+    for bad in 0..7 {
+        let mut snapshot = c.snapshot();
+        let next_id = snapshot.next_id;
+        let entry = snapshot.history.last_mut().unwrap();
+        match bad {
+            0 => entry.voices[0].asset = "font.reader".into(),
+            1 => entry.voices[0].asset = "missing".into(),
+            2 => entry.voices[0].gain = 4.1,
+            3 => entry.voices[0].instance = next_id,
+            4 => entry.interaction = 0,
+            5 => entry.voices.push(entry.voices[0].clone()),
+            _ => entry.voices = vec![entry.voices[0].clone(); MAX_HISTORY_VOICES + 1],
+        }
+        assert!(
+            Core::restore(c.validated_program().clone(), snapshot, "reading").is_err(),
+            "{bad}"
+        );
+    }
+    let mut old = serde_json::to_value(c.snapshot()).unwrap();
+    for entry in old["history"].as_array_mut().unwrap() {
+        entry.as_object_mut().unwrap().remove("voices");
+        entry.as_object_mut().unwrap().remove("interaction");
+        entry.as_object_mut().unwrap().remove("choice");
+    }
+    let restored = Core::restore(
+        c.validated_program().clone(),
+        serde_json::from_value(old).unwrap(),
+        "reading",
+    )
+    .unwrap();
+    assert!(restored
+        .state()
+        .history
+        .iter()
+        .all(|record| record.voices.is_empty()));
+}
 #[test]
 fn voice_can_bind_at_gate_without_consuming_it_and_restore_pins_the_instance() {
     let mut c = start(program());
@@ -212,6 +678,7 @@ fn uncommitted_dialogue_cannot_restore_a_forged_reading_binding() {
         .unwrap()
         .reading = Some(DialogueReading {
         voice: None,
+        active_voices: vec![],
         wait: VoiceWaitPolicy::Parallel,
         revision: 1,
     });

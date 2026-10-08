@@ -2385,6 +2385,7 @@ dependencies = [
 name = "nir-engine"
 version = "0.1.1"
 dependencies = [
+ "js-sys",
  "nir-content",
  "nir-format",
  "nir-player",
@@ -2392,6 +2393,7 @@ dependencies = [
  "nir-render-wgpu",
  "serde",
  "serde_json",
+ "wasm-bindgen",
  "web-sys",
 ]
 
@@ -3079,6 +3081,7 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

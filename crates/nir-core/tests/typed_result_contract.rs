@@ -72,6 +72,288 @@ fn offered(c: &Core) -> &OfferedChoice {
     c.state().choice.as_ref().expect("interaction pending")
 }
 
+#[test]
+fn choice_history_records_only_committed_choices_and_freezes_offered_labels() {
+    for mode in ["plain", "typed"] {
+        let mut c = start(program(mode, Some(&[1, 2]), None));
+        let choice = offered(&c).clone();
+        assert!(c.state().history.is_empty());
+        for (interaction, option, sequence) in [
+            (choice.interaction + 99, "stay", 1),
+            (choice.interaction, "unknown", 2),
+            (choice.interaction, "stay", 0),
+        ] {
+            c.step(
+                CoreInput::Choose {
+                    interaction,
+                    option: option.into(),
+                    sequence,
+                },
+                1000,
+            );
+            assert!(c.state().history.is_empty());
+        }
+        c.step(
+            CoreInput::SelectChoice {
+                interaction: choice.interaction,
+                option: "stay".into(),
+                sequence: 3,
+            },
+            1000,
+        );
+        assert!(
+            c.state().history.is_empty(),
+            "cursor movement is not a committed choice"
+        );
+        c.step(
+            CoreInput::Choose {
+                interaction: choice.interaction,
+                option: "stay".into(),
+                sequence: 4,
+            },
+            1000,
+        );
+        let h = &c.state().history[0];
+        assert_eq!(h.interaction, choice.interaction);
+        assert!(h.voices.is_empty());
+        assert_eq!(h.locale, choice.locale);
+        assert_eq!(h.font_plan_digest, choice.font_plan_digest);
+        assert_eq!(h.text, choice.options[1].label);
+        let record = h.choice.as_ref().unwrap();
+        assert_eq!(record.id, choice.id);
+        assert_eq!(
+            record.resolution,
+            HistoryChoiceResolution::Selected {
+                option: "stay".into()
+            }
+        );
+        assert_eq!(record.options.len(), 2);
+        for (frozen, offered) in record.options.iter().zip(&choice.options) {
+            assert_eq!(frozen.id, offered.id);
+            assert_eq!(frozen.label, offered.label);
+            assert_eq!(frozen.enabled, offered.enabled);
+        }
+        c.step(
+            CoreInput::Choose {
+                interaction: choice.interaction,
+                option: "walk".into(),
+                sequence: 5,
+            },
+            1000,
+        );
+        assert_eq!(
+            c.state().history.len(),
+            1,
+            "duplicate callback cannot append"
+        );
+        let snapshot = c.snapshot();
+        let restored =
+            Core::restore(c.validated_program().clone(), snapshot.clone(), "typed").unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.state().history).unwrap(),
+            serde_json::to_value(snapshot.history).unwrap()
+        );
+        assert_eq!(restored.state().variables, c.state().variables);
+        assert_eq!(restored.state().outcome, c.state().outcome);
+    }
+}
+
+#[test]
+fn history_distinguishes_default_timeout_and_explicit_cancel_without_result_writes() {
+    let mut timeout = start(program("typed", Some(&[1, 2]), Some(1_000_000)));
+    timeout.step(
+        CoreInput::Time {
+            delta_us: 1_100_000,
+        },
+        1000,
+    );
+    let record = timeout.state().history[0].choice.as_ref().unwrap();
+    assert_eq!(
+        record.resolution,
+        HistoryChoiceResolution::TimedOut {
+            option: "stay".into()
+        }
+    );
+    assert_eq!(timeout.state().variables["picked"], Value::I32(2));
+    let mut cancel = start(program("cancel", Some(&[1, 2]), None));
+    cancel.step(
+        CoreInput::CancelChoice {
+            interaction: offered(&cancel).interaction,
+            sequence: 1,
+        },
+        1000,
+    );
+    let h = &cancel.state().history[0];
+    let record = h.choice.as_ref().unwrap();
+    assert_eq!(record.resolution, HistoryChoiceResolution::Cancelled);
+    assert_eq!(
+        h.text,
+        record
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(cancel.state().variables["picked"], Value::I32(0));
+    for c in [&timeout, &cancel] {
+        let restored = Core::restore(c.validated_program().clone(), c.snapshot(), "typed").unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.state().history).unwrap(),
+            serde_json::to_value(&c.state().history).unwrap()
+        );
+    }
+}
+
+#[test]
+fn choice_history_excludes_hidden_rows_and_preserves_disabled_rows() {
+    let mut p = program("typed", Some(&[1, 2]), None);
+    let disabled =
+        serde_json::from_value(json!({"type":"const","value":{"type":"bool","value":false}}))
+            .unwrap();
+    p.choices.get_mut("route").unwrap().options[0].enabled = Some(disabled);
+    let mut c = start(p.clone());
+    let interaction = offered(&c).interaction;
+    c.step(
+        CoreInput::Choose {
+            interaction,
+            option: "walk".into(),
+            sequence: 1,
+        },
+        1000,
+    );
+    assert!(c.state().history.is_empty());
+    c.step(
+        CoreInput::Choose {
+            interaction,
+            option: "stay".into(),
+            sequence: 2,
+        },
+        1000,
+    );
+    let rows = &c.state().history[0].choice.as_ref().unwrap().options;
+    assert_eq!(rows.len(), 2);
+    assert!(!rows[0].enabled);
+    let option = &mut p.choices.get_mut("route").unwrap().options[0];
+    option.visible = option.enabled.take();
+    let mut c = start(p);
+    c.step(
+        CoreInput::Choose {
+            interaction: offered(&c).interaction,
+            option: "stay".into(),
+            sequence: 1,
+        },
+        1000,
+    );
+    let rows = &c.state().history[0].choice.as_ref().unwrap().options;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "stay");
+}
+
+#[test]
+fn history_restore_rejects_invalid_resolution_option_identity_and_mixed_voice_metadata() {
+    let mut c = start(program("typed", Some(&[1, 2]), None));
+    c.step(
+        CoreInput::Choose {
+            interaction: offered(&c).interaction,
+            option: "stay".into(),
+            sequence: 1,
+        },
+        1000,
+    );
+    let snapshot = c.snapshot();
+    let rejects = |bad| {
+        assert_eq!(
+            Core::restore(c.validated_program().clone(), bad, "typed")
+                .err()
+                .unwrap()
+                .code,
+            "E_SNAPSHOT"
+        )
+    };
+    let mut bad = snapshot.clone();
+    bad.history[0].choice.as_mut().unwrap().resolution = HistoryChoiceResolution::Selected {
+        option: "unknown".into(),
+    };
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    bad.history[0].choice.as_mut().unwrap().options[1].enabled = false;
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    bad.history[0].choice.as_mut().unwrap().id = "unknown".into();
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    bad.history[0].choice.as_mut().unwrap().options[0].source_revision += 1;
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    let record = bad.history[0].choice.as_mut().unwrap();
+    record.options.push(record.options[0].clone());
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    bad.history[0].text.push_str("tampered");
+    rejects(bad);
+    let mut bad = snapshot.clone();
+    bad.history[0].interaction = 0;
+    rejects(bad);
+    let mut bad = snapshot;
+    bad.history[0].voices.push(HistoryVoice {
+        instance: 1,
+        asset: "voice.arrival".into(),
+        gain: 1.,
+    });
+    rejects(bad);
+}
+
+#[test]
+fn oversized_choice_history_does_not_fault_or_change_the_committed_result() {
+    let mut p = program("typed", Some(&[1, 2]), None);
+    p.locales
+        .get_mut("en")
+        .unwrap()
+        .get_mut("walk")
+        .unwrap()
+        .spans = vec![Span::Text {
+        id: "body".into(),
+        text: "a".repeat(128 * 1024),
+        emphasis: false,
+    }];
+    let option = p.choices["route"].options[0].clone();
+    p.choices.get_mut("route").unwrap().options = (0..40)
+        .map(|i| ChoiceOption {
+            id: format!("row{i}"),
+            ..option.clone()
+        })
+        .collect();
+    for block in p.functions.get_mut("main").unwrap().blocks.values_mut() {
+        if let Terminator::Interact {
+            choice, branches, ..
+        } = &mut block.terminator
+        {
+            if choice == "route" {
+                *branches = (0..40)
+                    .map(|i| (format!("row{i}"), "after_walk".into()))
+                    .collect();
+            }
+        }
+    }
+    let mut c = start(p);
+    c.step(
+        CoreInput::Choose {
+            interaction: offered(&c).interaction,
+            option: "row39".into(),
+            sequence: 1,
+        },
+        1000,
+    );
+    assert!(c.state().fault.is_none());
+    assert_eq!(c.state().outcome.as_deref(), Some("walk"));
+    assert_eq!(c.state().variables["picked"], Value::I32(1));
+    assert!(
+        c.state().history.is_empty(),
+        "derived history must fit whole or be omitted"
+    );
+}
+
 /// Choosing commits the option's declared value before the branch; the host
 /// named an id and never supplied the value.
 #[test]

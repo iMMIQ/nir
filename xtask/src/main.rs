@@ -152,6 +152,12 @@ fn main() -> Result<()> {
                 )?;
             }
             fs::copy("crates/nir-platform-web/host.js", "dist/sdk/host.js")?;
+            for name in ["runtime-worker.js", "asset-worker.js"] {
+                fs::copy(
+                    format!("crates/nir-platform-web/{name}"),
+                    format!("dist/sdk/{name}"),
+                )?;
+            }
             fs::copy("docs/IMPORT.md", "dist/sdk/IMPORT.md")?;
             if cfg!(windows) {
                 run(Command::new("cargo").args([

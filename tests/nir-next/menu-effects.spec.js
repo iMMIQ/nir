@@ -35,6 +35,9 @@ test('page effects enter once per prepared page, stop with it, and defer closes 
   await page.keyboard.press('Escape');
   await page.waitForFunction(()=>{const s=window.__nir.state();return s.screen==='Menu'&&!s.loading;});
   await page.waitForFunction(()=>window.contextStarts[1]>=4);
+  // An authored menu track replaces ambience: retain and suspend Story/BGM,
+  // rather than mixing two songs or destroying the original source.
+  await page.waitForFunction(()=>window.deviceClocks[0].state==='suspended');
   const overlay=await ui();
   expect(overlay.starts).toBe(4);
   await page.waitForTimeout(150);
@@ -58,6 +61,7 @@ test('page effects enter once per prepared page, stop with it, and defer closes 
   const midFade=await ui();
   expect(midFade.stops).toBe(overlay.stops);
   await page.waitForFunction(()=>window.__nir.state().screen==='Story');
+  await page.waitForFunction(()=>window.deviceClocks[0].state==='running');
   const closed=await ui();
   expect(closed.stops).toBeGreaterThan(overlay.stops);
   expect(await page.evaluate(()=>window.__nir.state().menu_opacity)).toBe(1);

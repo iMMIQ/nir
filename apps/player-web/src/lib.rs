@@ -51,11 +51,23 @@ pub async fn probe_backend() -> String {
         .into()
 }
 async fn renderer(
-    canvas_id: &str,
+    canvas_value: JsValue,
     selection: BackendSelection,
 ) -> std::result::Result<Renderer, JsValue> {
     let backend = selected_backend(selection).await;
-    let canvas = nir_platform_web::canvas(canvas_id)?;
+    let (target, w, h) = if let Some(id) = canvas_value.as_string() {
+        let canvas = nir_platform_web::canvas(&id)?;
+        let w = canvas.width();
+        let h = canvas.height();
+        (wgpu::SurfaceTarget::Canvas(canvas), w, h)
+    } else {
+        let canvas: web_sys::OffscreenCanvas = canvas_value
+            .dyn_into()
+            .map_err(|_| js("E_CANVAS: expected OffscreenCanvas"))?;
+        let w = canvas.width();
+        let h = canvas.height();
+        (wgpu::SurfaceTarget::OffscreenCanvas(canvas), w, h)
+    };
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: match backend {
             RendererBackend::WebGpu => wgpu::Backends::BROWSER_WEBGPU,
@@ -64,11 +76,7 @@ async fn renderer(
         },
         ..Default::default()
     });
-    let w = canvas.width();
-    let h = canvas.height();
-    let surface = instance
-        .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
-        .map_err(js)?;
+    let surface = instance.create_surface(target).map_err(js)?;
     Renderer::new(&instance, surface, w, h, backend)
         .await
         .map_err(js)
@@ -79,11 +87,11 @@ pub struct GpuReplacement {
 }
 #[wasm_bindgen]
 pub async fn create_gpu(
-    canvas_id: String,
+    canvas_id: JsValue,
     backend: String,
 ) -> std::result::Result<GpuReplacement, JsValue> {
     Ok(GpuReplacement {
-        renderer: renderer(&canvas_id, BackendSelection::parse(&backend)?).await?,
+        renderer: renderer(canvas_id, BackendSelection::parse(&backend)?).await?,
     })
 }
 #[wasm_bindgen]
@@ -96,19 +104,27 @@ impl Engine {
         executable_json: String,
         release: String,
         title: String,
-        canvas_id: String,
+        canvas_id: JsValue,
         preferences_json: String,
         backend: String,
+        audio_decode_sample_rate: u32,
     ) -> std::result::Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let executable =
             nir_content::parse(executable_json.as_bytes(), "runtime-executable").map_err(js)?;
         let preferences =
             nir_content::parse(preferences_json.as_bytes(), "preferences").map_err(js)?;
-        let renderer = renderer(&canvas_id, BackendSelection::parse(&backend)?).await?;
+        let renderer = renderer(canvas_id, BackendSelection::parse(&backend)?).await?;
         Ok(Self {
-            inner: nir_engine::Engine::new(executable, release, title, Some(preferences), renderer)
-                .map_err(js)?,
+            inner: nir_engine::Engine::new_with_audio_sample_rate(
+                executable,
+                release,
+                title,
+                Some(preferences),
+                renderer,
+                Some(audio_decode_sample_rate),
+            )
+            .map_err(js)?,
         })
     }
     pub fn begin_turn(&mut self) {
@@ -134,6 +150,9 @@ impl Engine {
     }
     pub fn accepts(&self, request: u32) -> bool {
         self.inner.accepts(request)
+    }
+    pub fn accepts_resource(&self, request: u32) -> bool {
+        self.inner.accepts_resource(request)
     }
     pub fn accepts_content(&self, request: u32) -> bool {
         self.inner.accepts_content(request)
@@ -191,6 +210,18 @@ impl Engine {
         bytes: &[u8],
     ) -> std::result::Result<bool, JsValue> {
         self.inner.resource(request, id, bytes).map_err(js)
+    }
+    pub fn resource_decoded(
+        &mut self,
+        request: u32,
+        id: String,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<bool, JsValue> {
+        self.inner
+            .resource_decoded(request, id, width, height, pixels)
+            .map_err(js)
     }
     pub fn resource_fault(
         &mut self,
@@ -283,6 +314,9 @@ impl Engine {
     pub fn hidden(&mut self, value: bool) -> std::result::Result<(), JsValue> {
         self.inner.hidden(value).map_err(js)
     }
+    pub fn audio_blocked(&mut self, value: bool) -> std::result::Result<(), JsValue> {
+        self.inner.audio_blocked(value).map_err(js)
+    }
     pub fn audio_ended(&mut self, task: u32, session: u32) -> std::result::Result<(), JsValue> {
         self.inner.audio_ended(task, session).map_err(js)
     }
@@ -362,4 +396,24 @@ impl Engine {
     pub fn replace_gpu(&mut self, replacement: GpuReplacement) -> std::result::Result<(), JsValue> {
         self.inner.replace_gpu(replacement.renderer).map_err(js)
     }
+}
+
+#[wasm_bindgen]
+pub fn decode_image(bytes: &[u8]) -> Result<js_sys::Array, JsValue> {
+    let (w, h, pixels) = nir_render_wgpu::decode_image(bytes).map_err(js)?;
+    let result = js_sys::Array::new();
+    result.push(&JsValue::from(w));
+    result.push(&JsValue::from(h));
+    result.push(&js_sys::Uint8Array::from(pixels.as_slice()));
+    Ok(result)
+}
+
+#[wasm_bindgen]
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    nir_content::digest(bytes)
+}
+
+#[wasm_bindgen]
+pub fn inspect_save_slot(json: &str, slot: u32, release: &str, game: &str) -> Result<u32, JsValue> {
+    nir_player::inspect_save_slot(json, slot, release, game).map_err(js)
 }

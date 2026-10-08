@@ -70,9 +70,9 @@ test('M3 sustained reading restore and device recovery', async ({ browser, conte
     await modulePage.goto(`${fixture.origin}/?test=1`); await settled(modulePage, 'Title');
     report.release = await page.evaluate(() => window.__nir.diagnostics().release);
     report.engine = await page.evaluate(() => window.__nir.diagnostics().engine);
-    report.actualAdapters = await page.evaluate(() => window.__nirActualAdapters);
+    report.actualAdapters = await page.evaluate(() => window.__nir.actualAdapters());
     if (process.env.NIR_PERF_MODE === 'hardware')
-      assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nirActualAdapters]));
+      assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nir.actualAdapters()]));
     const started = performance.now();
     let cycle = 0;
     do {

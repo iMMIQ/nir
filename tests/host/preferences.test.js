@@ -42,19 +42,23 @@ test('saved preferences are negotiated from the small runtime root before boot p
         default_locale:'zh-Hans',
     };
     const saved={ui_locale:'en',text_locale:'en',font_scale:1.4,bgm_volume:.8,voice_volume:.2,sfx_volume:.5,reduced_motion:true};
-    assert.deepEqual(initialRuntimePreferences(program,saved,['zh-CN'],false),{...saved,text_speed:1,auto_wait_scale:1});
+    assert.deepEqual(initialRuntimePreferences(program,saved,['zh-CN'],false),{...saved,text_speed:1,auto_wait_scale:1,auto_wait_voice:true,voice_continue:true,character_voices:{}});
     const initial=initialRuntimePreferences(program,null,['en-US'],false);
     assert.equal(initial.text_locale,'en');
     const reading=initialRuntimePreferences(program,{...saved,text_speed:2,auto_wait_scale:.5},[],false);
     assert.equal(reading.text_speed,2);
     assert.equal(reading.auto_wait_scale,.5);
+    assert.equal(initialRuntimePreferences(program,{...saved,auto_wait_voice:false},[],false).auto_wait_voice,false);
+    for(const value of [null,'false',0,{}])assert.equal(initialRuntimePreferences(program,{...saved,auto_wait_voice:value},[],false).auto_wait_voice,true);
+    assert.equal(initialRuntimePreferences(program,{...saved,voice_continue:false},[],false).voice_continue,false);
+    for(const value of [null,'false',0,{}])assert.equal(initialRuntimePreferences(program,{...saved,voice_continue:value},[],false).voice_continue,true);
     const corrupt=initialRuntimePreferences(program,{...saved,text_speed:NaN,auto_wait_scale:'fast'},[],false);
     assert.equal(corrupt.text_speed,1);
     assert.equal(corrupt.auto_wait_scale,1);
     assert.equal(Object.hasOwn(initial,'auto_delay_us'),false);
     const damaged=initialRuntimePreferences(program,{ui_locale:'__proto__',text_locale:'constructor',font_scale:NaN,bgm_volume:'loud',voice_volume:Infinity,sfx_volume:null,reduced_motion:'yes',surprise:true},[],false);
     assert.deepEqual(damaged,{
-        ui_locale:'zh-Hans',text_locale:'zh-Hans',font_scale:1.1,bgm_volume:.6,voice_volume:.7,sfx_volume:.3,reduced_motion:false,text_speed:1,auto_wait_scale:1,
+        ui_locale:'zh-Hans',text_locale:'zh-Hans',font_scale:1.1,bgm_volume:.6,voice_volume:.7,sfx_volume:.3,reduced_motion:false,text_speed:1,auto_wait_scale:1,auto_wait_voice:true,voice_continue:true,character_voices:{},
     });
 });
 test('asset requests must carry exact full descriptors for every requested ID',()=>{

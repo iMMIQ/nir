@@ -1,4 +1,5 @@
 import {test,expect} from '@playwright/test';
+import {recoverAudioOutput} from './audio-output-helper.js';
 async function start(page){
  await page.addInitScript(()=>{
   window.audioAudit={ramps:[],sources:[],gains:[]};
@@ -19,8 +20,9 @@ test('event gain, continuous stop envelope, pause and restored remaining segment
  await start(page);
  await page.waitForFunction(()=>{const p=window.audioAudit.ramps[0].param;return p.value<.9&&p.value>.1;});
  // The audio device continues while the main thread is stalled; input pauses
- // Story before it catches up. Saving must preserve the audible ramp, not rewind it.
- await page.evaluate(()=>{const until=performance.now()+800;while(performance.now()<until){}window.__nir.action({type:'menu'});});
+ // Story before it catches up. Background suspension freezes all buses; saving
+ // must preserve the audible ramp, not rewind it.
+ await page.evaluate(()=>{const until=performance.now()+800;while(performance.now()<until){}window.__nir.action({type:'menu'});window.__nir.hidden(true);});
  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&window.audioAudit.context.state==='suspended');
  const value=await page.evaluate(()=>window.audioAudit.ramps[0].param.value);
  const appearance=await page.evaluate(()=>window.__nir.state().dialogue_appearance);
@@ -32,7 +34,7 @@ test('event gain, continuous stop envelope, pause and restored remaining segment
  expect(await page.evaluate(()=>window.audioAudit.context.state)).toBe('suspended');
  await page.evaluate(()=>window.__nir.action({type:'save',slot:1}));
  // Wait on a completed storage transaction through the committed IndexedDB record.
- await page.waitForFunction(async()=>{
+ await expect.poll(()=>page.evaluate(async()=>{
   const databases=await indexedDB.databases();
   for(const d of databases){
    const db=await new Promise((ok,no)=>{const r=indexedDB.open(d.name);r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error);});
@@ -40,7 +42,7 @@ test('event gain, continuous stop envelope, pause and restored remaining segment
     const count=await new Promise((ok,no)=>{const r=db.transaction('saves').objectStore('saves').count();r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error);});db.close();if(count)return true;
    }else db.close();
   }return false;
- });
+ })).toBe(true);
  await page.evaluate(()=>window.__nir.action({type:'load',slot:1}));
  await page.waitForFunction(()=>window.audioAudit.ramps.length>=2&&!window.__nir.state().loading);
  const restored=await page.evaluate(()=>window.audioAudit.ramps.at(-1).param.value);
@@ -50,8 +52,10 @@ test('event gain, continuous stop envelope, pause and restored remaining segment
  expect(Math.abs(restoredAppearance.opacity-appearance.opacity)).toBeLessThan(.03);
  expect(restoredAppearance.background_opacity).toBe(appearance.background_opacity);
  expect(restoredAppearance.text_opacity).toBe(appearance.text_opacity);
+ await page.evaluate(()=>window.__nir.hidden(false));
  await page.evaluate(()=>window.__nir.action({type:'close'}));
  await page.evaluate(()=>window.__nir.action({type:'continue'}));
+ await recoverAudioOutput(page);
  await page.waitForFunction(()=>window.audioAudit.sources.at(-1).ended===true,{},{timeout:15000});
  expect(await page.evaluate(()=>window.__nir.state().error)).toBeFalsy();
  expect(errors).toEqual([]);

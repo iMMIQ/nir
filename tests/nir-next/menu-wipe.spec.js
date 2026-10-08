@@ -1,4 +1,5 @@
 import {test,expect} from '@playwright/test';
+import {recoverAudioOutput} from './audio-output-helper.js';
 
 // The sampled columns sit at x=.1/.9 of the viewport and y=.3 — inside the
 // full-stage page background but clear of the dialogue window (y>=450), the
@@ -58,6 +59,8 @@ test('spatial page reveals composite over the frozen frame and defer the close e
   // Let the title's own enter reveal settle before leaving the page.
   await page.waitForFunction(()=>window.__nir.state().menu_transition===null);
   await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Story'&&!window.__nir.state().loading);
+  await recoverAudioOutput(page);
   await page.waitForFunction(()=>{const s=window.__nir.state();return s.screen==='Story'&&s.dialogue?.ready&&!s.loading;});
   await page.keyboard.press('Escape');
   await page.waitForFunction(()=>{const s=window.__nir.state();return s.screen==='Menu'&&!s.loading;});
@@ -74,6 +77,9 @@ test('spatial page reveals composite over the frozen frame and defer the close e
   expect(enterDone.every(page_),'finished reveal covers the frame').toBe(true);
   // Close reverses the composite: the sound and lock land immediately, the
   // exit itself waits for the erase to finish.
+  await page.waitForFunction(()=>__nir.diagnostics().host_work.audio_domains.story.buses.bgm.state==='running'||
+    document.querySelector('#nir-audio-resume')?.hidden===false);
+  await recoverAudioOutput(page);
   await page.getByRole('button',{name:'Return to story',exact:true}).focus();
   await page.keyboard.press('Enter');
   expect(await page.evaluate(()=>window.__nir.state().screen)).toBe('Menu');
@@ -87,6 +93,7 @@ test('spatial page reveals composite over the frozen frame and defer the close e
   expect(story_(closeMid[1]),'the frame returns where the erase has passed').toBe(true);
   await page.evaluate(()=>window.__nir.hidden(false));
   await page.waitForFunction(()=>window.__nir.state().screen==='Story');
+  await recoverAudioOutput(page);
   expect(await page.evaluate(()=>window.__nir.state().paused)).toBe(false);
   const closed=await settled(page,'reports/nir-next/menu-wipe-close-end.png',story_);
   expect(closed.every(story_),'the finished close leaves the story bare').toBe(true);

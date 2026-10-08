@@ -51,7 +51,7 @@ test('window wipe reveal erases from the leading edge and paused progress surviv
   await page.waitForTimeout(250);
   expect(await page.evaluate(()=>window.__nir.state().window)).toBe(progress);
   await page.evaluate(()=>window.__nir.action({type:'save',slot:2}));
-  await page.waitForFunction(()=>/Saved in this browser|浏览器已保存/.test(window.__nir.state().status));
+  await page.waitForFunction(()=>/Saved|已保存/.test(window.__nir.state().status));
   const session=await page.evaluate(()=>window.__nir.state().session);
   await page.evaluate(()=>window.__nir.action({type:'load',slot:2}));
   await page.waitForFunction(session=>window.__nir.state().session>session&&!window.__nir.state().loading,session);

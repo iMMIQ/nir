@@ -1,10 +1,9 @@
 //! Shared decoded audio with O(1) offset seeks.
 //!
-//! `rodio::SamplesBuffer` + `skip_duration` pulls one sample per skipped
-//! frame on the owner thread at voice start; `BufferSource` computes the
-//! start index directly from the same integer math rodio uses, so playback
-//! positions match the previous construction bit for bit while the sample
-//! data is shared between voices through one `Arc`.
+//! Offset seeks compute a frame index on the owner thread and share one Arc.
+//! Whole-track loops use the same rounded frame timeline as authored loop
+//! regions; seeking never splits a stereo frame or accumulates per-sample
+//! nanosecond rounding. Finite voices keep their existing floor-frame seek.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +27,35 @@ impl AudioBuffer {
     pub fn rate(&self) -> u32 {
         self.rate
     }
+    pub fn source_with_region(
+        &self,
+        offset_us: u64,
+        looped: bool,
+        region: Option<nir_format::AudioLoopRegion>,
+    ) -> Result<BufferSource, &'static str> {
+        let Some(region) = region else {
+            return Ok(self.source(offset_us, looped));
+        };
+        if !looped {
+            return Err("E_AUDIO_LOOP: region on a finite voice");
+        }
+        let frames = (self.samples.len() / self.channels as usize) as u64;
+        let (start, end) = region
+            .frame_bounds(self.rate, frames)
+            .ok_or("E_AUDIO_LOOP: invalid decoded loop frames")?;
+        let position = region
+            .playback_frame(offset_us, self.rate, frames)
+            .ok_or("E_AUDIO_LOOP: invalid playhead")?;
+        Ok(BufferSource {
+            samples: self.samples.clone(),
+            channels: self.channels,
+            rate: self.rate,
+            pos: position as usize * self.channels as usize,
+            looped: true,
+            loop_start: start as usize * self.channels as usize,
+            loop_end: end as usize * self.channels as usize,
+        })
+    }
     pub fn source(&self, offset_us: u64, looped: bool) -> BufferSource {
         BufferSource::new(
             self.samples.clone(),
@@ -46,12 +74,29 @@ pub struct BufferSource {
     rate: u32,
     pos: usize,
     looped: bool,
+    loop_start: usize,
+    loop_end: usize,
 }
 impl BufferSource {
-    /// `offset_us` semantics mirror the previous rodio construction:
-    /// looped voices reduce the offset modulo the buffer duration, then
-    /// advance whole spans of the repeated stream; finite voices skip with
-    /// the per-channel frame count of a span-less buffer.
+    /// Keep one converter for the voice lifetime. Sink queues and mixers can
+    /// divide Sources into spans; resampling inside those spans would restart
+    /// fractional phase at every span or authored loop boundary.
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    pub fn at_device_rate(self, rate: u32) -> DeviceSource {
+        use rodio::Source;
+        let channels = self.channels;
+        let source_rate = self.rate;
+        let duration = self.total_duration();
+        let rate = rate.max(1);
+        DeviceSource {
+            input: rodio::conversions::SampleRateConverter::new(self, source_rate, rate, channels),
+            channels,
+            rate,
+            duration,
+        }
+    }
+    /// Loop offsets select a complete nearest frame and wrap in integer
+    /// frames. Finite offsets retain the unchecked floor-frame seek policy.
     pub fn new(
         samples: Arc<Vec<f32>>,
         channels: u16,
@@ -65,28 +110,11 @@ impl BufferSource {
         let mut pos = 0;
         if len > 0 && offset_us > 0 {
             if looped {
-                // rodio::buffer::SamplesBuffer::total_duration:
-                // 1e9 * len / rate / channels nanoseconds.
-                let total_ns =
-                    (len as u64).saturating_mul(1_000_000_000) / rate as u64 / channels as u64;
-                let total_us = total_ns / 1_000;
-                let offset = if total_us > 0 {
-                    offset_us % total_us
-                } else {
-                    offset_us
-                };
-                // skip_duration over repeat_infinite(): spans of `len`
-                // samples, each skipped sample costing 1e9/rate/channels ns.
-                let ns_per_sample: u128 = 1_000_000_000 / rate as u128 / channels as u128;
-                let span_ns = len as u128 * ns_per_sample;
-                let mut remaining = offset as u128 * 1_000;
-                let mut skipped: u128 = 0;
-                while span_ns <= remaining {
-                    skipped += len as u128;
-                    remaining -= span_ns;
+                let frames = len / channels as usize;
+                if frames > 0 {
+                    let frame = (offset_us as u128 * rate as u128 + 500_000) / 1_000_000;
+                    pos = (frame % frames as u128) as usize * channels as usize;
                 }
-                skipped += remaining / ns_per_sample;
-                pos = (skipped % len as u128) as usize;
             } else {
                 // SamplesBuffer::current_span_len() is None, so skip_duration
                 // takes the unchecked path: frames * channels samples.
@@ -101,20 +129,148 @@ impl BufferSource {
             rate,
             pos,
             looped,
+            loop_start: 0,
+            loop_end: len,
         }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub struct DeviceSource {
+    input: rodio::conversions::SampleRateConverter<BufferSource>,
+    channels: u16,
+    rate: u32,
+    duration: Option<Duration>,
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl Iterator for DeviceSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        self.input.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.input.size_hint()
+    }
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl rodio::Source for DeviceSource {
+    // Output format stays fixed across every intro and loop boundary. Any
+    // outer queue span conversion is now at an identical rate (a passthrough).
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+}
+
+/// The sink's queue survives an output-device replacement. The old stream is
+/// dropped by the output worker before a new mixer can pull this same queue;
+/// its cursor, resampler, envelope and Sink position never restart.
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[derive(Clone)]
+pub struct SharedVoiceQueue {
+    input: Arc<std::sync::Mutex<FixedVoiceQueue>>,
+    channels: u16,
+    rate: u32,
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl SharedVoiceQueue {
+    pub fn new(input: rodio::queue::SourcesQueueOutput, channels: u16, rate: u32) -> Self {
+        Self {
+            input: Arc::new(std::sync::Mutex::new(FixedVoiceQueue::new(
+                input, channels, rate,
+            ))),
+            channels,
+            rate,
+        }
+    }
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl Iterator for SharedVoiceQueue {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        self.input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next()
+    }
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl rodio::Source for SharedVoiceQueue {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Each NIR sink owns one voice of a known, fixed format. Announce that
+/// format before the queue's initially empty source has yielded any audio;
+/// otherwise the mixer bootstraps with rodio's empty-source 48 kHz mono
+/// metadata and can prefetch silence or convert the first span incorrectly.
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub struct FixedVoiceQueue {
+    input: rodio::queue::SourcesQueueOutput,
+    channels: u16,
+    rate: u32,
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl FixedVoiceQueue {
+    pub fn new(input: rodio::queue::SourcesQueueOutput, channels: u16, rate: u32) -> Self {
+        Self {
+            input,
+            channels,
+            rate,
+        }
+    }
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl Iterator for FixedVoiceQueue {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        self.input.next()
+    }
+}
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+impl rodio::Source for FixedVoiceQueue {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
     }
 }
 impl Iterator for BufferSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        if self.pos < self.samples.len() {
+        if self.pos < self.loop_end {
             let sample = self.samples[self.pos];
             self.pos += 1;
             Some(sample)
-        } else if self.looped && !self.samples.is_empty() {
-            // Looping restarts the asset from its first sample.
-            self.pos = 1;
-            Some(self.samples[0])
+        } else if self.looped && self.loop_start < self.loop_end {
+            // Intro is traversed once; subsequent cycles start at the region.
+            self.pos = self.loop_start + 1;
+            Some(self.samples[self.loop_start])
         } else {
             None
         }
@@ -131,17 +287,13 @@ impl Iterator for BufferSource {
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 impl rodio::Source for BufferSource {
     fn current_span_len(&self) -> Option<usize> {
-        // Report the run of contiguous samples ahead, wrapping to the next
-        // full cycle once the current one is exhausted: rodio's
-        // UniformSourceIterator consumes spans up to 32,768 samples and
-        // rebuilds its rate/channel converters when a span ends, so an
-        // unknown length here (None) would fall it back to 512-sample
-        // spans and reset the resampler phase ~64x more often - audible
-        // on looped assets whose rate differs from the output device.
-        if self.pos >= self.samples.len() {
-            Some(self.samples.len())
+        // Direct consumers can inspect the contiguous run up to the loop
+        // boundary. Playback resolves rate conversion continuously through
+        // DeviceSource before the Sink's queue can split this run into spans.
+        if self.pos >= self.loop_end {
+            Some(self.loop_end - self.loop_start)
         } else {
-            Some(self.samples.len() - self.pos)
+            Some(self.loop_end - self.pos)
         }
     }
     fn channels(&self) -> u16 {
@@ -164,6 +316,72 @@ impl rodio::Source for BufferSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_repeats_body_without_intro_tail_or_channel_phase_errors() {
+        let buffer = AudioBuffer::from_parts(Arc::new((0..16).map(|i| i as f32).collect()), 2, 10);
+        let region = nir_format::AudioLoopRegion {
+            start_us: nir_format::Micros(200_000),
+            end_us: nir_format::Micros(600_000),
+        };
+        let actual: Vec<f32> = buffer
+            .source_with_region(0, true, Some(region))
+            .unwrap()
+            .take(28)
+            .collect();
+        let expected: Vec<f32> = (0..12)
+            .chain(4..12)
+            .chain(4..12)
+            .map(|i| i as f32)
+            .collect();
+        assert_eq!(actual, expected);
+        for (offset, expected) in [
+            (600_000, vec![4., 5., 6., 7., 8., 9.]),
+            (900_000, vec![10., 11., 4., 5., 6., 7.]),
+            (1_400_000, vec![4., 5., 6., 7., 8., 9.]),
+            (u64::MAX, vec![8., 9., 10., 11., 4., 5.]),
+        ] {
+            assert_eq!(
+                buffer
+                    .source_with_region(offset, true, Some(region))
+                    .unwrap()
+                    .take(6)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(buffer.source_with_region(0, false, Some(region)).is_err());
+        let too_long = nir_format::AudioLoopRegion {
+            end_us: nir_format::Micros(900_000),
+            ..region
+        };
+        assert!(buffer.source_with_region(0, true, Some(too_long)).is_err());
+        let zero_frames = nir_format::AudioLoopRegion {
+            start_us: nir_format::Micros(200_001),
+            end_us: nir_format::Micros(200_002),
+        };
+        assert!(buffer
+            .source_with_region(0, true, Some(zero_frames))
+            .is_err());
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[test]
+    fn region_spans_end_at_the_loop_boundary_and_then_exclude_intro() {
+        use rodio::Source as _;
+        let buffer = AudioBuffer::from_parts(Arc::new(vec![0.; 16]), 2, 10);
+        let region = nir_format::AudioLoopRegion {
+            start_us: nir_format::Micros(200_000),
+            end_us: nir_format::Micros(600_000),
+        };
+        let mut source = buffer.source_with_region(0, true, Some(region)).unwrap();
+        assert_eq!(source.current_span_len(), Some(12));
+        assert_eq!(source.total_duration(), None);
+        assert_eq!(source.by_ref().take(12).count(), 12);
+        assert_eq!(source.current_span_len(), Some(8));
+        source.next();
+        assert_eq!(source.current_span_len(), Some(7));
+    }
 
     fn pattern(len: usize) -> Vec<f32> {
         (0..len).map(|i| i as f32 * 0.5 - 3.).collect()
@@ -224,22 +442,59 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     #[test]
-    fn looped_sources_match_repeat_infinite_skip_at_all_offsets() {
-        for (channels, rate, frames) in [(1u16, 44_100u32, 5_000), (2, 48_000, 3_731)] {
-            let samples = pattern(frames * channels as usize);
-            let total_us = frames as u64 * 1_000_000 / rate as u64;
-            for offset_us in [0, total_us / 2, total_us + total_us / 3, total_us * 7] {
-                let take = samples.len() * 3 + 7;
-                let actual: Vec<f32> =
-                    AudioBuffer::from_parts(Arc::new(samples.clone()), channels, rate)
-                        .source(offset_us, true)
-                        .take(take)
-                        .collect();
-                let expected = rodio_reference(&samples, channels, rate, offset_us, true, take);
-                assert_eq!(actual, expected, "{channels}ch {rate}Hz @{offset_us}us");
+    fn whole_track_loop_seek_matches_an_explicit_full_region() {
+        for (channels, rate, len) in [(1, 8_000, 53), (2, 44_100, 4096), (2, 48_000, 1536)] {
+            let samples = Arc::new(pattern(len));
+            let buffer = AudioBuffer::from_parts(samples, channels, rate);
+            let frames = (len / channels as usize) as u64;
+            let duration_us = (frames * 1_000_000 + u64::from(rate) / 2) / u64::from(rate);
+            let region = nir_format::AudioLoopRegion {
+                start_us: nir_format::Micros(0),
+                end_us: nir_format::Micros(duration_us),
+            };
+            for offset in [
+                0,
+                duration_us / 2,
+                duration_us.saturating_sub(1),
+                duration_us,
+                duration_us * 7,
+                u64::MAX,
+            ] {
+                let actual = buffer
+                    .source(offset, true)
+                    .take(len * 3)
+                    .collect::<Vec<_>>();
+                let expected = buffer
+                    .source_with_region(offset, true, Some(region))
+                    .unwrap()
+                    .take(len * 3)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{channels}ch {rate}Hz @{offset}us");
             }
+        }
+    }
+    #[test]
+    fn looping_stereo_seek_preserves_channel_order_and_long_track_position() {
+        // These two saved positions previously started on a right sample,
+        // or drifted hundreds of samples ahead through nanosecond truncation.
+        for (rate, seconds, offset, frame) in [
+            (44_100, 2, 347_000, 15_303),
+            (48_000, 120, 109_483_355, 5_255_201),
+        ] {
+            let samples = (0..rate * seconds)
+                .flat_map(|i| [i as f32, -(i as f32) - 0.5])
+                .collect();
+            let buffer = AudioBuffer::from_parts(Arc::new(samples), 2, rate);
+            assert_eq!(
+                buffer.source(offset, true).take(4).collect::<Vec<_>>(),
+                [
+                    frame as f32,
+                    -(frame as f32) - 0.5,
+                    (frame + 1) as f32,
+                    -((frame + 1) as f32) - 0.5
+                ]
+            );
         }
     }
 
@@ -277,5 +532,132 @@ mod tests {
         // once exhausted) so rodio's converter chunks stay long.
         assert_eq!(looping.current_span_len(), Some(1_000));
         assert_eq!(looping.total_duration(), None);
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "android")))]
+mod recovery_tests {
+    use super::*;
+    use rodio::{mixer::mixer, source::UniformSourceIterator, Sink};
+
+    #[test]
+    fn output_mixer_replacement_keeps_the_same_voice_cursor_and_sink() {
+        let buffer = AudioBuffer::from_parts(Arc::new(vec![1., 2., 3., 4.]), 1, 4);
+        let (sink, queue) = Sink::new();
+        sink.append(buffer.source(0, true).at_device_rate(4));
+        let queue = SharedVoiceQueue::new(queue, 1, 4);
+        let (old, mut output) = mixer(1, 4);
+        old.add(queue.clone());
+        assert_eq!(output.by_ref().take(3).collect::<Vec<_>>(), [1., 2., 3.]);
+        drop(output);
+        drop(old);
+        let (new, mut output) = mixer(1, 4);
+        new.add(queue);
+        assert_eq!(
+            output.by_ref().take(5).collect::<Vec<_>>(),
+            [4., 1., 2., 3., 4.]
+        );
+        assert!(!sink.empty());
+    }
+    #[test]
+    fn output_replacement_inside_body_keeps_intro_once_and_the_current_loop_frame() {
+        let buffer = AudioBuffer::from_parts(
+            Arc::new(vec![-10., -9., 1., 2., 3., 4., 5., 6., 7., 8.]),
+            1,
+            10,
+        );
+        let region = nir_format::AudioLoopRegion {
+            start_us: nir_format::Micros(200_000),
+            end_us: nir_format::Micros(600_000),
+        };
+        let (sink, queue) = Sink::new();
+        sink.append(
+            buffer
+                .source_with_region(0, true, Some(region))
+                .unwrap()
+                .at_device_rate(10),
+        );
+        let queue = SharedVoiceQueue::new(queue, 1, 10);
+        let (old, mut output) = mixer(1, 10);
+        old.add(queue.clone());
+        assert_eq!(
+            output.by_ref().take(7).collect::<Vec<_>>(),
+            [-10., -9., 1., 2., 3., 4., 1.]
+        );
+        drop(output);
+        drop(old);
+        let (new, output) = mixer(1, 10);
+        new.add(queue);
+        let expected = buffer
+            .source_with_region(700_000, true, Some(region))
+            .unwrap()
+            .take(32)
+            .collect::<Vec<_>>();
+        assert_eq!(output.take(32).collect::<Vec<_>>(), expected);
+        assert!(!sink.empty());
+    }
+
+    #[test]
+    fn replacement_device_rate_converts_the_remaining_queue_without_replaying_intro() {
+        let buffer = AudioBuffer::from_parts(Arc::new(vec![1., 2., 3., 4.]), 1, 4);
+        let (sink, queue) = Sink::new();
+        sink.append(buffer.source(0, true).at_device_rate(4));
+        let queue = SharedVoiceQueue::new(queue, 1, 4);
+        let (old, mut output) = mixer(1, 4);
+        old.add(queue.clone());
+        assert_eq!(output.by_ref().take(3).collect::<Vec<_>>(), [1., 2., 3.]);
+        drop(output);
+        drop(old);
+        let (new, output) = mixer(1, 8);
+        new.add(queue);
+        let expected =
+            UniformSourceIterator::new(buffer.source(750_000, true).at_device_rate(4), 1, 8)
+                .take(32)
+                .collect::<Vec<_>>();
+        assert_eq!(output.take(32).collect::<Vec<_>>(), expected);
+        assert!(!sink.empty());
+    }
+
+    #[test]
+    fn output_replacement_keeps_the_owned_fade_and_stereo_frame_phase() {
+        use crate::audio_envelope::{EnvelopeSamples, Ramp};
+        use std::sync::Mutex;
+        let buffer = AudioBuffer::from_parts(Arc::new(vec![1.; 16]), 2, 4);
+        let envelope = Arc::new(Mutex::new(Ramp::default()));
+        envelope
+            .lock()
+            .unwrap()
+            .set_owned(Some(7), 250_000, 1., 0., 1_000_000);
+        let (sink, queue) = Sink::new();
+        sink.append(EnvelopeSamples::new(
+            buffer.source(0, true).at_device_rate(4),
+            envelope.clone(),
+            2,
+            4,
+        ));
+        let queue = SharedVoiceQueue::new(queue, 2, 4);
+        let (old, mut output) = mixer(2, 4);
+        old.add(queue.clone());
+        assert_eq!(
+            output.by_ref().take(4).collect::<Vec<_>>(),
+            [1., 1., 0.75, 0.75]
+        );
+        let observed = envelope.lock().unwrap().observation().unwrap();
+        assert_eq!(observed.owner, 7);
+        assert_eq!(observed.elapsed_us.0, 500_000);
+        drop(output);
+        drop(old);
+        // No callback is consuming the queue while the output is unavailable.
+        assert_eq!(envelope.lock().unwrap().observation(), Some(observed));
+        let (new, output) = mixer(2, 4);
+        new.add(queue);
+        assert_eq!(
+            output.take(6).collect::<Vec<_>>(),
+            [0.5, 0.5, 0.25, 0.25, 0., 0.]
+        );
+        let restored = envelope.lock().unwrap().observation().unwrap();
+        assert_eq!(restored.owner, 7);
+        assert_eq!(restored.elapsed_us.0, 1_250_000);
+        assert!(!sink.empty());
     }
 }

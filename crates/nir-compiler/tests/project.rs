@@ -10,6 +10,71 @@ fn project() -> tempfile::TempDir {
     d
 }
 #[test]
+fn authored_history_voice_is_opt_in_inferred_and_gated_in_source_and_runtime() {
+    for flow in [false, true] {
+        let d = project();
+        let path = d.path().join("themes/rain/theme.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let content = if flow {
+            "{type = \"history_flow\", voice_controls = true, size = 24, line_height = 36, gap = 12, wheel_step = 48, page_step = 120, max_visible = 32, color = [1,1,1,1]}"
+        } else {
+            "{type = \"history_window\", voice_controls = true, offset_local = \"offset\", limit = 4, row_height = 80, size = 24, color = [1,1,1,1]}"
+        };
+        let theme=format!("{original}\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[image_menus.title.locals.offset]\ntype = \"int\"\ninitial = 0\nmin = 0\nmax = 999\n[[image_menus.title.elements]]\nid = \"records\"\nrect = [40,40,600,360]\ncontent = {content}\n");
+        fs::write(&path, &theme).unwrap();
+        let loaded = load_project(d.path()).unwrap();
+        assert!(loaded
+            .program
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-voice.v1"));
+        compile(&loaded.program).unwrap();
+        let mut missing = loaded.program.clone();
+        missing.requires.retain(|c| c != "ui.menu-history-voice.v1");
+        assert_eq!(
+            nir_core::ValidatedProgram::new(missing).unwrap_err().code,
+            "E_CAPABILITY"
+        );
+        let sdk = test_sdk();
+        resolve(d.path(), sdk.path()).unwrap();
+        let out = d.path().join("dist/history-voice");
+        let report = build(d.path(), sdk.path(), &out, true).unwrap();
+        let release: nir_format::ReleaseManifest = serde_json::from_slice(
+            &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+        )
+        .unwrap();
+        let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+            &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+        )
+        .unwrap();
+        nir_core::ValidatedProgram::from_runtime(executable.program.clone()).unwrap();
+        let mut root = executable.program;
+        root.requires.retain(|c| c != "ui.menu-history-voice.v1");
+        assert_eq!(
+            nir_core::ValidatedProgram::from_runtime(root)
+                .unwrap_err()
+                .code,
+            "E_CAPABILITY"
+        );
+        fs::write(
+            &path,
+            theme.replace("voice_controls = true", "voice_controls = false"),
+        )
+        .unwrap();
+        let legacy = load_project(d.path()).unwrap();
+        assert!(!legacy
+            .program
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-voice.v1"));
+        let serialized =
+            serde_json::to_value(&legacy.program.theme.image_menus["title"].elements[0].content)
+                .unwrap();
+        assert!(serialized.get("voice_controls").is_none());
+        compile(&legacy.program).unwrap();
+    }
+}
+#[test]
 fn checks_and_scenarios() {
     let p = load_project(&source()).unwrap();
     let e = compile(&p.program).unwrap();
@@ -208,6 +273,8 @@ fn test_sdk() -> tempfile::TempDir {
         "player_web.js",
         "player_web_bg.wasm",
         "host.js",
+        "runtime-worker.js",
+        "asset-worker.js",
         "index.html",
         "bootstrap.js",
         "THIRD-PARTY.txt",
@@ -763,6 +830,52 @@ fn fixed_auto_delay_configuration_emits_only_its_used_capability() {
         .requires
         .iter()
         .any(|c| c == "player.auto-delay-policy.v1"));
+}
+
+#[test]
+fn loop_region_capability_tracks_story_compositions_and_menu_music() {
+    for mode in ["plain", "composed", "menu"] {
+        let d = project();
+        assert!(!load_project(d.path())
+            .unwrap()
+            .program
+            .requires
+            .iter()
+            .any(|cap| cap == "audio.loop-region.v1"));
+        if mode == "menu" {
+            let path = d.path().join("themes/rain/theme.toml");
+            let mut theme = fs::read_to_string(&path).unwrap();
+            theme.push_str("\n[image_menus.title]\nbackground = \"bg.station\"\nbuttons = []\n[image_menus.title.effects.music]\nasset = \"audio.bgm\"\nloop_region = { start_us = \"200000\", end_us = \"600000\" }\n");
+            fs::write(path, theme).unwrap();
+        } else {
+            let path = d.path().join("content/ch01/story.nir.json");
+            let mut content: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let music = content["cues"]["opening"]["effects"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|definition| definition["id"] == "music")
+                .unwrap();
+            music["effect"]["loop_region"] =
+                serde_json::json!({"start_us":"200000","end_us":"600000"});
+            if mode == "composed" {
+                let child = music.clone();
+                *music = serde_json::json!({"id":"music-chain","scope":"session","effect":{"type":"sequence","children":[child]}});
+            }
+            fs::write(path, serde_json::to_vec(&content).unwrap()).unwrap();
+        }
+        let loaded = load_project(d.path()).unwrap();
+        assert!(
+            loaded
+                .program
+                .requires
+                .iter()
+                .any(|cap| cap == "audio.loop-region.v1"),
+            "{mode}"
+        );
+        compile(&loaded.program).unwrap();
+    }
 }
 
 #[test]

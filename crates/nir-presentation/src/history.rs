@@ -50,11 +50,22 @@ impl HistoryStyle {
 struct Extent {
     top: f32,
     height: f32,
+    heading: f32,
+    control: f32,
 }
 #[derive(Debug, Clone, Copy)]
 enum Anchor {
     Latest,
+    Control {
+        key: usize,
+        fraction: f32,
+    },
     Text {
+        key: usize,
+        byte: usize,
+        line_fraction: f32,
+    },
+    Heading {
         key: usize,
         byte: usize,
         line_fraction: f32,
@@ -81,6 +92,8 @@ pub struct HistoryLayout {
     anchor: Anchor,
     prepared: bool,
     anchor_offset: Option<f32>,
+    choice_labels: Option<[TextRun; 3]>,
+    voice_controls: bool,
 }
 impl HistoryLayout {
     pub fn new(rows: Arc<[MenuHistoryRow]>, style: HistoryStyle) -> Result<Self, String> {
@@ -116,7 +129,71 @@ impl HistoryLayout {
             anchor: Anchor::Latest,
             prepared,
             anchor_offset: None,
+            choice_labels: None,
+            voice_controls: false,
         })
+    }
+    pub fn voice_controls(&mut self, enabled: bool, text: &mut TextEngine) -> Result<bool, String> {
+        if enabled == self.voice_controls {
+            return Ok(false);
+        }
+        if self.ready() && !self.rows.is_empty() {
+            self.anchor = self.capture_anchor(text)?;
+        }
+        self.voice_controls = enabled;
+        self.extents.clear();
+        self.anchor_offset = None;
+        self.total = 0.;
+        self.offset = 0.;
+        self.prepared = self.rows.is_empty();
+        Ok(true)
+    }
+    /// UI labels carry their own locale/font plan. The author's frozen option
+    /// labels continue using their original story fonts after a language change.
+    pub fn choice_labels(
+        &mut self,
+        labels: [TextRun; 3],
+        text: &mut TextEngine,
+    ) -> Result<bool, String> {
+        if self.choice_labels.as_ref().is_some_and(|old| {
+            old.iter().zip(&labels).all(|(a, b)| {
+                a.text == b.text
+                    && a.locale == b.locale
+                    && a.font_plan_digest == b.font_plan_digest
+                    && a.font_assets == b.font_assets
+            })
+        }) {
+            return Ok(false);
+        }
+        if self.rows.iter().all(|row| row.entry.choice.is_none()) {
+            self.choice_labels = Some(labels);
+            return Ok(false);
+        }
+        if self.ready() && !self.rows.is_empty() {
+            self.anchor = self.capture_anchor(text)?;
+        }
+        self.choice_labels = Some(labels);
+        self.extents.clear();
+        self.anchor_offset = None;
+        self.total = 0.;
+        self.offset = 0.;
+        self.prepared = self.rows.is_empty();
+        Ok(true)
+    }
+    fn heading_run(&self, index: usize) -> Result<Option<TextRun>, String> {
+        let Some(choice) = self.rows[index].entry.choice else {
+            return Ok(None);
+        };
+        let mut run = self
+            .choice_labels
+            .as_ref()
+            .ok_or("E_HISTORY_LAYOUT: missing choice UI font plan")?[choice.index()]
+        .clone();
+        run.width = self.style.width;
+        run.height = MAX_EXTENT;
+        run.size = self.style.size * 0.8;
+        run.line_height = self.style.line_height;
+        Ok(Some(run))
     }
     pub fn ready(&self) -> bool {
         self.prepared
@@ -139,7 +216,12 @@ impl HistoryLayout {
             visible: None,
             x: 0.,
             y: 0.,
-            width: self.style.width,
+            width: super::history_controls::voice_layout(
+                self.style.width,
+                self.voice_controls,
+                entry.voice_count,
+            )
+            .0,
             // Shaping does not depend on visible height. Use the same bounded
             // height for measurement and painting to reuse its exact cache key.
             height: MAX_EXTENT,
@@ -193,15 +275,11 @@ impl HistoryLayout {
             }
             let run = self.run(index);
             let buffer = Self::shape(text, &run)?;
-            let height = buffer
+            let body_height = buffer
                 .layout_runs()
                 .map(|line| line.line_top + line.line_height)
                 .fold(self.style.line_height, f32::max);
-            let top = self.total + if index == 0 { 0. } else { self.style.gap };
-            let total = top + height;
-            if !total.is_finite() || total > MAX_EXTENT || total <= top {
-                return Err("E_HISTORY_LAYOUT: measured extent exceeds budget".into());
-            }
+            let mut anchor_body = None;
             if let Anchor::Text {
                 key,
                 byte,
@@ -219,11 +297,68 @@ impl HistoryLayout {
                         })
                         .last()
                         .unwrap_or(0.);
-                    self.anchor_offset =
-                        Some(top + line_top + line_fraction * self.style.line_height);
+                    anchor_body = Some(line_top + line_fraction * self.style.line_height);
                 }
             }
-            self.extents.push(Extent { top, height });
+            let mut anchor_heading = None;
+            let heading = if let Some(run) = self.heading_run(index)? {
+                let buffer = Self::shape(text, &run)?;
+                if let Anchor::Heading {
+                    key,
+                    byte,
+                    line_fraction,
+                } = self.anchor
+                {
+                    if self.rows[index].key == key {
+                        let offsets = TextEngine::line_offsets(&run);
+                        let line_top = buffer
+                            .layout_runs()
+                            .filter_map(|line| {
+                                let start = offsets[line.line_i]
+                                    + line.glyphs.iter().map(|g| g.start).min().unwrap_or(0);
+                                (start <= byte).then_some(line.line_top)
+                            })
+                            .last()
+                            .unwrap_or(0.);
+                        anchor_heading = Some(line_top + line_fraction * self.style.line_height);
+                    }
+                }
+                buffer
+                    .layout_runs()
+                    .map(|line| line.line_top + line.line_height)
+                    .fold(self.style.line_height, f32::max)
+            } else {
+                0.
+            };
+            let (_, control, voice) = super::history_controls::voice_layout(
+                self.style.width,
+                self.voice_controls,
+                entry.voice_count,
+            );
+            let height =
+                (body_height + heading + control).max(if voice.is_some() { 44. } else { 0. });
+            let top = self.total + if index == 0 { 0. } else { self.style.gap };
+            let total = top + height;
+            if !total.is_finite() || total > MAX_EXTENT || total <= top {
+                return Err("E_HISTORY_LAYOUT: measured extent exceeds budget".into());
+            }
+            if let Some(offset) = anchor_body {
+                self.anchor_offset = Some(top + control + heading + offset);
+            }
+            if let Some(offset) = anchor_heading {
+                self.anchor_offset = Some(top + control + offset);
+            }
+            if let Anchor::Control { key, fraction } = self.anchor {
+                if self.rows[index].key == key {
+                    self.anchor_offset = Some(top + control * fraction);
+                }
+            }
+            self.extents.push(Extent {
+                top,
+                height,
+                heading,
+                control,
+            });
             self.total = total;
             progress.entries += 1;
             progress.bytes += bytes;
@@ -239,7 +374,7 @@ impl HistoryLayout {
         let max = (self.total - self.style.height).max(0.);
         self.offset = match self.anchor {
             Anchor::Latest => max,
-            Anchor::Text { .. } => self
+            Anchor::Text { .. } | Anchor::Heading { .. } | Anchor::Control { .. } => self
                 .anchor_offset
                 .ok_or("E_HISTORY_LAYOUT: stale text anchor")?
                 .clamp(0., max),
@@ -258,12 +393,25 @@ impl HistoryLayout {
             .partition_point(|e| e.top + e.height <= self.offset)
             .min(self.rows.len() - 1);
         let extent = self.extents[index];
-        let run = self.run(index);
+        if extent.control > 0. && self.offset < extent.top + extent.control {
+            return Ok(Anchor::Control {
+                key: self.rows[index].key,
+                fraction: (self.offset - extent.top) / extent.control,
+            });
+        }
+        let in_heading =
+            extent.heading > 0. && self.offset < extent.top + extent.control + extent.heading;
+        let run = if in_heading {
+            self.heading_run(index)?.unwrap()
+        } else {
+            self.run(index)
+        };
+        let run_top = extent.top + extent.control + if in_heading { 0. } else { extent.heading };
         let offsets = TextEngine::line_offsets(&run);
         let buffer = Self::shape(text, &run)?;
         let (byte, top) = buffer
             .layout_runs()
-            .filter(|line| line.line_top <= self.offset - extent.top)
+            .filter(|line| line.line_top <= self.offset - run_top)
             .map(|line| {
                 (
                     offsets[line.line_i] + line.glyphs.iter().map(|g| g.start).min().unwrap_or(0),
@@ -272,10 +420,19 @@ impl HistoryLayout {
             })
             .last()
             .unwrap_or((0, 0.));
-        Ok(Anchor::Text {
-            key: self.rows[index].key,
-            byte,
-            line_fraction: (self.offset - extent.top - top) / self.style.line_height,
+        let line_fraction = (self.offset - run_top - top) / self.style.line_height;
+        Ok(if in_heading {
+            Anchor::Heading {
+                key: self.rows[index].key,
+                byte,
+                line_fraction,
+            }
+        } else {
+            Anchor::Text {
+                key: self.rows[index].key,
+                byte,
+                line_fraction,
+            }
         })
     }
     /// Reflow retains the first visible logical character and its fractional
@@ -362,16 +519,87 @@ impl HistoryLayout {
         if end.saturating_sub(first) > MAX_VISIBLE {
             return Err("E_HISTORY_LAYOUT: visible text-run budget exceeded".into());
         }
-        Ok((first..end)
-            .map(|index| {
-                let mut run = self.run(index);
-                run.x = x;
-                run.y = y + self.extents[index].top - self.offset;
-                run.color = color;
-                run.clip = Some(rect);
-                run
-            })
-            .collect())
+        let mut runs = vec![];
+        for index in first..end {
+            let run_y = y + self.extents[index].top - self.offset;
+            if let Some(mut heading) = self.heading_run(index)? {
+                heading.x = x;
+                heading.y = run_y + self.extents[index].control;
+                heading.color = color;
+                heading.clip = Some(rect);
+                runs.push(heading);
+            }
+            let mut run = self.run(index);
+            run.x = x;
+            run.y = run_y + self.extents[index].control + self.extents[index].heading;
+            run.color = color;
+            run.clip = Some([
+                rect[0],
+                rect[1],
+                ((x + run.width).min(rect[0] + rect[2]) - rect[0]).max(0.),
+                rect[3],
+            ]);
+            runs.push(run);
+        }
+        if runs.len() > MAX_VISIBLE {
+            return Err("E_HISTORY_LAYOUT: visible text-run budget exceeded".into());
+        }
+        Ok(runs)
+    }
+    pub fn visible_voices(
+        &self,
+        origin: [f32; 2],
+        clip: [f32; 4],
+    ) -> Result<Vec<(usize, [f32; 4])>, String> {
+        if !self.ready() {
+            return Err("E_HISTORY_LAYOUT: incomplete measurement".into());
+        }
+        if origin
+            .iter()
+            .chain(clip.iter())
+            .any(|v| !v.is_finite() || v.abs() > MAX_EXTENT)
+            || clip[2] < 0.
+            || clip[3] < 0.
+        {
+            return Err("E_HISTORY_LAYOUT: invalid voice paint arguments".into());
+        }
+        let left = origin[0].max(clip[0]);
+        let right = (origin[0] + self.style.width).min(clip[0] + clip[2]);
+        let top = origin[1].max(clip[1]);
+        let bottom = (origin[1] + self.style.height).min(clip[1] + clip[3]);
+        if left >= right || top >= bottom {
+            return Ok(vec![]);
+        }
+        let clip = [left, top, right - left, bottom - top];
+        let first = self
+            .extents
+            .partition_point(|e| e.top + e.height <= self.offset + top - origin[1]);
+        let end = self
+            .extents
+            .partition_point(|e| e.top < self.offset + bottom - origin[1]);
+        let mut buttons = vec![];
+        for (row, extent) in self.rows[first..end].iter().zip(&self.extents[first..end]) {
+            let (_, _, rect) = super::history_controls::voice_layout(
+                self.style.width,
+                self.voice_controls,
+                row.entry.voice_count,
+            );
+            if let Some(mut rect) = rect {
+                rect[0] += origin[0];
+                rect[1] += origin[1] + extent.top - self.offset;
+                if rect[0] >= clip[0]
+                    && rect[1] >= clip[1]
+                    && rect[0] + rect[2] <= clip[0] + clip[2] + 0.01
+                    && rect[1] + rect[3] <= clip[1] + clip[3] + 0.01
+                {
+                    buttons.push((row.key, rect));
+                }
+            }
+        }
+        if buttons.len() > MAX_VISIBLE {
+            return Err("E_HISTORY_LAYOUT: visible voice budget exceeded".into());
+        }
+        Ok(buttons)
     }
 }
 
@@ -393,6 +621,9 @@ mod tests {
         MenuHistoryRow {
             key,
             entry: HistoryView {
+                key,
+                voice_count: 0,
+                choice: None,
                 speaker: String::new(),
                 text: text.into(),
                 locale: "en".into(),
@@ -419,6 +650,180 @@ mod tests {
             assert!(progress.entries <= BATCH_ENTRIES);
         }
         panic!("measurement did not terminate");
+    }
+    fn labels(locale: &str) -> [TextRun; 3] {
+        let dummy = HistoryLayout::new(vec![row(0, "")].into(), style()).unwrap();
+        [
+            crate::HistoryChoiceKind::Selected,
+            crate::HistoryChoiceKind::TimedOut,
+            crate::HistoryChoiceKind::Cancelled,
+        ]
+        .map(|kind| {
+            let mut run = dummy.run(0);
+            run.text = crate::Messages::default().text(locale, kind.message());
+            run.locale = locale.into();
+            run.font_plan_digest = format!("ui-{locale}");
+            run.font_assets = if locale == "en" {
+                vec!["font.ui".into()]
+            } else {
+                vec!["font.ui".into(), "font.reader".into()]
+            };
+            run
+        })
+    }
+    #[test]
+    fn voice_controls_keep_body_clear_and_only_offer_complete_targets_after_scroll_and_reflow() {
+        let rows: Arc<[_]> = (0..1000)
+            .map(|key| {
+                let mut record = row(key, "Frozen voice record ".repeat(3));
+                record.entry.voice_count = 1;
+                record
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let mut text = engine();
+        let mut layout = HistoryLayout::new(rows, style()).unwrap();
+        layout.voice_controls(true, &mut text).unwrap();
+        finish(&mut layout, &mut text);
+        layout.scroll_to(0.);
+        let origin = [20., 30.];
+        let clip = [20., 30., 320., 96.];
+        let buttons = layout.visible_voices(origin, clip).unwrap();
+        assert_eq!(buttons[0], (0, [222., 30., 118., 44.]));
+        let runs = layout.visible_runs(origin, Some(clip), [1.; 4]).unwrap();
+        assert_eq!(runs[0].width, 194.);
+        assert_eq!(runs[0].clip.unwrap()[2], 194.);
+        assert!(layout
+            .visible_voices(origin, [20., 31., 320., 43.])
+            .unwrap()
+            .is_empty());
+        layout.scroll_to(1.);
+        assert!(layout
+            .visible_voices(origin, clip)
+            .unwrap()
+            .iter()
+            .all(|(key, _)| *key != 0));
+        layout
+            .reflow(
+                HistoryStyle {
+                    width: 180.,
+                    ..style()
+                },
+                &mut text,
+            )
+            .unwrap();
+        finish(&mut layout, &mut text);
+        layout.scroll_to(0.);
+        let narrow = [20., 30., 180., 96.];
+        assert_eq!(
+            layout.visible_voices(origin, narrow).unwrap()[0],
+            (0, [20., 30., 118., 44.])
+        );
+        let runs = layout.visible_runs(origin, Some(narrow), [1.; 4]).unwrap();
+        assert_eq!(runs[0].y, 82.);
+        assert_eq!(runs[0].width, 180.);
+        layout.scroll_to(26.);
+        assert!(
+            matches!(layout.capture_anchor(&mut text).unwrap(), Anchor::Control {key:0,fraction} if (fraction-0.5).abs()<0.01)
+        );
+        layout
+            .reflow(
+                HistoryStyle {
+                    width: 200.,
+                    ..style()
+                },
+                &mut text,
+            )
+            .unwrap();
+        finish(&mut layout, &mut text);
+        assert_eq!(layout.offset(), Some(26.));
+        assert!(text.cache_stats().entries <= 128);
+        assert!(layout.visible_voices([f32::NAN, 0.], narrow).is_err());
+        assert!(layout.visible_voices(origin, [0., 0., -1., 96.]).is_err());
+        assert!(layout
+            .visible_voices(origin, [0., 0., f32::INFINITY, 96.])
+            .is_err());
+    }
+    #[test]
+    fn choice_heading_uses_ui_fonts_and_reflow_preserves_heading_body_and_latest_anchors() {
+        let mut first = row(0, "Frozen option text ".repeat(80));
+        first.entry.choice = Some(crate::HistoryChoiceKind::TimedOut);
+        let mut layout =
+            HistoryLayout::new(vec![first, row(1, "Latest dialogue")].into(), style()).unwrap();
+        let mut text = engine();
+        text.add_font_asset(
+            "font.ui",
+            include_bytes!("../../../examples/rain-letters/assets/fonts/ABeeZee-Regular.ttf")
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(layout
+            .measure_next(&mut text)
+            .unwrap_err()
+            .contains("missing choice UI font plan"));
+        layout.choice_labels(labels("en"), &mut text).unwrap();
+        finish(&mut layout, &mut text);
+        assert_eq!(layout.extents[0].heading, 24.);
+        layout.scroll_to(6.);
+        let runs = layout.visible_runs([20., 30.], None, [1.; 4]).unwrap();
+        assert_eq!(runs[0].text, "Automatic choice");
+        assert_eq!(runs[0].font_plan_digest, "ui-en");
+        assert_eq!(runs[0].font_assets, ["font.ui"]);
+        assert_eq!(runs[1].font_plan_digest, "frozen-plan");
+        assert_eq!(runs[1].font_assets, ["font.reader"]);
+        assert_eq!(runs[1].y - runs[0].y, layout.extents[0].heading);
+        assert_eq!(runs[0].clip, runs[1].clip);
+        assert!(matches!(
+            layout.capture_anchor(&mut text).unwrap(),
+            Anchor::Heading {
+                key: 0,
+                line_fraction: 0.25,
+                ..
+            }
+        ));
+        layout
+            .reflow(
+                HistoryStyle {
+                    width: 100.,
+                    size: 20.,
+                    line_height: 30.,
+                    ..style()
+                },
+                &mut text,
+            )
+            .unwrap();
+        finish(&mut layout, &mut text);
+        assert!((layout.offset().unwrap() - 7.5).abs() < 0.1);
+        layout.scroll_to(layout.extents[0].heading + 30. * 6. + 7.5);
+        let anchor = layout.capture_anchor(&mut text).unwrap();
+        let Anchor::Text {
+            byte,
+            line_fraction,
+            ..
+        } = anchor
+        else {
+            panic!()
+        };
+        assert!(byte > 0);
+        layout.choice_labels(labels("zh-Hans"), &mut text).unwrap();
+        finish(&mut layout, &mut text);
+        let Anchor::Text {
+            byte: after,
+            line_fraction: after_fraction,
+            ..
+        } = layout.capture_anchor(&mut text).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(after, byte);
+        assert_eq!(after_fraction, line_fraction);
+        assert_eq!(layout.heading_run(0).unwrap().unwrap().locale, "zh-Hans");
+        assert_eq!(layout.run(0).locale, "en");
+        layout.scroll_to(f32::MAX);
+        layout.reflow(style(), &mut text).unwrap();
+        finish(&mut layout, &mut text);
+        assert_eq!(layout.offset(), layout.max_offset());
+        assert!(!layout.choice_labels(labels("zh-Hans"), &mut text).unwrap());
     }
     #[test]
     fn actual_wrapping_produces_continuous_clipped_records_and_reuses_shapes() {

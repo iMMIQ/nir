@@ -71,7 +71,7 @@ async function runRoute(browser, fixture, profile, repetition) {
     await applyNetwork(context, page, profile);
     await page.goto(`${fixture.origin}/?test=1`);
     await page.waitForFunction(() => window.__nir?.state().ready && !window.__nir.state().loading);
-    const adapters = await page.evaluate(() => window.__nirActualAdapters);
+    const adapters = await page.evaluate(() => window.__nir.actualAdapters());
     const engineAdapter = (await state(page)).adapter;
     if (hardware) assertHardwareAdapter(engineAdapter, adapters);
     await startCapture(page);
@@ -165,7 +165,7 @@ async function runRoute(browser, fixture, profile, repetition) {
       diagnostics:window.__nir?.diagnostics(),
       checkpoints:window.__nirPerfCapture?.checkpoints,
       events:window.__nirPerfCapture?.events,
-      resources:performance.getEntriesByType('resource').slice(-1000).map(entry=>entry.toJSON()),
+      resources:window.__nir.resourceTimings().slice(-1000).map(entry=>entry.toJSON?.()||entry),
     })).catch(captureError=>({captureError:String(captureError)}));
     await fs.mkdir('reports',{recursive:true});
     await fs.writeFile(`reports/performance-failure-${profile.id}-${fixture.moduleCount}-${fixture.prefetchContent}-${repetition}-${Date.now()}.json`,JSON.stringify({error:String(error),progress,release:fixture.channel.release,repetition,prefetch:fixture.prefetchContent,...failure},null,2));

@@ -96,7 +96,7 @@ test('prepared interactions with long history', async ({ browser }) => {
     await page.goto(`${fixture.origin}/?test=1`);
     await settled(page, 'Title');
     if (process.env.NIR_PERF_MODE === 'hardware') {
-      assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nirActualAdapters]));
+      assertHardwareAdapter(...await page.evaluate(() => [window.__nir.state().adapter, window.__nir.actualAdapters()]));
     }
     for (const [i, step] of fixture.steps.entries()) {
       // Advance browses overflow before changing dialogue; finish that reading
@@ -118,7 +118,7 @@ test('prepared interactions with long history', async ({ browser }) => {
     report.release = await page.evaluate(() => window.__nir.diagnostics().release);
     report.engine = await page.evaluate(() => window.__nir.diagnostics().engine);
     report.historyCount = saved.history_count;
-    report.actualAdapters = await page.evaluate(() => window.__nirActualAdapters);
+    report.actualAdapters = await page.evaluate(() => window.__nir.actualAdapters());
     report.runs.menuOpen = []; report.runs.menuClose = [];
     for (let i = 0; i < samples; i++) {
       report.runs.menuOpen.push(await measure(page, { type: 'menu' }, 'Menu'));
@@ -172,7 +172,7 @@ test('prepared interactions with long history', async ({ browser }) => {
     if (cdp) {
       report.network = network;
       report.networkTruncated = network.length >= maxNetworkEvents;
-      report.resources = await page.evaluate(() => performance.getEntriesByType('resource').map(e => e.toJSON())).catch(() => []);
+      report.resources = await page.evaluate(() => window.__nir.resourceTimings().map(e => e.toJSON?.()||e)).catch(() => []);
       const completed = new Promise(resolve => cdp.once('Tracing.tracingComplete', resolve));
       await cdp.send('Tracing.end');
       const { stream } = await completed;

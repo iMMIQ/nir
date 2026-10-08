@@ -1836,6 +1836,27 @@ fn bad_runtime(at: &str, message: &str) -> Diagnostic {
 fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+fn validate_menu_audio_loops(
+    theme: &Theme,
+    requires: &[String],
+    duration: impl Fn(&str) -> Option<u64>,
+) -> Result<()> {
+    for (id, menu) in &theme.image_menus {
+        if let Some(music) = menu.effects.as_ref().and_then(|e| e.music.as_ref()) {
+            if let Some(region) = music.loop_region {
+                if !requires.iter().any(|c| c == "audio.loop-region.v1") {
+                    return Err(err("E_CAPABILITY", id, "audio.loop-region.v1"));
+                }
+                // Runtime roots contain asset identities; the catalog later
+                // supplies duration and completes the same validation.
+                if !region.valid(duration(&music.asset).unwrap_or(u64::MAX)) {
+                    return Err(err("E_AUDIO_LOOP", id, "invalid menu music loop region"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn validate_image_menus(
     theme: &Theme,
     asset: impl Fn(&str) -> Option<AssetKind>,
@@ -1876,6 +1897,7 @@ fn validate_image_menus(
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
     validate_ui_config(&root.theme, &root.player)?;
+    validate_menu_audio_loops(&root.theme, &root.requires, |_| None)?;
     if root.theme.image_menus.values().any(ImageMenu::uses_effects)
         && !root.requires.iter().any(|c| c == "ui.menu-effects.v1")
     {
@@ -2047,6 +2069,22 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "E_CAPABILITY",
             "theme.image_menus",
             "ui.menu-history-availability.v1",
+        ));
+    }
+    if root
+        .theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_voice)
+        && !root
+            .requires
+            .iter()
+            .any(|c| c == "ui.menu-history-voice.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-voice.v1",
         ));
     }
     if root.theme.image_menus.values().any(ImageMenu::uses_history)
@@ -2487,6 +2525,22 @@ fn validate_runtime_objects(view: &RuntimeProgramView, objects: &[RuntimeObject]
                 }
             }
             RuntimeObject::Catalog(package) => {
+                // A static body can be prefetched before its media catalog.
+                // Complete interval validation as soon as duration is available,
+                // including declarations resident before this catalog arrived.
+                for (id, cue) in view.cues.iter() {
+                    for definition in &cue.effects {
+                        validate_audio_loop(
+                            &definition.effect,
+                            &view.requires,
+                            &|asset| view.asset(asset).map(|a| a.duration_us.0),
+                            id,
+                        )?;
+                    }
+                }
+                validate_menu_audio_loops(&view.theme, &view.requires, |asset| {
+                    package.assets.get(asset).map(|a| a.duration_us.0)
+                })?;
                 for (id, asset) in &package.assets {
                     if asset.bytes > MAX_INPUT_BYTES as u64 * 16
                         || asset.width > 8192
@@ -2611,6 +2665,12 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
         let mut stages = 0;
         let mut dialogues = 0;
         for def in &cue.effects {
+            validate_audio_loop(
+                &def.effect,
+                &view.requires,
+                &|asset| view.asset(asset).map(|a| a.duration_us.0),
+                id,
+            )?;
             if !names.insert(&def.id) {
                 return Err(err("E_DUPLICATE", id, &def.id));
             }
@@ -3307,6 +3367,42 @@ struct ComposeCheck<'a> {
 
 /// One composition child: scope inheritance, forbidden kinds, capabilities,
 /// assets and stop targets, exactly like a top-level effect.
+fn validate_audio_loop(
+    effect: &Effect,
+    requires: &[String],
+    duration: &impl Fn(&str) -> Option<u64>,
+    at: &str,
+) -> Result<()> {
+    if effect.effect_tree_any(&|e| {
+        matches!(
+            e,
+            Effect::Audio {
+                loop_region: Some(_),
+                ..
+            }
+        )
+    }) && !requires.iter().any(|cap| cap == "audio.loop-region.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "audio.loop-region.v1"));
+    }
+    if effect.effect_tree_any(&|e| match e {
+        Effect::Audio {
+            asset,
+            looped,
+            loop_region: Some(region),
+            ..
+        } => !looped || !region.valid(duration(asset).unwrap_or(u64::MAX)),
+        _ => false,
+    }) {
+        return Err(Diagnostic::new(
+            "E_AUDIO_LOOP",
+            at,
+            "loop requires 0 <= start < end <= decoded duration",
+        ));
+    }
+    Ok(())
+}
+
 fn check_compose_child<'a>(
     def: &'a EffectDef,
     parent_scope: Scope,
@@ -3570,6 +3666,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         return validate_runtime_root(root);
     }
     validate_ui_config(&p.theme, &p.player)?;
+    validate_menu_audio_loops(&p.theme, &p.requires, |asset| {
+        p.assets.get(asset).map(|a| a.duration_us.0)
+    })?;
     if (p.theme.menu_overlay.is_some()
         || p.theme.image_menus.values().any(ImageMenu::uses_services))
         && !p.requires.iter().any(|c| c == "ui.menu-services.v1")
@@ -3720,6 +3819,18 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             "E_CAPABILITY",
             "theme.image_menus",
             "ui.menu-history-availability.v1",
+        ));
+    }
+    if p.theme
+        .image_menus
+        .values()
+        .any(ImageMenu::uses_history_voice)
+        && !p.requires.iter().any(|c| c == "ui.menu-history-voice.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.image_menus",
+            "ui.menu-history-voice.v1",
         ));
     }
     if p.theme.image_menus.values().any(ImageMenu::uses_history)
@@ -4015,6 +4126,12 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         let mut stage_count = 0;
         let mut dialogue_count = 0;
         for def in &cue.effects {
+            validate_audio_loop(
+                &def.effect,
+                &p.requires,
+                &|asset| p.assets.get(asset).map(|a| a.duration_us.0),
+                id,
+            )?;
             if !names.insert(&def.id) {
                 return Err(err("E_DUPLICATE", id, &def.id));
             }
@@ -4741,6 +4858,96 @@ mod runtime_tests {
             catalog: "resources".into(),
             assets: BTreeMap::from([("font".into(), font), ("image".into(), image)]),
         })
+    }
+
+    #[test]
+    fn delayed_catalog_completes_loop_validation_in_either_install_order() {
+        let mut body = empty_static();
+        body.cues.insert(
+            "m.music".into(),
+            serde_json::from_value(serde_json::json!({
+                "effects":[{"id":"m.loop","scope":"session","effect":{
+                "type":"audio","asset":"audio","bus":"bgm","looped":true,
+                    "loop_region":{"start_us":"200000","end_us":"600000"}
+                }}]
+            }))
+            .unwrap(),
+        );
+        body.activation_recipes
+            .insert("m.music".into(), BTreeSet::from(["audio".into()]));
+        let (fixture, batch) =
+            runtime_fixture(BTreeMap::from([("m.main".into(), simple_function())]), body);
+        let mut root = fixture.runtime_root().unwrap().clone();
+        root.requires
+            .extend(["audio.buffer.v1".into(), "audio.loop-region.v1".into()]);
+        root.assets.insert(
+            "audio".into(),
+            AssetIndexEntry {
+                kind: AssetKind::Audio,
+                object: "2".repeat(64),
+                catalog: "resources".into(),
+            },
+        );
+        let base = ValidatedProgram::from_runtime(root.clone()).unwrap();
+        for catalog_first in [false, true] {
+            for duration in [500_000, 800_000] {
+                let RuntimeObject::Catalog(mut catalog) = catalog_block() else {
+                    unreachable!()
+                };
+                catalog.assets.insert(
+                    "audio".into(),
+                    Asset {
+                        kind: AssetKind::Audio,
+                        object: "2".repeat(64),
+                        bytes: 1,
+                        width: 0,
+                        height: 0,
+                        duration_us: Micros(duration),
+                        decoded_bytes: 4,
+                    },
+                );
+                let catalog_batch = vec![(
+                    ContentKey::Catalog {
+                        catalog: "resources".into(),
+                    },
+                    RuntimeObject::Catalog(catalog),
+                    100,
+                )];
+                let (first, second) = if catalog_first {
+                    (catalog_batch, batch.clone())
+                } else {
+                    (batch.clone(), catalog_batch)
+                };
+                // Static declarations may arrive before duration metadata.
+                let staged = base.install_batch(first).unwrap();
+                let result = staged.install_batch(second);
+                if duration == 800_000 {
+                    assert!(result.is_ok(), "{:?}", result.unwrap_err());
+                } else {
+                    assert_eq!(result.unwrap_err().code, "E_AUDIO_LOOP");
+                    // A rejected candidate cannot add its objects to live state.
+                    assert_eq!(
+                        staged.is_resident(&ContentKey::Static { module: "m".into() }),
+                        !catalog_first
+                    );
+                    assert_eq!(
+                        staged.is_resident(&ContentKey::Catalog {
+                            catalog: "resources".into()
+                        }),
+                        catalog_first
+                    );
+                }
+            }
+        }
+        root.requires.retain(|cap| cap != "audio.loop-region.v1");
+        assert_eq!(
+            ValidatedProgram::from_runtime(root)
+                .unwrap()
+                .install_batch(batch)
+                .unwrap_err()
+                .code,
+            "E_CAPABILITY"
+        );
     }
 
     #[test]

@@ -633,3 +633,121 @@ fn cancelling_observed_fade_commits_device_value_and_late_owner_cannot_change_it
     c.observe_audio_positions(&[late]).unwrap();
     assert_eq!(c.audio_envelope(sound), (0.25, 0.25, Micros(0)));
 }
+
+fn loop_region_program() -> Program {
+    let mut p = audio_program(1.);
+    p.requires.push("audio.loop-region.v1".into());
+    if let Effect::Audio {
+        asset,
+        looped,
+        loop_region,
+        bus,
+        ..
+    } = &mut p.cues.get_mut("audio-test").unwrap().effects[0].effect
+    {
+        *looped = true;
+        *bus = AudioBus::Bgm;
+        *loop_region = Some(AudioLoopRegion {
+            start_us: Micros(200_000),
+            end_us: Micros(600_000),
+        });
+        // This VM fixture carries no media bytes. Supply the duration that a
+        // compiler-generated catalog records for this synthetic sound.
+        p.assets.get_mut(asset).unwrap().duration_us = Micros(800_000);
+    }
+    p
+}
+
+#[test]
+fn loop_region_is_declared_metadata_and_cumulative_position_survives_restore() {
+    let (mut core, commands) = start(loop_region_program());
+    let expected = AudioLoopRegion {
+        start_us: Micros(200_000),
+        end_us: Micros(600_000),
+    };
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, CoreIntent::AudioStart {
+        looped: true, loop_region: Some(region), position_us: Micros(0), ..
+    } if *region == expected)));
+    let task = core.state().handles["sample"];
+    core.observe_audio_positions(&[AudioPosition {
+        task,
+        position_us: Micros(1_400_000),
+        envelope: None,
+    }])
+    .unwrap();
+    let tick = core.state().tick_us;
+    let restored = Core::restore(
+        core.validated_program().clone(),
+        core.snapshot(),
+        "audio-test",
+    )
+    .unwrap();
+    assert_eq!(restored.state().tick_us, tick);
+    assert_eq!(
+        restored.state().tasks[&task].audio_position_us,
+        Some(Micros(1_400_000))
+    );
+    // Forged interval metadata cannot change the declared sound after restore.
+    let mut snapshot = core.snapshot();
+    if let Effect::Audio { loop_region, .. } = &mut snapshot.tasks.get_mut(&task).unwrap().effect {
+        *loop_region = Some(AudioLoopRegion {
+            start_us: Micros(0),
+            end_us: Micros(700_000),
+        });
+    }
+    assert!(Core::restore(core.validated_program().clone(), snapshot, "audio-test").is_err());
+}
+
+#[test]
+fn loop_region_requires_capability_looping_and_valid_asset_duration() {
+    let mut missing = loop_region_program();
+    missing.requires.retain(|cap| cap != "audio.loop-region.v1");
+    assert_eq!(
+        ValidatedProgram::new(missing).unwrap_err().code,
+        "E_CAPABILITY"
+    );
+    for (looped, start, end) in [
+        (false, 200_000, 600_000),
+        (true, 600_000, 600_000),
+        (true, 700_000, 600_000),
+        (true, 0, u64::MAX),
+    ] {
+        let mut p = loop_region_program();
+        if let Effect::Audio {
+            looped: looping,
+            loop_region,
+            ..
+        } = &mut p.cues.get_mut("audio-test").unwrap().effects[0].effect
+        {
+            *looping = looped;
+            *loop_region = Some(AudioLoopRegion {
+                start_us: Micros(start),
+                end_us: Micros(end),
+            });
+        }
+        assert_eq!(ValidatedProgram::new(p).unwrap_err().code, "E_AUDIO_LOOP");
+    }
+}
+
+#[test]
+fn composition_audio_cannot_bypass_loop_region_validation() {
+    let mut p = loop_region_program();
+    p.requires.push("task.compose.v1".into());
+    let cue = p.cues.get_mut("audio-test").unwrap();
+    let child = cue.effects.remove(0);
+    cue.effects.insert(
+        0,
+        EffectDef {
+            id: "composite".into(),
+            scope: Scope::Session,
+            effect: Effect::Sequence {
+                children: vec![child],
+            },
+        },
+    );
+    assert!(ValidatedProgram::new(p.clone()).is_ok());
+    p.requires.retain(|cap| cap != "audio.loop-region.v1");
+    assert_eq!(ValidatedProgram::new(p).unwrap_err().code, "E_CAPABILITY");
+}

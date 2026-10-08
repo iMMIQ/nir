@@ -1,4 +1,7 @@
 use crate::*;
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 /// Maximum suspended parent pages in one authored navigation context.
 pub const MAX_MENU_PARENTS: usize = 8;
@@ -87,6 +90,8 @@ pub enum MenuContent {
         thumb_asset: Option<String>,
     },
     HistoryFlow {
+        #[serde(default, skip_serializing_if = "is_false")]
+        voice_controls: bool,
         size: f32,
         line_height: f32,
         gap: f32,
@@ -96,6 +101,8 @@ pub enum MenuContent {
         color: [f32; 4],
     },
     HistoryWindow {
+        #[serde(default, skip_serializing_if = "is_false")]
+        voice_controls: bool,
         offset_local: String,
         limit: u32,
         row_height: f32,
@@ -245,7 +252,11 @@ impl ImageMenu {
                 | MenuContent::TextButton { .. }
                 | MenuContent::Toggle { .. }
                 | MenuContent::Range { .. } => 1,
-                MenuContent::HistoryWindow { limit, .. } => limit.min(65) as usize,
+                MenuContent::HistoryWindow {
+                    limit,
+                    voice_controls,
+                    ..
+                } => limit.min(65) as usize * if voice_controls { 2 } else { 1 },
                 MenuContent::HistoryFlow { max_visible, .. } => max_visible.min(65) as usize,
                 _ => 0,
             })
@@ -259,6 +270,23 @@ impl ImageMenu {
                     .filter(|e| matches!(e.content, MenuContent::HistoryScrollbar { .. }))
                     .count()
                     * 3
+                + self
+                    .elements
+                    .iter()
+                    .map(|e| match e.content {
+                        MenuContent::HistoryWindow {
+                            limit,
+                            voice_controls: true,
+                            ..
+                        } => limit as usize,
+                        MenuContent::HistoryFlow {
+                            max_visible,
+                            voice_controls: true,
+                            ..
+                        } => max_visible as usize,
+                        _ => 0,
+                    })
+                    .sum::<usize>()
                 > 256
         {
             return Err(fail());
@@ -401,6 +429,7 @@ impl ImageMenu {
                     }
                 }
                 MenuContent::HistoryFlow {
+                    voice_controls,
                     size,
                     line_height,
                     gap,
@@ -408,15 +437,17 @@ impl ImageMenu {
                     page_step,
                     max_visible,
                     color,
+                    ..
                 } => {
                     if !size.is_finite() || !(8. ..=128.).contains(size)
                         || !line_height.is_finite() || !(*size..=512.).contains(line_height)
                         || !gap.is_finite() || !(0. ..=1024.).contains(gap)
                         || !wheel_step.is_finite() || !(1. ..=8192.).contains(wheel_step)
                         || !page_step.is_finite() || !(1. ..=8192.).contains(page_step)
-                        || !(3..=64).contains(max_visible)
+                        || !((if *voice_controls { 6 } else { 3 })..=64).contains(max_visible)
                         // Worst-case minimum reader scale, plus both partial edge records.
-                        || e.rect[3] > line_height * 0.8 * max_visible.saturating_sub(2) as f32
+                        || e.rect[3] > line_height * 0.8
+                            * (if *voice_controls { max_visible / 2 } else { *max_visible }).saturating_sub(2) as f32
                         || color.iter().any(|c| !c.is_finite() || !(0. ..=1.).contains(c))
                     {
                         return Err(fail());
@@ -428,6 +459,7 @@ impl ImageMenu {
                     row_height,
                     size,
                     color,
+                    ..
                 } => {
                     if !(1..=16).contains(limit)
                         || !row_height.is_finite()
@@ -531,6 +563,8 @@ pub struct MenuTransition {
 #[serde(deny_unknown_fields)]
 pub struct MenuMusic {
     pub asset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_region: Option<AudioLoopRegion>,
     #[serde(default)]
     pub bus: AudioBus,
     #[serde(default = "one", skip_serializing_if = "is_one")]
@@ -661,6 +695,20 @@ impl MenuEffects {
     }
 }
 impl ImageMenu {
+    pub fn uses_history_voice(&self) -> bool {
+        self.elements.iter().any(|e| {
+            matches!(
+                e.content,
+                MenuContent::HistoryFlow {
+                    voice_controls: true,
+                    ..
+                } | MenuContent::HistoryWindow {
+                    voice_controls: true,
+                    ..
+                }
+            )
+        })
+    }
     pub fn uses_effects(&self) -> bool {
         self.effects.is_some()
     }
@@ -1082,51 +1130,18 @@ impl ImageMenu {
 }
 
 impl Theme {
-    /// Preserve legacy title-page preparation, excluding overlay-only pages.
-    /// Effect sounds and music ride along so boot decodes them with the page.
+    /// Initial title media only. Other pages are admitted when navigation
+    /// requests them, including their effects and music.
     pub fn title_image_assets(&self) -> BTreeSet<String> {
-        let Some(root) = self.menu_overlay.as_deref() else {
-            // No overlay: every page is title-reachable, effects included.
-            let mut assets = self.image_assets();
-            assets.extend(self.image_menus.values().flat_map(ImageMenu::effect_assets));
-            return assets;
-        };
-        let closure = |roots: Vec<String>| {
-            let mut pending = roots;
-            let mut seen = BTreeSet::new();
-            while let Some(id) = pending.pop() {
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                if let Some(menu) = self.image_menus.get(&id) {
-                    pending.extend(menu.controls().filter_map(|(_, a, _)| match a {
-                        ImageMenuAction::Menu { menu } | ImageMenuAction::PushMenu { menu } => {
-                            Some(menu.clone())
-                        }
-                        _ => None,
-                    }));
-                }
-            }
-            seen
-        };
-        let overlay = closure(vec![root.into()]);
-        let mut roots: Vec<_> = self
-            .image_menus
-            .keys()
-            .filter(|id| !overlay.contains(*id))
-            .cloned()
-            .collect();
-        roots.push("title".into());
-        let title = closure(roots);
         self.dialogue
             .background
             .iter()
             .cloned()
             .chain(
                 self.image_menus
-                    .iter()
-                    .filter(|(id, _)| title.contains(*id))
-                    .flat_map(|(_, menu)| menu.prepared_assets()),
+                    .get("title")
+                    .into_iter()
+                    .flat_map(ImageMenu::prepared_assets),
             )
             .collect()
     }
@@ -1208,10 +1223,21 @@ impl ImageMenu {
         locals: &BTreeMap<String, MenuValue>,
         total: usize,
     ) -> Option<(String, i32)> {
+        self.history_page_with_capacity(window, delta, locals, total, None)
+    }
+    pub fn history_page_with_capacity(
+        &self,
+        window: &str,
+        delta: i32,
+        locals: &BTreeMap<String, MenuValue>,
+        total: usize,
+        capacity: Option<usize>,
+    ) -> Option<(String, i32)> {
         let element = self.elements.iter().find(|e| e.id == window)?;
         let MenuContent::HistoryWindow {
             offset_local,
             limit,
+            voice_controls,
             ..
         } = &element.content
         else {
@@ -1220,12 +1246,29 @@ impl ImageMenu {
         let MenuLocal::Int { max, .. } = self.locals.get(offset_local)? else {
             return None;
         };
+        if *limit == 0 {
+            return None;
+        }
         let MenuValue::Int(value) = locals.get(offset_local)? else {
             return None;
         };
-        let end = total.saturating_sub(*limit as usize).min(*max as usize) as i64;
+        let effective = if *voice_controls {
+            capacity
+                .unwrap_or(*limit as usize)
+                .clamp(1, *limit as usize)
+        } else {
+            *limit as usize
+        };
+        // Whole-page commands use the visible capacity; explicit single
+        // record steps retain the author's delta.
+        let delta = if *voice_controls && delta % *limit as i32 == 0 {
+            delta as i64 / *limit as i64 * effective as i64
+        } else {
+            delta as i64
+        };
+        let end = total.saturating_sub(effective).min(*max as usize) as i64;
         let current = (*value as i64).clamp(0, end);
-        let next = (current + delta as i64).clamp(0, end);
+        let next = (current + delta).clamp(0, end);
         (next != current).then(|| (offset_local.clone(), next as i32))
     }
 }

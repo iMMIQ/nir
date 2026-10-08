@@ -21,6 +21,8 @@ fn test_sdk() -> tempfile::TempDir {
         "player_web.js",
         "player_web_bg.wasm",
         "host.js",
+        "runtime-worker.js",
+        "asset-worker.js",
         "index.html",
         "bootstrap.js",
         "THIRD-PARTY.txt",

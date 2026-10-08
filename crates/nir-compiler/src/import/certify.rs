@@ -149,7 +149,16 @@ fn round(p: &mut Player, automatic: bool) -> bool {
 }
 
 fn drive(p: &mut Player, automatic: bool, limit: usize) {
-    for _ in 0..limit {
+    let mut progress = std::time::Instant::now();
+    for round_index in 0..limit {
+        if round_index % 32 == 0 && progress.elapsed().as_secs() >= 15 {
+            eprintln!(
+                "Player route: round={round_index} automatic={automatic} screen={:?} paused={} tick={} history={} position={:?}",
+                p.screen, p.paused(), p.core().state().tick_us.0,
+                p.core().state().history.len(), p.core().location()
+            );
+            progress = std::time::Instant::now();
+        }
         if !round(p, automatic) {
             return;
         }

@@ -62,7 +62,7 @@ pub struct ReadingState {
     dialogue: TextView,
     history: TextView,
     choice_offset: f32,
-    settings_offset: f32,
+    panels: PanelOffsets,
 }
 impl ReadingState {
     pub fn matches(&self, identity: (u32, u32)) -> bool {
@@ -87,7 +87,9 @@ impl ReadingState {
             }
             ScrollRegion::Choices => self.choice_offset = offset,
             ScrollRegion::History => self.history.offset = offset,
-            ScrollRegion::Settings => self.settings_offset = offset,
+            ScrollRegion::Menu => self.panels.menu = offset,
+            ScrollRegion::Saves => self.panels.saves = offset,
+            ScrollRegion::Settings => self.panels.settings = offset,
         }
         true
     }
@@ -155,7 +157,7 @@ impl ReadingState {
             messages,
             &heights,
             self.choice_offset,
-            self.settings_offset,
+            &self.panels,
         );
         let paints = p.menu_paint.len();
         self.project_history_flow(&mut p, m, identity.0, messages, text);
@@ -172,7 +174,10 @@ impl ReadingState {
             let view = match region {
                 ScrollRegion::Dialogue => &mut self.dialogue,
                 ScrollRegion::History => &mut self.history,
-                ScrollRegion::Choices | ScrollRegion::Settings => continue,
+                ScrollRegion::Choices
+                | ScrollRegion::Settings
+                | ScrollRegion::Menu
+                | ScrollRegion::Saves => continue,
             };
             let shape = TextEngine::key(r);
             let buffer = &text.buffers[&shape];
@@ -189,6 +194,11 @@ impl ReadingState {
                     bottom = bottom.max(line.line_top + line.line_height);
                     lines.push((start, line.line_top));
                 }
+            }
+            if region == ScrollRegion::Dialogue && bottom > r.height {
+                // A fullscreen text window has no room above or below; keep
+                // its overflow controls out of the readable clipped content.
+                r.height = dialogue_content_height(r.y, r.height, p.height);
             }
             let max = (bottom - r.height).max(0.);
             if view.follow {
@@ -236,10 +246,20 @@ impl ReadingState {
             .find(|v| v.region == ScrollRegion::Choices)
             .map(|v| v.offset)
             .unwrap_or(0.);
-        self.settings_offset = p
+        self.panels.settings = p
             .scrolls
             .iter()
             .find(|v| v.region == ScrollRegion::Settings)
+            .map_or(0., |v| v.offset);
+        self.panels.menu = p
+            .scrolls
+            .iter()
+            .find(|v| v.region == ScrollRegion::Menu)
+            .map_or(0., |v| v.offset);
+        self.panels.saves = p
+            .scrolls
+            .iter()
+            .find(|v| v.region == ScrollRegion::Saves)
             .map_or(0., |v| v.offset);
         for v in views {
             controls(&mut p, v, m, messages);
@@ -251,24 +271,34 @@ impl ReadingState {
 pub(super) fn controls(p: &mut DrawPacket, view: ScrollView, m: &UiModel, messages: &Messages) {
     let first_quad = p.quads.len();
     let first_text = p.texts.len();
-    let [x, y, w, h] = view.rect;
-    let button_width = ((w - 6.) / 2.).min(144.);
+    let bounds = control_rects(&view, p.width, p.height);
     // Always reachable outside the clipped content, including while a Gate is latched.
     for (i, delta, label, enabled) in [
-        (0., -1, "scroll-back", view.offset > 0.5),
-        (1., 1, "scroll-forward", view.offset < view.max - 0.5),
+        (0, -1, "scroll-back", view.offset > 0.5),
+        (1, 1, "scroll-forward", view.offset < view.max - 0.5),
     ] {
-        let bx = x + i * (button_width + 6.);
+        let rect = bounds[i];
+        let full_label = messages.text(&m.ui_locale, label);
+        let painted_label = if matches!(
+            view.region,
+            ScrollRegion::Menu | ScrollRegion::Saves | ScrollRegion::Settings
+        ) && rect[2] < 120.
+        {
+            messages.text(&m.ui_locale, &format!("{label}-compact"))
+        } else {
+            full_label.clone()
+        };
         p.button(
-            messages.text(&m.ui_locale, label),
+            painted_label,
             UiAction::Scroll {
                 region: view.region,
                 delta,
             },
-            [bx, y + h + 2., button_width, 36.],
+            rect,
             false,
             &m.theme,
         );
+        p.semantics.last_mut().unwrap().label = full_label;
         p.semantics.last_mut().unwrap().enabled = enabled;
         if !enabled {
             p.texts.last_mut().unwrap().color = m.theme.muted;
@@ -284,4 +314,115 @@ pub(super) fn controls(p: &mut DrawPacket, view: ScrollView, m: &UiModel, messag
         }
     }
     p.scrolls.push(view);
+}
+
+// Reserve a control row only for overflowing text when neither side of the
+// authored window has room. Its remaining content still uses the scroll view.
+fn dialogue_content_height(top: f32, height: f32, viewport_height: f32) -> f32 {
+    if top < 46. && top + height + 46. > viewport_height {
+        (viewport_height - top - 46.).max(0.)
+    } else {
+        height
+    }
+}
+
+fn control_rects(view: &ScrollView, width: f32, height: f32) -> [[f32; 4]; 2] {
+    let [x, y, w, h] = view.rect;
+    if view.region != ScrollRegion::Dialogue {
+        let button_width = ((w - 6.) / 2.).min(144.);
+        let button_height = if matches!(
+            view.region,
+            ScrollRegion::Menu | ScrollRegion::Saves | ScrollRegion::Settings
+        ) {
+            44.
+        } else {
+            36.
+        };
+        return [0., 1.].map(|i| {
+            [
+                x + i * (button_width + 6.),
+                y + h + 2.,
+                button_width,
+                button_height,
+            ]
+        });
+    }
+    let button_width = ((w - 6.) / 2.)
+        .clamp(44., 144.)
+        .min(((width - 6.) / 2.).max(0.));
+    let x = x.clamp(0., (width - 2. * button_width - 6.).max(0.));
+    let button_height = 44.;
+    let y = if y + h + 2. + button_height <= height {
+        y + h + 2.
+    } else {
+        (y - 2. - button_height).max(0.)
+    };
+    [0., 1.].map(|i| [x + i * (button_width + 6.), y, button_width, button_height])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dialogue(rect: [f32; 4]) -> ScrollView {
+        ScrollView {
+            menu: None,
+            region: ScrollRegion::Dialogue,
+            rect,
+            offset: 0.,
+            max: 105.,
+            step: 135.,
+        }
+    }
+
+    #[test]
+    fn bottom_dialogue_has_visible_touch_controls_without_covering_text() {
+        // Imported 1024x768 textbox and its scaled 320x240 landscape viewport.
+        for (width, height, rect) in [
+            (1024., 768., [17., 578., 990., 175.]),
+            (320., 240., [5.3, 180.6, 309.4, 54.6]),
+        ] {
+            let view = dialogue(rect);
+            for [x, y, w, h] in control_rects(&view, width, height) {
+                assert!(w >= 44. && h >= 44., "touch control too small");
+                assert!(
+                    x >= 0. && y >= 0. && x + w <= width && y + h <= height,
+                    "scroll control clipped by viewport"
+                );
+                assert!(
+                    y + h <= rect[1] || y >= rect[1] + rect[3],
+                    "scroll control covers readable text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_height_dialogue_reserves_room_and_keeps_content_scrollable() {
+        let height = dialogue_content_height(0., 480., 480.);
+        assert!(height > 0. && height < 480.);
+        let view = dialogue([0., 0., 640., height]);
+        for [_, y, _, h] in control_rects(&view, 640., 480.) {
+            assert!(y >= height && y + h <= 480.);
+        }
+        // A textbox with room above doesn't sacrifice any text height.
+        assert_eq!(dialogue_content_height(100., 380., 480.), 380.);
+    }
+
+    #[test]
+    fn normal_dialogue_uses_room_below_while_other_scroll_regions_keep_layout() {
+        let view = dialogue([12., 300., 616., 100.]);
+        for [_, y, _, h] in control_rects(&view, 640., 480.) {
+            assert_eq!(y, 402.);
+            assert!(h >= 44.);
+        }
+        let history = ScrollView {
+            region: ScrollRegion::History,
+            ..view
+        };
+        assert_eq!(
+            control_rects(&history, 640., 480.)[0],
+            [12., 402., 144., 36.]
+        );
+    }
 }

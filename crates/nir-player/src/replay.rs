@@ -13,7 +13,7 @@ const REPLAY_ENTRY_BUDGET: u32 = 1_000;
 pub(super) struct ReplayWork {
     pub phase: ReplayPhase,
     snapshot: Snapshot,
-    checkpoints: Vec<Snapshot>,
+    checkpoints: Checkpoints,
     screen: Screen,
     return_screen: Screen,
     image_menu: String,

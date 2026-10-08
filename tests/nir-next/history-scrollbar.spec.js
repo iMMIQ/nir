@@ -1,6 +1,6 @@
 import {test,expect} from '@playwright/test';
 
-test('image history scrollbar continuously drags, paints states and rejects stale gestures',async({page})=>{
+test('image history scrollbar continuously drags, paints states and rejects stale gestures',async({page},testInfo)=>{
   await page.setViewportSize({width:1280,height:720});
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto('http://127.0.0.1:4218/?test=1&backend=webgl2',{waitUntil:'domcontentloaded'});
@@ -27,7 +27,11 @@ test('image history scrollbar continuously drags, paints states and rejects stal
   expect(initial.offset).toBe(initial.max);
   await expect(page.getByRole('button',{name:'History scroll +',exact:true})).toBeDisabled();
   await page.mouse.move(1000,600);
-  await expect.poll(()=>color(x,initial.thumb[1]+6)).toEqual([0,80,240]);
+  try {await expect.poll(()=>color(x,initial.thumb[1]+6)).toEqual([0,80,240]);} catch(error) {
+    await testInfo.attach('initial-scrollbar-state',{body:JSON.stringify({initial,color:await color(x,initial.thumb[1]+6),
+      current:await page.evaluate(()=>__nir.state())},null,2),contentType:'application/json'});
+    await testInfo.attach('initial-scrollbar-frame',{body:await page.screenshot(),contentType:'image/png'});throw error;
+  }
   expect(await color(x,initial.increase[1]+8)).toEqual([100,100,100]);
   // Track and thumb share one semantic node: hover must still update when
   // crossing between their image parts without changing that target.

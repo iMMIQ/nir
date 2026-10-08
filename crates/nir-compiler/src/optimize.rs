@@ -15,8 +15,9 @@
 //!
 //! MP3 files always carry a LAME gapless tag; the native loader trims the
 //! recorded delay/padding so decoded sample counts match the authored WAV and
-//! the manifest's `decoded_bytes` cap stays exact. Browsers trim the same tag
-//! inside `decodeAudioData`. Converted outputs are cached under
+//! the manifest's source `decoded_bytes` cap stays exact. Browsers trim the
+//! same tag inside `decodeAudioData`, then resample into the context rate;
+//! Web admission accounts for that rate separately. Converted outputs are cached under
 //! `.nir/cache/optimize` keyed by source digest plus parameters and tool
 //! identity, so repeated dev-preview builds only encode what changed.
 
@@ -686,8 +687,8 @@ pub(crate) fn optimize_media(
                 report.audio.converted += 1;
                 report.audio.bytes_before += bytes.len() as u64;
                 report.audio.bytes_after += converted.len() as u64;
-                // duration_us and decoded_bytes stay authored: players trim the
-                // LAME tag, so decoded sample counts match the source WAV.
+                // duration_us and decoded_bytes stay authored. Native trims
+                // to source frames; Web separately budgets context-rate PCM.
                 let asset = p.program.assets.get_mut(id).unwrap();
                 asset.object = nir_content::digest(&converted);
                 asset.bytes = converted.len() as u64;

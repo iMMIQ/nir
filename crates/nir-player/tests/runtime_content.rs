@@ -255,6 +255,190 @@ fn drain(
 }
 
 #[test]
+fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
+    use nir_core::{HistoryChoice, HistoryChoiceOption, HistoryChoiceResolution, HistoryEntry};
+    let (mut root, mut objects) = bundled();
+    let source: Program =
+        serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    let module = "old".to_owned();
+    let function: Function = serde_json::from_value(serde_json::json!({
+        "entry":"end","blocks":{"end":{"terminator":{"type":"end","outcome":"old"}}}
+    }))
+    .unwrap();
+    let signature = FunctionSignature::from(&function);
+    let code = object(
+        &mut objects,
+        &ModuleCode {
+            format: 2,
+            module: module.clone(),
+            functions: BTreeMap::from([("old.entry".into(), function)]),
+        },
+    );
+    let contracts: BTreeMap<_, _> = ["walk", "stay"]
+        .into_iter()
+        .map(|id| (format!("old.{id}"), source.texts[id].clone()))
+        .collect();
+    let mut choice = source.choices["route"].clone();
+    for option in &mut choice.options {
+        option.text = format!("old.{}", option.text);
+    }
+    let static_content = object(
+        &mut objects,
+        &ModuleStatic {
+            format: 2,
+            module: module.clone(),
+            scenes: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            choices: BTreeMap::from([("old.route".into(), choice)]),
+            text_contracts: contracts.clone(),
+            activation_recipes: BTreeMap::new(),
+        },
+    );
+    let locales = source
+        .locales
+        .iter()
+        .map(|(locale, texts)| {
+            let hash = object(
+                &mut objects,
+                &ModuleTexts {
+                    format: 2,
+                    module: module.clone(),
+                    locale: locale.clone(),
+                    texts: ["walk", "stay"]
+                        .into_iter()
+                        .map(|id| (format!("old.{id}"), texts[id].clone()))
+                        .collect(),
+                },
+            );
+            (locale.clone(), hash)
+        })
+        .collect();
+    root.modules.insert(
+        module.clone(),
+        ModuleIndex {
+            functions: BTreeMap::from([("old.entry".into(), signature.clone())]),
+            texts: contracts.keys().cloned().collect(),
+            code,
+            static_content,
+            locales,
+        },
+    );
+    root.function_index.insert(
+        "old.entry".into(),
+        RuntimeFunctionIndex {
+            module: module.clone(),
+            signature,
+        },
+    );
+    root.choice_owners
+        .insert("old.route".into(), module.clone());
+    for (id, c) in &contracts {
+        root.text_owners.insert(id.clone(), module.clone());
+        root.text_contracts.insert(
+            id.clone(),
+            RuntimeTextIdentity {
+                module: module.clone(),
+                meaning_revision: c.meaning_revision,
+                source_revision: c.source_revision,
+                contract_revision: c.contract_revision,
+                contract_digest: c.contract_digest.clone(),
+            },
+        );
+    }
+    let mut original =
+        Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
+    let boot = original.pump(vec![], 1000);
+    drain(&mut original, boot, &objects);
+    let start = action(&mut original, UiAction::NewGame);
+    drain(&mut original, start, &objects);
+    let mut snapshot = original.core().snapshot();
+    let interaction = snapshot.next_id;
+    snapshot.next_id += 1;
+    let choice = HistoryChoice {
+        id: "old.route".into(),
+        resolution: HistoryChoiceResolution::Selected {
+            option: "stay".into(),
+        },
+        options: ["walk", "stay"]
+            .into_iter()
+            .map(|id| {
+                let c = &contracts[&format!("old.{id}")];
+                HistoryChoiceOption {
+                    id: id.into(),
+                    text_id: format!("old.{id}"),
+                    label: format!("Frozen {id}"),
+                    enabled: true,
+                    meaning_revision: c.meaning_revision,
+                    source_revision: c.source_revision,
+                    contract_digest: c.contract_digest.clone(),
+                }
+            })
+            .collect(),
+    };
+    let c = &contracts["old.stay"];
+    snapshot.history.push(HistoryEntry {
+        interaction,
+        text_id: "old.stay".into(),
+        meaning_revision: c.meaning_revision,
+        source_revision: c.source_revision,
+        contract_digest: c.contract_digest.clone(),
+        locale: snapshot.locale.clone(),
+        font_plan_digest: root.locale_config.text[&snapshot.locale].digest.clone(),
+        speaker: String::new(),
+        speaker_id: String::new(),
+        text: "Frozen stay".into(),
+        voices: vec![],
+        choice: Some(choice),
+    });
+    let mut restored = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = restored.pump(vec![], 1000);
+    let boot_keys = drain(&mut restored, boot, &objects);
+    let commands = restored.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(SaveEnvelope {
+                format: 1,
+                slot: 0,
+                revision: 1,
+                digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+                snapshot: snapshot.clone(),
+            }),
+        }],
+        1000,
+    );
+    let keys = drain(&mut restored, commands, &objects);
+    assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+    assert!(restored.core().state().fault.is_none());
+    assert_eq!(
+        restored.core().state().history.len(),
+        snapshot.history.len()
+    );
+    assert_eq!(restored.core().state().variables, snapshot.variables);
+    for key in boot_keys.iter().chain(&keys) {
+        assert!(
+            !matches!(key, ContentKey::Code { module } | ContentKey::Static { module } | ContentKey::Text { module,.. } if module=="old"),
+            "history must not retain/fetch old module bodies: {key:?}"
+        );
+    }
+    let commands = action(&mut restored, UiAction::Continue);
+    drain(&mut restored, commands, &objects);
+    let before = serde_json::to_value(restored.core().snapshot()).unwrap();
+    let commands = action(&mut restored, UiAction::History);
+    let keys = drain(&mut restored, commands, &objects);
+    assert!(keys.is_empty());
+    let rows = restored.model().history;
+    let h = rows.iter().find(|h| h.choice.is_some()).unwrap();
+    assert_eq!(h.text, "Frozen stay");
+    assert_eq!(
+        h.choice,
+        Some(nir_presentation::HistoryChoiceKind::Selected)
+    );
+    assert_eq!(
+        serde_json::to_value(restored.core().snapshot()).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn runtime_boot_loads_catalogs_then_execution_loads_independent_module_blocks() {
     let (root, objects) = bundled();
     let mut p = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
@@ -409,7 +593,128 @@ fn cold_restore_prepares_canonical_definitions_and_original_dialogue_locale() {
 }
 
 #[test]
-fn history_identity_does_not_reload_an_old_chapters_bodies() {
+fn cold_restore_prepares_bound_voice_timer_metadata_even_after_the_voice_ended() {
+    for finished in [false, true] {
+        let (mut root, mut objects) = bundled();
+        root.requires
+            .extend(["text.voice-binding.v1".into(), "text.voice-timer.v1".into()]);
+        let asset = "audio.voice".to_owned();
+        let module = root.modules.get_mut("story").unwrap();
+        let mut code: ModuleCode = serde_json::from_slice(&objects[&module.code]).unwrap();
+        code.functions
+            .get_mut("main")
+            .unwrap()
+            .blocks
+            .get_mut("wait_intro")
+            .unwrap()
+            .ops
+            .push(Op {
+                id: "sampled-voice-binding".into(),
+                operation: Operation::DialogueVoice {
+                    task: "line".into(),
+                    voice: Some("spoken".into()),
+                    wait: VoiceWaitPolicy::SampledRemaining,
+                },
+            });
+        module.code = object(&mut objects, &code);
+        let mut data: ModuleStatic =
+            serde_json::from_slice(&objects[&module.static_content]).unwrap();
+        data.cues.get_mut("intro").unwrap().effects.push(EffectDef {
+            id: "spoken".into(),
+            scope: Scope::Session,
+            effect: Effect::Audio {
+                asset: asset.clone(),
+                bus: AudioBus::Voice,
+                looped: false,
+                loop_region: None,
+                gain: 1.,
+            },
+        });
+        data.activation_recipes
+            .get_mut("intro")
+            .unwrap()
+            .insert(asset.clone());
+        module.static_content = object(&mut objects, &data);
+        root.task_owners.insert("spoken".into(), "story".into());
+        let mut original =
+            Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
+        let commands = original.pump(vec![], 1000);
+        drain(&mut original, commands, &objects);
+        let commands = action(&mut original, UiAction::NewGame);
+        drain(&mut original, commands, &objects);
+        let voice = original.core().state().handles["spoken"];
+        if finished {
+            original.pump(
+                vec![AppEvent::AudioEnded {
+                    domain: TimeDomain::Story,
+                    task: voice,
+                    session: original.generation.session,
+                }],
+                1000,
+            );
+        }
+        let snapshot = original.core().snapshot();
+        assert_eq!(
+            original
+                .core()
+                .dialogue()
+                .unwrap()
+                .1
+                .reading
+                .as_ref()
+                .unwrap()
+                .voice,
+            Some(voice)
+        );
+        let envelope = SaveEnvelope {
+            format: 1,
+            slot: 0,
+            revision: 1,
+            digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+            snapshot,
+        };
+        let catalog = ContentKey::Catalog {
+            catalog: root.assets[&asset].catalog.clone(),
+        };
+        let mut restored =
+            Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+        let commands = restored.pump(vec![], 1000);
+        let boot_keys = drain(&mut restored, commands, &objects);
+        assert!(
+            !boot_keys.contains(&catalog),
+            "voice metadata is cold at title"
+        );
+        let commands = restored.pump(
+            vec![AppEvent::Loaded {
+                envelope: Box::new(envelope),
+            }],
+            1000,
+        );
+        let keys = drain(&mut restored, commands, &objects);
+        assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+        assert!(
+            keys.contains(&catalog),
+            "duration must be prepared before core restore"
+        );
+        assert!(!restored.is_loading());
+        assert_eq!(
+            restored.retained_assets().contains(&asset),
+            !finished,
+            "an ended binding needs catalog metadata, not decoded media"
+        );
+        assert_eq!(
+            restored.core().state().tick_us,
+            original.core().state().tick_us
+        );
+        assert_eq!(
+            restored.core().state().variables,
+            original.core().state().variables
+        );
+    }
+}
+
+#[test]
+fn history_voice_loads_only_its_catalog_and_keeps_cancelled_decode_budget_until_ack() {
     let (mut root, mut objects) = bundled();
     let source: Program =
         serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
@@ -486,6 +791,34 @@ fn history_identity_does_not_reload_an_old_chapters_bodies() {
             contract_digest: contract.contract_digest.clone(),
         },
     );
+    root.requires.push("text.voice-binding.v1".into());
+    let voice_asset = "old.voice".to_owned();
+    let mut audio = source
+        .assets
+        .values()
+        .find(|a| a.kind == AssetKind::Audio)
+        .unwrap()
+        .clone();
+    audio.object = nir_content::digest(voice_asset.as_bytes());
+    audio.decoded_bytes = 1_048_576;
+    audio.duration_us = Micros(1_000_000);
+    let voice_catalog = object(
+        &mut objects,
+        &AssetCatalog {
+            format: 2,
+            catalog: voice_asset.clone(),
+            assets: BTreeMap::from([(voice_asset.clone(), audio.clone())]),
+        },
+    );
+    root.catalogs.insert(voice_asset.clone(), voice_catalog);
+    root.assets.insert(
+        voice_asset.clone(),
+        AssetIndexEntry {
+            kind: AssetKind::Audio,
+            object: audio.object.clone(),
+            catalog: voice_asset.clone(),
+        },
+    );
     let mut original =
         Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
     let boot = original.pump(vec![], 1000);
@@ -494,6 +827,13 @@ fn history_identity_does_not_reload_an_old_chapters_bodies() {
     drain(&mut original, start, &objects);
     let mut snapshot = original.core().snapshot();
     snapshot.history.push(nir_core::HistoryEntry {
+        choice: None,
+        interaction: original.core().dialogue().unwrap().1.interaction,
+        voices: vec![nir_core::HistoryVoice {
+            instance: *snapshot.handles.values().next().unwrap(),
+            asset: voice_asset.clone(),
+            gain: 0.75,
+        }],
         text_id,
         source_revision: contract.source_revision,
         meaning_revision: contract.meaning_revision,
@@ -501,6 +841,7 @@ fn history_identity_does_not_reload_an_old_chapters_bodies() {
         locale: "zh-Hans".into(),
         font_plan_digest: root.locale_config.text["zh-Hans"].digest.clone(),
         speaker: String::new(),
+        speaker_id: String::new(),
         text: "Frozen old history".into(),
     });
     let mut restored = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
@@ -530,6 +871,115 @@ fn history_identity_does_not_reload_an_old_chapters_bodies() {
     assert_eq!(
         restored.core().state().history.last().unwrap().text,
         "Frozen old history"
+    );
+    assert!(
+        !keys.contains(&ContentKey::Catalog {
+            catalog: voice_asset.clone()
+        }),
+        "loading a save must not download all history voices"
+    );
+    action(&mut restored, UiAction::Continue);
+    action(&mut restored, UiAction::History);
+    let state = serde_json::to_value(restored.core().snapshot()).unwrap();
+    let entry = restored.core().state().history.len() - 1;
+    let replay = action(&mut restored, UiAction::HistoryVoice { entry });
+    let (request, requirements) = replay
+        .iter()
+        .find_map(|command| match command {
+            AppCommand::GetContent {
+                request, objects, ..
+            } => Some((*request, objects.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(
+        requirements[0].key,
+        Some(ContentKey::Catalog {
+            catalog: voice_asset.clone()
+        })
+    );
+    let failed = restored.pump(
+        vec![AppEvent::ContentFailed {
+            request,
+            message: "offline".into(),
+        }],
+        1000,
+    );
+    assert!(!failed
+        .iter()
+        .any(|c| matches!(c, AppCommand::GetAssets { .. })));
+    assert!(restored.history_voice_model().unwrap().failed);
+    assert!(restored.error.is_none());
+    assert!(!restored.is_loading());
+    let replay = action(&mut restored, UiAction::HistoryVoice { entry });
+    let request = replay
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetContent { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    let prepared = restored.pump(
+        vec![AppEvent::ContentReady {
+            request,
+            objects: requirements
+                .iter()
+                .map(|r| objects[&r.hash].clone())
+                .collect(),
+        }],
+        1000,
+    );
+    let request = prepared
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetAssets {
+                request,
+                assets,
+                descriptors,
+                ..
+            } => {
+                assert_eq!(assets, &vec![voice_asset.clone()]);
+                assert_eq!(descriptors[&voice_asset].decoded_bytes, audio.decoded_bytes);
+                Some(*request)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let reserved = restored.memory_used();
+    let cancelled = action(&mut restored, UiAction::StopHistoryVoice);
+    assert!(cancelled
+        .iter()
+        .any(|c| matches!(c, AppCommand::CancelAssets { request: id } if *id == request)));
+    assert_eq!(
+        restored.memory_used(),
+        reserved,
+        "physical cancellation has not completed"
+    );
+    assert!(!restored.accepts_resource(request));
+    let stale = restored.pump(
+        vec![AppEvent::AssetReady {
+            request,
+            asset: voice_asset.clone(),
+        }],
+        1000,
+    );
+    assert!(!stale.iter().any(|c| matches!(
+        c,
+        AppCommand::AudioStart {
+            domain: TimeDomain::ForegroundUi,
+            ..
+        }
+    )));
+    restored.pump(vec![AppEvent::AssetsCancelled { request }], 1000);
+    assert_eq!(
+        restored.memory_used() + audio.decoded_bytes + audio.bytes,
+        reserved
+    );
+    action(&mut restored, UiAction::Close);
+    assert_eq!(
+        serde_json::to_value(restored.core().snapshot()).unwrap(),
+        state
     );
 }
 
@@ -1100,4 +1550,64 @@ fn failed_slot_restore_content_can_return_to_the_unchanged_story() {
     assert!(!p.paused());
     assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), before);
     assert!(!p.accepts_content(request));
+}
+
+#[test]
+fn failed_content_retry_coalesces_until_its_next_terminal_and_preserves_live_state() {
+    let (root, objects) = bundled();
+    let mut p = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let before = serde_json::to_value(p.core().snapshot()).unwrap();
+    let commands = p.pump(vec![], 1000);
+    let request = commands
+        .into_iter()
+        .find_map(|c| match c {
+            AppCommand::GetContent { request, .. } => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    p.pump(
+        vec![AppEvent::ContentFailed {
+            request,
+            message: "offline".into(),
+        }],
+        1000,
+    );
+    assert!(!p.retrying());
+    let commands = action(&mut p, UiAction::Retry);
+    let next = commands
+        .iter()
+        .find_map(|c| match c {
+            AppCommand::GetContent { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(p.status.is_empty());
+    assert!(p.is_loading());
+    assert!(
+        p.error.is_none(),
+        "Content retry replaces the old fault with loading"
+    );
+    for _ in 0..20 {
+        let commands = action(&mut p, UiAction::Retry);
+        assert!(!commands.iter().any(|c| matches!(
+            c,
+            AppCommand::GetContent { .. } | AppCommand::CancelContent { .. }
+        )));
+    }
+    assert!(p.accepts_content(next));
+    assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), before);
+    p.pump(
+        vec![AppEvent::ContentFailed {
+            request: next,
+            message: "still offline".into(),
+        }],
+        1000,
+    );
+    assert!(!p.retrying());
+    let commands = action(&mut p, UiAction::Retry);
+    drain(&mut p, commands, &objects);
+    assert!(p.error.is_none());
+    assert!(!p.retrying());
+    assert!(!p.is_loading());
+    assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), before);
 }

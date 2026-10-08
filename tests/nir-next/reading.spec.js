@@ -34,12 +34,12 @@ test('idle reading saves the advancing audio offset and restores its paused posi
     return v&&v.offset+v.context.currentTime-v.started>1;
   });
   await page.evaluate(()=>{const end=performance.now()+800;while(performance.now()<end){};window.__nir.action({type:'menu'});});
-  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&window.offsetAudit[0].context.state==='suspended');
+  await page.waitForFunction(()=>window.__nir.state().screen==='Menu'&&window.offsetAudit[0].context.state==='running');
   const savedOffset=await page.evaluate(()=>{
     const v=window.offsetAudit[0];return v.offset+v.context.currentTime-v.started;
   });
   await page.evaluate(()=>window.__nir.action({type:'save',slot:1}));
-  await page.waitForFunction(async()=>{
+  await expect.poll(()=>page.evaluate(async()=>{
     for(const item of await indexedDB.databases()) {
       const db=await new Promise((resolve,reject)=>{const r=indexedDB.open(item.name);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
       if(db.objectStoreNames.contains('saves')) {
@@ -47,7 +47,7 @@ test('idle reading saves the advancing audio offset and restores its paused posi
         db.close();if(count)return true;
       }else db.close();
     }return false;
-  });
+  })).toBe(true);
   await page.waitForTimeout(200);
   const count=await page.evaluate(()=>window.offsetAudit.length);
   await page.evaluate(()=>window.__nir.action({type:'load',slot:1}));

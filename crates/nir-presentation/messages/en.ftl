@@ -5,6 +5,7 @@ close = Back to story
 back = Back
 settings = Settings
 history = History
+history-compact = Log
 saves = Save / Load
 save = Save
 load = Load
@@ -22,11 +23,20 @@ motion = Reduce motion
 export = Export save
 import = Import save
 retry = Retry
+sound-unavailable = Sound unavailable
+sound-reconnecting = Reconnecting sound…
+sound-recovery-hint = Retry or save in Menu.
+storage-unavailable = Settings or read progress unavailable
+storage-recovery-hint = Your current reading is kept. You can retry.
+storage-retrying = Restoring settings and read progress…
+storage-save-unconfirmed = Save confirmation pending
+retrying = Retrying…
 loading = Preparing the scene…
 paused = Paused · Continue when ready
 ending = THE END
 empty-slot = Empty slot
-saved = Saved in this browser
+saved = Saved
+save-pending = Still confirming the save. You can keep reading; this slot remains busy.
 saving = Saving…
 read-failed = Could not load
 
@@ -38,6 +48,8 @@ error-host = Player operation failed.
 
 scroll-back = Page up
 scroll-forward = Page down
+scroll-back-compact = Up
+scroll-forward-compact = Down
 
 language-zh = 简体中文
 language-en = English
@@ -60,7 +72,13 @@ reveal-hint = · · ·
 
 text-speed = Text speed
 auto-wait = Auto wait
-reading-preferences-hint = Text speed applies to the next dialogue; auto wait applies to the next timer.
+auto-wait-voice = Auto waits for voice
+voice-continue = Continue voice on advance
+character-voices = Character voices
+character-mute = Mute
+character-unmute = Unmute
+voice-continue-hint = OFF stops this dialogue's voice on advance. Skip stops it in either mode. Authored stops still apply.
+reading-preferences-hint = Text speed applies to the next dialogue; voice waiting to the next auto cycle, other waiting to the next timer.
 
 hide-interface = Hide
 show-interface = Show interface
@@ -70,3 +88,15 @@ confirm-overwrite = Confirm overwrite
 cancel-overwrite = Cancel
 
 history-unavailable = History is unavailable. Close this page and try again.
+history-voice = Replay voice
+history-voice-stop = Stop voice
+history-voice-failed = Retry voice
+
+history-choice = Choice
+history-choice-timeout = Automatic choice
+history-choice-cancelled = Cancelled choice
+history-voice-stop-compact = Stop
+
+unavailable-slot = Unreadable slot
+
+cancel-navigation = Cancel page change

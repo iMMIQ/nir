@@ -38,7 +38,17 @@ window.nirDiagnostics.download()
 
 请求槽在预留时冻结来源代次；取消、完成和迟到回调使用同一 host_request。它与剧情资源 request 分开。关联链覆盖：输入接收/派发、准备请求、资源排队/准入、获取及 hash 校验、音频解码、图像解码与纹理分配、分块上传入队、可供后续有序使用、文字准备、租约、提交、渲染提交、存储事务、设备恢复。准备请求带 Cue 与逻辑位置；资源阶段带对象 hash。
 
-所有微秒时间为十进制字符串，使用页面 performance 时钟。Rust 原子解码/分配、上传和呈现准备给出 start_us/end_us；播放器逻辑事件的 at_us 是宿主消费命令时的观测时间。事件按记录顺序导出，跨层延迟可能使原子阶段的 start_us 早于前一条记录；分析应使用各阶段实际字段。上传入队与有序可用不表示 GPU 已完成，render_submitted 也不代表像素实际到达屏幕。GPU 时间和物理进程内存标为未测量。初始化在宿主启动前失败时仍由启动错误壳报告，不会产生完整宿主追踪。
+所有微秒时间为十进制字符串，以页面导航为时间原点；Worker performance 时间通过 timeOrigin 偏移映射到该轴。Rust 原子解码/分配、上传和呈现准备给出 start_us/end_us；播放器逻辑事件的 at_us 是宿主消费命令时的观测时间。事件按记录顺序导出，跨层延迟可能使原子阶段的 start_us 早于前一条记录；分析应使用各阶段实际字段。上传入队与有序可用不表示 GPU 已完成，render_submitted 表示宿主观察到提交计数变化，也不代表像素实际到达屏幕；Worker 运行时的提交 CPU 区间来自 Rust profile。GPU 时间和物理进程内存标为未测量。初始化在宿主启动前失败时仍由启动错误壳报告，不会产生完整宿主追踪。
+
+execution 记录实际 owner、RPC 水位及 Runtime 发起的 GPU adapter 信息。Asset 的资源时间以摘要和白名单数值进入独立 4096 项有界环，不导出 URL；缺少 ResourceTiming 或环覆盖都会明确标记。测试入口合并主线程与 Worker 网络时间，性能脚本因此仍统计实际内容请求。state.wasm_memory_bytes 只包含 Runtime 堆；execution.asset_wasm_memory_bytes 另记 Asset 堆容量，两者都不是物理进程内存。
+
+进程测量中的 `jsHeapUsedBytes` 来自页面的 CDP `Performance.getMetrics`，不能当作两个 Worker 的 JS 堆总和。生命周期诊断可以按需使用 `tests/performance/process-memory.js` 的 `createWorkerHeapProbe`，分别采样 Runtime 和 Asset 的 `Runtime.getHeapUsage`，记录 usedSize、totalSize、embedderHeapUsedSize 与 backingStorageSize。这些字段按原始含义分列；WASM、ArrayBuffer 等 backing storage 与其他媒体/容量计数可能重叠，不直接相加。采样失败明确记录，探针关闭时解除 CDP 会话；默认一小时测试的采样开销保持原样。强制 GC 仅用于独立的生命周期诊断尾段，不用于掩盖正常阅读中的增长，也不代表播放器能主动回收驱动缓存。
+
+`resource_memory` 分开记录压缩资源缓存、实际音频 PCM 和渲染器分配。`media.decoded_audio_bytes` 按实际 AudioBuffer 的帧数 × 声道数 × 4 统计，缓存及活动声音共享同一缓冲时只计一次；`active_audio_bytes` 是其中仍在使用的部分，不能再相加。`image_staging_bytes` 只统计宿主尚未转移的 RGBA；转移后由渲染器 `image_upload_pixel_bytes` 记录。启用诊断时在获取和解码分配点记录媒体峰值，不对关闭诊断的普通运行扫描缓存；关闭诊断时峰值为 null。
+
+`renderer`/`state.renderer_memory` 仅在开启 profiling（诊断或测试）时计算，记录现有图片纹理、待上传纹理及像素、转场/窗口/菜单离屏纹理、顶点缓冲；`accounted_gpu_bytes` 是已统计纹理与顶点缓冲的逻辑分配之和。它排除字形图集、交换链、驱动对齐、队列保留和浏览器内部副本，不能代表全部显存或实际物理驻留。效果结束后的下一次渲染释放不再使用的离屏纹理；GPU 队列仍可保留尚未完成命令所需的内部引用。旧 `resident_bytes` 仍是资源准入估算，不能当作实际解码或显存数据。网络 ResourceTiming 的编码响应字节与 HTTP 缓存命中另行分析，不以媒体缓存大小代替下载量。
+
+`state.audio_decode_sample_rate` 记录 Web 用于解码的 AudioContext 采样率，并在首次标题准备前传给共享 Player；原生为 null，继续使用源 PCM 合同。Web 音频准入取声明 `decoded_bytes` 与 `(ceil(duration_us × sample_rate / 1000000) + 1) × 2 × 4` 的较大值，再加压缩字节；没有声道声明时按最多双声道 f32 预留。一帧余量覆盖微秒时长截断及重采样取整。整数成本饱和到 u64 上限，超预算在获取/解码前拒绝；不修改已校验的作品时长或源 PCM 字节。音频解码后核对采样率、1–2 声道及实际帧容量，超限以 `E_AUDIO_MEMORY` 准备失败处理，保留当前场景与声音并可重试。这里控制的是共享媒体准入估算与已接受 PCM；浏览器内部解码工作区和物理占用仍需独立测量。
 
 ## 重复测量
 
@@ -102,6 +112,14 @@ bun run test:performance:hardware --trace=off --grep 'navigation baseline|module
 `encodedBodySize` 是 HTTP 内容编码后的正文长度，`decodedBodySize` 是解压后长度；两者与内容账本的“对象编码字节”不是同一层概念。预压缩只减少网络传输，不降低驻留预算。长尾记录需包含触发章节、预取状态、请求阶段与实际适配器，不能仅凭一次最大值断言根因。
 
 `host_work` 补充资源池活动／排队数、共享下载、内容与媒体任务、owner 回调／请求槽、音频状态，以及最多 128 条待处理内容任务身份和阶段，不包含正文。性能路线失败时在关闭上下文前导出 `performance-failure-*.json`，保留这些状态、阶段事件和资源时间线。
+
+`host_work.audio_domains.*.buses.*` 同时记录设备时钟 `clock_seconds`、浏览器报告的 `base_latency_ms`、`resume_pending/pending_gesture/pending_suspended/resume_wait_ms`、`resume_error/output_error`，以及实际 `resume()` 调用的 `resume_attempts/resume_resolved/resume_rejected/last_resume_ms/max_resume_ms`。计数饱和于 u32 上限，每个物理通道只有固定大小的累计字段；合并的重复恢复输入不增加调用计数。尚未结束的最新请求没有 `last_resume_ms`，旧请求终态计入累计值，但不能覆盖最新等待与错误状态。ForegroundUi 的三个总线视图指向同一个设备，不应将它们重复相加。
+
+`host_work.story_clock` 与测试完整状态中的 `story_clock` 来自共享引擎，在每次实际 Player pump 前后采样 VM 时钟，Worker 和主线程均使用同一实现。它只保留固定大小的最近恢复记录：`pause_revision/resume_revision`（饱和计数）、`paused_advance_us`（连续暂停区间的时间增量）、`resume_tick_us`（解除前的剧情时钟）、`first_advance_us`（解除后首个正增量）及 `first_advance_delay_us`（该增量距解除的 owner 单调时钟间隔）。首个增量记录不会被后续正常播放覆盖；未发生时为 null，换会话或时钟回退清空旧记录。标题、菜单、加载和其他暂停所有权仍按实际可推进状态计算。这些字段不改变剧情调度、不写入存档，也不证明物理音频输出。
+
+恢复后的两次宿主读取之间可能包含正常阅读，不能把它们的总时钟差当成首帧补时。恢复验收同时检查暂停期间不推进、恢复令牌与声音实例不变，以及 owner 记录的首个实际增量；延迟 Worker 回复的回归仍使用 250000us 的原增量阈值。
+
+恢复耗时从实际调用前到 Promise 终态，用宿主单调时钟测量；`resume_wait_ms` 是当前未完成请求已等待的时间。`base_latency_ms` 是浏览器给出的名义处理延迟，不能代替启动耗时、输入到听到声音的延迟或硬件输出验收。计时不改变暂停所有权，不设置新的恢复超时，也不自动重试。分析浏览器 trace 时须在失败页面销毁前结束记录，并区分流创建取消、客户端断开和平台错误；[Chromium 153 的 OutputStream 源码](https://chromium.googlesource.com/chromium/src/+/refs/tags/153.0.8010.52/services/audio/output_stream.cc) 显示 `OnError` 也用于客户端断开，不能只按事件名归因。
 
 ## 交互与主线程分段计时
 
