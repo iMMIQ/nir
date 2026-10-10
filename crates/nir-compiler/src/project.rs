@@ -1540,7 +1540,6 @@ fn wav_info(b: &[u8]) -> Result<(u64, u64)> {
     ))
 }
 pub fn compile(p: &Program) -> Result<Executable> {
-    ValidatedProgram::new(p.clone())?;
     let mut addresses = vec![];
     let mut resume_map = BTreeMap::new();
     let mut semantic_cost_map = vec![];

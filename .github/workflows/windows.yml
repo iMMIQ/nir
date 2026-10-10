@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component clippy --target wasm32-unknown-unknown
+        run: python scripts/install_toolchain.py
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       # fmt, the wasm32 player-web check, and the architecture check run in the
       # Engine quality workflow on the same triggers. Tests and clippy stay here

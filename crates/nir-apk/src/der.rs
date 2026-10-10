@@ -1,5 +1,5 @@
 //! Minimal DER (X.690) encoding and parsing for the self-signed certificate
-//! and ECDSA signatures. Only the subset needed by this crate is implemented.
+//! only. Signatures use the DER implementation from p256.
 #![forbid(unsafe_code)]
 
 pub(crate) const TAG_INTEGER: u8 = 0x02;
@@ -146,37 +146,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Encodes an ECDSA-Sig-Value: `SEQUENCE { INTEGER r, INTEGER s }` from
-/// fixed-width big-endian scalars.
-pub(crate) fn ecdsa_sig_der(r: &[u8], s: &[u8]) -> Vec<u8> {
-    sequence(&[&positive_int(r), &positive_int(s)])
-}
-
-/// Parses an ECDSA-Sig-Value into two fixed-width big-endian scalars.
-pub(crate) fn parse_ecdsa_sig_der(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut reader = Reader::new(bytes);
-    let body = reader.expect(TAG_SEQUENCE)?;
-    if !reader.is_empty() {
-        return None;
-    }
-    let mut inner = Reader::new(body);
-    let scalars = [inner.expect(TAG_INTEGER)?, inner.expect(TAG_INTEGER)?];
-    if !inner.is_empty() {
-        return None;
-    }
-    let mut out = [Vec::new(), Vec::new()];
-    for (slot, scalar) in out.iter_mut().zip(scalars) {
-        let start = scalar.iter().position(|&b| b != 0).unwrap_or(scalar.len());
-        let trimmed = &scalar[start..];
-        if trimmed.len() > 32 {
-            return None;
-        }
-        slot.resize(32 - trimmed.len(), 0);
-        slot.extend_from_slice(trimmed);
-    }
-    Some((out[0].clone(), out[1].clone()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,20 +180,5 @@ mod tests {
             vec![0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]
         );
         assert_eq!(oid(&[2, 5, 4, 3]), vec![0x06, 0x03, 0x55, 0x04, 0x03]);
-    }
-
-    #[test]
-    fn ecdsa_signature_round_trip() {
-        let r = [0x90u8; 32];
-        let s = [0x01u8, 0x02, 0x03];
-        let der = ecdsa_sig_der(&r, &s);
-        // SEQUENCE { INTEGER(33 bytes, padded), INTEGER(3 bytes) } = 40 content bytes.
-        assert_eq!(&der[..6], &[0x30, 0x28, 0x02, 0x21, 0x00, 0x90]);
-        let (parsed_r, parsed_s) = parse_ecdsa_sig_der(&der).unwrap();
-        assert_eq!(parsed_r, r.to_vec());
-        assert_eq!(parsed_s.len(), 32);
-        assert_eq!(&parsed_s[29..], &[1, 2, 3]);
-        assert!(parse_ecdsa_sig_der(&[0x30, 0x00]).is_none());
-        assert!(parse_ecdsa_sig_der(&der[..der.len() - 1]).is_none());
     }
 }

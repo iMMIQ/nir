@@ -484,15 +484,6 @@ export async function queueContentSkip(job,envelope,{post,skip,isActive=()=>true
 const WORK_PRIORITIES={required:0,near:1,speculative:2,prefetch:2,background:3};
 export function workPriority(value){return Object.hasOwn(WORK_PRIORITIES,value)?(value==='prefetch'?'speculative':value):'required';}
 
-export function awaitAbortable(promise,signal) {
-    if(signal.aborted)return Promise.reject(signal.reason);
-    return new Promise((resolve,reject)=>{
-        const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason);};
-        signal.addEventListener('abort',abort,{once:true});
-        Promise.resolve(promise).then(value=>{signal.removeEventListener('abort',abort);resolve(value);},error=>{signal.removeEventListener('abort',abort);reject(error);});
-    });
-}
-
 // Each pool owns one bounded phase. An aborted running task keeps its place
 // until the underlying operation settles, including uncancellable decoders.
 // Only scheduling estimates are always on: at most eight phases, 32 numbers

@@ -5,10 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nir-format.workspace = true
 wasm-bindgen.workspace = true
-js-sys.workspace = true
 web-sys.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "=0.3.77"
-features = ["Window", "Performance", "Document", "HtmlCanvasElement", "Element"]
+features = ["Window", "Document", "HtmlCanvasElement", "Element"]

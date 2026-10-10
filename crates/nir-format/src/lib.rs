@@ -999,6 +999,49 @@ pub enum Milestone {
 pub struct Cue {
     pub effects: Vec<EffectDef>,
 }
+impl Cue {
+    /// Media needed to prepare this cue. Callers supply their resident scene
+    /// and text views; font selection and cached recipes remain their policy.
+    pub fn media_assets<'a>(
+        &self,
+        theme: &Theme,
+        scene: impl Fn(&str) -> Option<&'a [Node]>,
+        text: impl Fn(&str) -> Option<&'a TextContract>,
+    ) -> BTreeSet<String> {
+        let mut assets = BTreeSet::new();
+        let mut text_ids = BTreeSet::new();
+        for definition in &self.effects {
+            let effect = &definition.effect;
+            effect.collect_text_ids(&mut text_ids);
+            effect.collect_dialogue_style_assets(theme, &mut assets);
+            match effect {
+                Effect::StagePresent {
+                    scene: id,
+                    transition,
+                    ..
+                } => {
+                    assets.extend(transition.asset().map(str::to_owned));
+                    if let Some(nodes) = scene(id) {
+                        assets.extend(effect.stage_image_assets(nodes).cloned());
+                    }
+                }
+                Effect::Audio { asset, .. } => {
+                    assets.insert(asset.clone());
+                }
+                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
+                    effect.collect_audio_assets(&mut assets);
+                }
+                _ => {}
+            }
+        }
+        for id in text_ids {
+            if let Some(contract) = text(&id) {
+                assets.extend(contract.images.iter().map(|image| image.asset.clone()));
+            }
+        }
+        assets
+    }
+}
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1406,11 +1449,6 @@ impl TweenTarget {
                 _ => (0.0..=1.0).contains(&value),
             }
     }
-    /// The device renders one linear ramp per envelope owner, so envelope
-    /// tracks must delegate linearly like timed stops do.
-    pub fn requires_linear_easing(&self) -> bool {
-        matches!(self, Self::AudioInstance { .. })
-    }
 }
 impl Effect {
     /// Legacy Clip and typed Tween use one evaluator and one writer identity.
@@ -1790,6 +1828,18 @@ impl Function {
     }
 }
 impl Program {
+    pub fn cue_media_assets(&self, id: &str) -> BTreeSet<String> {
+        self.cues
+            .get(id)
+            .map(|cue| {
+                cue.media_assets(
+                    &self.theme,
+                    |id| self.scenes.get(id).map(Vec::as_slice),
+                    |id| self.texts.get(id),
+                )
+            })
+            .unwrap_or_default()
+    }
     pub fn uses_float80(&self) -> bool {
         self.variables.values().any(|v| v.ty() == ValueType::F80)
             || self.functions.values().any(Function::uses_float80)

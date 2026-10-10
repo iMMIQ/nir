@@ -21,7 +21,7 @@ jobs:
         with:
           bun-version-file: .bun-version
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target aarch64-linux-android
+        run: python scripts/install_toolchain.py
       - name: Restore Rust dependencies, build artifacts and CLI tools
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

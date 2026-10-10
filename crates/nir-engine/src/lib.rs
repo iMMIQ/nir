@@ -479,9 +479,6 @@ impl Engine {
                 .node(&self.packet, self.input_identity(), self.player.screen)?;
         Some((n.rect[0] + n.rect[2] / 2., n.rect[1] + n.rect[3] / 2.))
     }
-    pub fn hit_action(&self, x: f32, y: f32) -> Option<UiAction> {
-        self.packet.hit(x, y)
-    }
     pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), String> {
         if self.reading.hover_history_bar(x, y) {
             self.visual_invalidated = true;

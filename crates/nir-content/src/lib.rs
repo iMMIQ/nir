@@ -451,30 +451,7 @@ pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
     Ok(())
 }
 pub fn cue_assets(p: &Program, cue: &str) -> BTreeSet<String> {
-    let mut set = BTreeSet::new();
-    if let Some(c) = p.cues.get(cue) {
-        for def in &c.effects {
-            def.effect.collect_text_image_assets(&p.texts, &mut set);
-            def.effect.collect_dialogue_style_assets(&p.theme, &mut set);
-            match &def.effect {
-                Effect::StagePresent {
-                    scene, transition, ..
-                } => {
-                    set.extend(transition.asset().map(str::to_owned));
-                    if let Some(nodes) = p.scenes.get(scene) {
-                        set.extend(def.effect.stage_image_assets(nodes).cloned());
-                    }
-                }
-                Effect::Audio { asset, .. } => {
-                    set.insert(asset.clone());
-                }
-                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
-                    def.effect.collect_audio_assets(&mut set);
-                }
-                _ => {}
-            }
-        }
-    }
+    let mut set = p.cue_media_assets(cue);
     set.extend(
         p.assets
             .iter()
@@ -482,21 +459,6 @@ pub fn cue_assets(p: &Program, cue: &str) -> BTreeSet<String> {
             .map(|(id, _)| id.clone()),
     );
     set
-}
-pub fn negotiate(requested: &str, available: &BTreeSet<String>, default: &str) -> String {
-    if available.contains(requested) {
-        return requested.into();
-    }
-    let alias = match requested {
-        "zh" | "zh-CN" | "zh-SG" => "zh-Hans",
-        s if s.starts_with("en-") => "en",
-        _ => default,
-    };
-    if available.contains(alias) {
-        alias.into()
-    } else {
-        default.into()
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -508,10 +470,5 @@ mod tests {
     #[test]
     fn corrupted_bytes() {
         assert!(verify(b"changed", &digest(b"original")).is_err());
-    }
-    #[test]
-    fn script_not_guessed() {
-        let a = BTreeSet::from(["zh-Hans".into(), "en".into()]);
-        assert_eq!(negotiate("zh-Hant", &a, "en"), "en");
     }
 }

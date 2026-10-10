@@ -10,20 +10,3 @@ pub fn canvas(id: &str) -> std::result::Result<web_sys::HtmlCanvasElement, wasm_
         .dyn_into()
         .map_err(|_| wasm_bindgen::JsValue::from_str("E_CANVAS: expected canvas"))
 }
-
-#[cfg(target_arch = "wasm32")]
-pub fn now_us() -> nir_format::Micros {
-    use wasm_bindgen::{JsCast, JsValue};
-    let performance =
-        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance")).unwrap();
-    let now = js_sys::Reflect::get(&performance, &JsValue::from_str("now")).unwrap();
-    nir_format::Micros(
-        (now.unchecked_into::<js_sys::Function>()
-            .call0(&performance)
-            .unwrap()
-            .as_f64()
-            .unwrap()
-            * 1000.)
-            .round() as u64,
-    )
-}

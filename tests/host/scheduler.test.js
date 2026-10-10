@@ -1,17 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ContentStagingBudget, OwnerInbox, SharedRequests, WorkPool, acquireRequiredContentStage, awaitAbortable, contentBatchEnvelope, queueContentSkip, workPriority } from '../../crates/nir-platform-web/host.js';
-
-test('cancelled required audio wait settles even when resume never does',async()=>{
-    let rejectResume;
-    const resume=new Promise((_,reject)=>{rejectResume=reject;});
-    const controller=new AbortController();
-    const waiting=awaitAbortable(resume,controller.signal);
-    controller.abort(new Error('media cancelled'));
-    await assert.rejects(waiting,/media cancelled/);
-    rejectResume(new Error('late resume failure'));
-    await new Promise(resolve=>setImmediate(resolve));
-});
+import { ContentStagingBudget, OwnerInbox, SharedRequests, WorkPool, acquireRequiredContentStage, contentBatchEnvelope, queueContentSkip, workPriority } from '../../crates/nir-platform-web/host.js';
 
 test('phase queues rank all priorities and preserve FIFO without a deadline',async()=>{
     const pool=new WorkPool(1),signal=new AbortController().signal,order=[];

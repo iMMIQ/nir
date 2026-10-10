@@ -10,10 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 nir-engine.workspace = true
 nir-format.workspace = true
-nir-core.workspace = true
 nir-content.workspace = true
-nir-assets.workspace = true
-nir-presentation.workspace = true
 nir-player.workspace = true
 nir-render-wgpu.workspace = true
 nir-platform-web.workspace = true
@@ -25,4 +22,4 @@ console_error_panic_hook = "0.1"
 
 [dependencies.web-sys]
 workspace = true
-features = ["OffscreenCanvas", "Performance"]
+features = ["OffscreenCanvas"]

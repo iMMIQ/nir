@@ -2318,6 +2318,7 @@ name = "nir-apk"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64",
  "flate2",
  "p256",
  "sha2",
@@ -2352,7 +2353,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
  "symphonia",
  "tempfile",
  "toml",
@@ -2398,7 +2398,6 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -2417,8 +2416,6 @@ dependencies = [
 name = "nir-platform-web"
 version = "0.1.1"
 dependencies = [
- "js-sys",
- "nir-format",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -2444,7 +2441,6 @@ dependencies = [
  "fluent-bundle",
  "nir-format",
  "serde",
- "unic-langid",
  "unicode-script",
  "unicode-segmentation",
 ]
@@ -3074,14 +3070,11 @@ version = "0.1.1"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
- "nir-assets",
  "nir-content",
- "nir-core",
  "nir-engine",
  "nir-format",
  "nir-platform-web",
  "nir-player",
- "nir-presentation",
  "nir-render-wgpu",
  "serde_json",
  "wasm-bindgen",
@@ -5530,7 +5523,6 @@ name = "xtask"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "serde_json",
 ]
 
 [[package]]

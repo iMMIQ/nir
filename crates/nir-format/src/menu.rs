@@ -1129,24 +1129,6 @@ impl ImageMenu {
     }
 }
 
-impl Theme {
-    /// Initial title media only. Other pages are admitted when navigation
-    /// requests them, including their effects and music.
-    pub fn title_image_assets(&self) -> BTreeSet<String> {
-        self.dialogue
-            .background
-            .iter()
-            .cloned()
-            .chain(
-                self.image_menus
-                    .get("title")
-                    .into_iter()
-                    .flat_map(ImageMenu::prepared_assets),
-            )
-            .collect()
-    }
-}
-
 /// A bounded save slot, either literal or selected by a local integer.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]

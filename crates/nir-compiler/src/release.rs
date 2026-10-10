@@ -344,38 +344,6 @@ fn declaration_owner(id: &str, modules: &BTreeSet<String>) -> Result<String> {
     Ok(owner)
 }
 
-fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
-    let mut assets = BTreeSet::new();
-    if let Some(cue) = program.cues.get(cue_id) {
-        for definition in &cue.effects {
-            definition
-                .effect
-                .collect_text_image_assets(&program.texts, &mut assets);
-            definition
-                .effect
-                .collect_dialogue_style_assets(&program.theme, &mut assets);
-            match &definition.effect {
-                Effect::StagePresent {
-                    scene, transition, ..
-                } => {
-                    assets.extend(transition.asset().map(str::to_owned));
-                    if let Some(nodes) = program.scenes.get(scene) {
-                        assets.extend(definition.effect.stage_image_assets(nodes).cloned());
-                    }
-                }
-                Effect::Audio { asset, .. } => {
-                    assets.insert(asset.clone());
-                }
-                Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
-                    definition.effect.collect_audio_assets(&mut assets);
-                }
-                _ => {}
-            }
-        }
-    }
-    assets
-}
-
 fn asset_consumers(
     program: &Program,
     scene_owners: &BTreeMap<String, String>,
@@ -875,7 +843,7 @@ fn package_runtime(
                 .filter(|asset| source.assets[asset.as_str()].kind != AssetKind::Font)
                 .cloned()
                 .collect();
-            let actual = cue_media_assets(source, cue);
+            let actual = source.cue_media_assets(cue);
             if expected != actual {
                 bail!("E_RECIPE: eager reference recipe differs for {cue}");
             }
@@ -1486,7 +1454,6 @@ pub fn build_profile(
     // Compile and validate the complete source representation first. Runtime
     // lowering is a packaging transform and must not hide invalid references.
     let reference = compile(&p.program)?;
-    nir_content::validate_executable(&reference)?;
     let runtime = package_runtime(out, &mut objects, &p.program, &reference)?;
     validate_runtime_packages(out, &runtime.executable)?;
     let game_id = p.program.game_id.clone();

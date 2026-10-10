@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -93,7 +94,8 @@ impl SigningIdentity {
                     .context("E_SIGNING_PEM: malformed end line")?;
                 let current = block.take().context("E_SIGNING_PEM: stray end line")?;
                 ensure!(current == label, "E_SIGNING_PEM: block label mismatch");
-                let decoded = base64_decode(buffer.trim())
+                let decoded = STANDARD
+                    .decode(buffer.trim())
                     .with_context(|| format!("E_SIGNING_PEM: bad base64 in {label} block"))?;
                 match label {
                     KEY_BLOCK => scalar = Some(decoded),
@@ -156,25 +158,20 @@ impl SigningIdentity {
     /// Signs `message` with ECDSA/SHA-256 and returns the DER ECDSA-Sig-Value.
     pub(crate) fn sign_der(&self, message: &[u8]) -> Vec<u8> {
         let signature: Signature = self.key.sign(message);
-        let bytes = signature.to_bytes();
-        der::ecdsa_sig_der(&bytes[..32], &bytes[32..])
+        signature.to_der().as_bytes().to_vec()
     }
 
     /// Verifies a DER ECDSA-Sig-Value over `message` with the given
     /// SubjectPublicKeyInfo.
     pub(crate) fn verify_der(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
-        let (r, s) = match der::parse_ecdsa_sig_der(signature) {
-            Some(parts) => parts,
-            None => return false,
+        let Ok(signature) = Signature::from_der(signature) else {
+            return false;
         };
         let point = match extract_spki_point(public_key) {
             Some(point) => point,
             None => return false,
         };
         let Ok(key) = VerifyingKey::from_sec1_bytes(&point) else {
-            return false;
-        };
-        let Ok(signature) = Signature::from_slice(&[r, s].concat()) else {
             return false;
         };
         use p256::ecdsa::signature::Verifier;
@@ -216,72 +213,12 @@ pub(crate) fn certificate_spki(certificate: &[u8]) -> Result<Vec<u8>> {
 
 fn pem_block(label: &str, data: &[u8]) -> String {
     let mut out = format!("-----BEGIN {label}-----\n");
-    for chunk in base64_encode(data).as_bytes().chunks(64) {
+    for chunk in STANDARD.encode(data).as_bytes().chunks(64) {
         out.push_str(std::str::from_utf8(chunk).unwrap());
         out.push('\n');
     }
     out.push_str(&format!("-----END {label}-----\n"));
     out
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    fn inverse(b: u8) -> Option<u32> {
-        match b {
-            b'A'..=b'Z' => Some((b - b'A') as u32),
-            b'a'..=b'z' => Some((b - b'a') as u32 + 26),
-            b'0'..=b'9' => Some((b - b'0') as u32 + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = text.bytes().filter(|&b| b != b'\r' && b != b'\n').collect();
-    let pad = bytes.iter().filter(|&&b| b == b'=').count();
-    if pad > 2 || !bytes.len().is_multiple_of(4) || bytes[..bytes.len() - pad].contains(&b'=') {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut n: u32 = 0;
-        for (i, &b) in chunk.iter().enumerate() {
-            let digit = if b == b'=' { 0 } else { inverse(b)? };
-            n |= digit << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk[2] != b'=' {
-            out.push((n >> 8) as u8);
-        }
-        if chunk[3] != b'=' {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
 }
 
 fn spki_der(public_key: &VerifyingKey) -> Vec<u8> {
@@ -349,9 +286,8 @@ fn build_certificate(key: &SigningKey) -> Vec<u8> {
         &spki_der(public_key),
     ]);
     let signature: Signature = key.sign(&tbs);
-    let bytes = signature.to_bytes();
-    let signature_der = der::ecdsa_sig_der(&bytes[..32], &bytes[32..]);
-    der::sequence(&[&tbs, &algorithm, &der::bit_string(&signature_der)])
+    let signature_der = signature.to_der();
+    der::sequence(&[&tbs, &algorithm, &der::bit_string(signature_der.as_bytes())])
 }
 
 #[cfg(test)]
@@ -469,28 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        for input in [
-            &b""[..],
-            b"f",
-            b"fo",
-            b"foo",
-            b"foobar",
-            &[0u8, 255, 10, 128],
-        ] {
-            let encoded = base64_encode(input);
-            assert_eq!(base64_decode(&encoded).unwrap(), input);
-        }
-        assert!(base64_decode("!!!!").is_none());
-        assert!(base64_decode("Zm9vY").is_none());
-    }
-
-    #[test]
     fn seed_determinism() {
         assert_eq!(
             test_identity().to_pem(),
@@ -503,6 +417,15 @@ mod tests {
                 .certificate_der()
         );
         assert!(SigningIdentity::from_seed(&[7u8; 31]).is_err());
+    }
+
+    #[test]
+    fn certificate_bytes_remain_stable() {
+        let identity = SigningIdentity::from_seed(&[0x42u8; 32]).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(identity.certificate_der())),
+            "be88e406c30b886ca3bc7733351985fb5e635dae55959c2e976a75eac49fe71a"
+        );
     }
 
     #[test]

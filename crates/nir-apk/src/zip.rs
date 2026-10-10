@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{bail, ensure, Context, Result};
-use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression, Crc};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -34,43 +34,6 @@ impl Method {
             Method::Store => METHOD_STORE,
             Method::Deflate => METHOD_DEFLATE,
         }
-    }
-}
-
-/// ISO-HDLC CRC-32 (reflected, polynomial 0xedb88320) as required by ZIP.
-#[derive(Clone)]
-pub struct Crc32 {
-    value: u32,
-}
-
-impl Crc32 {
-    pub fn new() -> Self {
-        Self { value: 0xffff_ffff }
-    }
-
-    pub fn update(&mut self, data: &[u8]) -> &mut Self {
-        for &byte in data {
-            let mut c = self.value ^ byte as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xedb8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            self.value = c;
-        }
-        self
-    }
-
-    pub fn finish(&self) -> u32 {
-        self.value ^ 0xffff_ffff
-    }
-}
-
-impl Default for Crc32 {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -137,7 +100,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         let header = local_header(name, method, &extra, 0, 0, 0);
         self.out.write_all(&header).context("E_ZIP_WRITE")?;
         self.offset += header.len() as u64;
-        let mut crc = Crc32::new();
+        let mut crc = Crc::new();
         let mut uncompressed: u64 = 0;
         let mut buffer = [0u8; 64 * 1024];
         let compressed = {
@@ -176,7 +139,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             compressed <= MAX_U32 && uncompressed <= MAX_U32,
             "E_ZIP_TOO_LARGE: entry {name:?} exceeds ZIP limits"
         );
-        let header = local_header(name, method, &extra, crc.finish(), compressed, uncompressed);
+        let header = local_header(name, method, &extra, crc.sum(), compressed, uncompressed);
         self.out
             .seek(SeekFrom::Start(local_offset))
             .context("E_ZIP_SEEK")?;
@@ -187,7 +150,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.entries.push(EntryRecord {
             name: name.to_owned(),
             method: method.code(),
-            crc32: crc.finish(),
+            crc32: crc.sum(),
             compressed_size: compressed as u32,
             uncompressed_size: uncompressed as u32,
             local_offset: local_offset as u32,
@@ -463,7 +426,11 @@ pub fn extract_entry(data: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
         entry.name
     );
     ensure!(
-        Crc32::new().update(&output).finish() == entry.crc32,
+        {
+            let mut crc = Crc::new();
+            crc.update(&output);
+            crc.sum()
+        } == entry.crc32,
         "E_ZIP_CRC: {} CRC mismatch",
         entry.name
     );
@@ -500,7 +467,9 @@ mod tests {
             (&[0xff; 32], 0xff6c_ab0b),
         ];
         for (input, expected) in cases {
-            assert_eq!(Crc32::new().update(input).finish(), *expected, "{input:?}");
+            let mut crc = Crc::new();
+            crc.update(input);
+            assert_eq!(crc.sum(), *expected, "{input:?}");
         }
     }
 

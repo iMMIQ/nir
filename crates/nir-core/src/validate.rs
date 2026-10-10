@@ -204,44 +204,16 @@ impl RuntimeProgramView {
         if let Some(assets) = self.cue_recipes.get(cue) {
             return assets.as_ref().clone();
         }
-        let mut set = BTreeSet::new();
-        if let Some(definition) = self.cues.get(cue) {
-            for effect in &definition.effects {
-                effect
-                    .effect
-                    .collect_dialogue_style_assets(&self.theme, &mut set);
-                match &effect.effect {
-                    Effect::StagePresent {
-                        scene, transition, ..
-                    } => {
-                        set.extend(transition.asset().map(str::to_owned));
-                        if let Some(nodes) = self.scenes.get(scene) {
-                            set.extend(effect.effect.stage_image_assets(nodes).cloned());
-                        }
-                    }
-                    Effect::Audio { asset, .. } => {
-                        set.insert(asset.clone());
-                    }
-                    Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
-                        effect.effect.collect_audio_assets(&mut set);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some(definition) = self.cues.get(cue) {
-            let contracts: BTreeMap<_, _> = self
-                .texts
-                .iter()
-                .map(|(id, c)| (id.clone(), c.clone()))
-                .collect();
-            for effect in &definition.effects {
-                effect
-                    .effect
-                    .collect_text_image_assets(&contracts, &mut set);
-            }
-        }
-        set
+        self.cues
+            .get(cue)
+            .map(|definition| {
+                definition.media_assets(
+                    &self.theme,
+                    |id| self.scenes.get(id).map(Vec::as_slice),
+                    |id| self.texts.get(id),
+                )
+            })
+            .unwrap_or_default()
     }
     /// Materialize the legacy source representation on demand. Runtime roots
     /// cannot be converted because unloaded bodies are deliberately absent.
@@ -368,38 +340,11 @@ impl RuntimeProgramView {
                 )
             })
             .collect();
-        let mut cue_recipes = BTreeMap::new();
-        for cue in p.cues.keys() {
-            let mut assets = BTreeSet::new();
-            if let Some(definition) = p.cues.get(cue) {
-                for effect in &definition.effects {
-                    effect
-                        .effect
-                        .collect_text_image_assets(&p.texts, &mut assets);
-                    effect
-                        .effect
-                        .collect_dialogue_style_assets(&p.theme, &mut assets);
-                    match &effect.effect {
-                        Effect::StagePresent {
-                            scene, transition, ..
-                        } => {
-                            assets.extend(transition.asset().map(str::to_owned));
-                            if let Some(nodes) = p.scenes.get(scene) {
-                                assets.extend(effect.effect.stage_image_assets(nodes).cloned());
-                            }
-                        }
-                        Effect::Audio { asset, .. } => {
-                            assets.insert(asset.clone());
-                        }
-                        Effect::Sequence { .. } | Effect::ParallelAll { .. } => {
-                            effect.effect.collect_audio_assets(&mut assets);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            cue_recipes.insert(cue.clone(), Arc::new(assets));
-        }
+        let cue_recipes = p
+            .cues
+            .keys()
+            .map(|cue| (cue.clone(), Arc::new(p.cue_media_assets(cue))))
+            .collect();
         let title_nodes = p
             .title_scene
             .as_ref()

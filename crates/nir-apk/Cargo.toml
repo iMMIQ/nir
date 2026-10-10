@@ -9,3 +9,4 @@ anyhow.workspace = true
 flate2.workspace = true
 sha2.workspace = true
 p256.workspace = true
+base64 = "0.22"

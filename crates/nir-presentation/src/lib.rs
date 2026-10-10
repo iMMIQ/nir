@@ -3147,7 +3147,6 @@ pub struct TextEngine {
     pub shapes: u64,
     families: std::collections::BTreeMap<String, &'static str>,
     configured_plan: String,
-    next_compat_font: u32,
     pub missing_font: Option<String>,
     cache_recency: std::collections::BTreeMap<String, u64>,
     cache_clock: u64,
@@ -3191,7 +3190,6 @@ impl Default for TextEngine {
             shapes: 0,
             families: Default::default(),
             configured_plan: String::new(),
-            next_compat_font: 0,
             missing_font: None,
             cache_recency: Default::default(),
             cache_clock: 0,
@@ -3202,12 +3200,6 @@ impl Default for TextEngine {
     }
 }
 impl TextEngine {
-    pub fn add_font(&mut self, bytes: Vec<u8>) {
-        let id = format!("@compat-font-{}", self.next_compat_font);
-        self.next_compat_font = self.next_compat_font.saturating_add(1);
-        self.add_font_asset(&id, bytes)
-            .expect("valid explicit font asset");
-    }
     pub fn add_font_asset(
         &mut self,
         asset: &str,
