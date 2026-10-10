@@ -84,6 +84,8 @@ impl Player {
             self.effective_text_locale.clone(),
             function,
         )?;
+        candidate.merge_profile_facts(&self.profile)?;
+        candidate.set_profile_values(&self.profile_values)?;
         let output = candidate.step(CoreInput::None, (*budget).min(REPLAY_ENTRY_BUDGET));
         *budget -= output.work_used;
         let needs = self.replay_entry_needs(&output.intents)?;
@@ -147,6 +149,7 @@ impl Player {
             self.replay_work = None;
             return Ok(());
         };
+        candidate.merge_profile_facts(&self.profile)?;
         let output = candidate.step(CoreInput::None, REPLAY_ENTRY_BUDGET);
         self.candidate = Some(candidate);
         let needs = match self.replay_entry_needs(&output.intents) {
@@ -275,18 +278,23 @@ mod replay_tests {
             serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
         program.requires.push("ui.replay.v1".into());
         program.requires.push("ui.menu-services.v1".into());
+        program.requires.push("story.profile-value.v1".into());
+        program
+            .variables
+            .insert("replay_value".into(), nir_format::Value::I32(0));
         program.functions.insert(
             "replay".into(),
             serde_json::from_value(serde_json::json!({
                 "entry": "start",
                 "blocks": {
-                    "start": {"ops": [], "terminator": {"type": "activate", "cue": "arrival", "next": "wait"}},
+                    "start": {"ops": [{"id":"read-value","operation":{"type":"profile_value_read","target":"replay_value","key":"mutable"}}], "terminator": {"type": "activate", "cue": "arrival", "next": "wait"}},
                     "wait": {"ops": [], "terminator": {
                         "type": "await",
                         "conditions": [{"task": "line", "milestone": {"type": "finished"}}],
                         "next": "mark", "on_cancelled": "mark", "on_failed": "mark"
                     }},
-                    "mark": {"ops": [{"id": "seen.once", "operation": {"type": "profile_merge", "key": "replay-seen"}}],
+                    "mark": {"ops": [{"id": "seen.once", "operation": {"type": "profile_merge", "key": "replay-seen"}},
+                        {"id":"clear-value","operation":{"type":"profile_value_assign","target":"replay_value","key":"mutable","value":{"type":"const","value":{"type":"i32","value":0}}}}],
                              "terminator": {"type": "end", "outcome": "replay-done"}}
                 }
             }))
@@ -448,6 +456,8 @@ mod replay_tests {
     #[test]
     fn replay_freezes_session_and_returns_after_outcome() {
         let mut p = story_overlay();
+        p.profile_values
+            .insert("mutable".into(), nir_format::Value::I32(1));
         let frozen_location = p.core.location().to_string();
         let frozen_checkpoints = p.checkpoints.len();
         let frozen_instance = p.menu_session.instance;
@@ -478,6 +488,10 @@ mod replay_tests {
         assert_eq!(p.screen, Screen::Story);
         assert!(p.generation.session > frozen_session);
         assert_eq!(p.core.state().frames[0].function, "replay");
+        assert_eq!(
+            p.core.state().variables["replay_value"],
+            nir_format::Value::I32(1)
+        );
         // The replay's checkpoint ledger starts over; the frozen one waits.
         assert!(p.checkpoints.len() <= 1);
 
@@ -498,6 +512,11 @@ mod replay_tests {
 
         // The replayed line's profile merge never escapes the replay.
         assert!(!p.profile.contains("replay-seen"));
+        assert_eq!(p.profile_values["mutable"], nir_format::Value::I32(1));
+        assert!(p
+            .commands
+            .iter()
+            .all(|c| !matches!(c, AppCommand::PersistProfileValues { .. })));
         assert!(p
             .commands
             .iter()

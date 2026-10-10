@@ -73,6 +73,79 @@ fn offered(c: &Core) -> &OfferedChoice {
 }
 
 #[test]
+fn image_choices_validate_capability_geometry_and_preserve_typed_restore() {
+    let mut p = program("typed", Some(&[7, 9]), None);
+    p.requires
+        .extend(["choice.image.v1".into(), "choice.disabled-image.v1".into()]);
+    let asset = p
+        .assets
+        .iter()
+        .find(|(_, a)| a.kind == AssetKind::Image)
+        .unwrap()
+        .0
+        .clone();
+    for option in &mut p.choices.get_mut("route").unwrap().options {
+        option.image = Some(ChoiceImage {
+            asset: asset.clone(),
+            hover_asset: None,
+            disabled_asset: Some(asset.clone()),
+            rect: [120., 80., 300., 200.],
+        });
+    }
+    for mutation in [
+        "cap",
+        "disabled-cap",
+        "disabled-asset",
+        "mixed",
+        "size",
+        "asset",
+    ] {
+        let mut invalid = p.clone();
+        match mutation {
+            "cap" => invalid.requires.retain(|c| c != "choice.image.v1"),
+            "disabled-cap" => invalid.requires.retain(|c| c != "choice.disabled-image.v1"),
+            "disabled-asset" => {
+                invalid.choices.get_mut("route").unwrap().options[0]
+                    .image
+                    .as_mut()
+                    .unwrap()
+                    .disabled_asset = Some("audio.bgm".into())
+            }
+            "mixed" => invalid.choices.get_mut("route").unwrap().options[0].image = None,
+            "size" => {
+                invalid.choices.get_mut("route").unwrap().options[0]
+                    .image
+                    .as_mut()
+                    .unwrap()
+                    .rect[2] = 0.
+            }
+            _ => {
+                invalid.choices.get_mut("route").unwrap().options[0]
+                    .image
+                    .as_mut()
+                    .unwrap()
+                    .asset = "missing".into()
+            }
+        }
+        assert!(ValidatedProgram::new(invalid).is_err(), "{mutation}");
+    }
+    let c = start(p.clone());
+    let mut restored =
+        Core::restore(ValidatedProgram::new(p).unwrap(), c.snapshot(), "typed").unwrap();
+    let interaction = offered(&restored).interaction;
+    restored.step(
+        CoreInput::Choose {
+            interaction,
+            option: "stay".into(),
+            sequence: 1,
+        },
+        1000,
+    );
+    assert_eq!(restored.state().variables["picked"], Value::I32(9));
+    assert_eq!(restored.state().outcome.as_deref(), Some("stay"));
+}
+
+#[test]
 fn choice_history_records_only_committed_choices_and_freezes_offered_labels() {
     for mode in ["plain", "typed"] {
         let mut c = start(program(mode, Some(&[1, 2]), None));
@@ -320,6 +393,7 @@ fn oversized_choice_history_does_not_fault_or_change_the_committed_result() {
     let option = p.choices["route"].options[0].clone();
     p.choices.get_mut("route").unwrap().options = (0..40)
         .map(|i| ChoiceOption {
+            image: None,
             id: format!("row{i}"),
             ..option.clone()
         })

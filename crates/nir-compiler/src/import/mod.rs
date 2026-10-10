@@ -1,5 +1,6 @@
 //! Offline external-engine import. Only the author compiler depends on readers;
 //! neither the player nor generated games require the original engine.
+mod cinema;
 mod livenovel;
 mod lower;
 mod lsb;
@@ -76,11 +77,21 @@ fn read_binary(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[derive(Clone)]
 struct Source {
     root: PathBuf,
+    paths: std::cell::RefCell<BTreeMap<String, PathBuf>>,
     scripts: BTreeMap<String, Arc<lsb::Script>>,
     bytes_read: usize,
 }
+#[derive(Debug)]
+struct MissingSourcePath(String);
+impl std::fmt::Display for MissingSourcePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "E_IMPORT_PATH: missing source file {}", self.0)
+    }
+}
+impl std::error::Error for MissingSourcePath {}
 impl Source {
     fn new(path: &Path) -> Result<Self> {
         let root = fs::canonicalize(path).context("E_IMPORT_SOURCE: source directory not found")?;
@@ -90,6 +101,7 @@ impl Source {
         );
         Ok(Self {
             root,
+            paths: std::cell::RefCell::new(BTreeMap::new()),
             scripts: BTreeMap::new(),
             bytes_read: 0,
         })
@@ -107,6 +119,9 @@ impl Source {
                 .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
             "E_IMPORT_PATH: path must stay inside source directory"
         );
+        if let Some(path) = self.paths.borrow().get(&normalized) {
+            return Ok(path.clone());
+        }
         let mut candidate = self.root.clone();
         for component in relative.components() {
             if let Component::Normal(part) = component {
@@ -125,6 +140,9 @@ impl Source {
                             .is_some_and(|s| s.eq_ignore_ascii_case(name))
                     })
                     .collect();
+                if matches.is_empty() {
+                    return Err(MissingSourcePath(normalized.clone()).into());
+                }
                 ensure!(
                     matches.len() == 1,
                     "E_IMPORT_PATH: missing or ambiguous source file {name}"
@@ -138,6 +156,11 @@ impl Source {
             full.starts_with(&self.root),
             "E_IMPORT_PATH: symlink escapes source directory"
         );
+        ensure!(
+            self.paths.borrow().len() < 100_000,
+            "E_IMPORT_LIMIT: source path cache"
+        );
+        self.paths.borrow_mut().insert(normalized, full.clone());
         Ok(full)
     }
     fn read(&mut self, name: &str) -> Result<(String, Arc<lsb::Script>)> {
@@ -353,8 +376,81 @@ pub fn convert(options: &ImportOptions, sdk: &Path) -> Result<ImportReport> {
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    let pretty = serde_json::to_vec_pretty(value)?;
+    // Large generated route graphs can exceed the reader's byte budget
+    // solely through indentation. Preserve all data and the existing reader
+    // limit by writing compact JSON when the readable form exceeds it.
+    let bytes = if pretty.len() > nir_format::MAX_INPUT_BYTES {
+        serde_json::to_vec(value)?
+    } else {
+        pretty
+    };
+    fs::write(path, bytes)?;
     Ok(())
+}
+
+/// Source fragments share one declaration namespace. Partition declarations,
+/// never functions or instruction streams, to preserve cross-file references
+/// while keeping each file within the existing strict JSON parser bound.
+fn write_story_fragments(directory: &Path, story: &serde_json::Value) -> Result<Vec<String>> {
+    use serde_json::json;
+    if serde_json::to_vec(story)?.len() <= nir_format::MAX_INPUT_BYTES {
+        write_json(&directory.join("story.nir.json"), story)?;
+        return Ok(vec!["story.nir.json".into()]);
+    }
+    crate::project::validate_generated_fragment(story)?;
+    let mut sources = Vec::new();
+    let mut fragment = json!({"fragment_format":1});
+    let mut bytes = 512;
+    let flush = |fragment: &mut serde_json::Value, sources: &mut Vec<String>| -> Result<()> {
+        let name = if sources.is_empty() {
+            "story.nir.json".into()
+        } else {
+            format!("story{:04}.nir.json", sources.len())
+        };
+        ensure!(
+            serde_json::to_vec(fragment)?.len() <= nir_format::MAX_INPUT_BYTES,
+            "E_IMPORT_LIMIT: generated story fragment exceeds 16 MiB"
+        );
+        write_json(&directory.join(&name), fragment)?;
+        sources.push(name);
+        *fragment = json!({"fragment_format":1});
+        Ok(())
+    };
+    for field in [
+        "variables",
+        "functions",
+        "scenes",
+        "sprite_timelines",
+        "cues",
+        "choices",
+    ] {
+        for (name, value) in story[field].as_object().into_iter().flatten() {
+            let size = serde_json::to_vec(name)?.len() + serde_json::to_vec(value)?.len() + 4;
+            ensure!(
+                size + 512 <= nir_format::MAX_INPUT_BYTES,
+                "E_IMPORT_LIMIT: {field}.{name} cannot fit a bounded source fragment"
+            );
+            if bytes > 512 && bytes + size > 8 * 1024 * 1024 {
+                flush(&mut fragment, &mut sources)?;
+                bytes = 512;
+            }
+            let values = fragment
+                .as_object_mut()
+                .unwrap()
+                .entry(field.to_owned())
+                .or_insert_with(|| json!({}));
+            values
+                .as_object_mut()
+                .unwrap()
+                .insert(name.clone(), value.clone());
+            bytes += size;
+        }
+    }
+    if bytes > 512 {
+        flush(&mut fragment, &mut sources)?;
+    }
+    Ok(sources)
 }
 fn export(
     root: &Path,
@@ -376,7 +472,7 @@ fn export(
     let texts = root.join("content/main/texts");
     fs::remove_dir_all(&texts)?;
     fs::create_dir(&texts)?;
-    write_json(&root.join("content/main/story.nir.json"), story)?;
+    let story_sources = write_story_fragments(&root.join("content/main"), story)?;
     write_json(&texts.join("source.json"), imported_texts)?;
     let mut contracts = BTreeMap::new();
     let mut ledger = TextRevisions {
@@ -389,6 +485,17 @@ fn export(
             source_revision: 1,
             contract_revision: 1,
             meaning_revision: 1,
+            images: doc
+                .spans
+                .iter()
+                .filter_map(|s| match s {
+                    nir_format::Span::Image { id, image } => Some(nir_format::TextImageContract {
+                        id: id.clone(),
+                        asset: image.asset.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
             gates: doc
                 .spans
                 .iter()
@@ -400,7 +507,37 @@ fn export(
                     }
                 })
                 .collect(),
-            params: BTreeMap::new(),
+            pauses: doc
+                .spans
+                .iter()
+                .filter_map(|span| match span {
+                    nir_format::Span::Pause { id, timeout_us } => {
+                        Some(nir_format::TextPauseContract {
+                            id: id.clone(),
+                            timeout_us: *timeout_us,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
+            params: doc
+                .spans
+                .iter()
+                .filter_map(|span| {
+                    if let nir_format::Span::Param { name, .. } = span {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .map(|name| {
+                    let value = story["variables"]
+                        .get(name)
+                        .with_context(|| format!("E_IMPORT_TEXT: undeclared parameter {name}"))?;
+                    let value: nir_format::Value = serde_json::from_value(value.clone())?;
+                    Ok((name.clone(), value.ty()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
         };
         let runtime = nir_format::TextContract {
             source_revision: 1,
@@ -408,7 +545,9 @@ fn export(
             meaning_revision: 1,
             contract_digest: String::new(),
             gates: c.gates.clone(),
-            params: BTreeMap::new(),
+            pauses: c.pauses.clone(),
+            images: c.images.clone(),
+            params: c.params.clone(),
         };
         ledger.texts.insert(
             id.clone(),
@@ -418,10 +557,11 @@ fn export(
                 meaning_revision: 1,
                 source_digest: nir_content::digest(&serde_json::to_vec(&doc.spans)?),
                 contract_digest: nir_format::text_contract_digest(&runtime),
-                shape_digest: nir_content::digest(&serde_json::to_vec(&(
-                    c.params.clone(),
-                    c.gates.clone(),
-                ))?),
+                shape_digest: nir_content::digest(&if c.pauses.is_empty() {
+                    serde_json::to_vec(&(c.params.clone(), c.gates.clone()))?
+                } else {
+                    serde_json::to_vec(&(c.params.clone(), c.gates.clone(), c.pauses.clone()))?
+                }),
                 reviewed: BTreeMap::new(),
             },
         );
@@ -429,7 +569,7 @@ fn export(
     }
     write_json(&texts.join("contracts.json"), &contracts)?;
     write_json(&texts.join("revisions.json"), &ledger)?;
-    let module = json!({"id":"main", "module_format":1, "sources":["story.nir.json"], "text_contracts":"texts/contracts.json",
+    let module = json!({"id":"main", "module_format":1, "sources":story_sources, "text_contracts":"texts/contracts.json",
         "text_revisions":"texts/revisions.json", "exports":{"start":"main"}, "text_bundles":{options.locale.clone():"texts/source.json"}});
     fs::write(
         root.join("content/main/module.toml"),

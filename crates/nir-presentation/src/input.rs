@@ -71,11 +71,14 @@ pub fn pointer_action(
                 && !model.loading
                 && !model.paused
                 && model.choices.is_empty()
-                && model.dialogue.is_some())
-            .then_some(UiAction::Advance)
+                && (model.dialogue.is_some() || model.advance_wait))
+                .then_some(UiAction::Advance)
         }
         2 => match model.screen {
             Screen::Title if model.menu_depth > 0 => Some(UiAction::Close),
+            Screen::Story if model.choice_cancellable && !model.paused && !model.loading => {
+                Some(UiAction::CancelChoice)
+            }
             Screen::Story => Some(UiAction::Menu),
             Screen::Menu | Screen::Settings | Screen::Saves | Screen::History => {
                 Some(UiAction::Close)
@@ -221,7 +224,8 @@ pub fn primary_action(packet: &DrawPacket, model: &UiModel) -> Option<UiAction> 
             .map(|n| n.action.clone()),
         Screen::Story if model.paused => visible(UiAction::Continue),
         Screen::Story
-            if model.choices.is_empty() && (model.dialogue.is_some() || model.hidden_dialogue) =>
+            if model.choices.is_empty()
+                && (model.dialogue.is_some() || model.hidden_dialogue || model.advance_wait) =>
         {
             Some(UiAction::Advance)
         }

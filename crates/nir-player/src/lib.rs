@@ -34,6 +34,13 @@ const INPUT_CAPACITY: usize = 128;
 /// Ceiling for the sum of all decoded-asset leases (stage media, fonts,
 /// audio); the render-surface reservation is carved out of the same ledger.
 const MEMORY_LEDGER_LIMIT: u64 = 256 * 1024 * 1024;
+fn render_surface_cost(stage: &Stage, width: u32, height: u32) -> u64 {
+    // RGBA8: two stage freeze targets, the physical window root and two
+    // physical menu roots. Fixed slack covers glyph/vertex working storage.
+    stage.width as u64 * stage.height as u64 * 8
+        + width as u64 * height as u64 * 12
+        + 8 * 1024 * 1024
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -65,12 +72,14 @@ pub struct SaveEnvelope {
 pub enum PersistenceKind {
     Preferences,
     Profile,
+    ProfileValues,
 }
 impl PersistenceKind {
     fn location(self) -> &'static str {
         match self {
             Self::Preferences => "preferences",
             Self::Profile => "profile",
+            Self::ProfileValues => "profile_values",
         }
     }
 }
@@ -249,6 +258,9 @@ pub enum AppCommand {
         /// progress already stored by another release or browser tab.
         keys: BTreeSet<String>,
     },
+    PersistProfileValues {
+        values: BTreeMap<String, nir_format::Value>,
+    },
     ListSaves,
     Trace {
         event: String,
@@ -375,8 +387,10 @@ pub enum AppEvent {
     Slots(Vec<SlotView>, BTreeMap<u32, u32>),
     Preferences(Preferences),
     Profile(BTreeSet<String>),
+    ProfileValues(BTreeMap<String, nir_format::Value>),
     PreferencesRecovered(Preferences),
     ProfileRecovered(BTreeSet<String>),
+    ProfileValuesRecovered(BTreeMap<String, nir_format::Value>),
     PersistenceReadFailed {
         kind: PersistenceKind,
         message: String,
@@ -462,6 +476,8 @@ pub struct Player {
     interface_hidden: bool,
     menu_peek: bool,
     pub profile: BTreeSet<String>,
+    profile_values: BTreeMap<String, nir_format::Value>,
+    profile_value_edits: BTreeMap<String, nir_format::Value>,
     image_menu: String,
     menu_session: MenuSession,
     overlay_menu: Option<String>,
@@ -599,12 +615,11 @@ impl Player {
         let ledger = BudgetLedger::new(MEMORY_LEDGER_LIMIT);
         let _surface_budget = ledger.reserve(&BTreeMap::from([(
             "@render-surfaces".into(),
-            // Two stage-sized freeze targets plus the window root at typical
-            // stage cost; the root actually tracks the swapchain extent, so
-            // the slack covers surfaces up to 4K.
-            validated.program().stage.width as u64 * validated.program().stage.height as u64 * 12
-                + 8 * 1024 * 1024
-                + 48 * 1024 * 1024,
+            render_surface_cost(
+                &validated.program().stage,
+                validated.program().stage.width,
+                validated.program().stage.height,
+            ),
         )]))?;
         let menu_session =
             MenuSession::new(core.program().theme.image_menus.get("title"), &preferences);
@@ -642,6 +657,8 @@ impl Player {
             interface_hidden: false,
             menu_peek: false,
             profile: BTreeSet::new(),
+            profile_values: BTreeMap::new(),
+            profile_value_edits: BTreeMap::new(),
             image_menu: "title".into(),
             menu_session,
             overlay_menu: None,
@@ -774,6 +791,8 @@ impl Player {
                 line_height: 27.,
                 color: [0., 0., 0., 0.],
                 emphasis: vec![],
+                images: vec![],
+                image_scale: 1.,
                 scroll: 0.,
                 clip: None,
                 region: None,
@@ -794,8 +813,22 @@ impl Player {
                 for span in &doc.spans {
                     match span {
                         Span::Text { text: value, .. } => text.push_str(value),
+                        Span::Ruby {
+                            text: value,
+                            reading,
+                            ..
+                        } => {
+                            text.push_str(value);
+                            append(
+                                reading.clone(),
+                                &candidate.text_locale,
+                                &text_plan.fonts,
+                                &text_plan.digest,
+                            );
+                        }
+                        Span::Image { .. } => {}
                         Span::Break { .. } => text.push('\n'),
-                        Span::Gate { .. } => {}
+                        Span::Gate { .. } | Span::Pause { .. } => {}
                         Span::Param { name, .. } => {
                             if let Some(value) = self
                                 .core
@@ -810,6 +843,7 @@ impl Player {
                                     }
                                     Value::I32(value) => text.push_str(&value.to_string()),
                                     Value::String(value) => text.push_str(value),
+                                    Value::F80(value) => text.push_str(&value.to_string()),
                                 }
                             }
                         }
@@ -979,6 +1013,7 @@ impl Player {
             .choice
             .as_ref()
             .map(|c| c.interaction)
+            .or_else(|| self.core.advance_wait())
             .or_else(|| self.core.dialogue().map(|(_, d)| d.interaction))
             .unwrap_or(0)
     }
@@ -989,6 +1024,22 @@ impl Player {
     }
     pub fn memory_used(&self) -> u64 {
         self.ledger.used()
+    }
+    /// Account for actual physical compositor roots before their owner resizes.
+    /// The global media ledger limit is unchanged; a failed resize is atomic.
+    pub fn reserve_render_surfaces(&mut self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+            return Err(Diagnostic::new(
+                "E_VIEWPORT",
+                "resize",
+                "invalid physical extent",
+            ));
+        }
+        self._surface_budget.resize_single(render_surface_cost(
+            &self.validated.program().stage,
+            width,
+            height,
+        ))
     }
     pub fn audio_decode_sample_rate(&self) -> Option<u32> {
         self.audio_decode_sample_rate
@@ -1056,7 +1107,9 @@ impl Player {
         }
     }
     fn overlay_bus_paused(&self, bus: AudioBus) -> bool {
-        self.pauses.contains("menu") && (bus != AudioBus::Bgm || self.menu_effects.music.is_some())
+        self.core.state().audio_paused.contains(&bus)
+            || (self.pauses.contains("menu")
+                && (bus != AudioBus::Bgm || self.menu_effects.music.is_some()))
     }
     /// Actual playback policy; menu ownership cannot release a device/background pause.
     pub fn bus_paused(&self, domain: TimeDomain, bus: AudioBus) -> bool {
@@ -1201,6 +1254,26 @@ impl Player {
             .chain(s.draft.iter())
             .filter_map(|n| n.asset.clone())
             .collect();
+        a.extend(
+            s.dialogue_decorations
+                .values()
+                .map(|image| image.asset.clone()),
+        );
+        for images in s
+            .tasks
+            .values()
+            .filter_map(|t| t.dialogue.as_ref())
+            .map(|d| d.inline_images())
+            .chain(
+                s.pending
+                    .iter()
+                    .flat_map(|p| p.dialogues.values())
+                    .map(|d| d.inline_images()),
+            )
+            .chain(s.history.iter().map(|h| h.images.clone()))
+        {
+            a.extend(images.into_iter().map(|i| i.image.asset));
+        }
         for t in s.tasks.values().filter(|t| t.state == TaskState::Running) {
             a.extend(
                 t.source
@@ -1222,6 +1295,15 @@ impl Player {
             a.extend(self.validated.cue_assets(&pending.cue));
         }
         // Keep only the active overlay's media; hidden pages pin nothing. The
+        if let Some(choice) = &s.choice {
+            if let Some(definition) = core.program().choices.get(&choice.id) {
+                for image in definition.options.iter().filter_map(|o| o.image.as_ref()) {
+                    a.insert(image.asset.clone());
+                    a.extend(image.hover_asset.iter().cloned());
+                    a.extend(image.disabled_asset.iter().cloned());
+                }
+            }
+        }
         // page's effect sounds and music stay resident with its images, or the
         // host prunes the decoded buffers the moment the page needs them.
         if self.screen == Screen::Menu {
@@ -1232,7 +1314,13 @@ impl Player {
                 a.extend(menu.prepared_assets());
             }
         }
-        a.extend(core.program().theme.dialogue.background.iter().cloned());
+        let dialogue = s
+            .dialogue_style
+            .as_ref()
+            .and_then(|id| core.program().theme.dialogue_styles.get(id))
+            .map(|style| &style.dialogue)
+            .unwrap_or(&core.program().theme.dialogue);
+        a.extend(dialogue.background.iter().cloned());
         // Operation-committed masks belong to no cue recipe; the loaded-body
         // set keeps authored reveals from stalling on their first encounter.
         a.extend(self.validated.window_transition_assets());
@@ -1743,6 +1831,10 @@ impl Player {
         self.observe("media_lookahead_requested", Some(request));
     }
     fn step(&mut self, input: CoreInput, budget: &mut u32) -> Result<()> {
+        self.core.merge_profile_facts(&self.profile)?;
+        if !self.replay_live() {
+            self.core.set_profile_values(&self.profile_values)?;
+        }
         self.core.set_text_speed(self.preferences.text_speed)?;
         let before_location = self.core.location();
         let output = self.core.step(input, *budget);
@@ -1869,6 +1961,15 @@ impl Player {
                                 keys: BTreeSet::from([key]),
                             });
                         }
+                    }
+                }
+                CoreIntent::ProfileValueAssign { key, value } => {
+                    if !self.replay_live() && self.profile_values.get(&key) != Some(&value) {
+                        self.profile_values.insert(key.clone(), value.clone());
+                        self.profile_value_edits.insert(key.clone(), value.clone());
+                        self.commands.push(AppCommand::PersistProfileValues {
+                            values: BTreeMap::from([(key, value)]),
+                        });
                     }
                 }
                 CoreIntent::Checkpoint => {
@@ -2134,6 +2235,9 @@ impl Player {
         // prepared. Runs after the event loop so prepare completions inside
         // this turn are visible without waiting for the next host frame.
         if let Err(e) = self.update_menu_effects(&mut remaining) {
+            self.report(e, true);
+        }
+        if let Err(e) = self.open_story_modal() {
             self.report(e, true);
         }
         if let Err(e) = self.sync_menu_state() {
@@ -2746,6 +2850,21 @@ impl Player {
                 self.start_locale_switch()?;
             }
             AppEvent::Profile(keys) => self.profile.extend(keys),
+            AppEvent::ProfileValues(mut values) | AppEvent::ProfileValuesRecovered(mut values) => {
+                values.extend(self.profile_value_edits.clone());
+                if !self.replay_live() {
+                    self.core.set_profile_values(&values)?;
+                }
+                self.profile_values = values;
+                self.persistence_failures
+                    .remove(&(PersistenceKind::ProfileValues, PersistencePhase::Read));
+                self.clear_storage_warning("profile_values");
+                if !self.profile_value_edits.is_empty() {
+                    self.commands.push(AppCommand::PersistProfileValues {
+                        values: self.profile_value_edits.clone(),
+                    });
+                }
+            }
             AppEvent::PreferencesRecovered(p) => {
                 let merged = self.preference_recovery.merge(p, &self.preferences);
                 self.event(AppEvent::Preferences(merged), budget)?;
@@ -3006,7 +3125,15 @@ impl Player {
                 // and a reading confirmation.
             }
         }
-        let assets = self.retained_assets();
+        // Committing this cue can already reach the next preparation barrier.
+        // Its catalog may still be loading, and its media has its own future
+        // reservation. Transfer only resources authenticated/prepared by this
+        // lease into the active group; keep the old group until replacement.
+        let assets = self
+            .retained_assets()
+            .intersection(lease.assets())
+            .cloned()
+            .collect();
         let active = self.ledger.reserve(&self.costs(&assets)?)?;
         self.active = Some(active);
         drop(lease);
@@ -3288,6 +3415,12 @@ impl Player {
             self.set_interface_hidden(false);
             return Ok(());
         }
+        if resolved_menu
+            && matches!(a, UiAction::ToggleAuto | UiAction::ToggleSkip)
+            && self.screen == Screen::Story
+        {
+            self.finish_story_modal(budget)?;
+        }
         let cancelled_slot_restore = self.slot_restore;
         if matches!(
             &a,
@@ -3355,6 +3488,14 @@ impl Player {
             }
             UiAction::HoverImage { id } => {
                 self.hovered_image = id.filter(|id| {
+                    if self.screen == Screen::Story {
+                        return self.core.state().choice.as_ref().is_some_and(|choice| {
+                            choice
+                                .options
+                                .iter()
+                                .any(|option| option.id == *id && option.enabled)
+                        });
+                    }
                     self.active_menu_id()
                         .and_then(|menu| self.core.program().theme.image_menus.get(menu))
                         .is_some_and(|menu| menu.controls().any(|(control, _, _)| control == id))
@@ -3555,6 +3696,9 @@ impl Player {
                 self.screen = Screen::Story;
             }
             UiAction::Menu | UiAction::Settings | UiAction::History | UiAction::Saves => {
+                if self.screen == Screen::Story && self.core.state().menu_disabled {
+                    return Ok(());
+                }
                 if matches!(a, UiAction::Menu) && self.screen != Screen::Menu {
                     self.overlay_menu = None;
                     // Force a fresh overlay when reopening from the story.
@@ -3596,7 +3740,7 @@ impl Player {
                 ) {
                     return Ok(());
                 }
-                self.commit_close(cancelled_slot_restore)?;
+                self.commit_close(cancelled_slot_restore, budget)?;
             }
             UiAction::Title => {
                 self.image_menu = "title".into();
@@ -3732,6 +3876,8 @@ impl Player {
                 // Replay sessions never touch storage: saves belong to the
                 // frozen session, which returns with its own history intact.
                 if self.replay_live()
+                    || self.story_modal_load()
+                    || self.core.state().menu_disabled
                     || self.return_screen == Screen::Title
                     || slot > 2
                     || self
@@ -4133,6 +4279,7 @@ impl Player {
             });
         let window_reveal_live = window_transition.is_some();
         UiModel {
+            advance_wait: c.advance_wait().is_some(),
             transition_style: c.transition_style(),
             image_menu: self.active_menu_id().unwrap_or(&self.image_menu).to_owned(),
             authored_menu: self.active_menu_id().is_some()
@@ -4154,13 +4301,14 @@ impl Player {
             transition: if title_context || self.preferences.reduced_motion {
                 None
             } else {
-                c.transition().map(|(n, p)| (n.to_vec(), p))
+                c.transition()
             },
             stage: [
                 c.program().stage.width as f32,
                 c.program().stage.height as f32,
             ],
             dialogue_appearance: c.sample_dialogue_appearance(),
+            dialogue_decorations: c.state().dialogue_decorations.clone(),
             interface_hidden: self.interface_hidden && screen == Screen::Story,
             hidden_dialogue: c.state().dialogue_hidden
                 && c.dialogue().is_some()
@@ -4179,6 +4327,7 @@ impl Player {
                 .filter(|_| !c.state().dialogue_hidden || window_reveal_live)
                 .map(|(_, d)| DialogueView {
                     full_text: d.full_text(),
+                    images: d.inline_images(),
                     visible_text: d.visible_text(),
                     speaker: d.speaker.clone(),
                     ready: d.awaiting_advance,
@@ -4197,6 +4346,19 @@ impl Player {
                             })
                             .collect()
                     },
+                    ruby: {
+                        let mut offset = 0;
+                        d.spans
+                            .iter()
+                            .filter_map(|s| {
+                                let start = offset;
+                                offset += s.text.len();
+                                s.ruby
+                                    .as_ref()
+                                    .map(|reading| (start, offset, reading.clone()))
+                            })
+                            .collect()
+                    },
                 }),
             choices: c
                 .state()
@@ -4207,6 +4369,15 @@ impl Player {
                         .iter()
                         .map(|o| ChoiceView {
                             id: o.id.clone(),
+                            image: self
+                                .core
+                                .program()
+                                .choices
+                                .get(&c.id)
+                                .and_then(|choice| {
+                                    choice.options.iter().find(|option| option.id == o.id)
+                                })
+                                .and_then(|option| option.image.clone()),
                             label: o.label.clone(),
                             enabled: o.enabled,
                             selected: c.selected.as_deref() == Some(o.id.as_str()),
@@ -4244,7 +4415,21 @@ impl Player {
             locale_pending: self.locale_pending(),
             locale_error: self.locale_error.clone(),
             preflight_texts: vec![],
-            theme: (*c.program().theme).clone(),
+            theme: {
+                let mut theme = (*c.program().theme).clone();
+                if screen == Screen::Story {
+                    if let Some(style) = c
+                        .state()
+                        .dialogue_style
+                        .as_ref()
+                        .and_then(|id| theme.dialogue_styles.get(id))
+                    {
+                        theme.dialogue = style.dialogue.clone();
+                        theme.text = style.text;
+                    }
+                }
+                theme
+            },
             history: if screen == Screen::History {
                 Self::history_rows(c, self.history_offset, 3)
                     .into_iter()
@@ -4268,7 +4453,10 @@ impl Player {
             slots: self.slots.clone(),
             save_confirmation: self.save_confirmation.as_ref().map(|c| (c.token, c.slot)),
             busy_slots: self.save_jobs.values().map(|(slot, _)| *slot).collect(),
-            can_save: self.screen != Screen::Title
+            menu_disabled: self.core.state().menu_disabled,
+            can_save: !self.core.state().menu_disabled
+                && !self.story_modal_load()
+                && self.screen != Screen::Title
                 && self.return_screen != Screen::Title
                 && self.slot_load.is_none(),
             replay_active: self.replay_live(),
@@ -4365,6 +4553,42 @@ mod media_tests {
         );
         p
     }
+    #[test]
+    fn physical_surface_admission_tracks_extent_without_touching_audio_or_failed_state() {
+        let mut player =
+            Player::new(title_music_program(), "release".into(), "title".into()).unwrap();
+        let original_cost = render_surface_cost(&player.validated.program().stage, 1280, 720);
+        let before = player.memory_used();
+        let snapshot = player.core.state().clone();
+        let command_count = player.commands.len();
+        player.reserve_render_surfaces(640, 360).unwrap();
+        let small_cost = render_surface_cost(&player.validated.program().stage, 640, 360);
+        assert_eq!(player.memory_used(), before - original_cost + small_cost);
+        player.reserve_render_surfaces(3840, 2160).unwrap();
+        let large_cost = render_surface_cost(&player.validated.program().stage, 3840, 2160);
+        assert_eq!(player.memory_used(), before - original_cost + large_cost);
+        let large_used = player.memory_used();
+        assert_eq!(
+            player
+                .reserve_render_surfaces(16384, 16384)
+                .unwrap_err()
+                .code,
+            "E_BUDGET"
+        );
+        assert_eq!(player.memory_used(), large_used);
+        assert_eq!(
+            player.reserve_render_surfaces(0, 720).unwrap_err().code,
+            "E_VIEWPORT"
+        );
+        player.reserve_render_surfaces(1280, 720).unwrap();
+        assert_eq!(player.memory_used(), before);
+        assert_eq!(
+            serde_json::to_value(player.core.state()).unwrap(),
+            serde_json::to_value(snapshot).unwrap()
+        );
+        assert_eq!(player.commands.len(), command_count);
+    }
+
     #[test]
     fn boot_music_reserves_context_pcm_before_any_host_decode_without_changing_authored_data() {
         let p = title_music_program();

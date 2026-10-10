@@ -30,11 +30,11 @@
           "freeBytesAtCapture": 28935696384
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.z2Lrdu",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -3521,11 +3521,11 @@
           "freeBytesAtCapture": 28862996480
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.XVW4AN",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -3818,11 +3818,11 @@
           "freeBytesAtCapture": 28496912384
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.XVW4AN",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -4115,11 +4115,11 @@
           "freeBytesAtCapture": 28944089088
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.CZdGGG",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -8081,11 +8081,11 @@
           "freeBytesAtCapture": 28944089088
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.7dvJBI",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -8378,11 +8378,11 @@
           "freeBytesAtCapture": 28735062016
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.7dvJBI",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -8675,11 +8675,11 @@
           "freeBytesAtCapture": 28953858048
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.qjGl1T",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -9053,11 +9053,11 @@
           "freeBytesAtCapture": 28843339776
         },
         "chromium": {
-          "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+          "path": "chromium",
           "version": "Chromium 153.0.8010.52",
           "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
           "nativeSharedMemory": true,
-          "temporaryDirectory": "/tmp/nix-shell.qjGl1T",
+          "temporaryDirectory": "<temporary-directory>",
           "temporaryStorage": "disk",
           "temporaryFilesystem": {
             "type": 2435016766,
@@ -9597,11 +9597,11 @@
         "freeBytesAtCapture": 28722110464
       },
       "chromium": {
-        "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+        "path": "chromium",
         "version": "Chromium 153.0.8010.52",
         "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native",
         "nativeSharedMemory": true,
-        "temporaryDirectory": "/tmp/nix-shell.qjGl1T",
+        "temporaryDirectory": "<temporary-directory>",
         "temporaryStorage": "disk",
         "temporaryFilesystem": {
           "type": 2435016766,

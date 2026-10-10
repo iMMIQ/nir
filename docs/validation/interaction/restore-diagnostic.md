@@ -71,7 +71,7 @@ SHA-256 digests are in [restore-summary.json](restore-summary.json).
 |---|---|---|---:|---:|---:|---:|
 | `novelc` | timed `novelc serve` | default `/tmp`, disk-backed shared memory | 254.05 ms | 13,341.8 ms | 14,299.0 ms | 4/30 |
 | `node` | independent Node static server | default `/tmp`, disk-backed shared memory | 263.75 ms | 16,658.3 ms | 19,322.1 ms | 3/30 |
-| `tmpfs` | timed `novelc serve` | `TMPDIR=/dev/shm/nir-m3-profile` | 205.6 ms | 224.6 ms | 227.9 ms | 0/30 |
+| `tmpfs` | timed `novelc serve` | `TMPDIR=<memory-backed-temp-dir>` | 205.6 ms | 224.6 ms | 227.9 ms | 0/30 |
 | `native-shm` | timed `novelc serve` | `TMPDIR=/tmp`, Chromium native `/dev/shm` | 205.05 ms | 243.2 ms | 333.9 ms | 0/30 |
 
 The first three rounds used Playwright's `--disable-dev-shm-usage` default; the

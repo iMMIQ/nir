@@ -112,6 +112,8 @@ impl ReadingState {
                 line_height: view.style.line_height,
                 color: view.color,
                 emphasis: vec![],
+                images: vec![],
+                image_scale: 1.,
                 scroll: 0.,
                 clip: None,
                 region: None,

@@ -78,6 +78,8 @@ pub struct ThemeManifest {
     #[serde(default)]
     pub dialogue: DialogueProps,
     #[serde(default)]
+    pub dialogue_styles: BTreeMap<String, DialogueStyle>,
+    #[serde(default)]
     pub choice: ChoiceProps,
     #[serde(default)]
     pub image_menus: BTreeMap<String, ImageMenu>,
@@ -206,6 +208,7 @@ pub(crate) fn resolve_config(
             "base",
             "slots",
             "dialogue",
+            "dialogue_styles",
             "choice",
             "image_menus",
             "menu_overlay",
@@ -223,6 +226,7 @@ pub(crate) fn resolve_config(
         tokens_path = relative(root, path.parent().unwrap(), &m.tokens)?;
         theme.slots = m.slots;
         theme.dialogue = m.dialogue;
+        theme.dialogue_styles = m.dialogue_styles;
         theme.choice = m.choice;
         theme.image_menus = m.image_menus;
         theme.menu_overlay = m.menu_overlay;

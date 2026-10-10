@@ -44,6 +44,7 @@ pub(crate) enum IoRequest {
     },
     WritePreferences(Preferences),
     MergeProfile(BTreeSet<String>),
+    MergeProfileValues(BTreeMap<String, nir_format::Value>),
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IoFailure {
@@ -88,6 +89,7 @@ impl IoRequest {
             Self::Export { job, .. } => IoFailure::Export(*job),
             Self::WritePreferences(_) => IoFailure::Persist(PersistenceKind::Preferences),
             Self::MergeProfile(_) => IoFailure::Persist(PersistenceKind::Profile),
+            Self::MergeProfileValues(_) => IoFailure::Persist(PersistenceKind::ProfileValues),
         }
     }
 }
@@ -599,6 +601,13 @@ fn run_storage_worker(
                     message: error.to_string(),
                 },
             },
+            PersistenceKind::ProfileValues => match storage.profile_values() {
+                Ok(value) => AppEvent::ProfileValuesRecovered(value),
+                Err(error) => AppEvent::PersistenceReadFailed {
+                    kind,
+                    message: error.to_string(),
+                },
+            },
             PersistenceKind::Profile => match storage.profile() {
                 Ok(value) => AppEvent::ProfileRecovered(value),
                 Err(error) => AppEvent::PersistenceReadFailed {
@@ -619,6 +628,10 @@ fn run_storage_worker(
         IoRequest::WritePreferences(p) => {
             persist(storage.write_preferences(&p), PersistenceKind::Preferences)
         }
+        IoRequest::MergeProfileValues(values) => persist(
+            storage.merge_profile_values(values),
+            PersistenceKind::ProfileValues,
+        ),
         IoRequest::MergeProfile(mut keys) => {
             keys.append(&mut failed_profile);
             let result = storage.merge_profile(keys.clone());
@@ -1958,7 +1971,8 @@ mod tests {
                         envelope: saved.take().unwrap(),
                     })
                 }
-                IoRequest::List
+                IoRequest::MergeProfileValues(_)
+                | IoRequest::List
                 | IoRequest::Export { .. }
                 | IoRequest::ReadMetadata(_)
                 | IoRequest::ConfirmSave(_) => {

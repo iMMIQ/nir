@@ -36,7 +36,7 @@ NIR 是使用 Rust / WASM / WebGPU / WebGL2 实现的叙事引擎，提供浏览
 
 ## 外部引擎导入
 
-SDK 的 `novelc` 内置 Rust 导入工具，无需 Python。当前实验性支持 LiveMaker LSB 116 的结构检查、基础控制流和同步对白迁移；识别到已适配的 LiveNovel 配置时，还可迁移事件、原图标题／回想菜单、GAL 图像及 WAV/Ogg 声音。未支持的语义会报告阻塞项，原引擎效果的替代会列入报告。运行 `novelc import inspect <游戏目录>` 检查原包，或 `novelc import livemaker <游戏目录> --out <新工程目录>` 转换。具体范围、草稿模式和限制见 [外部引擎导入](docs/IMPORT.md)。
+SDK 的 `novelc` 内置 Rust 导入工具，无需 Python。当前实验性支持 LiveMaker LSB 116/117 的结构检查、基础控制流和同步对白迁移；识别到已适配的 LiveNovel 配置时，还可迁移事件、原图标题／回想菜单、GAL 图像及 WAV/Ogg 声音。未支持的语义会报告阻塞项，原引擎效果的替代会列入报告。运行 `novelc import inspect <游戏目录>` 检查原包，或 `novelc import livemaker <游戏目录> --out <新工程目录>` 转换。具体范围、草稿模式和限制见 [外部引擎导入](docs/IMPORT.md)。
 
 ## Windows 原生发布
 

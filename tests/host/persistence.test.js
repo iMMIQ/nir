@@ -8,6 +8,7 @@ function fixture() {
         request:(work,success,failure)=>jobs.push({work,success,failure}),
         writePreferences:value=>writes.push({kind:'preferences',value}),
         mergeProfile:value=>writes.push({kind:'profile',value}),
+        writeProfileValues:value=>writes.push({kind:'profile_values',value}),
         stored:kind=>events.push({kind,ok:true}),
         failed:(kind,error)=>events.push({kind,error,ok:false}),
     });
@@ -73,4 +74,15 @@ test('explicit retry flushes retained progress once without repeating active or 
     assert.equal(f.queue.retry('profile'),true);assert.equal(f.queue.retry('profile'),false);await f.finish(1);
     assert.deepEqual(f.writes.map(w=>w.value),[['first'],['first']]);assert.equal(f.queue.retry('profile'),false);
     f.queue.close();assert.equal(f.queue.retry('profile'),false);
+});
+
+test('mutable progress coalesces latest values while a prior write is pending and survives failure', async()=>{
+    const f=fixture(),v=n=>({type:'i32',value:n});
+    f.queue.submit('profile_values',{diagnosis:v(1)});
+    f.queue.submit('profile_values',{diagnosis:v(0),other:v(7)});
+    await f.finish(0);assert.equal(f.jobs.length,2);
+    await f.finish(1,new Error('quota'));assert.equal(f.jobs.length,2);
+    assert.equal(f.queue.retry('profile_values'),true);await f.finish(2);
+    assert.deepEqual(f.writes[2].value,{diagnosis:v(0),other:v(7)});
+    assert.equal(f.queue.retry('profile_values'),false);
 });

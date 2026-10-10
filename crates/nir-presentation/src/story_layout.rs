@@ -1,6 +1,7 @@
 use super::*;
 fn model() -> UiModel {
     UiModel {
+        advance_wait: false,
         transition_style: StageTransition::Dissolve,
         image_menu: Default::default(),
         authored_menu: Default::default(),
@@ -17,6 +18,7 @@ fn model() -> UiModel {
         transition: Default::default(),
         stage: [1280., 720.],
         dialogue: Some(DialogueView {
+            images: vec![],
             full_text: "A long line of readable words. ".repeat(30),
             visible_text: "A long line of readable words. ".repeat(30),
             speaker: "Aya".into(),
@@ -26,13 +28,16 @@ fn model() -> UiModel {
             font_plan_digest: "fixture".into(),
             font_assets: vec!["font.reader".into()],
             emphasis: vec![],
+            ruby: vec![],
         }),
         hidden_dialogue: Default::default(),
         window_transition: Default::default(),
         menu_transition: Default::default(),
         menu_element_animations: Default::default(),
         interface_hidden: Default::default(),
+        menu_disabled: false,
         dialogue_appearance: Default::default(),
+        dialogue_decorations: Default::default(),
         choices: Default::default(),
         choice_cancellable: Default::default(),
         prefs: Default::default(),
@@ -92,6 +97,172 @@ fn toolbar(action: &UiAction) -> bool {
             | UiAction::ToggleInterface
     )
 }
+#[test]
+fn dialogue_images_keep_stage_geometry_and_share_visibility_without_background_alpha() {
+    use nir_format::{DialogueDecoration, DialogueDecorationSlot};
+    let mut m = model();
+    m.theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    m.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    m.dialogue_appearance.background_opacity = 0.2;
+    m.dialogue_decorations.insert(
+        DialogueDecorationSlot::Portrait,
+        DialogueDecoration {
+            asset: "portrait".into(),
+            rect: [10., 350., 80., 100.],
+        },
+    );
+    let packet = project(&m, 640., 480., &Messages::default());
+    let image = packet
+        .quads
+        .iter()
+        .find(|q| q.asset.as_deref() == Some("portrait"))
+        .unwrap();
+    assert_eq!(image.rect, [5., 235., 40., 50.]);
+    assert_eq!(image.color[3], 1.);
+    m.prefs.font_scale = 1.4;
+    let enlarged = project(&m, 640., 480., &Messages::default());
+    assert_eq!(
+        enlarged
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("portrait"))
+            .unwrap()
+            .rect,
+        image.rect
+    );
+    m.hidden_dialogue = true;
+    let dialogue = m.dialogue.take(); // Player omits hidden live text from UiModel.
+    let hidden = project(&m, 640., 480., &Messages::default());
+    assert!(!hidden
+        .quads
+        .iter()
+        .any(|q| q.asset.as_deref() == Some("portrait")));
+    m.hidden_dialogue = false;
+    m.dialogue = dialogue;
+    m.window_transition = Some(WindowTransition {
+        style: StageTransition::Dissolve,
+        to_visible: false,
+        progress: 0.5,
+    });
+    let fading = project(&m, 640., 480., &Messages::default());
+    assert_eq!(
+        fading
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("portrait"))
+            .unwrap()
+            .color[3],
+        0.5
+    );
+}
+#[test]
+fn inline_images_reserve_exact_width_reveal_and_use_the_text_clip() {
+    let mut m = model();
+    let d = m.dialogue.as_mut().unwrap();
+    d.speaker.clear();
+    d.full_text = "AA\u{fffc}BB".into();
+    d.visible_text = "AA".into();
+    d.images = vec![InlineImagePlacement {
+        offset: 2,
+        image: InlineImage {
+            asset: "icon".into(),
+            width: 21,
+            height: 19,
+            align: InlineImageAlign::Center,
+            margins: [3, 5, 2, 4],
+        },
+    }];
+    let mut engine = TextEngine::default();
+    engine
+        .add_font_asset(
+            "font.reader",
+            include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+        )
+        .unwrap();
+    let mut reading = ReadingState::default();
+    let before = reading.project(&m, (1, 1), 1280., 720., &Messages::default(), &mut engine);
+    assert!(!before
+        .quads
+        .iter()
+        .any(|q| q.asset.as_deref() == Some("icon")));
+    m.dialogue.as_mut().unwrap().visible_text = "AA\u{fffc}".into();
+    let shown = reading.project(&m, (1, 1), 1280., 720., &Messages::default(), &mut engine);
+    let text = shown
+        .texts
+        .iter()
+        .find(|r| r.region == Some(ScrollRegion::Dialogue))
+        .unwrap();
+    let line = engine.buffers[&TextEngine::key(text)]
+        .layout_runs()
+        .next()
+        .unwrap();
+    let glyph = line.glyphs.iter().find(|g| g.start == 2).unwrap();
+    assert!((glyph.w - 29.).abs() < 0.01, "image slot width {}", glyph.w);
+    let image = shown
+        .quads
+        .iter()
+        .find(|q| q.asset.as_deref() == Some("icon"))
+        .unwrap();
+    assert_eq!(&image.rect[2..], &[21., 19.]);
+    assert!((image.rect[0] - (text.x + glyph.x + 3.)).abs() < 0.01);
+    assert_eq!(image.clip, Some([text.x, text.y, text.width, text.height]));
+    let after = line.glyphs.iter().find(|g| g.start == 5).unwrap();
+    assert!(after.x >= glyph.x + 29. - 0.01);
+}
+#[test]
+fn cancellable_image_choices_offer_touch_cancel_and_guard_right_click() {
+    let mut m = model();
+    m.choice_cancellable = true;
+    m.choices = vec![ChoiceView {
+        id: "option".into(),
+        label: "Option".into(),
+        enabled: true,
+        selected: false,
+        locale: "en".into(),
+        font_plan_digest: "fixture".into(),
+        font_assets: vec![],
+        image: Some(ChoiceImage {
+            asset: "picture".into(),
+            hover_asset: None,
+            disabled_asset: None,
+            rect: [100., 100., 180., 120.],
+        }),
+    }];
+    let p = project(&m, 1280., 720., &Messages::default());
+    let cancel = p
+        .semantics
+        .iter()
+        .find(|n| n.action == UiAction::CancelChoice)
+        .unwrap();
+    assert_eq!(
+        pointer_action(&p, &m, cancel.rect[0] + 10., cancel.rect[1] + 10., 0),
+        Some(UiAction::CancelChoice)
+    );
+    assert_eq!(
+        pointer_action(&p, &m, 20., 20., 2),
+        Some(UiAction::CancelChoice)
+    );
+    m.loading = true;
+    assert_ne!(
+        pointer_action(&p, &m, 20., 20., 2),
+        Some(UiAction::CancelChoice)
+    );
+    m.loading = false;
+    m.paused = true;
+    assert_ne!(
+        pointer_action(&p, &m, 20., 20., 2),
+        Some(UiAction::CancelChoice)
+    );
+    m.paused = false;
+    m.choice_cancellable = false;
+    let p = project(&m, 1280., 720., &Messages::default());
+    assert!(!p
+        .semantics
+        .iter()
+        .any(|n| n.action == UiAction::CancelChoice));
+    assert_eq!(pointer_action(&p, &m, 20., 20., 2), Some(UiAction::Menu));
+}
+
 #[test]
 fn toolbar_controls_have_touch_targets_in_wide_landscape() {
     let m = model();

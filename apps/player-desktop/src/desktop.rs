@@ -183,6 +183,7 @@ impl Runtime {
             renderer,
         ))?;
         engine_result(engine.event(AppEvent::Profile(startup.profile)))?;
+        engine_result(engine.event(AppEvent::ProfileValues(startup.profile_values)))?;
         for failure in startup.failures {
             engine_result(engine.event(failure))?;
         }
@@ -903,6 +904,9 @@ impl Runtime {
                     AppCommand::PersistPreferences { preferences } => {
                         self.update_voice_volumes();
                         self.submit_storage(IoRequest::WritePreferences(preferences))?
+                    }
+                    AppCommand::PersistProfileValues { values } => {
+                        self.submit_storage(IoRequest::MergeProfileValues(values))?
                     }
                     AppCommand::PersistProfile { keys } => {
                         self.submit_storage(IoRequest::MergeProfile(keys))?

@@ -185,6 +185,184 @@ fn playing() -> Player {
     ready(&mut p, c);
     p
 }
+
+#[test]
+fn authored_story_modal_closes_to_continuation_and_cold_restore_owns_a_fresh_page() {
+    use nir_presentation::Screen;
+    for image_menu in [false, true] {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.requires = CAPABILITIES.iter().map(|s| (*s).into()).collect();
+        program.theme.menu_overlay = Some("story.gallery".into());
+        program.theme.image_menus.insert(
+            "story.gallery".into(),
+            serde_json::from_value(serde_json::json!({
+                "builtin_navigation":true,"background":"bg.station","elements":[],"buttons":[]
+            }))
+            .unwrap(),
+        );
+        let target = if image_menu {
+            serde_json::json!({"type":"image_menu","menu":"story.gallery"})
+        } else {
+            serde_json::json!({"type":"load_saves"})
+        };
+        program.cues.insert("story.modal".into(), serde_json::from_value(serde_json::json!({"effects":[
+            {"id":"story.modal","scope":"session","effect":{"type":"story_modal","target":target}},
+            {"id":"music.modal","scope":"session","effect":{"type":"audio","asset":"audio.bgm","bus":"bgm","looped":true}}
+        ]})).unwrap());
+        program.cues.insert("story.after".into(), serde_json::from_value(serde_json::json!({"effects":[
+            {"id":"after.modal","scope":"session","effect":{"type":"delay","duration_us":"1000000"}}
+        ]})).unwrap());
+        let main = program.functions.get_mut("main").unwrap();
+        main.entry = "modal.entry".into();
+        main.blocks.extend(serde_json::from_value::<std::collections::BTreeMap<String, Block>>(serde_json::json!({
+            "modal.entry":{"terminator":{"type":"activate","cue":"story.modal","next":"modal.wait"}},
+            "modal.wait":{"terminator":{"type":"await","conditions":[{"task":"story.modal","milestone":{"type":"finished"}}],"next":"modal.after","on_cancelled":"failed","on_failed":"failed"}},
+            "modal.after":{"terminator":{"type":"activate","cue":"story.after","next":"modal.hold"}},
+            "modal.hold":{"terminator":{"type":"await","conditions":[{"task":"after.modal","milestone":{"type":"finished"}}],"next":"start","on_cancelled":"failed","on_failed":"failed"}}
+        })).unwrap());
+        let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+        let commands = p.pump(vec![], 1000);
+        ready(&mut p, commands);
+        let commands = action(&mut p, UiAction::NewGame);
+        let commands = ready(&mut p, commands);
+        assert_eq!(
+            p.screen,
+            if image_menu {
+                Screen::Menu
+            } else {
+                Screen::Saves
+            }
+        );
+        if !image_menu {
+            assert!(commands.iter().any(|c| matches!(c, AppCommand::ListSaves)));
+        }
+        let task = p.core().state().handles["story.modal"];
+        let music = p.core().state().handles["music.modal"];
+        let old_token = p.core().state().tasks[&task].modal_interaction;
+        let old_session = p.generation.session;
+        let commands = action(&mut p, UiAction::Save { slot: 1 });
+        let envelope = commands.into_iter().find_map(|c| {
+            if let AppCommand::Save { envelope, .. } = c {
+                Some(envelope)
+            } else {
+                None
+            }
+        });
+        assert_eq!(envelope.is_some(), image_menu);
+        if let Some(envelope) = envelope {
+            let commands = p.pump(vec![AppEvent::Loaded { envelope }], 1000);
+            ready(&mut p, commands);
+            assert_eq!(p.screen, Screen::Menu);
+            assert_ne!(p.core().state().tasks[&task].modal_interaction, old_token);
+            p.pump(
+                vec![AppEvent::Action {
+                    action: UiAction::Close,
+                    interaction: 0,
+                    sequence: 100,
+                    session: old_session,
+                }],
+                1000,
+            );
+            assert_eq!(p.screen, Screen::Menu);
+            action(&mut p, UiAction::Continue);
+        }
+        let commands = action(&mut p, UiAction::Close);
+        let commands = ready(&mut p, commands);
+        assert_eq!(p.screen, Screen::Story);
+        assert_eq!(
+            p.core().state().tasks[&task].state,
+            nir_core::TaskState::Finished
+        );
+        assert_eq!(
+            p.core().state().tasks[&music].state,
+            nir_core::TaskState::Running
+        );
+        assert!(p.core().state().handles.contains_key("after.modal"));
+        assert!(!commands.iter().any(|c| matches!(
+            c,
+            AppCommand::AudioStart { .. } | AppCommand::AudioStop { .. }
+        )));
+        assert!(p.error.is_none(), "{:?}", p.error);
+    }
+}
+
+#[test]
+fn image_choices_share_stage_transform_hit_regions_and_hover_assets() {
+    use nir_presentation::{project, ChoiceView, Messages, Screen};
+    let mut model = playing().model();
+    model.screen = Screen::Story;
+    model.loading = false;
+    model.paused = false;
+    model.stage = [1024., 768.];
+    model.dialogue = None;
+    model.choices = vec![ChoiceView {
+        id: "map".into(),
+        label: "Map".into(),
+        enabled: true,
+        selected: false,
+        image: Some(nir_format::ChoiceImage {
+            asset: "normal".into(),
+            hover_asset: Some("hover".into()),
+            disabled_asset: None,
+            rect: [578., 267., 200., 100.],
+        }),
+        locale: model.text_locale.clone(),
+        font_plan_digest: model.text_font_plan_digest.clone(),
+        font_assets: model.text_fonts.clone(),
+    }];
+    for (width, height) in [(1024., 768.), (390., 844.), (844., 390.)] {
+        let packet = project(&model, width, height, &Messages::default());
+        let quad = packet
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("normal"))
+            .unwrap();
+        let scale = (width / 1024.).min(height / 768.);
+        assert!((quad.rect[0] - ((width - 1024. * scale) / 2. + 578. * scale)).abs() < 0.001);
+        let hit = packet
+            .hit_node(
+                quad.rect[0] + quad.rect[2] / 2.,
+                quad.rect[1] + quad.rect[3] / 2.,
+            )
+            .unwrap();
+        assert_eq!(
+            hit.action,
+            UiAction::Choose {
+                option: "map".into()
+            }
+        );
+        model.hovered_image = Some("map".into());
+        let hovered = project(&model, width, height, &Messages::default());
+        assert!(hovered
+            .quads
+            .iter()
+            .any(|q| q.asset.as_deref() == Some("hover")));
+        assert!(!model.choices[0].selected);
+        model.hovered_image = None;
+    }
+    model.choices[0].enabled = false;
+    model.choices[0].selected = true;
+    model.hovered_image = Some("map".into());
+    model.choices[0].image.as_mut().unwrap().disabled_asset = Some("disabled".into());
+    let disabled = project(&model, 1024., 768., &Messages::default());
+    assert!(disabled
+        .quads
+        .iter()
+        .any(|q| q.asset.as_deref() == Some("disabled")));
+    assert!(!disabled
+        .quads
+        .iter()
+        .any(|q| q.asset.as_deref() == Some("hover")));
+    assert!(
+        !disabled
+            .semantics
+            .iter()
+            .find(|node| node.label == "Map")
+            .unwrap()
+            .enabled
+    );
+}
 /// A rain.json variant whose story opens on a typed interaction: the route
 /// options carry i32 values written to `picked`, and `mode` picks between
 /// plain, typed, and typed-plus-cancel destinations.
@@ -1700,6 +1878,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
     m.paused = false;
     m.choices = vec![
         ChoiceView {
+            image: None,
             id: "walk".into(),
             label: "Walk".into(),
             enabled: true,
@@ -1709,6 +1888,7 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
             font_assets: m.text_fonts.clone(),
         },
         ChoiceView {
+            image: None,
             id: "stay".into(),
             label: "Stay".into(),
             enabled: false,
@@ -1941,6 +2121,7 @@ fn measured_choice_list_exposes_every_stable_option_with_bounded_hit_regions() {
     m.prefs.font_scale = 1.5;
     m.choices = (0..24)
         .map(|i| ChoiceView {
+            image: None,
             id: format!("option-{i}"),
             label: if i == 3 {
                 "沿着河边，一起走回去。".repeat(80)
@@ -1994,6 +2175,7 @@ fn history_allows_browsing_inside_a_long_entry() {
     m.screen = Screen::History;
     m.loading = false;
     m.history = vec![nir_presentation::HistoryView {
+        images: vec![],
         key: 0,
         voice_count: 0,
         choice: None,
@@ -2064,6 +2246,7 @@ fn dialogue_opacity_multiplies_author_colors_without_fading_scene() {
             opacity: 0.5,
             background_opacity: 0.4,
             text_opacity: 0.6,
+            text_offset: [0.; 2],
         };
         let after = project(&model, 1280., 800., &messages);
         assert_eq!(before.quads.len(), after.quads.len());
@@ -4510,6 +4693,7 @@ fn shared_primary_router_obeys_available_title_actions_and_choice_focus() {
     m.screen = Screen::Story;
     assert_eq!(primary_action(&packet, &m), Some(UiAction::Advance));
     m.choices.push(ChoiceView {
+        image: None,
         id: "one".into(),
         label: "one".into(),
         enabled: true,
@@ -4693,6 +4877,130 @@ fn custom_dialogue_rect_has_a_static_hint_without_changing_text_bounds() {
         hint.y >= text.y + text.height,
         "full-screen default padding can hold the hint without covering text"
     );
+}
+
+#[test]
+fn independent_text_rect_tracks_stage_letterboxing_and_keeps_window_geometry() {
+    use nir_presentation::{project, Messages};
+    let p = interface_player(HidePolicy::ContinueStory, false);
+    let mut model = p.model();
+    model.theme.dialogue.rect = Some([100., 400., 1000., 250.]);
+    model.theme.dialogue.text_rect = Some([270., 550., 650., 80.]);
+    model.theme.dialogue.opacity = 0.;
+    for (width, height) in [(1280., 720.), (390., 844.), (844., 390.)] {
+        let packet = project(&model, width, height, &Messages::default());
+        let text = packet
+            .texts
+            .iter()
+            .find(|t| t.region == Some(ScrollRegion::Dialogue))
+            .unwrap();
+        let scale = (width / model.stage[0]).min(height / model.stage[1]);
+        assert!((text.x - ((width - model.stage[0] * scale) / 2. + 270. * scale)).abs() < 0.001);
+        assert!((text.y - ((height - model.stage[1] * scale) / 2. + 550. * scale)).abs() < 0.001);
+        assert!((text.width - 650. * scale).abs() < 0.001);
+        assert!((text.height - 80. * scale).abs() < 0.001);
+        assert!(packet
+            .quads
+            .iter()
+            .any(|q| q.rect[2] == 1000. * scale && q.color[3] == 0.));
+    }
+}
+
+#[test]
+fn dialogue_quake_moves_body_ruby_and_images_inside_a_stationary_surface() {
+    use nir_presentation::{Messages, ReadingState, TextEngine};
+    let mut model = playing().model();
+    model.theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    model.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    let dialogue = model.dialogue.as_mut().unwrap();
+    dialogue.full_text = "Reader\u{fffc}".into();
+    dialogue.visible_text = dialogue.full_text.clone();
+    dialogue.ready = true;
+    dialogue.font_assets = vec!["fixture.font".into()];
+    dialogue.font_plan_digest = "fixture".into();
+    dialogue.ruby = vec![(0, 6, "reading".into())];
+    dialogue.images = vec![serde_json::from_value(serde_json::json!({
+        "offset":6,"image":{"asset":"fixture.inline","width":32,"height":24,"align":"center","margins":[2,3,0,0]}
+    })).unwrap()];
+    let mut text = TextEngine::default();
+    text.add_font_asset(
+        "fixture.font",
+        include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+    )
+    .unwrap();
+    for (width, height) in [(1280., 720.), (390., 844.), (844., 390.)] {
+        let mut reading = ReadingState::default();
+        model.dialogue_appearance.text_offset = [0.; 2];
+        let before = reading.project(
+            &model,
+            (1, 1),
+            width,
+            height,
+            &Messages::default(),
+            &mut text,
+        );
+        model.dialogue_appearance.text_offset = [12., -7.];
+        let after = reading.project(
+            &model,
+            (1, 1),
+            width,
+            height,
+            &Messages::default(),
+            &mut text,
+        );
+        let scale = (width / model.stage[0]).min(height / model.stage[1]);
+        let base = before
+            .texts
+            .iter()
+            .position(|t| t.region == Some(ScrollRegion::Dialogue))
+            .unwrap();
+        let ruby = before
+            .texts
+            .iter()
+            .position(|t| t.text == "reading")
+            .unwrap();
+        for index in [base, ruby] {
+            let (a, b) = (&before.texts[index], &after.texts[index]);
+            assert!((b.x - a.x - 12. * scale).abs() < 0.001);
+            assert!((b.y - a.y + 7. * scale).abs() < 0.001);
+            assert_eq!((a.width, a.height, a.scroll), (b.width, b.height, b.scroll));
+            let clip = a.clip.unwrap_or([a.x, a.y, a.width, a.height]);
+            assert_eq!(b.clip, Some(clip));
+        }
+        assert_eq!(
+            before
+                .quads
+                .iter()
+                .filter(|q| q.asset.as_deref() != Some("fixture.inline"))
+                .collect::<Vec<_>>(),
+            after
+                .quads
+                .iter()
+                .filter(|q| q.asset.as_deref() != Some("fixture.inline"))
+                .collect::<Vec<_>>()
+        );
+        let image = before
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("fixture.inline"))
+            .unwrap();
+        let moved = after
+            .quads
+            .iter()
+            .find(|q| q.asset.as_deref() == Some("fixture.inline"))
+            .unwrap();
+        assert!((moved.rect[0] - image.rect[0] - 12. * scale).abs() < 0.001);
+        assert!((moved.rect[1] - image.rect[1] + 7. * scale).abs() < 0.001);
+        assert_eq!(image.clip, moved.clip);
+        assert_eq!(
+            serde_json::to_value(before.scrolls).unwrap(),
+            serde_json::to_value(after.scrolls).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(before.semantics).unwrap(),
+            serde_json::to_value(after.semantics).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -5037,6 +5345,9 @@ fn transition_masks_leave_the_active_asset_set_and_reenter_on_restore() {
             id: "mask".into(),
             scope: Scope::Session,
             effect: Effect::StagePresent {
+                dialogue_visible: None,
+                inherit_images: Vec::new(),
+                inherit_image_geometry: Vec::new(),
                 scene,
                 duration_us: Micros(1000),
                 transition: StageTransition::Mask {
@@ -6471,6 +6782,9 @@ fn startup_metadata_warnings_survive_preparation_and_clear_independently_without
                     AppEvent::PreferencesRecovered(p.preferences.clone())
                 }
                 PersistenceKind::Profile => AppEvent::ProfileRecovered(Default::default()),
+                PersistenceKind::ProfileValues => {
+                    AppEvent::ProfileValuesRecovered(Default::default())
+                }
             };
             let commands = p.pump(vec![recovered], 1000);
             assert_eq!(serde_json::to_vec(&p.core().snapshot()).unwrap(), snapshot);

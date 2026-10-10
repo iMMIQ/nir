@@ -138,16 +138,15 @@ impl<'a> Reader<'a> {
                 let value = match self.u8()? {
                     0 => Literal::Variable(self.string()?),
                     1 => Literal::Int(self.i32()?),
-                    2 => {
-                        self.bytes(10)?;
-                        Literal::Unsupported
-                    }
+                    2 => nir_format::Float80::from_le_bytes(self.bytes(10)?.try_into()?)
+                        .map(Literal::Float)
+                        .unwrap_or(Literal::Unsupported),
                     3 => Literal::Int(self.u8()?.into()),
                     4 => Literal::String(self.string()?),
                     ty => bail!("E_IMPORT_EXPRESSION: unknown operand type {ty}"),
                 };
                 literal = match &value {
-                    Literal::Int(_) | Literal::String(_) => Some(value.clone()),
+                    Literal::Int(_) | Literal::Float(_) | Literal::String(_) => Some(value.clone()),
                     _ => None,
                 };
                 operands.push(value);
@@ -217,6 +216,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<String> {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub(super) enum Literal {
     Int(i32),
+    Float(nir_format::Float80),
     String(String),
     Variable(String),
     Unsupported,
@@ -286,6 +286,8 @@ pub(super) enum Body {
         initial: Expression,
         scope: u8,
     },
+    VariableDelete(String),
+    Motion(Vec<Expression>),
     GetProperty {
         target: Expression,
         property: Expression,
@@ -312,7 +314,7 @@ pub(super) enum Body {
     Calc(Expression),
     Wait(Vec<Expression>),
     Text {
-        text: Novel,
+        text: Box<Novel>,
         target: Expression,
         history: Expression,
         wait: Expression,
@@ -346,8 +348,8 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
     let version = r.u32()?;
     // Keep version gates explicit rather than guessing layouts of other releases.
     ensure!(
-        version == 116,
-        "E_IMPORT_VERSION: supported LSB version is 116, found {version}"
+        matches!(version, 116 | 117),
+        "E_IMPORT_VERSION: supported LSB versions are 116 and 117, found {version}"
     );
     r.u8()?; // script flags
     let types = r.count(64)?;
@@ -406,7 +408,10 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                 3 => {
                     body = Body::Label(r.string()?);
                 }
-                16 | 27 => {
+                16 => {
+                    body = Body::VariableDelete(r.string()?);
+                }
+                27 => {
                     r.string()?;
                 }
                 4 => {
@@ -461,6 +466,11 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     ] {
                         parameters.insert(name.into(), r.expr()?);
                     }
+                    // LSB117 appends DifferenceOnly after StopEvent. Preserve
+                    // it for semantic validation instead of losing alignment.
+                    if version == 117 {
+                        parameters.insert("difference_only".into(), r.expr()?);
+                    }
                     body = Body::Flip {
                         parameters,
                         targets,
@@ -485,7 +495,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     let n = r.count(16 * 1024 * 1024)?;
                     let text = novel(r.bytes(n)?)?;
                     body = Body::Text {
-                        text,
+                        text: Box::new(text),
                         target: r.expr()?,
                         history: r.expr()?,
                         wait: r.expr()?,
@@ -530,7 +540,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
                     r.u8()?;
                 }
                 57 => {
-                    r.exprs(7)?;
+                    body = Body::Motion(r.exprs(7)?);
                 }
                 58 => {
                     body = Body::HistoryFormat {
@@ -575,6 +585,19 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
 #[derive(Clone, Debug)]
 pub(super) enum Glyph {
     Char(String),
+    Variable(String),
+    RubyChar {
+        text: String,
+        reading: String,
+        style: i32,
+    },
+    InlineImage {
+        source: String,
+        align: u8,
+        hover: String,
+        margins: [i32; 4],
+        down: String,
+    },
     Break(u8),
     Event(Vec<String>),
     Unsupported,
@@ -586,6 +609,10 @@ pub(super) struct Novel {
     pub events: BTreeMap<String, usize>,
     pub has_conditions_or_links: bool,
     pub has_ruby: bool,
+    pub conditions: Vec<(u32, String)>,
+    pub links: Vec<(u32, String, String)>,
+    pub glyph_conditions: Vec<i32>,
+    pub glyph_links: Vec<i32>,
 }
 fn novel(data: &[u8]) -> Result<Novel> {
     let mut r = Reader::new(data);
@@ -599,26 +626,31 @@ fn novel(data: &[u8]) -> Result<Novel> {
         "E_IMPORT_TEXT_VERSION: unsupported TpWord {version}"
     );
     let mut result = Novel::default();
+    let mut legacy_link = false;
     let styles = r.count(100_000)?;
+    let mut ruby_styles = Vec::with_capacity(styles);
     for _ in 0..styles {
         r.bytes(22)?;
         r.string()?;
-        result.has_ruby |= !r.string()?.is_empty();
+        let ruby = r.string()?;
+        ensure!(
+            ruby.len() <= 4096,
+            "E_IMPORT_TEXT: ruby annotation exceeds 4 KiB"
+        );
+        result.has_ruby |= !ruby.is_empty();
+        ruby_styles.push(ruby);
         r.bytes(8)?;
     }
     if version >= 104 {
         let n = r.count(100_000)?;
         for _ in 0..n {
-            r.u32()?;
-            r.string()?;
+            result.conditions.push((r.u32()?, r.string()?));
         }
     }
     if version >= 105 {
         let n = r.count(100_000)?;
         for _ in 0..n {
-            r.u32()?;
-            r.string()?;
-            r.string()?;
+            result.links.push((r.u32()?, r.string()?, r.string()?));
         }
     }
     let n = r.count(1_000_000)?;
@@ -626,13 +658,18 @@ fn novel(data: &[u8]) -> Result<Novel> {
         let kind = r.u8()?;
         *result.counts.entry(format!("{kind:02x}")).or_default() += 1;
         if version >= 104 {
-            result.has_conditions_or_links |= r.i32()? != -1;
+            let condition = r.i32()?;
+            result.has_conditions_or_links |= condition != -1;
+            result.glyph_conditions.push(condition);
         }
         if matches!(kind, 1 | 9) {
             if version >= 105 {
-                result.has_conditions_or_links |= r.i32()? != -1;
+                let link = r.i32()?;
+                result.has_conditions_or_links |= link != -1;
+                result.glyph_links.push(link);
             } else {
-                result.has_conditions_or_links |= !r.string()?.is_empty();
+                legacy_link |= !r.string()?.is_empty();
+                result.has_conditions_or_links |= legacy_link;
             }
             r.u32()?; // source reveal speed is normalized by the importer
         }
@@ -645,8 +682,21 @@ fn novel(data: &[u8]) -> Result<Novel> {
                 } else {
                     &ordered
                 })?;
-                r.i32()?;
-                Glyph::Char(text)
+                let style = r.i32()?;
+                ensure!(
+                    style >= 0 && (style as usize) < ruby_styles.len(),
+                    "E_IMPORT_TEXT: invalid style index"
+                );
+                let reading = &ruby_styles[style as usize];
+                if reading.is_empty() {
+                    Glyph::Char(text)
+                } else {
+                    Glyph::RubyChar {
+                        text,
+                        reading: reading.clone(),
+                        style,
+                    }
+                }
             }
             2 => {
                 r.u8()?;
@@ -667,61 +717,111 @@ fn novel(data: &[u8]) -> Result<Novel> {
                 Glyph::Event(event.split("\r\n").map(str::to_owned).collect())
             }
             7 | 10 => {
-                r.i32()?;
+                let style = r.i32()?;
+                ensure!(
+                    style >= 0 && (style as usize) < ruby_styles.len(),
+                    "E_IMPORT_TEXT: invalid variable style index"
+                );
                 if version > 100 {
                     r.u32()?;
                 }
                 if (101..105).contains(&version) {
-                    r.string()?;
+                    legacy_link |= !r.string()?.is_empty();
                 }
                 if version >= 105 {
-                    r.i32()?;
+                    result.glyph_links.push(r.i32()?);
                 }
                 if version < 102 {
                     r.expr()?;
+                    Glyph::Unsupported
                 } else {
-                    r.string()?;
+                    let name = r.string()?;
+                    if kind == 7 && ruby_styles[style as usize].is_empty() {
+                        Glyph::Variable(name)
+                    } else {
+                        Glyph::Unsupported
+                    }
                 }
-                Glyph::Unsupported
             }
             9 => {
-                r.string()?;
-                r.u8()?;
-                if version >= 103 {
-                    r.string()?;
+                let source = r.string()?;
+                let align = r.u8()?;
+                let hover = if version >= 103 {
+                    r.string()?
+                } else {
+                    String::new()
+                };
+                let margins = if version >= 105 {
+                    [r.i32()?, r.i32()?, r.i32()?, r.i32()?]
+                } else {
+                    [0; 4]
+                };
+                let down = if version >= 105 {
+                    r.string()?
+                } else {
+                    String::new()
+                };
+                Glyph::InlineImage {
+                    source,
+                    align,
+                    hover,
+                    margins,
+                    down,
                 }
-                if version >= 105 {
-                    r.bytes(16)?;
-                    r.string()?;
-                }
-                Glyph::Unsupported
             }
             _ => bail!("E_IMPORT_GLYPH: unknown glyph type {kind}"),
         };
         result.glyphs.push(glyph);
     }
     r.done()?;
+    // Newer source compilers emit explicit empty default condition/link
+    // rows. Resolve every index before certifying that they have no action;
+    // nonempty expressions and link callbacks remain unsupported.
+    let mut active = legacy_link;
+    for index in &result.glyph_conditions {
+        ensure!(*index >= -1, "E_IMPORT_TEXT: invalid condition index");
+        if *index >= 0 {
+            let (_, expression) = result
+                .conditions
+                .get(*index as usize)
+                .context("E_IMPORT_TEXT: condition index outside table")?;
+            active |= !expression.is_empty();
+        }
+    }
+    for index in &result.glyph_links {
+        ensure!(*index >= -1, "E_IMPORT_TEXT: invalid link index");
+        if *index >= 0 {
+            let (_, name, action) = result
+                .links
+                .get(*index as usize)
+                .context("E_IMPORT_TEXT: link index outside table")?;
+            active |= !name.is_empty() || !action.is_empty();
+        }
+    }
+    result.has_conditions_or_links = active;
     Ok(result)
 }
 
 pub(super) fn startup(data: &[u8]) -> Result<String> {
     let mut r = Reader::new(data);
+    let version = r.u32()?;
     ensure!(
-        r.u32()? == 116,
-        "E_IMPORT_VERSION: supported LPB version is 116"
+        matches!(version, 116 | 117),
+        "E_IMPORT_VERSION: supported LPB versions are 116 and 117, found {version}"
     );
     r.string()?; // title
     r.bytes(16)?;
     r.string()
 }
 
-/// Read the documented LPB116 settings prefix. Later project/editor sections are
+/// Read the documented LPB116/117 settings prefix. Later project/editor sections are
 /// intentionally not interpreted or exported by the importer.
 pub(super) fn project_settings(data: &[u8]) -> Result<BTreeMap<String, Literal>> {
     let mut r = Reader::new(data);
+    let version = r.u32()?;
     ensure!(
-        r.u32()? == 116,
-        "E_IMPORT_VERSION: supported LPB version is 116"
+        matches!(version, 116 | 117),
+        "E_IMPORT_VERSION: supported LPB versions are 116 and 117, found {version}"
     );
     r.string()?;
     r.bytes(16)?; // project title and reserved header
@@ -741,10 +841,9 @@ pub(super) fn project_settings(data: &[u8]) -> Result<BTreeMap<String, Literal>>
         let name = r.string()?;
         let value = match kind {
             1 => Literal::Int(r.i32()?),
-            2 => {
-                r.bytes(10)?;
-                Literal::Unsupported
-            }
+            2 => nir_format::Float80::from_le_bytes(r.bytes(10)?.try_into()?)
+                .map(Literal::Float)
+                .unwrap_or(Literal::Unsupported),
             3 => Literal::Int(r.u8()?.into()),
             4 => Literal::String(r.string()?),
             _ => bail!("E_IMPORT_SETTINGS: unsupported setting type {kind}"),
@@ -760,6 +859,52 @@ pub(super) fn project_settings(data: &[u8]) -> Result<BTreeMap<String, Literal>>
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    #[test]
+    fn version117_flip_reads_difference_only_and_preserves_next_command() {
+        let mut args = vec![];
+        for n in [3, 200, 0, 1] {
+            args.extend(integer(n));
+        }
+        u32b(&mut args, 0); // targets
+        for n in [0, 20, 1, 0, 0, 0] {
+            args.extend(integer(n));
+        }
+        let mut label = vec![];
+        string(&mut label, "after-flip");
+        let mut bytes = script(&[command(13, 10, &args), command(3, 11, &label)]);
+        bytes[..4].copy_from_slice(&117u32.to_le_bytes());
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed.version, 117);
+        let Body::Flip { parameters, .. } = &parsed.commands[0].body else {
+            panic!("missing flip");
+        };
+        assert_eq!(parameters.len(), 10);
+        assert!(matches!(
+            parameters["difference_only"].literal,
+            Some(Literal::Int(0))
+        ));
+        assert!(matches!(&parsed.commands[1].body, Body::Label(s) if s == "after-flip"));
+        for end in 0..bytes.len() {
+            assert!(parse(&bytes[..end]).is_err(), "truncated prefix {end}");
+        }
+        bytes[..4].copy_from_slice(&116u32.to_le_bytes());
+        assert!(parse(&bytes).is_err(), "117 field cannot be read as116");
+        bytes[..4].copy_from_slice(&118u32.to_le_bytes());
+        assert!(parse(&bytes).is_err());
+    }
+    #[test]
+    fn version117_project_prefix_preserves_startup_and_settings() {
+        let mut bytes = settings_file(&[("StatusBGMVolume", 400), ("StatusAutoTextWait", 1200)]);
+        bytes[..4].copy_from_slice(&117u32.to_le_bytes());
+        assert_eq!(startup(&bytes).unwrap(), "main.lsb");
+        let values = project_settings(&bytes).unwrap();
+        assert!(matches!(values["StatusBGMVolume"], Literal::Int(400)));
+        assert!(matches!(values["StatusAutoTextWait"], Literal::Int(1200)));
+        assert!(project_settings(&bytes[..bytes.len() - 1]).is_err());
+        bytes[..4].copy_from_slice(&118u32.to_le_bytes());
+        assert!(startup(&bytes).is_err());
+        assert!(project_settings(&bytes).is_err());
+    }
     #[test]
     fn layout_variable_property_read_and_loop_updates_preserve_data_flow() {
         let mut variable = vec![];
@@ -817,6 +962,21 @@ pub(super) mod tests {
             matches!(&parsed.commands[3].body, Body::LoopCondition { condition, target: 77 } if condition.flag().unwrap())
         );
     }
+    #[test]
+    fn extended_literals_preserve_all_ten_bytes_without_host_float_rounding() {
+        let bits = (0x3fffu128 << 64) | (1u128 << 63) | 1;
+        let mut bytes = vec![];
+        u32b(&mut bytes, 1);
+        bytes.push(1);
+        string(&mut bytes, "____arg");
+        u32b(&mut bytes, 1);
+        bytes.push(2);
+        bytes.extend_from_slice(&bits.to_le_bytes()[..10]);
+        let expression = Reader::new(&bytes).expr().unwrap();
+        assert!(matches!(expression.literal, Some(Literal::Float(v)) if v.bits() == bits));
+        assert!(Reader::new(&bytes[..bytes.len() - 1]).expr().is_err());
+    }
+
     #[test]
     fn string_temporary_is_folded_without_evaluating_source_variables() {
         let mut bytes = vec![];
@@ -1174,7 +1334,12 @@ pub(super) mod tests {
     }
     pub fn dialogue(text: &str) -> Vec<u8> {
         let mut b = b"TpWord105".to_vec();
-        for _ in 0..3 {
+        u32b(&mut b, 1);
+        b.extend([0; 22]);
+        string(&mut b, "");
+        string(&mut b, "");
+        b.extend([0; 8]);
+        for _ in 0..2 {
             u32b(&mut b, 0);
         }
         u32b(&mut b, text.chars().count() as u32);
@@ -1207,6 +1372,80 @@ pub(super) mod tests {
         }
         args
     }
+    #[test]
+    fn inline_images_keep_geometry_and_validate_explicit_default_tables() {
+        let file = |condition: &str, index: u32| {
+            let mut b = b"TpWord105".to_vec();
+            u32b(&mut b, 0); // no font decorators on the inline image
+            u32b(&mut b, 1);
+            u32b(&mut b, 1);
+            string(&mut b, condition);
+            u32b(&mut b, 1);
+            u32b(&mut b, 1);
+            string(&mut b, "");
+            string(&mut b, "");
+            u32b(&mut b, 1);
+            b.push(9);
+            u32b(&mut b, index);
+            u32b(&mut b, 0);
+            u32b(&mut b, 0);
+            string(&mut b, "icons\\heart.gal");
+            b.push(3);
+            string(&mut b, "hover.gal");
+            for value in [1, 2, 3, 4] {
+                u32b(&mut b, value);
+            }
+            string(&mut b, "down.gal");
+            b
+        };
+        let bytes = file("", 0);
+        let parsed = novel(&bytes).unwrap();
+        assert!(!parsed.has_conditions_or_links);
+        assert!(
+            matches!(&parsed.glyphs[0], Glyph::InlineImage { source, align:3, hover, margins:[1,2,3,4], down }
+            if source == "icons\\heart.gal" && hover == "hover.gal" && down == "down.gal")
+        );
+        assert!(novel(&file("enabled", 0)).unwrap().has_conditions_or_links);
+        assert!(novel(&file("", 1)).is_err());
+        assert!(novel(&bytes[..bytes.len() - 1]).is_err());
+    }
+    #[test]
+    fn variable_glyphs_preserve_slot_names_and_validate_links_and_styles() {
+        let file = |kind: u8, style: u32, link: u32| {
+            let mut b = b"TpWord105".to_vec();
+            u32b(&mut b, 1);
+            b.extend([0; 22]);
+            string(&mut b, "");
+            string(&mut b, "");
+            b.extend([0; 8]);
+            u32b(&mut b, 0);
+            u32b(&mut b, 1);
+            u32b(&mut b, 1);
+            string(&mut b, "open");
+            string(&mut b, "callback");
+            u32b(&mut b, 1);
+            b.push(kind);
+            u32b(&mut b, u32::MAX);
+            u32b(&mut b, style);
+            u32b(&mut b, 0);
+            u32b(&mut b, link);
+            string(&mut b, "Counter");
+            b
+        };
+        let bytes = file(7, 0, u32::MAX);
+        let parsed = novel(&bytes).unwrap();
+        assert!(matches!(&parsed.glyphs[0], Glyph::Variable(name) if name == "Counter"));
+        assert!(!parsed.has_conditions_or_links);
+        assert!(novel(&file(7, 0, 0)).unwrap().has_conditions_or_links);
+        assert!(novel(&file(7, 0, 1)).is_err());
+        assert!(novel(&file(7, 1, u32::MAX)).is_err());
+        assert!(matches!(
+            novel(&file(10, 0, u32::MAX)).unwrap().glyphs[0],
+            Glyph::Unsupported
+        ));
+        assert!(novel(&bytes[..bytes.len() - 1]).is_err());
+    }
+
     #[test]
     fn reads_japanese_and_rejects_truncation() {
         let bytes = script(&[command(20, 15, &dialogue("こんにちは。"))]);

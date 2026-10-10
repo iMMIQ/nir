@@ -152,6 +152,7 @@ pub struct Storage {
 pub(crate) struct StartupStorage {
     pub(crate) preferences: Option<Preferences>,
     pub(crate) profile: BTreeSet<String>,
+    pub(crate) profile_values: std::collections::BTreeMap<String, nir_format::Value>,
     pub(crate) failures: Vec<AppEvent>,
 }
 impl Storage {
@@ -241,11 +242,48 @@ impl Storage {
             });
             BTreeSet::new()
         });
+        let profile_values = self.profile_values().unwrap_or_else(|error| {
+            failures.push(AppEvent::PersistenceReadFailed {
+                kind: PersistenceKind::ProfileValues,
+                message: error.to_string(),
+            });
+            Default::default()
+        });
         StartupStorage {
+            profile_values,
             preferences,
             profile,
             failures,
         }
+    }
+    pub fn profile_values(&self) -> Result<std::collections::BTreeMap<String, nir_format::Value>> {
+        match fs::read(self.root.join("profile-values.json")) {
+            Ok(bytes) => {
+                let values = nir_content::parse(&bytes, "profile_values")?;
+                ensure!(
+                    nir_format::valid_profile_values(&values),
+                    "E_PROFILE_VALUES_RECORD"
+                );
+                Ok(values)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+    pub fn merge_profile_values(
+        &self,
+        values: std::collections::BTreeMap<String, nir_format::Value>,
+    ) -> Result<()> {
+        let mut all = self.profile_values()?;
+        all.extend(values);
+        ensure!(
+            nir_format::valid_profile_values(&all),
+            "E_PROFILE_VALUES_RECORD"
+        );
+        atomic_write(
+            &self.root.join("profile-values.json"),
+            &serde_json::to_vec(&all)?,
+        )
     }
     pub fn profile(&self) -> Result<BTreeSet<String>> {
         match fs::read(self.root.join("profile.json")) {
@@ -443,6 +481,51 @@ mod tests {
         publish(&manifest);
         assert!(Bundle::open(temp.path()).is_err());
     }
+    #[test]
+    fn mutable_profile_values_survive_releases_and_preserve_corrupt_records() {
+        use nir_format::Value;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Storage::open(temp.path(), "game", "dev", &"a".repeat(64)).unwrap();
+        store
+            .merge_profile_values(BTreeMap::from([
+                ("flag".into(), Value::I32(1)),
+                ("name".into(), Value::String("reader".into())),
+            ]))
+            .unwrap();
+        drop(store);
+        let store = Storage::open(temp.path(), "game", "dev", &"b".repeat(64)).unwrap();
+        store
+            .merge_profile_values(BTreeMap::from([("flag".into(), Value::I32(0))]))
+            .unwrap();
+        assert_eq!(store.profile_values().unwrap()["flag"], Value::I32(0));
+        assert_eq!(
+            store.profile_values().unwrap()["name"],
+            Value::String("reader".into())
+        );
+        let other = Storage::open(temp.path(), "game", "release", &"b".repeat(64)).unwrap();
+        assert!(other.profile_values().unwrap().is_empty());
+        let path = store.root.join("profile-values.json");
+        for bytes in [
+            b"{broken".to_vec(),
+            serde_json::to_vec(&BTreeMap::from([("".to_owned(), Value::I32(1))])).unwrap(),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            let startup = store.startup();
+            assert!(startup.profile_values.is_empty());
+            assert!(matches!(
+                startup.failures.as_slice(),
+                [AppEvent::PersistenceReadFailed {
+                    kind: PersistenceKind::ProfileValues,
+                    ..
+                }]
+            ));
+            assert!(store
+                .merge_profile_values(BTreeMap::from([("flag".into(), Value::I32(1))]))
+                .is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn profile_is_monotonic_and_preferences_survive_reopen() {
         let temp = tempfile::tempdir().unwrap();

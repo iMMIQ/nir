@@ -7463,7 +7463,7 @@
         "freeBytesAtCapture": 28097609728
       },
       "chromium": {
-        "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+        "path": "chromium",
         "version": "Chromium 153.0.8010.52",
         "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native"
       },
@@ -16802,7 +16802,7 @@
         "freeBytesAtCapture": 28460666880
       },
       "chromium": {
-        "path": "/nix/store/flqqsdvs8l0l86zwacyardqfi9ayz3qg-chromium-153.0.8010.52/bin/chromium",
+        "path": "chromium",
         "version": "Chromium 153.0.8010.52",
         "args": "--ozone-platform=x11 --enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist --use-angle=vulkan --enable-features=Vulkan --use-vulkan=native"
       },

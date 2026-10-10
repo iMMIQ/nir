@@ -551,10 +551,17 @@ impl Renderer {
     pub fn destroy(&self) {
         self.device.destroy();
     }
+    pub fn surface_extent(&self) -> [u32; 2] {
+        [self.config.width, self.config.height]
+    }
     pub fn resize(&mut self, w: u32, h: u32) {
         let w = w.max(1).min(self.device.limits().max_texture_dimension_2d);
         let h = h.max(1).min(self.device.limits().max_texture_dimension_2d);
         if self.config.width != w || self.config.height != h {
+            // These roots are rebuilt from the draw packet, so release their
+            // old extent before the owner allocates the replacement roots.
+            self.window_root = None;
+            self.menu_roots = None;
             self.config.width = w;
             self.config.height = h;
             if let Some(surface) = &self.surface {
@@ -1262,16 +1269,22 @@ impl Renderer {
                             a,
                         ]
                     };
-                    for (dx, dy, u, v) in [
-                        (0., 0., 0., 0.),
-                        (w, 0., 1., 0.),
-                        (0., h, 0., 1.),
-                        (0., h, 0., 1.),
-                        (w, 0., 1., 0.),
-                        (w, h, 1., 1.),
+                    let corners =
+                        q.corners
+                            .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
+                    for (index, u, v) in [
+                        (0, 0., 0.),
+                        (1, 1., 0.),
+                        (2, 0., 1.),
+                        (2, 0., 1.),
+                        (1, 1., 0.),
+                        (3, 1., 1.),
                     ] {
                         verts.push(Vertex {
-                            pos: [(x + dx) / p.width * 2. - 1., 1. - (y + dy) / p.height * 2.],
+                            pos: [
+                                corners[index][0] / p.width * 2. - 1.,
+                                1. - corners[index][1] / p.height * 2.,
+                            ],
                             uv: [u, v],
                             color,
                         });

@@ -206,6 +206,7 @@ impl ReadingState {
                     1.
                 };
                 Quad {
+                    corners: None,
                     rect: *rect,
                     asset: Some(asset.unwrap_or(&images.asset).clone()),
                     color: [tint, tint, tint, view.quad.color[3]],

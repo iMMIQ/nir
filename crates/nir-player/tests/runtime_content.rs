@@ -71,6 +71,7 @@ fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
     let static_content = object(
         &mut objects,
         &ModuleStatic {
+            sprite_timelines: Default::default(),
             format: 2,
             module: owner.clone(),
             scenes: p.scenes.clone(),
@@ -110,6 +111,7 @@ fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
         .cloned()
         .unwrap_or_default();
     let root = RuntimeProgram {
+        timeline_owners: Default::default(),
         format: 2,
         game_id: p.game_id,
         revision: p.revision,
@@ -124,6 +126,7 @@ fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
                 (
                     id.clone(),
                     RuntimeFunctionIndex {
+                        execution_module: None,
                         module: owner.clone(),
                         signature: FunctionSignature::from(f),
                     },
@@ -161,6 +164,7 @@ fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
                 (
                     id.clone(),
                     RuntimeTextIdentity {
+                        images: vec![],
                         module: owner.clone(),
                         source_revision: t.source_revision,
                         contract_revision: t.contract_revision,
@@ -255,6 +259,123 @@ fn drain(
 }
 
 #[test]
+fn consecutive_cues_commit_before_the_next_asset_catalog_is_ready() {
+    let (mut root, mut objects) = bundled();
+    let function: Function = serde_json::from_value(serde_json::json!({
+        "entry":"start","blocks":{
+            "start":{"terminator":{"type":"activate","cue":"opening","next":"enter"}},
+            "enter":{"terminator":{"type":"activate","cue":"enter","next":"wait"}},
+            "wait":{"terminator":{"type":"await","conditions":[{"task":"stage","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}},
+            "done":{"terminator":{"type":"end","outcome":"completed"}}
+        }
+    })).unwrap();
+    let signature = FunctionSignature::from(&function);
+    let code = object(
+        &mut objects,
+        &ModuleCode {
+            format: 2,
+            module: "story".into(),
+            functions: BTreeMap::from([("main".into(), function)]),
+        },
+    );
+    let module = root.modules.get_mut("story").unwrap();
+    module.code = code;
+    module.functions = BTreeMap::from([("main".into(), signature.clone())]);
+    root.function_index = BTreeMap::from([(
+        "main".into(),
+        RuntimeFunctionIndex {
+            module: "story".into(),
+            execution_module: None,
+            signature,
+        },
+    )]);
+    let declarations: ModuleStatic =
+        serde_json::from_slice(&objects[&root.modules["story"].static_content]).unwrap();
+    root.title_scene = Some("station".into());
+    root.title_nodes = declarations.scenes["station"].clone();
+    let mut p = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = p.pump(vec![], 1000);
+    drain(&mut p, boot, &objects);
+    assert!(p.asset_descriptor("actor.aki").is_none());
+    let boot_memory = p.memory_used();
+    let mut queue = action(&mut p, UiAction::NewGame);
+    let mut held = None;
+    for _ in 0..20 {
+        let mut next = vec![];
+        for command in queue {
+            let events = match command {
+                AppCommand::GetContent {
+                    request,
+                    objects: requirements,
+                    ..
+                } => {
+                    if requirements.iter().any(|r| matches!(&r.key, Some(ContentKey::Catalog{catalog}) if catalog=="actor.aki")) {
+                        held = Some((request,requirements));
+                        continue;
+                    }
+                    vec![AppEvent::ContentReady {
+                        request,
+                        objects: requirements
+                            .iter()
+                            .map(|r| objects[&r.hash].clone())
+                            .collect(),
+                    }]
+                }
+                AppCommand::GetAssets {
+                    request, assets, ..
+                } => assets
+                    .into_iter()
+                    .map(|asset| AppEvent::AssetReady { request, asset })
+                    .collect(),
+                AppCommand::PreparePresentation { request } => {
+                    vec![AppEvent::PresentationReady { request }]
+                }
+                AppCommand::PrepareLocale { request, .. } => {
+                    vec![AppEvent::LocaleReady { request }]
+                }
+                _ => vec![],
+            };
+            if !events.is_empty() {
+                next.extend(p.pump(events, 1000));
+            }
+        }
+        queue = next;
+        if held.is_some() {
+            break;
+        }
+    }
+    let (request, requirements) = held.expect("next cue must request its own catalog");
+    assert_eq!(p.error, None);
+    assert_eq!(p.diagnostic, None);
+    assert_eq!(p.core().state().pending.as_ref().unwrap().cue, "enter");
+    assert!(p
+        .core()
+        .state()
+        .scene
+        .iter()
+        .any(|node| node.asset.as_deref() == Some("bg.station")));
+    assert!(p.asset_descriptor("actor.aki").is_none());
+    assert!(
+        p.memory_used() > boot_memory,
+        "committed music remains admitted while the next catalog loads"
+    );
+    let ready = p.pump(
+        vec![AppEvent::ContentReady {
+            request,
+            objects: requirements
+                .iter()
+                .map(|r| objects[&r.hash].clone())
+                .collect(),
+        }],
+        1000,
+    );
+    drain(&mut p, ready, &objects);
+    assert_eq!(p.error, None);
+    assert!(p.core().state().pending.is_none());
+    assert!(p.retained_assets().contains("actor.aki"));
+}
+
+#[test]
 fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
     use nir_core::{HistoryChoice, HistoryChoiceOption, HistoryChoiceResolution, HistoryEntry};
     let (mut root, mut objects) = bundled();
@@ -285,6 +406,7 @@ fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
     let static_content = object(
         &mut objects,
         &ModuleStatic {
+            sprite_timelines: Default::default(),
             format: 2,
             module: module.clone(),
             scenes: BTreeMap::new(),
@@ -326,6 +448,7 @@ fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
     root.function_index.insert(
         "old.entry".into(),
         RuntimeFunctionIndex {
+            execution_module: None,
             module: module.clone(),
             signature,
         },
@@ -337,6 +460,7 @@ fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
         root.text_contracts.insert(
             id.clone(),
             RuntimeTextIdentity {
+                images: vec![],
                 module: module.clone(),
                 meaning_revision: c.meaning_revision,
                 source_revision: c.source_revision,
@@ -377,6 +501,7 @@ fn completed_choice_history_restores_without_loading_the_old_chapter_bodies() {
     };
     let c = &contracts["old.stay"];
     snapshot.history.push(HistoryEntry {
+        images: vec![],
         interaction,
         text_id: "old.stay".into(),
         meaning_revision: c.meaning_revision,
@@ -738,6 +863,7 @@ fn history_voice_loads_only_its_catalog_and_keeps_cancelled_decode_budget_until_
     let static_content = object(
         &mut objects,
         &ModuleStatic {
+            sprite_timelines: Default::default(),
             format: 2,
             module: module.clone(),
             scenes: BTreeMap::new(),
@@ -776,6 +902,7 @@ fn history_voice_loads_only_its_catalog_and_keeps_cancelled_decode_budget_until_
     root.function_index.insert(
         function_id,
         RuntimeFunctionIndex {
+            execution_module: None,
             module: module.clone(),
             signature,
         },
@@ -784,6 +911,7 @@ fn history_voice_loads_only_its_catalog_and_keeps_cancelled_decode_budget_until_
     root.text_contracts.insert(
         text_id.clone(),
         RuntimeTextIdentity {
+            images: vec![],
             module,
             source_revision: contract.source_revision,
             contract_revision: contract.contract_revision,
@@ -827,6 +955,7 @@ fn history_voice_loads_only_its_catalog_and_keeps_cancelled_decode_budget_until_
     drain(&mut original, start, &objects);
     let mut snapshot = original.core().snapshot();
     snapshot.history.push(nir_core::HistoryEntry {
+        images: vec![],
         choice: None,
         interaction: original.core().dialogue().unwrap().1.interaction,
         voices: vec![nir_core::HistoryVoice {
@@ -1007,6 +1136,7 @@ fn hundred_module_story_loads_incrementally_and_budget_rejection_preserves_old_v
         let static_content = object(
             &mut objects,
             &ModuleStatic {
+                sprite_timelines: Default::default(),
                 format: 2,
                 module: module.clone(),
                 scenes: BTreeMap::new(),
@@ -1029,6 +1159,7 @@ fn hundred_module_story_loads_incrementally_and_budget_rejection_preserves_old_v
         root.function_index.insert(
             function_id,
             RuntimeFunctionIndex {
+                execution_module: None,
                 module: module.clone(),
                 signature,
             },
@@ -1350,6 +1481,7 @@ fn player_evicts_and_reloads_returned_modules_without_replaying_calls() {
         let static_content = object(
             &mut objects,
             &ModuleStatic {
+                sprite_timelines: Default::default(),
                 format: 2,
                 module: name.clone(),
                 scenes: BTreeMap::new(),
@@ -1372,6 +1504,7 @@ fn player_evicts_and_reloads_returned_modules_without_replaying_calls() {
         root.function_index.insert(
             function_id,
             RuntimeFunctionIndex {
+                execution_module: None,
                 module: name,
                 signature,
             },
@@ -1610,4 +1743,279 @@ fn failed_content_retry_coalesces_until_its_next_terminal_and_preserves_live_sta
     assert!(!p.retrying());
     assert!(!p.is_loading());
     assert_eq!(serde_json::to_value(p.core().snapshot()).unwrap(), before);
+}
+
+#[test]
+fn code_package_start_and_cold_restore_load_shared_scope_without_parent_code() {
+    let (mut root, mut objects) = bundled();
+    let original: ModuleCode =
+        serde_json::from_slice(&objects[&root.modules["story"].code]).unwrap();
+    let mut function = original.functions["main"].clone();
+    for block in function.blocks.values_mut() {
+        for op in &mut block.ops {
+            op.id = format!("packed_{}", op.id);
+        }
+    }
+    let signature = FunctionSignature::from(&function);
+    let code = object(
+        &mut objects,
+        &ModuleCode {
+            format: 2,
+            module: "pack".into(),
+            functions: BTreeMap::from([("pack_entry".into(), function)]),
+        },
+    );
+    let static_content = object(
+        &mut objects,
+        &ModuleStatic {
+            sprite_timelines: Default::default(),
+            format: 2,
+            module: "pack".into(),
+            scenes: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            choices: BTreeMap::new(),
+            text_contracts: BTreeMap::new(),
+            activation_recipes: BTreeMap::new(),
+        },
+    );
+    root.modules.insert(
+        "pack".into(),
+        ModuleIndex {
+            functions: BTreeMap::from([("pack_entry".into(), signature.clone())]),
+            texts: BTreeSet::new(),
+            code,
+            static_content,
+            locales: BTreeMap::new(),
+        },
+    );
+    root.function_index.insert(
+        "pack_entry".into(),
+        RuntimeFunctionIndex {
+            module: "pack".into(),
+            execution_module: Some("story".into()),
+            signature,
+        },
+    );
+    root.entry = "pack_entry".into();
+    root.requires.push("story.code-packages.v1".into());
+    let mut p = Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
+    let boot = p.pump(vec![], 1000);
+    drain(&mut p, boot, &objects);
+    let start = action(&mut p, UiAction::NewGame);
+    let keys = drain(&mut p, start, &objects);
+    assert!(p.error.is_none(), "{:?}", p.diagnostic);
+    assert!(p.core().dialogue().is_some());
+    for key in [
+        ContentKey::Static {
+            module: "story".into(),
+        },
+        ContentKey::Static {
+            module: "pack".into(),
+        },
+        ContentKey::Code {
+            module: "pack".into(),
+        },
+        ContentKey::Text {
+            module: "story".into(),
+            locale: "zh-Hans".into(),
+        },
+    ] {
+        assert!(keys.contains(&key), "missing {key:?}");
+    }
+    assert!(!keys.contains(&ContentKey::Code {
+        module: "story".into()
+    }));
+    assert!(p.content_residency().blocks.iter().any(|block| block.key
+        == ContentKey::Static {
+            module: "story".into()
+        }
+        && !block.pinned_by.is_empty()));
+    let snapshot = p.core().snapshot();
+    let music = snapshot.handles["music"];
+    let preferences = root.player.preferences("en".into(), "en".into());
+    let mut restored =
+        Player::new_runtime(root, "release".into(), "Test".into(), Some(preferences)).unwrap();
+    let boot = restored.pump(vec![], 1000);
+    drain(&mut restored, boot, &objects);
+    let envelope = SaveEnvelope {
+        format: 1,
+        slot: 0,
+        revision: 1,
+        digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+        snapshot,
+    };
+    let load = restored.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(envelope),
+        }],
+        1000,
+    );
+    let keys = drain(&mut restored, load, &objects);
+    assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+    assert!(!keys.contains(&ContentKey::Code {
+        module: "story".into()
+    }));
+    assert_eq!(restored.core().state().handles["music"], music);
+    assert_eq!(
+        serde_json::to_value(&restored.core().dialogue().unwrap().1.spans).unwrap(),
+        serde_json::to_value(&p.core().dialogue().unwrap().1.spans).unwrap()
+    );
+    assert!(keys.contains(&ContentKey::Text {
+        module: "story".into(),
+        locale: "en".into()
+    }));
+}
+
+#[test]
+fn returned_animation_module_remains_pinned_and_cold_restore_fetches_shared_keyframes() {
+    use serde_json::json;
+    let (mut root, mut objects) = bundled();
+    root.player.prefetch_content = false;
+    root.requires.push("stage.sprite-timeline.v1".into());
+    let driver:Function=serde_json::from_value(json!({"entry":"start","blocks":{
+        "start":{"terminator":{"type":"activate","cue":"opening","next":"movie"}},
+        "movie":{"terminator":{"type":"call","function":"old.entry","args":{},"next":"intro"}},
+        "intro":{"terminator":{"type":"activate","cue":"intro","next":"wait"}},
+        "wait":{"terminator":{"type":"await","conditions":[{"task":"line","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"}},
+        "done":{"terminator":{"type":"end","outcome":"done"}}
+    }})).unwrap();
+    let module = root.modules.get_mut("story").unwrap();
+    let mut code: ModuleCode = serde_json::from_slice(&objects[&module.code]).unwrap();
+    code.functions.insert("main".into(), driver.clone());
+    module.code = object(&mut objects, &code);
+    module
+        .functions
+        .insert("main".into(), FunctionSignature::from(&driver));
+    root.function_index.get_mut("main").unwrap().signature = FunctionSignature::from(&driver);
+    let movie: Function = serde_json::from_value(json!({"entry":"show","blocks":{
+        "show":{"terminator":{"type":"activate","cue":"old.show","next":"return"}},
+        "return":{"terminator":{"type":"return"}}
+    }}))
+    .unwrap();
+    let signature = FunctionSignature::from(&movie);
+    let movie_code = ModuleCode {
+        format: 2,
+        module: "old".into(),
+        functions: BTreeMap::from([("old.entry".into(), movie)]),
+    };
+    let code_hash = object(&mut objects, &movie_code);
+    let timeline: SpriteTimeline =
+        serde_json::from_value(json!({"id":"old.frames","duration_us":"10000000","tracks":[
+            {"node":"picture","frames":[{"at_us":"0","rect":[0,0,32,24],"opacity":1},
+                {"at_us":"1000000","rect":[64,0,32,24],"opacity":1}]}
+        ]}))
+        .unwrap();
+    let nodes: Vec<Node> = serde_json::from_value(json!([
+        {"id":"movie","x":700,"y":100,"width":0,"height":0,"timeline_binding":"old.frames"},
+        {"id":"picture","parent":"movie","asset":"bg.station","x":0,"y":0,"width":32,"height":24}
+    ]))
+    .unwrap();
+    let cue:Cue=serde_json::from_value(json!({"effects":[
+        {"id":"old.stage","scope":"session","effect":{"type":"stage_present","scene":"old.scene"}},
+        {"id":"old.movie","scope":"session","effect":{"type":"sprite_timeline","timeline":"old.frames","root":"movie","duration_us":"10000000"}}
+    ]})).unwrap();
+    let package = ModuleStatic {
+        format: 2,
+        module: "old".into(),
+        sprite_timelines: BTreeMap::from([("old.frames".into(), timeline)]),
+        scenes: BTreeMap::from([("old.scene".into(), nodes)]),
+        cues: BTreeMap::from([("old.show".into(), cue)]),
+        choices: BTreeMap::new(),
+        text_contracts: BTreeMap::new(),
+        activation_recipes: BTreeMap::from([(
+            "old.show".into(),
+            BTreeSet::from(["bg.station".into()]),
+        )]),
+    };
+    let static_hash = object(&mut objects, &package);
+    root.modules.insert(
+        "old".into(),
+        ModuleIndex {
+            functions: BTreeMap::from([("old.entry".into(), signature.clone())]),
+            texts: BTreeSet::new(),
+            code: code_hash,
+            static_content: static_hash,
+            locales: BTreeMap::new(),
+        },
+    );
+    root.function_index.insert(
+        "old.entry".into(),
+        RuntimeFunctionIndex {
+            execution_module: None,
+            module: "old".into(),
+            signature,
+        },
+    );
+    root.scene_owners.insert("old.scene".into(), "old".into());
+    root.timeline_owners
+        .insert("old.frames".into(), "old".into());
+    root.cue_owners.insert("old.show".into(), "old".into());
+    for task in ["old.stage", "old.movie"] {
+        root.task_owners.insert(task.into(), "old".into());
+    }
+    let mut player =
+        Player::new_runtime(root.clone(), "release".into(), "Test".into(), None).unwrap();
+    let boot = player.pump(vec![], 1000);
+    drain(&mut player, boot, &objects);
+    let start = action(&mut player, UiAction::NewGame);
+    drain(&mut player, start, &objects);
+    assert!(player.error.is_none(), "{:?}", player.diagnostic);
+    assert!(player
+        .core()
+        .state()
+        .frames
+        .iter()
+        .all(|f| f.function != "old.entry"));
+    assert!(player.core().dialogue().is_some());
+    let old_static = ContentKey::Static {
+        module: "old".into(),
+    };
+    assert!(player
+        .content_residency()
+        .blocks
+        .iter()
+        .any(|b| b.key == old_static && !b.pinned_by.is_empty()));
+    assert!(player.content_residency().blocks.iter().any(|b| b.key
+        == ContentKey::Code {
+            module: "old".into()
+        }
+        && b.pinned_by.is_empty()));
+    let snapshot = player.core().snapshot();
+    let music = snapshot.handles["music"];
+    let timeline = snapshot.handles["old.movie"];
+    assert!(!serde_json::to_string(&snapshot)
+        .unwrap()
+        .contains("\"tracks\""));
+    let mut restored = Player::new_runtime(root, "release".into(), "Test".into(), None).unwrap();
+    let boot = restored.pump(vec![], 1000);
+    drain(&mut restored, boot, &objects);
+    let envelope = SaveEnvelope {
+        format: 1,
+        slot: 0,
+        revision: 1,
+        digest: nir_content::digest(&serde_json::to_vec(&snapshot).unwrap()),
+        snapshot,
+    };
+    let load = restored.pump(
+        vec![AppEvent::Loaded {
+            envelope: Box::new(envelope),
+        }],
+        1000,
+    );
+    let keys = drain(&mut restored, load, &objects);
+    assert!(restored.error.is_none(), "{:?}", restored.diagnostic);
+    assert!(keys.contains(&old_static));
+    assert!(!keys.contains(&ContentKey::Code {
+        module: "old".into()
+    }));
+    assert_eq!(restored.core().state().handles["music"], music);
+    assert_eq!(restored.core().state().handles["old.movie"], timeline);
+    assert_eq!(restored.core().sample_scene(), player.core().sample_scene());
+    let title = action(&mut player, UiAction::Title);
+    drain(&mut player, title, &objects);
+    assert!(player
+        .content_residency()
+        .blocks
+        .iter()
+        .any(|b| b.key == old_static && b.pinned_by.is_empty()));
 }

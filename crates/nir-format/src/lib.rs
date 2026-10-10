@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod lame;
 mod menu;
+mod timeline;
 mod transition;
 mod tween;
 pub use menu::{
@@ -11,8 +12,12 @@ pub use menu::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+pub use timeline::{SpriteKeyframe, SpriteTimeline, SpriteTimelineTrack};
 pub use transition::{MaskChannel, StageTransition, WipeDirection};
-pub use tween::{interpolate, DialogueAppearance, ScalarTween};
+pub use tween::{interpolate, DialogueAppearance, ScalarTween, SourceMotionCurve};
+
+mod float80;
+pub use float80::Float80;
 
 pub const FORMAT_VERSION: u32 = 1;
 /// Wire version for the indexed, lazily loaded runtime root. Source `Program`
@@ -24,7 +29,29 @@ pub const SNAPSHOT_VERSION: u32 = 2;
 pub const CAPABILITIES: &[&str] = &[
     "module.lazy.v1",
     "control.v1",
+    "control.advance-wait.v1",
+    "story.profile-read.v1",
+    "story.profile-value.v1",
+    "story.float80.v1",
+    "story.code-packages.v1",
     "stage.sprite.v1",
+    "stage.bitmap-text.v1",
+    "stage.sprite-continuity.v1",
+    "stage.dialogue-shake.v1",
+    "stage.sprite-wave.v1",
+    "stage.sprite-transform.v1",
+    "stage.sprite-timeline.v1",
+    "stage.window-flip.v1",
+    "stage.inherit-image.v1",
+    "stage.inherit-image-geometry.v1",
+    "stage.sprite-shake.v1",
+    "stage.sprite-quake.v1",
+    "stage.sprite-lifecycle.v1",
+    "stage.source-motion.v1",
+    "stage.source-opacity.v1",
+    "dialogue.style.v1",
+    "dialogue.decoration.v1",
+    "ui.story-modal.v1",
     "stage.dissolve.v1",
     "clip.scalar.v1",
     "tween.target.v1",
@@ -32,9 +59,12 @@ pub const CAPABILITIES: &[&str] = &[
     "text.revisions.v1",
     "text.gate.v1",
     "choice.v1",
+    "choice.image.v1",
+    "choice.disabled-image.v1",
     "audio.buffer.v1",
     "audio.gain.v1",
     "audio.stop.v1",
+    "audio.pause.v1",
     "audio.gain-tween.v1",
     "audio.loop-region.v1",
     "ui.image-menu.v1",
@@ -45,6 +75,12 @@ pub const CAPABILITIES: &[&str] = &[
     "player.hide-policy.v1",
     "player.auto-delay-policy.v1",
     "text.shadow.v1",
+    "text.rect.v1",
+    "text.pause.v1",
+    "text.ruby.v1",
+    "text.inline-image.v1",
+    "player.menu-access.v1",
+    "ui.menu-pages.v1",
     "stage.wipe.v1",
     "stage.mask.v1",
     "ui.menu-elements.v1",
@@ -71,6 +107,7 @@ pub const CAPABILITIES: &[&str] = &[
     "story.typed-result.v1",
     "media.webp.v1",
     "media.mp3.v1",
+    "content.interned-json.v1",
 ];
 /// Device observation, separate from the deterministic Story task clock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +278,7 @@ pub type Result<T> = std::result::Result<T, Diagnostic>;
 pub enum ValueType {
     Bool,
     I32,
+    F80,
     String,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -254,6 +292,7 @@ pub enum ValueType {
 pub enum Value {
     Bool(bool),
     I32(i32),
+    F80(Float80),
     String(String),
 }
 impl Value {
@@ -261,10 +300,21 @@ impl Value {
         match self {
             Self::Bool(_) => ValueType::Bool,
             Self::I32(_) => ValueType::I32,
+            Self::F80(_) => ValueType::F80,
             Self::String(_) => ValueType::String,
         }
     }
 }
+/// Bounds for independent typed progress, shared by Core and native storage.
+pub fn valid_profile_values(values: &BTreeMap<String, Value>) -> bool {
+    values.len() <= 4096
+        && values.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 1024
+                && !matches!(value, Value::String(s) if s.len() > 65536)
+        })
+}
+
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -283,6 +333,23 @@ pub enum Expr {
     Not {
         value: Box<Expr>,
     },
+    ToF80 {
+        value: Box<Expr>,
+    },
+    ToI32 {
+        value: Box<Expr>,
+    },
+}
+impl Expr {
+    pub fn uses_float80(&self) -> bool {
+        match self {
+            Self::Const { value } => value.ty() == ValueType::F80,
+            Self::ToF80 { .. } | Self::ToI32 { .. } => true,
+            Self::Not { value } => value.uses_float80(),
+            Self::Binary { left, right, .. } => left.uses_float80() || right.uses_float80(),
+            Self::Var { .. } => false,
+        }
+    }
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -323,6 +390,8 @@ pub struct Program {
     pub modules: BTreeMap<String, ModuleIndex>,
     #[serde(default)]
     pub scenes: BTreeMap<String, Vec<Node>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sprite_timelines: BTreeMap<String, SpriteTimeline>,
     #[serde(default)]
     pub cues: BTreeMap<String, Cue>,
     #[serde(default)]
@@ -406,6 +475,8 @@ pub struct RuntimeProgram {
     /// Lightweight owner indexes for static and text objects.
     #[serde(default)]
     pub scene_owners: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub timeline_owners: BTreeMap<String, String>,
     #[serde(default)]
     pub cue_owners: BTreeMap<String, String>,
     #[serde(default)]
@@ -450,6 +521,32 @@ impl RuntimeProgram {
             .get(id)
             .map(|entry| entry.module.as_str())
     }
+    pub fn function_execution_module(&self, id: &str) -> Option<&str> {
+        self.function_index
+            .get(id)
+            .map(|index| index.execution_module.as_deref().unwrap_or(&index.module))
+    }
+    /// Validated roots give every function in a code package the same scope.
+    pub fn module_execution_scope(&self, module: &str) -> Option<&str> {
+        let id = self.modules.get(module)?.functions.keys().next()?;
+        self.function_execution_module(id)
+    }
+    pub fn content_prerequisites(&self, key: &ContentKey) -> BTreeSet<ContentKey> {
+        let mut keys = BTreeSet::new();
+        if let ContentKey::Code { module } | ContentKey::Text { module, .. } = key {
+            keys.insert(ContentKey::Static {
+                module: module.clone(),
+            });
+            if let ContentKey::Code { .. } = key {
+                if let Some(scope) = self.module_execution_scope(module) {
+                    keys.insert(ContentKey::Static {
+                        module: scope.into(),
+                    });
+                }
+            }
+        }
+        keys
+    }
     pub fn text_module(&self, id: &str) -> Option<&str> {
         self.text_owners.get(id).map(String::as_str)
     }
@@ -492,7 +589,11 @@ impl RuntimeProgram {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeFunctionIndex {
+    /// Physical package holding this function body.
     pub module: String,
+    /// Original declaration scope for compiler-generated code packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_module: Option<String>,
     pub signature: FunctionSignature,
 }
 
@@ -505,6 +606,8 @@ pub struct RuntimeTextIdentity {
     pub contract_revision: u32,
     pub meaning_revision: u32,
     pub contract_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TextImageContract>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -524,6 +627,8 @@ pub struct ModuleStatic {
     pub module: String,
     #[serde(default)]
     pub scenes: BTreeMap<String, Vec<Node>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sprite_timelines: BTreeMap<String, SpriteTimeline>,
     #[serde(default)]
     pub cues: BTreeMap<String, Cue>,
     #[serde(default)]
@@ -724,6 +829,28 @@ pub struct Op {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// Read an independent, monotonic profile fact as an I32 flag (0 or 1).
+    /// Saves freeze the destination slot; subsequent reads use current profile.
+    ProfileRead {
+        target: String,
+        key: String,
+    },
+    /// Typed profile values survive NewGame and Story snapshot restoration.
+    ProfileValueRead {
+        target: String,
+        key: String,
+    },
+    ProfileValueAssign {
+        target: String,
+        key: String,
+        value: Expr,
+    },
+    /// Pause one Story audio bus without stopping/restarting its instances.
+    /// Playback and envelope clocks freeze; background/menu pauses compose.
+    AudioPause {
+        bus: AudioBus,
+        paused: bool,
+    },
     DialogueVisibility {
         visible: bool,
         /// Styled reveal; absent or zero-duration commits flip instantly.
@@ -749,6 +876,9 @@ pub enum Operation {
     TaskControl {
         task: String,
         action: TaskAction,
+    },
+    MenuAccess {
+        enabled: bool,
     },
     DialogueContinue {
         task: String,
@@ -818,6 +948,10 @@ pub enum Terminator {
         next: String,
         on_cancelled: String,
         on_failed: String,
+        /// An explicit user advance may leave this wait; the awaited task
+        /// keeps running. Hosts cannot interrupt an ordinary Await.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_advance: Option<String>,
     },
     Interact {
         choice: String,
@@ -886,12 +1020,71 @@ pub enum Scope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Effect {
+    /// Suspend authored execution while the player owns a modal page.
+    StoryModal {
+        target: StoryModalTarget,
+    },
+    /// Prepared replacement of the dialogue window and its text metrics.
+    DialogueStyle {
+        style: String,
+    },
+    /// Prepared portrait/name image replacement without replacing live text.
+    DialogueDecoration {
+        slot: DialogueDecorationSlot,
+        image: Option<DialogueDecorationImage>,
+    },
+    /// Immutable local keyframes, clocked by this task and bound to a scene root.
+    SpriteTimeline {
+        timeline: String,
+        root: String,
+        duration_us: Micros,
+        /// Delete this bound root and its descendants on natural completion.
+        #[serde(default, skip_serializing_if = "is_false")]
+        delete_on_finish: bool,
+    },
+    /// A finite, captured text-content shake; the dialogue window stays still.
+    DialogueShake {
+        spec: DialogueShake,
+    },
+    /// A finite shared wave in local sprite translation, separate from X/Y
+    /// movement. Sampling preserves authored geometry and the parent transform.
+    SpriteWave {
+        nodes: Vec<String>,
+        spec: DialogueShake,
+    },
+    /// Independent finite paint offsets; each node/axis owns a frozen path.
+    SpriteShake {
+        nodes: Vec<String>,
+        mode: SpriteShakeMode,
+        spec: DialogueShake,
+    },
     StagePresent {
         scene: String,
+        /// Keep the concrete image already committed for these ordinary
+        /// leaf nodes. Resolved once at commit, before transition capture.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inherit_images: Vec<String>,
+        /// Keep the committed local rectangle together with its image. These
+        /// IDs must also occur in inherit_images; explicit changes omit them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inherit_image_geometry: Vec<String>,
+        /// Commit a reserved message-window flip at the same prepared instant
+        /// as the scene; its reveal shares this transition and duration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dialogue_visible: Option<bool>,
         #[serde(default, skip_serializing_if = "StageTransition::is_default")]
         transition: StageTransition,
         #[serde(default)]
         duration_us: Micros,
+    },
+    /// Stock integer-millisecond X/Y motion. It shares scalar writer identity
+    /// and replacement with Clip, while preserving the source curve sampling.
+    SourceMotion {
+        node: String,
+        property: Property,
+        to: i32,
+        duration_us: Micros,
+        curve: SourceMotionCurve,
     },
     Clip {
         node: String,
@@ -957,7 +1150,135 @@ pub enum Effect {
         children: Vec<EffectDef>,
     },
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpriteShakeMode {
+    Wave,
+    Bound,
+    Quake,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoryModalTarget {
+    ImageMenu { menu: String },
+    LoadSaves,
+    SaveSaves,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogueDecorationSlot {
+    Portrait,
+    Name,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueDecorationImage {
+    pub asset: String,
+    pub size: [u32; 2],
+    pub placement: DialogueDecorationPlacement,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DialogueDecorationPlacement {
+    Absolute {
+        point: [f32; 2],
+    },
+    /// Capture the active text rectangle's top-left at commit, not every frame.
+    TextOrigin {
+        offset: [f32; 2],
+    },
+}
+impl DialogueDecorationImage {
+    pub fn valid(&self) -> bool {
+        let point = match &self.placement {
+            DialogueDecorationPlacement::Absolute { point } => point,
+            DialogueDecorationPlacement::TextOrigin { offset } => offset,
+        };
+        !self.asset.is_empty()
+            && self.asset.len() <= 256
+            && self.size.iter().all(|n| (1..=8192).contains(n))
+            && point.iter().all(|n| n.is_finite() && n.abs() <= 8192.)
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueDecoration {
+    pub asset: String,
+    pub rect: [f32; 4],
+}
+impl DialogueDecoration {
+    pub fn valid(&self) -> bool {
+        !self.asset.is_empty()
+            && self.asset.len() <= 256
+            && self.rect.iter().all(|n| n.is_finite() && n.abs() <= 8192.)
+            && self.rect[2] > 0.
+            && self.rect[3] > 0.
+    }
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueShake {
+    pub amplitude: [u32; 2],
+    pub step_us: Micros,
+    pub duration_us: Micros,
+    #[serde(default)]
+    pub randomize: bool,
+}
+impl DialogueShake {
+    pub fn valid(&self) -> bool {
+        self.amplitude.iter().all(|n| *n <= 8192)
+            && self.amplitude.iter().any(|n| *n > 0)
+            && (1000..=1_000_000).contains(&self.step_us.0)
+            && self.step_us.0.is_multiple_of(1000)
+            && (1000..=60_000_000).contains(&self.duration_us.0)
+            && self.duration_us.0.is_multiple_of(1000)
+            && self.steps() <= 4096
+    }
+    pub fn steps(&self) -> u64 {
+        self.duration_us.0.div_ceil(self.step_us.0.max(1))
+    }
+}
 impl Effect {
+    pub fn collect_dialogue_style_assets(&self, theme: &Theme, assets: &mut BTreeSet<String>) {
+        if let Self::DialogueDecoration {
+            image: Some(image), ..
+        } = self
+        {
+            assets.insert(image.asset.clone());
+        }
+        if let Self::DialogueStyle { style } = self {
+            if let Some(asset) = theme
+                .dialogue_styles
+                .get(style)
+                .and_then(|style| style.dialogue.background.as_ref())
+            {
+                assets.insert(asset.clone());
+            }
+        }
+        if let Some(children) = self.compose_children() {
+            for child in children {
+                child.effect.collect_dialogue_style_assets(theme, assets);
+            }
+        }
+    }
+    /// Preparation fetches new image bindings; inherited images remain
+    /// owned by the current concrete scene rather than the template.
+    pub fn stage_image_assets<'a>(&'a self, nodes: &'a [Node]) -> impl Iterator<Item = &'a String> {
+        let inherited: &[String] = match self {
+            Self::StagePresent { inherit_images, .. } => inherit_images,
+            _ => &[],
+        };
+        nodes
+            .iter()
+            .filter(move |node| !inherited.contains(&node.id))
+            .filter_map(|node| node.asset.as_ref())
+    }
     /// Children of a composition, for tree walks shared by validation,
     /// compilation and the runtime.
     pub fn compose_children(&self) -> Option<&[EffectDef]> {
@@ -1009,6 +1330,30 @@ impl Effect {
         }
         for def in self.compose_children().unwrap_or(&[]) {
             def.effect.collect_audio_assets(out);
+        }
+    }
+    /// Inline image bindings are semantic text dependencies, including
+    /// dialogues nested in a composition.
+    pub fn collect_text_image_assets(
+        &self,
+        contracts: &BTreeMap<String, TextContract>,
+        out: &mut BTreeSet<String>,
+    ) {
+        if let Self::Dialogue { text, .. } = self {
+            if let Some(contract) = contracts.get(text) {
+                out.extend(contract.images.iter().map(|i| i.asset.clone()));
+            }
+        }
+        for def in self.compose_children().unwrap_or(&[]) {
+            def.effect.collect_text_image_assets(contracts, out);
+        }
+    }
+    pub fn collect_text_ids(&self, out: &mut BTreeSet<String>) {
+        if let Self::Dialogue { text, .. } = self {
+            out.insert(text.clone());
+        }
+        for def in self.compose_children().unwrap_or(&[]) {
+            def.effect.collect_text_ids(out);
         }
     }
 }
@@ -1070,6 +1415,36 @@ impl TweenTarget {
 impl Effect {
     /// Legacy Clip and typed Tween use one evaluator and one writer identity.
     pub fn scalar_track(&self, from: f32, base: f32) -> Option<(TweenTarget, ScalarTween, bool)> {
+        if let Self::SourceMotion {
+            node,
+            property,
+            to,
+            duration_us,
+            curve,
+        } = self
+        {
+            return Some((
+                TweenTarget::SceneNode {
+                    node: node.clone(),
+                    property: *property,
+                },
+                ScalarTween {
+                    from,
+                    base,
+                    to: if *property == Property::Opacity {
+                        *to as f32 / 255.
+                    } else {
+                        *to as f32
+                    },
+                    duration_us: *duration_us,
+                    easing: Easing::Linear,
+                    finish: FinishPolicy::CommitEnd,
+                    cancel: CancelPolicy::CommitCurrent,
+                    source_curve: Some(*curve),
+                },
+                true,
+            ));
+        }
         let (target, to, duration_us, replace, easing, finish, cancel) = match self {
             Self::Clip {
                 node,
@@ -1121,6 +1496,7 @@ impl Effect {
                 easing: *easing,
                 finish: *finish,
                 cancel: *cancel,
+                source_curve: None,
             },
             *replace,
         ))
@@ -1220,27 +1596,137 @@ pub enum Property {
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
-    #[serde(default = "one")]
+    #[serde(default, skip_serializing_if = "tween::offset_is_zero")]
+    pub offset: [f32; 2],
+    /// Paint-only affine geometry for a leaf sprite. Coordinates remain local
+    /// to the node, so ancestor translation/scale and scalar tracks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite_transform: Option<SpriteTransform>,
+    /// Immutable timeline declaration presented by this scene root. A task
+    /// holds the clock; snapshots retain only this resource identity and pose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_binding: Option<String>,
+    /// A continuation recipe keeps a missing animated root missing. Explicit
+    /// creation uses false, so a later authored recreation still takes effect.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inherit_existence: bool,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
     pub scale: f32,
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one")]
     pub opacity: f32,
-    #[serde(default = "white")]
+    #[serde(default = "white", skip_serializing_if = "is_white")]
     pub color: [f32; 4],
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub order: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<[f32; 4]>,
+    /// A scene recipe, expanded into ordinary frozen sprites at StagePresent.
+    /// The slot is global and explicitly captured by authored Assign operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitmap_text: Option<BitmapText>,
+    /// Preserve these local pose properties when this node already exists in
+    /// the prior scene; session/frame tweens retain their clock and binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserve_pose: Vec<Property>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpriteTransform {
+    pub origin: [f32; 2],
+    pub basis_x: [f32; 2],
+    pub basis_y: [f32; 2],
+}
+impl SpriteTransform {
+    pub fn corners(self, width: f32, height: f32) -> [[f32; 2]; 4] {
+        [[0., 0.], [width, 0.], [0., height], [width, height]].map(|[x, y]| {
+            [
+                self.origin[0] + x * self.basis_x[0] + y * self.basis_y[0],
+                self.origin[1] + x * self.basis_x[1] + y * self.basis_y[1],
+            ]
+        })
+    }
+    pub fn valid(self, width: f32, height: f32) -> bool {
+        self.origin
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= 8192.)
+            && self
+                .basis_x
+                .iter()
+                .chain(self.basis_y.iter())
+                .all(|v| v.is_finite() && v.abs() <= 64.)
+            && self
+                .corners(width, height)
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && v.abs() <= 32768.)
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BitmapAnchor {
+    Start,
+    Center,
+    End,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BitmapText {
+    pub slot: String,
+    /// Horizontal atlas with one fixed-size cell per Unicode scalar.
+    pub alphabet: String,
+    pub cell: [u32; 2],
+    pub line_spacing: u32,
+    pub align: BitmapAnchor,
+    /// For center/end anchors the node coordinate is the reference extent.
+    pub x_anchor: BitmapAnchor,
+    pub y_anchor: BitmapAnchor,
+}
+impl BitmapText {
+    pub fn valid(&self, variables: &BTreeMap<String, Value>) -> bool {
+        let chars: Vec<_> = self.alphabet.chars().collect();
+        !chars.is_empty()
+            && chars.len() <= 256
+            && chars.iter().collect::<BTreeSet<_>>().len() == chars.len()
+            && !chars.iter().any(|c| c.is_control())
+            && self.cell.iter().all(|n| (1..=8192).contains(n))
+            && self.cell[0]
+                .checked_mul(chars.len() as u32)
+                .is_some_and(|n| n <= 8192)
+            && self.line_spacing <= 8192
+            && matches!(
+                variables.get(&self.slot),
+                Some(Value::I32(_) | Value::String(_))
+            )
+    }
 }
 fn one() -> f32 {
     1.0
+}
+fn is_one(value: &f32) -> bool {
+    *value == 1.0
+}
+fn is_white(value: &[f32; 4]) -> bool {
+    *value == [1.0; 4]
+}
+fn is_zero_i32(value: &i32) -> bool {
+    *value == 0
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 fn white() -> [f32; 4] {
     [1.; 4]
@@ -1273,6 +1759,43 @@ pub struct Choice {
     #[serde(default)]
     pub default: Option<String>,
 }
+impl Choice {
+    pub fn uses_float80(&self) -> bool {
+        self.options.iter().any(|o| {
+            o.value.as_ref().is_some_and(|v| v.ty() == ValueType::F80)
+                || o.visible.iter().chain(&o.enabled).any(Expr::uses_float80)
+        })
+    }
+}
+impl Function {
+    pub fn uses_float80(&self) -> bool {
+        self.params
+            .values()
+            .chain(self.locals.values())
+            .chain(self.returns.iter())
+            .any(|ty| *ty == ValueType::F80)
+            || self.blocks.values().any(|b| {
+                b.ops.iter().any(|op| match &op.operation {
+                    Operation::Assign { value, .. }
+                    | Operation::ProfileValueAssign { value, .. } => value.uses_float80(),
+                    _ => false,
+                }) || match &b.terminator {
+                    Terminator::Branch { condition, .. } => condition.uses_float80(),
+                    Terminator::Switch { value, .. } => value.uses_float80(),
+                    Terminator::Call { args, .. } => args.values().any(Expr::uses_float80),
+                    Terminator::Return { value } => value.as_ref().is_some_and(Expr::uses_float80),
+                    _ => false,
+                }
+            })
+    }
+}
+impl Program {
+    pub fn uses_float80(&self) -> bool {
+        self.variables.values().any(|v| v.ty() == ValueType::F80)
+            || self.functions.values().any(Function::uses_float80)
+            || self.choices.values().any(Choice::uses_float80)
+    }
+}
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1287,6 +1810,20 @@ pub struct ChoiceOption {
     /// Every option must carry one of the target variable's type.
     #[serde(default)]
     pub value: Option<Value>,
+    /// Authored stage coordinates, sharing the stage's letterbox transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ChoiceImage>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceImage {
+    pub asset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_asset: Option<String>,
+    pub rect: [f32; 4],
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1298,8 +1835,60 @@ pub struct TextContract {
     pub contract_digest: String,
     #[serde(default)]
     pub gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pauses: Vec<TextPauseContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TextImageContract>,
     #[serde(default)]
     pub params: BTreeMap<String, ValueType>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TextPauseContract {
+    pub id: String,
+    pub timeout_us: Option<Micros>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TextImageContract {
+    pub id: String,
+    pub asset: String,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineImageAlign {
+    Top,
+    Center,
+    Bottom,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineImage {
+    pub asset: String,
+    pub width: u32,
+    pub height: u32,
+    pub align: InlineImageAlign,
+    #[serde(default)]
+    pub margins: [u32; 4],
+}
+impl InlineImage {
+    pub fn valid(&self) -> bool {
+        !self.asset.is_empty()
+            && self.asset.len() <= 1024
+            && (1..=1024).contains(&self.width)
+            && (1..=1024).contains(&self.height)
+            && self.margins.iter().all(|n| *n <= 512)
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineImagePlacement {
+    pub offset: u32,
+    pub image: InlineImage,
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1314,6 +1903,15 @@ pub struct TextDoc {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Span {
+    Image {
+        id: String,
+        image: InlineImage,
+    },
+    Ruby {
+        id: String,
+        text: String,
+        reading: String,
+    },
     Text {
         id: String,
         text: String,
@@ -1329,6 +1927,13 @@ pub enum Span {
     },
     Gate {
         id: String,
+    },
+    /// Wait for an advance inside a paragraph, preserving already revealed
+    /// text and playing voices. An optional timeout resumes automatically.
+    Pause {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_us: Option<Micros>,
     },
 }
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1414,6 +2019,8 @@ pub struct Theme {
     pub slots: ThemeSlots,
     #[serde(default)]
     pub dialogue: DialogueProps,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dialogue_styles: BTreeMap<String, DialogueStyle>,
     #[serde(default)]
     pub choice: ChoiceProps,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1431,6 +2038,7 @@ impl Default for Theme {
             muted: [0.58, 0.69, 0.69, 1.],
             slots: ThemeSlots::default(),
             dialogue: DialogueProps::default(),
+            dialogue_styles: BTreeMap::new(),
             choice: ChoiceProps::default(),
             menu_overlay: None,
             image_menus: BTreeMap::new(),
@@ -1577,6 +2185,11 @@ impl Theme {
         if let Some(asset) = &self.dialogue.background {
             assets.insert(asset.clone());
         }
+        assets.extend(
+            self.dialogue_styles
+                .values()
+                .filter_map(|style| style.dialogue.background.clone()),
+        );
         for menu in self.image_menus.values() {
             assets.extend(menu.image_assets());
         }
@@ -1632,6 +2245,17 @@ pub struct DialogueProps {
     pub opacity: f32,
     pub background: Option<String>,
     pub rect: Option<[f32; 4]>,
+    /// Absolute stage coordinates for the text surface, independent of the
+    /// decorative window. Requires an explicit window rectangle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_rect: Option<[f32; 4]>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueStyle {
+    pub dialogue: DialogueProps,
+    pub text: [f32; 4],
 }
 impl Default for DialogueProps {
     fn default() -> Self {
@@ -1644,6 +2268,7 @@ impl Default for DialogueProps {
             opacity: 1.,
             background: None,
             rect: None,
+            text_rect: None,
         }
     }
 }
@@ -1746,6 +2371,32 @@ impl PlayerDefaults {
 }
 /// Also enforced at runtime: a hand-written executable cannot bypass author checks.
 pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> {
+    if theme.dialogue_styles.len() > 32 {
+        return Err(Diagnostic::new(
+            "E_THEME_PROPS",
+            "theme.dialogue_styles",
+            "at most 32 styles",
+        ));
+    }
+    for (name, style) in &theme.dialogue_styles {
+        if name.is_empty()
+            || name.len() > 256
+            || style
+                .text
+                .iter()
+                .any(|value| !value.is_finite() || !(0. ..=1.).contains(value))
+        {
+            return Err(Diagnostic::new(
+                "E_THEME_PROPS",
+                name,
+                "invalid dialogue style identity or color",
+            ));
+        }
+        let mut check = theme.clone();
+        check.dialogue_styles.clear();
+        check.dialogue = style.dialogue.clone();
+        validate_ui_config(&check, player)?;
+    }
     let range = |value: f32, lo: f32, hi: f32| value.is_finite() && (lo..=hi).contains(&value);
     for (name, color) in [
         ("background", theme.background),
@@ -1766,7 +2417,13 @@ pub fn validate_ui_config(theme: &Theme, player: &PlayerDefaults) -> Result<()> 
         r.iter().all(|v| v.is_finite() && v.abs() <= 8192.) && r[2] > 0. && r[3] > 0.
     };
     if theme.dialogue.rect.as_ref().is_some_and(|r| !rect_ok(r))
-        || theme.image_menus.len() > 64
+        || theme
+            .dialogue
+            .text_rect
+            .as_ref()
+            .is_some_and(|r| !rect_ok(r))
+        || (theme.dialogue.text_rect.is_some() && theme.dialogue.rect.is_none())
+        || theme.image_menus.len() > 4096
         || (!theme.image_menus.is_empty()
             && !theme.image_menus.contains_key("title")
             && theme.menu_overlay.is_none())
@@ -2397,13 +3054,22 @@ pub enum ScrollRegion {
 /// Canonical semantic text contract identity. Source copy edits do not change it.
 pub fn text_contract_digest(c: &TextContract) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(&(
+    let legacy = (
         1u32,
         c.contract_revision,
         c.meaning_revision,
         &c.params,
         &c.gates,
-    ))
+    );
+    // Existing contracts keep their identity. Authored pauses are semantic:
+    // removing one or changing its deadline requires contract review.
+    let bytes = if !c.images.is_empty() {
+        serde_json::to_vec(&(legacy, &c.pauses, &c.images))
+    } else if c.pauses.is_empty() {
+        serde_json::to_vec(&legacy)
+    } else {
+        serde_json::to_vec(&(legacy, &c.pauses))
+    }
     .expect("text contract serialization");
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2411,9 +3077,35 @@ pub fn text_contract_digest(c: &TextContract) -> String {
 pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut gates = Vec::new();
+    let mut pauses = Vec::new();
+    let mut images = Vec::new();
     let mut params = BTreeSet::new();
     for span in spans {
         let sid = match span {
+            Span::Image { id, image } => {
+                if !image.valid() || images.len() >= 256 {
+                    return Err(Diagnostic::new("E_TEXT_IMAGE", id, "invalid inline image"));
+                }
+                images.push(TextImageContract {
+                    id: id.clone(),
+                    asset: image.asset.clone(),
+                });
+                id
+            }
+            Span::Ruby { id, text, reading } => {
+                if text.is_empty()
+                    || text.len() > 4096
+                    || reading.is_empty()
+                    || reading.len() > 4096
+                {
+                    return Err(Diagnostic::new(
+                        "E_TEXT_RUBY",
+                        id,
+                        "empty or excessive annotation",
+                    ));
+                }
+                id
+            }
             Span::Text { id, text, .. } => {
                 if text.len() > 128 * 1024 {
                     return Err(Diagnostic::new("E_LIMIT", id, "text too long"));
@@ -2421,6 +3113,20 @@ pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result
                 id
             }
             Span::Break { id } => id,
+            Span::Pause { id, timeout_us } => {
+                if timeout_us.is_some_and(|v| v.0 > 60_000_000) {
+                    return Err(Diagnostic::new(
+                        "E_LIMIT",
+                        id,
+                        "text pause exceeds 60 seconds",
+                    ));
+                }
+                pauses.push(TextPauseContract {
+                    id: id.clone(),
+                    timeout_us: *timeout_us,
+                });
+                id
+            }
             Span::Gate { id } => {
                 gates.push(id.clone());
                 id
@@ -2444,6 +3150,20 @@ pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result
     if gates != c.gates {
         return Err(Diagnostic::new("E_GATE", id, "gate order/count mismatch"));
     }
+    if pauses != c.pauses {
+        return Err(Diagnostic::new(
+            "E_TEXT_PAUSE",
+            id,
+            "pause order/deadline mismatch",
+        ));
+    }
+    if images != c.images {
+        return Err(Diagnostic::new(
+            "E_TEXT_IMAGE",
+            id,
+            "image identity/order mismatch",
+        ));
+    }
     if params != c.params.keys().cloned().collect() {
         return Err(Diagnostic::new(
             "E_TEXT_PARAM",
@@ -2457,6 +3177,30 @@ pub fn validate_text_spans(id: &str, c: &TextContract, spans: &[Span]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_nodes_preserve_legacy_defaults_and_authored_values() {
+        let legacy = serde_json::json!({"id":"sprite","parent":null,"asset":null,
+            "x":10,"y":20,"width":30,"height":40,"scale":1.0,"opacity":1.0,
+            "color":[1.0,1.0,1.0,1.0],"order":0,"clip":null});
+        let node: Node = serde_json::from_value(legacy).unwrap();
+        let sparse = serde_json::to_value(&node).unwrap();
+        assert_eq!(sparse.as_object().unwrap().len(), 5);
+        let restored: Node = serde_json::from_value(sparse).unwrap();
+        assert_eq!(restored, node);
+        let mut authored = node;
+        authored.parent = Some("parent".into());
+        authored.asset = Some("image".into());
+        authored.scale = 0.5;
+        authored.opacity = 0.25;
+        authored.color = [0., 0.25, 0.5, 0.75];
+        authored.order = -2;
+        authored.clip = Some([1., 2., 3., 4.]);
+        assert_eq!(
+            serde_json::from_value::<Node>(serde_json::to_value(&authored).unwrap()).unwrap(),
+            authored
+        );
+    }
 
     /// text.window-transition.v1: the styled reveal fields are optional and
     /// omit cleanly; the legacy two-field op still deserializes unchanged.

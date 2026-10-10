@@ -96,7 +96,7 @@ enum Command {
 enum ImportCommand {
     /// Inventory extracted LiveMaker LSB scripts without exporting game content.
     Inspect { source: PathBuf },
-    /// Convert LiveMaker 116; recognized LiveNovel profiles include events, menus and media.
+    /// Convert LiveMaker 116/117; recognized LiveNovel profiles include events, menus and media.
     Livemaker {
         source: PathBuf,
         #[arg(long)]

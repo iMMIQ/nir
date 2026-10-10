@@ -16,7 +16,62 @@ fn bundled() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
 }
 
 fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
+    bundled_encoding(sampled, false, false)
+}
+
+fn encoded_object<T: serde::Serialize>(
+    objects: &mut BTreeMap<String, Vec<u8>>,
+    value: &T,
+    interned: bool,
+) -> String {
+    if !interned {
+        return object(objects, value);
+    }
+    let (bytes, _) = nir_content::interned::encode(value).unwrap();
+    let hash = nir_content::digest(&bytes);
+    objects.insert(hash.clone(), bytes);
+    hash
+}
+
+fn bundled_encoding(
+    sampled: bool,
+    dense: bool,
+    interned: bool,
+) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
     let mut p: Program = serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+    if dense {
+        p.requires.push(nir_content::interned::CAPABILITY.into());
+        p.variables
+            .insert("payload".into(), Value::String(String::new()));
+        for index in 0..128 {
+            p.functions
+                .get_mut("main")
+                .unwrap()
+                .blocks
+                .get_mut("start")
+                .unwrap()
+                .ops
+                .push(Op {
+                    id: format!("neutral_{index}"),
+                    operation: Operation::Assign {
+                        target: "payload".into(),
+                        value: Expr::Const {
+                            value: Value::String("x".repeat(1024)),
+                        },
+                    },
+                });
+        }
+        for index in 0..1000 {
+            let mut scene = p.scenes["station"].clone();
+            scene[0].x = index as f32 / 10.;
+            p.scenes.insert(format!("unused_scene_{index}"), scene);
+            p.texts
+                .insert(format!("unused_text_{index}"), p.texts["intro"].clone());
+            for texts in p.locales.values_mut() {
+                texts.insert(format!("unused_text_{index}"), texts["intro"].clone());
+            }
+        }
+    }
     if sampled {
         p.requires
             .extend(["text.voice-binding.v1".into(), "text.voice-timer.v1".into()]);
@@ -66,17 +121,18 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
     let mut objects = BTreeMap::new();
     let owner = "story".to_owned();
     let owners = |ids: Vec<String>| ids.into_iter().map(|id| (id, owner.clone())).collect();
-    let code = object(
+    let code = encoded_object(
         &mut objects,
         &ModuleCode {
             format: 2,
             module: owner.clone(),
             functions: p.functions.clone(),
         },
+        interned,
     );
     let mut locales = BTreeMap::new();
     for (locale, texts) in &p.locales {
-        let hash = object(
+        let hash = encoded_object(
             &mut objects,
             &ModuleTexts {
                 format: 2,
@@ -84,6 +140,7 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
                 locale: locale.clone(),
                 texts: texts.clone(),
             },
+            interned,
         );
         locales.insert(locale.clone(), hash);
     }
@@ -97,9 +154,10 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
             (cue.clone(), assets)
         })
         .collect();
-    let static_content = object(
+    let static_content = encoded_object(
         &mut objects,
         &ModuleStatic {
+            sprite_timelines: Default::default(),
             format: 2,
             module: owner.clone(),
             scenes: p.scenes.clone(),
@@ -108,18 +166,20 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
             text_contracts: p.texts.clone(),
             activation_recipes: recipes,
         },
+        interned,
     );
     let mut catalogs = BTreeMap::new();
     let mut assets = BTreeMap::new();
     for (id, asset) in &p.assets {
         let catalog = id.clone();
-        let hash = object(
+        let hash = encoded_object(
             &mut objects,
             &AssetCatalog {
                 format: 2,
                 catalog: catalog.clone(),
                 assets: BTreeMap::from([(id.clone(), asset.clone())]),
             },
+            interned,
         );
         catalogs.insert(catalog.clone(), hash);
         assets.insert(
@@ -139,6 +199,7 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
         .cloned()
         .unwrap_or_default();
     let root = RuntimeProgram {
+        timeline_owners: Default::default(),
         format: 2,
         game_id: p.game_id,
         revision: p.revision,
@@ -153,6 +214,7 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
                 (
                     id.clone(),
                     RuntimeFunctionIndex {
+                        execution_module: None,
                         module: owner.clone(),
                         signature: FunctionSignature::from(f),
                     },
@@ -190,6 +252,7 @@ fn bundled_reading(sampled: bool) -> (RuntimeProgram, BTreeMap<String, Vec<u8>>)
                 (
                     id.clone(),
                     RuntimeTextIdentity {
+                        images: vec![],
                         module: owner.clone(),
                         source_revision: t.source_revision,
                         contract_revision: t.contract_revision,
@@ -220,14 +283,7 @@ fn package(
     let digest = root.content_requirement(&key).unwrap().digest;
     let bytes = &objects[&digest];
     assert_eq!(format!("{:x}", Sha256::digest(bytes)), digest);
-    let object = match &key {
-        ContentKey::Static { .. } => RuntimeObject::Static(serde_json::from_slice(bytes).unwrap()),
-        ContentKey::Code { .. } => RuntimeObject::Code(serde_json::from_slice(bytes).unwrap()),
-        ContentKey::Text { .. } => RuntimeObject::Text(serde_json::from_slice(bytes).unwrap()),
-        ContentKey::Catalog { .. } => {
-            RuntimeObject::Catalog(serde_json::from_slice(bytes).unwrap())
-        }
-    };
+    let object = nir_content::parse_runtime_object(root, &key, bytes).unwrap();
     (key, object, bytes.len() as u64)
 }
 
@@ -281,6 +337,96 @@ fn at_dialogue_in(view: ValidatedProgram, locale: &str) -> Core {
         }
     }
     panic!("fixture never reached a dialogue");
+}
+
+#[test]
+fn interned_packages_keep_live_audio_reading_and_staged_restore_identical() {
+    let install = |interned| {
+        let (root, objects) = bundled_encoding(true, true, interned);
+        let mut keys = vec![
+            ContentKey::Static {
+                module: "story".into(),
+            },
+            ContentKey::Code {
+                module: "story".into(),
+            },
+        ];
+        keys.extend(root.locales.iter().map(|locale| ContentKey::Text {
+            module: "story".into(),
+            locale: locale.clone(),
+        }));
+        keys.extend(root.catalogs.keys().map(|catalog| ContentKey::Catalog {
+            catalog: catalog.clone(),
+        }));
+        if interned {
+            let key = ContentKey::Code {
+                module: "story".into(),
+            };
+            let bytes = &objects[&root.content_requirement(&key).unwrap().digest];
+            assert!(serde_json::from_slice::<serde_json::Value>(bytes)
+                .unwrap()
+                .get("package_encoding")
+                .is_some());
+            let mut unsupported = root.clone();
+            unsupported
+                .requires
+                .retain(|cap| cap != nir_content::interned::CAPABILITY);
+            assert_eq!(
+                nir_content::parse_runtime_object(&unsupported, &key, bytes)
+                    .unwrap_err()
+                    .code,
+                "E_CAPABILITY"
+            );
+            let mut corrupt = bytes.clone();
+            corrupt[0] ^= 1;
+            assert_eq!(
+                nir_content::parse_runtime_object(&root, &key, &corrupt)
+                    .unwrap_err()
+                    .code,
+                "E_DIGEST"
+            );
+        }
+        let batch = keys
+            .into_iter()
+            .map(|key| package(&root, &objects, key))
+            .collect();
+        let view = ValidatedProgram::from_runtime(root)
+            .unwrap()
+            .install_batch(batch)
+            .unwrap();
+        assert!(view.residency().resident_bytes <= MAX_INPUT_BYTES as u64);
+        (view, objects)
+    };
+    let (plain, plain_objects) = install(false);
+    let (shared, shared_objects) = install(true);
+    assert!(shared.residency().resident_bytes < plain.residency().resident_bytes / 2);
+    let mut reference = at_dialogue(plain.clone());
+    let mut live = at_dialogue(shared.clone());
+    reference.step(CoreInput::Time { delta_us: 123_000 }, 1000);
+    live.step(CoreInput::Time { delta_us: 123_000 }, 1000);
+    assert_eq!(
+        serde_json::to_value(reference.snapshot()).unwrap(),
+        serde_json::to_value(live.snapshot()).unwrap()
+    );
+    let music = live.state().handles["music"];
+    live.replace_program(shared.clone()).unwrap();
+    let step = live.step(CoreInput::Time { delta_us: 10_000 }, 1000);
+    assert!(!step.intents.iter().any(|intent| matches!(
+        intent,
+        CoreIntent::AudioStart { .. } | CoreIntent::AudioStop { .. }
+    )));
+    assert_eq!(live.state().handles["music"], music);
+    reference.step(CoreInput::Time { delta_us: 10_000 }, 1000);
+    let reference_proof = verify_snapshot(&plain, &plain_objects, reference.snapshot()).unwrap();
+    let shared_proof = verify_snapshot(&shared, &shared_objects, live.snapshot()).unwrap();
+    let reference = Core::restore_verified(plain, reference_proof, "release").unwrap();
+    let restored = Core::restore_verified(shared, shared_proof, "release").unwrap();
+    assert_eq!(
+        serde_json::to_value(reference.snapshot()).unwrap(),
+        serde_json::to_value(restored.snapshot()).unwrap()
+    );
+    assert_eq!(restored.state().handles["music"], music);
+    assert_eq!(restored.state().tasks[&music].elapsed_us, Micros(133_000));
 }
 
 #[test]
@@ -606,6 +752,7 @@ fn long_fixture() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
                     Block {
                         ops: vec![],
                         terminator: Terminator::Await {
+                            on_advance: None,
                             conditions: vec![WaitCondition {
                                 task: task_id.clone(),
                                 milestone: Milestone::Finished,
@@ -637,6 +784,7 @@ fn long_fixture() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
         let static_content = object(
             &mut objects,
             &ModuleStatic {
+                sprite_timelines: Default::default(),
                 format: 2,
                 module: module.clone(),
                 scenes: BTreeMap::new(),
@@ -674,6 +822,7 @@ fn long_fixture() -> (RuntimeProgram, BTreeMap<String, Vec<u8>>) {
         root.function_index.insert(
             function_id,
             RuntimeFunctionIndex {
+                execution_module: None,
                 module: module.clone(),
                 signature,
             },
@@ -790,6 +939,7 @@ fn sequential_calls_across_101_modules_evict_reload_and_keep_old_handles() {
                 Block {
                     ops: vec![],
                     terminator: Terminator::Await {
+                        on_advance: None,
                         conditions: vec![WaitCondition {
                             task: "z000.delay".into(),
                             milestone: Milestone::Finished,
@@ -829,6 +979,7 @@ fn sequential_calls_across_101_modules_evict_reload_and_keep_old_handles() {
     root.function_index.insert(
         "z000.probe".into(),
         RuntimeFunctionIndex {
+            execution_module: None,
             module: "z000".into(),
             signature,
         },
@@ -876,6 +1027,7 @@ fn sequential_calls_across_101_modules_evict_reload_and_keep_old_handles() {
     root.function_index.insert(
         root.entry.clone(),
         RuntimeFunctionIndex {
+            execution_module: None,
             module: "story".into(),
             signature: signature.clone(),
         },
@@ -999,6 +1151,7 @@ fn prediction_fixture(hops: usize, stop: Option<Terminator>) -> Core {
     let future_static = object(
         &mut objects,
         &ModuleStatic {
+            sprite_timelines: Default::default(),
             format: 2,
             module: "future".into(),
             scenes: BTreeMap::new(),
@@ -1021,6 +1174,7 @@ fn prediction_fixture(hops: usize, stop: Option<Terminator>) -> Core {
     root.function_index.insert(
         "future.main".into(),
         RuntimeFunctionIndex {
+            execution_module: None,
             module: "future".into(),
             signature,
         },
@@ -1397,4 +1551,150 @@ fn runtime_story_exports_reject_missing_private_or_mistyped_values_and_undeclare
             "{case}: {error}"
         );
     }
+}
+
+#[test]
+fn code_package_entry_keeps_shared_audio_and_frozen_dialogue_through_restore() {
+    let (mut root, mut objects) = bundled_reading(true);
+    let code: ModuleCode = serde_json::from_slice(&objects[&root.modules["story"].code]).unwrap();
+    let mut function = code.functions["main"].clone();
+    for block in function.blocks.values_mut() {
+        for op in &mut block.ops {
+            op.id = format!("packed_{}", op.id);
+        }
+    }
+    let signature = FunctionSignature::from(&function);
+    let code_hash = object(
+        &mut objects,
+        &ModuleCode {
+            format: 2,
+            module: "pack".into(),
+            functions: BTreeMap::from([("pack_entry".into(), function)]),
+        },
+    );
+    let static_hash = object(
+        &mut objects,
+        &ModuleStatic {
+            sprite_timelines: Default::default(),
+            format: 2,
+            module: "pack".into(),
+            scenes: BTreeMap::new(),
+            cues: BTreeMap::new(),
+            choices: BTreeMap::new(),
+            text_contracts: BTreeMap::new(),
+            activation_recipes: BTreeMap::new(),
+        },
+    );
+    root.modules.insert(
+        "pack".into(),
+        ModuleIndex {
+            functions: BTreeMap::from([("pack_entry".into(), signature.clone())]),
+            texts: BTreeSet::new(),
+            code: code_hash,
+            static_content: static_hash,
+            locales: BTreeMap::new(),
+        },
+    );
+    root.function_index.insert(
+        "pack_entry".into(),
+        RuntimeFunctionIndex {
+            module: "pack".into(),
+            execution_module: Some("story".into()),
+            signature,
+        },
+    );
+    root.entry = "pack_entry".into();
+    root.requires.push("story.code-packages.v1".into());
+    let empty = ValidatedProgram::from_runtime(root.clone()).unwrap();
+    let child_keys = [
+        ContentKey::Static {
+            module: "pack".into(),
+        },
+        ContentKey::Code {
+            module: "pack".into(),
+        },
+    ];
+    assert_eq!(
+        empty
+            .install_batch(
+                child_keys
+                    .iter()
+                    .cloned()
+                    .map(|key| package(&root, &objects, key))
+                    .collect()
+            )
+            .unwrap_err()
+            .code,
+        "E_CONTENT_MISSING"
+    );
+    let mut keys: Vec<_> = child_keys.into();
+    keys.push(ContentKey::Static {
+        module: "story".into(),
+    });
+    keys.extend(root.locales.iter().map(|locale| ContentKey::Text {
+        module: "story".into(),
+        locale: locale.clone(),
+    }));
+    keys.extend(root.catalogs.keys().map(|catalog| ContentKey::Catalog {
+        catalog: catalog.clone(),
+    }));
+    let view = empty
+        .install_batch(
+            keys.into_iter()
+                .map(|key| package(&root, &objects, key))
+                .collect(),
+        )
+        .unwrap();
+    assert!(!view.is_resident(&ContentKey::Code {
+        module: "story".into()
+    }));
+    let mut core = at_dialogue(view.clone());
+    let music = core.state().handles["music"];
+    core.step(CoreInput::None, 10000);
+    assert_eq!(core.state().handles["music"], music);
+    let snapshot = core.snapshot();
+    let proof = verify_snapshot(&view, &objects, snapshot.clone()).unwrap();
+    let restored = Core::restore_verified(view.clone(), proof, "release").unwrap();
+    assert_eq!(restored.state().handles["music"], music);
+    assert_eq!(
+        serde_json::to_value(&restored.dialogue().unwrap().1.spans).unwrap(),
+        serde_json::to_value(&core.dialogue().unwrap().1.spans).unwrap()
+    );
+    let evicted = view
+        .evict(BTreeSet::from([ContentKey::Static {
+            module: "story".into(),
+        }]))
+        .unwrap();
+    assert_eq!(
+        core.replace_program(evicted).unwrap_err().code,
+        "E_CONTENT_MISSING"
+    );
+    let mut missing_cap = root.clone();
+    missing_cap
+        .requires
+        .retain(|cap| cap != "story.code-packages.v1");
+    assert_eq!(
+        ValidatedProgram::from_runtime(missing_cap)
+            .unwrap_err()
+            .code,
+        "E_CAPABILITY"
+    );
+    for scope in ["pack", "missing"] {
+        let mut invalid = root.clone();
+        invalid
+            .function_index
+            .get_mut("pack_entry")
+            .unwrap()
+            .execution_module = Some(scope.into());
+        assert_eq!(
+            ValidatedProgram::from_runtime(invalid).unwrap_err().code,
+            "E_MODULE"
+        );
+    }
+    let mut forged = root;
+    forged.cue_owners.insert("intro".into(), "pack".into());
+    assert_eq!(
+        ValidatedProgram::from_runtime(forged).unwrap_err().code,
+        "E_MODULE"
+    );
 }

@@ -264,7 +264,231 @@ impl ReadingState {
         for v in views {
             controls(&mut p, v, m, messages);
         }
+        apply_dialogue_offset(&mut p, m);
+        project_ruby(&mut p, m, text);
+        project_inline_images(&mut p, text);
         p
+    }
+}
+
+fn project_ruby(packet: &mut DrawPacket, model: &UiModel, engine: &mut TextEngine) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(dialogue) = &model.dialogue else {
+        return;
+    };
+    if dialogue.ruby.is_empty() {
+        return;
+    }
+    let Some((base_index, base)) = packet
+        .texts
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.region == Some(ScrollRegion::Dialogue))
+        .map(|(i, r)| (i, r.clone()))
+    else {
+        return;
+    };
+    let Some(buffer) = engine.buffers.get(&TextEngine::key(&base)) else {
+        return;
+    };
+    let offsets = TextEngine::line_offsets(&base);
+    let visible = base.visible.unwrap_or(base.text.len());
+    let mut annotations = vec![];
+    for (start, end, reading) in &dialogue.ruby {
+        if *end > visible
+            || *start >= *end
+            || *end > base.text.len()
+            || !base.text.is_char_boundary(*start)
+            || !base.text.is_char_boundary(*end)
+        {
+            continue;
+        }
+        let base_clusters: Vec<_> = base.text[*start..*end]
+            .grapheme_indices(true)
+            .map(|(i, _)| start + i)
+            .collect();
+        let ruby_clusters: Vec<_> = reading.graphemes(true).collect();
+        if base_clusters.is_empty() {
+            continue;
+        }
+        for line in buffer.layout_runs() {
+            let offset = offsets[line.line_i];
+            let glyphs: Vec<_> = line
+                .glyphs
+                .iter()
+                .filter(|g| offset + g.start >= *start && offset + g.end <= *end)
+                .collect();
+            if glyphs.is_empty() {
+                continue;
+            }
+            let first = glyphs.iter().map(|g| offset + g.start).min().unwrap();
+            let last = glyphs.iter().map(|g| offset + g.end).max().unwrap();
+            let lo = base_clusters.partition_point(|i| *i < first) * ruby_clusters.len()
+                / base_clusters.len();
+            let hi = base_clusters.partition_point(|i| *i < last) * ruby_clusters.len()
+                / base_clusters.len();
+            if lo == hi {
+                continue;
+            }
+            let left = glyphs.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+            let right = glyphs.iter().map(|g| g.x + g.w).fold(0., f32::max);
+            let width = (right - left).max(1.);
+            let mut run = base.clone();
+            run.text = ruby_clusters[lo..hi].concat();
+            run.x = base.x + left;
+            run.y = base.y + line.line_top - base.scroll - base.size * 0.6;
+            run.width = 8192.;
+            run.size = base.size * 0.45;
+            run.line_height = base.size * 0.6;
+            run.height = run.line_height;
+            run.visible = None;
+            run.scroll = 0.;
+            run.emphasis.clear();
+            run.images.clear();
+            run.region = None;
+            // Include the reserved annotation space in the same clipping
+            // surface and inherit the decorated window's opacity/shadow.
+            let clip = base
+                .clip
+                .unwrap_or([base.x, base.y, base.width, base.height]);
+            run.clip = Some([
+                clip[0],
+                clip[1] - base.size * 0.6,
+                clip[2],
+                clip[3] + base.size * 0.6,
+            ]);
+            annotations.push((run, width));
+        }
+    }
+    for (mut run, width) in annotations {
+        engine.layout_texts(std::slice::from_ref(&run));
+        let measured = engine
+            .buffers
+            .get(&TextEngine::key(&run))
+            .map(|b| {
+                b.layout_runs()
+                    .flat_map(|l| l.glyphs.iter().map(|g| g.x + g.w))
+                    .fold(0., f32::max)
+            })
+            .unwrap_or(width);
+        if measured > width {
+            run.size *= width / measured;
+            run.width = width + 1.;
+        } else {
+            run.x += (width - measured) / 2.;
+            run.width = width + 1.;
+        }
+        let index = packet.texts.len();
+        packet.texts.push(run);
+        if let Some(layer) = &mut packet.window_layers {
+            if layer.texts.contains(&base_index) {
+                layer.texts.push(index);
+            }
+        }
+        if let Some(layer) = &mut packet.menu_layers {
+            if layer.texts.contains(&base_index) {
+                layer.texts.push(index);
+            }
+        }
+    }
+}
+
+fn project_inline_images(packet: &mut DrawPacket, engine: &TextEngine) {
+    let mut images = vec![];
+    for (index, run) in packet
+        .texts
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.monochrome && !r.preflight_only && !r.images.is_empty())
+    {
+        let Some(buffer) = engine.buffers.get(&TextEngine::key(run)) else {
+            continue;
+        };
+        let offsets = TextEngine::line_offsets(run);
+        let visible = run.visible.unwrap_or(run.text.len());
+        for placement in &run.images {
+            let at = placement.offset as usize;
+            if at + 3 > visible {
+                continue;
+            }
+            for line in buffer.layout_runs() {
+                let offset = offsets[line.line_i];
+                let Some(glyph) = line.glyphs.iter().find(|g| offset + g.start == at) else {
+                    continue;
+                };
+                let image = &placement.image;
+                let scale = run.image_scale;
+                let box_height =
+                    (image.height + image.margins[2] + image.margins[3]) as f32 * scale;
+                let align = match image.align {
+                    InlineImageAlign::Top => 0.,
+                    InlineImageAlign::Center => (line.line_height - box_height) / 2.,
+                    InlineImageAlign::Bottom => line.line_height - box_height,
+                };
+                let rect = [
+                    run.x + glyph.x + image.margins[0] as f32 * scale,
+                    run.y + line.line_top - run.scroll + align + image.margins[2] as f32 * scale,
+                    image.width as f32 * scale,
+                    image.height as f32 * scale,
+                ];
+                let clip = run.clip.unwrap_or([run.x, run.y, run.width, run.height]);
+                images.push((
+                    index,
+                    Quad {
+                        corners: None,
+                        rect,
+                        color: [1., 1., 1., run.color[3]],
+                        asset: Some(image.asset.clone()),
+                        clip: Some(clip),
+                    },
+                ));
+                break;
+            }
+        }
+    }
+    for (text, quad) in images {
+        if let Some(layer) = &mut packet.window_layers {
+            if layer.texts.contains(&text) {
+                layer.quads.push(quad);
+                continue;
+            }
+        }
+        if let Some(layer) = &mut packet.menu_layers {
+            if layer.texts.contains(&text) {
+                layer.quads.push(quad);
+                continue;
+            }
+        }
+        if let Some(position) = packet
+            .menu_paint
+            .iter()
+            .position(|p| matches!(p, MenuPaint::Text(i) if *i == text))
+        {
+            let index = packet
+                .menu_quad_range
+                .map_or(packet.quads.len(), |(_, end)| end);
+            packet.quads.insert(index, quad);
+            for paint in &mut packet.menu_paint {
+                if let MenuPaint::Quad(i) = paint {
+                    if *i >= index {
+                        *i += 1;
+                    }
+                }
+            }
+            if let Some((_, end)) = &mut packet.menu_quad_range {
+                *end += 1;
+            }
+            if let Some(i) = &mut packet.dialogue_hint_quad {
+                if *i >= index {
+                    *i += 1;
+                }
+            }
+            packet
+                .menu_paint
+                .insert(position + 1, MenuPaint::Quad(index));
+        } else {
+            packet.quads.push(quad);
+        }
     }
 }
 

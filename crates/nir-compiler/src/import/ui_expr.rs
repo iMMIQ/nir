@@ -12,6 +12,7 @@ const MAX_TEXT: usize = 16 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum Term {
     Int { value: i32 },
+    Float { value: nir_format::Float80 },
     String { value: String },
     Read { name: String },
     Apply { op: Op, args: Vec<Term> },
@@ -19,6 +20,8 @@ pub(super) enum Term {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Op {
+    ToInt,
+    ToFloat,
     Add,
     Subtract,
     Multiply,
@@ -52,12 +55,13 @@ impl Term {
     pub fn truth(&self) -> Option<bool> {
         match self {
             Self::Int { value } => Some(*value != 0),
+            Self::Float { value } => Some(!value.is_zero()),
             _ => None,
         }
     }
     fn budget(&self) -> (usize, usize) {
         match self {
-            Self::Int { .. } => (1, 0),
+            Self::Int { .. } | Self::Float { .. } => (1, 0),
             Self::String { value } => (1, value.len()),
             Self::Read { name } => (1, name.len()),
             Self::Apply { args, .. } => args.iter().fold((1, 0), |(n, b), t| {
@@ -78,6 +82,7 @@ pub(super) fn temporary(name: &str) -> bool {
 fn operand(value: &Literal, locals: &BTreeMap<String, Term>) -> Result<Term> {
     Ok(match value {
         Literal::Int(value) => Term::Int { value: *value },
+        Literal::Float(value) => Term::Float { value: *value },
         Literal::String(value) => {
             ensure!(value.len() <= MAX_TEXT, "E_IMPORT_UI_EXPR_LIMIT: string");
             Term::String {
@@ -101,6 +106,28 @@ fn apply(op: Op, args: Vec<Term>) -> Result<Term> {
     let int = |value| Ok(Term::Int { value });
     match (op, args.as_slice()) {
         (Op::Not, [Term::Int { value }]) => return int(i32::from(*value == 0)),
+        (Op::Concat, [a, b])
+            if matches!(a, Term::String { .. } | Term::Int { .. })
+                && matches!(b, Term::String { .. } | Term::Int { .. }) =>
+        {
+            // LiveNovel's explicit ++ converts integer operands to decimal
+            // text (calc.html, "strings and numbers"). Fold only literal
+            // values; real formatting and runtime coercion stay unsupported.
+            let text = |term: &Term| match term {
+                Term::String { value } => value.clone(),
+                Term::Int { value } => value.to_string(),
+                _ => unreachable!(),
+            };
+            let a = text(a);
+            let b = text(b);
+            ensure!(
+                a.len() + b.len() <= MAX_TEXT,
+                "E_IMPORT_UI_EXPR_LIMIT: concatenation"
+            );
+            return Ok(Term::String {
+                value: format!("{a}{b}"),
+            });
+        }
         (op, [Term::Int { value: a }, Term::Int { value: b }]) => {
             let value = match op {
                 Op::Add => a.checked_add(*b),
@@ -126,15 +153,6 @@ fn apply(op: Op, args: Vec<Term>) -> Result<Term> {
         }
         (Op::Equal | Op::NotEqual, [Term::String { value: a }, Term::String { value: b }]) => {
             return int(i32::from((a == b) == (op == Op::Equal)));
-        }
-        (Op::Concat, [Term::String { value: a }, Term::String { value: b }]) => {
-            ensure!(
-                a.len() + b.len() <= MAX_TEXT,
-                "E_IMPORT_UI_EXPR_LIMIT: concatenation"
-            );
-            return Ok(Term::String {
-                value: format!("{a}{b}"),
-            });
         }
         _ => {}
     }
@@ -210,6 +228,8 @@ pub(super) fn normalize(expression: &Expression) -> Result<Option<Term>> {
                 Some(19) => (Op::ObjectExists, 1),
                 Some(20) => (Op::Not, 1),
                 Some(30) => (Op::IndexOfString, 2),
+                Some(37) => (Op::ToInt, 1),
+                Some(38) => (Op::ToFloat, 1),
                 Some(81) => (Op::IsDelimiter, 3),
                 Some(126) => (Op::Min, 2),
                 Some(127) => (Op::Max, 2),
@@ -446,6 +466,50 @@ mod tests {
             }
         );
         assert_eq!(t.truth(), None);
+    }
+    #[test]
+    fn literal_integer_concatenation_keeps_decimal_text_and_expression_bounds() {
+        for (left, right, expected) in [
+            (Literal::String("image".into()), Literal::Int(10), "image10"),
+            (Literal::Int(-7), Literal::String(".gal".into()), "-7.gal"),
+            (Literal::Int(0), Literal::Int(i32::MIN), "0-2147483648"),
+        ] {
+            let e = expr(vec![(19, "____arg", vec![left, right])]);
+            assert_eq!(
+                normalize(&e).unwrap(),
+                Some(Term::String {
+                    value: expected.into()
+                })
+            );
+        }
+        let prefix = "x".repeat(MAX_TEXT - 11);
+        let mut e = expr(vec![(
+            19,
+            "____arg",
+            vec![Literal::String(prefix.clone()), Literal::Int(i32::MIN)],
+        )]);
+        assert_eq!(
+            normalize(&e).unwrap(),
+            Some(Term::String {
+                value: format!("{prefix}-2147483648")
+            })
+        );
+        e.operations[0].2[0] = Literal::String("x".repeat(MAX_TEXT - 10));
+        assert!(normalize(&e).unwrap_err().to_string().contains("LIMIT"));
+        for value in [
+            var("counter"),
+            Literal::Float(nir_format::Float80::from_i32(10)),
+        ] {
+            let e = expr(vec![(
+                19,
+                "____arg",
+                vec![Literal::String("image".into()), value],
+            )]);
+            assert!(matches!(
+                normalize(&e).unwrap(),
+                Some(Term::Apply { op: Op::Concat, .. })
+            ));
+        }
     }
     #[test]
     fn folds_only_proven_constants_and_preserves_rounding_questions() {

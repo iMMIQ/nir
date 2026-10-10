@@ -219,6 +219,7 @@ impl MenuEffectsState {
                     easing: t.easing,
                     finish: nir_format::FinishPolicy::CommitEnd,
                     cancel: nir_format::CancelPolicy::CommitCurrent,
+                    source_curve: None,
                 },
                 start_us: now_us,
                 delay_us: t.delay_us.0,

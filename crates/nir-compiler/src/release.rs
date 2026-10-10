@@ -348,13 +348,19 @@ fn cue_media_assets(program: &Program, cue_id: &str) -> BTreeSet<String> {
     let mut assets = BTreeSet::new();
     if let Some(cue) = program.cues.get(cue_id) {
         for definition in &cue.effects {
+            definition
+                .effect
+                .collect_text_image_assets(&program.texts, &mut assets);
+            definition
+                .effect
+                .collect_dialogue_style_assets(&program.theme, &mut assets);
             match &definition.effect {
                 Effect::StagePresent {
                     scene, transition, ..
                 } => {
                     assets.extend(transition.asset().map(str::to_owned));
                     if let Some(nodes) = program.scenes.get(scene) {
-                        assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                        assets.extend(definition.effect.stage_image_assets(nodes).cloned());
                     }
                 }
                 Effect::Audio { asset, .. } => {
@@ -374,8 +380,39 @@ fn asset_consumers(
     program: &Program,
     scene_owners: &BTreeMap<String, String>,
     cue_owners: &BTreeMap<String, String>,
+    text_owners: &BTreeMap<String, String>,
+    choice_owners: &BTreeMap<String, String>,
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut consumers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (choice, definition) in &program.choices {
+        if let Some(module) = choice_owners.get(choice) {
+            for image in definition
+                .options
+                .iter()
+                .filter_map(|option| option.image.as_ref())
+            {
+                for asset in std::iter::once(&image.asset)
+                    .chain(image.hover_asset.iter())
+                    .chain(image.disabled_asset.iter())
+                {
+                    consumers
+                        .entry(asset.clone())
+                        .or_default()
+                        .insert(format!("module:{module}"));
+                }
+            }
+        }
+    }
+    for (text, contract) in &program.texts {
+        if let Some(module) = text_owners.get(text) {
+            for image in &contract.images {
+                consumers
+                    .entry(image.asset.clone())
+                    .or_default()
+                    .insert(format!("module:{module}"));
+            }
+        }
+    }
     for (scene, nodes) in &program.scenes {
         if let Some(module) = scene_owners.get(scene) {
             for asset in nodes.iter().filter_map(|node| node.asset.as_ref()) {
@@ -504,6 +541,125 @@ fn dependency_graph(
     Ok((graph, entry_module))
 }
 
+/// Scene declarations are immutable templates. Reusing an identical template
+/// retains every activation and its timing; each activation still captures a
+/// fresh scene generation. Keep ownership boundaries intact when coalescing.
+fn coalesce_scene_templates(source: &Program, modules: &BTreeSet<String>) -> Result<Program> {
+    let mut program = source.clone();
+    let mut templates: BTreeMap<(String, Vec<u8>), String> = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for (id, nodes) in &source.scenes {
+        let key = (declaration_owner(id, modules)?, serde_json::to_vec(nodes)?);
+        if let Some(canonical) = templates.get(&key) {
+            aliases.insert(id.clone(), canonical.clone());
+            program.scenes.remove(id);
+        } else {
+            templates.insert(key, id.clone());
+        }
+    }
+    fn remap(effect: &mut Effect, aliases: &BTreeMap<String, String>) {
+        match effect {
+            Effect::StagePresent { scene, .. } => {
+                if let Some(canonical) = aliases.get(scene) {
+                    *scene = canonical.clone();
+                }
+            }
+            Effect::Sequence { children } | Effect::ParallelAll { children } => {
+                for child in children {
+                    remap(&mut child.effect, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+    for cue in program.cues.values_mut() {
+        for effect in &mut cue.effects {
+            remap(&mut effect.effect, &aliases);
+        }
+    }
+    if let Some(canonical) = program.title_scene.as_ref().and_then(|id| aliases.get(id)) {
+        program.title_scene = Some(canonical.clone());
+    }
+    Ok(program)
+}
+
+/// Split immutable function bodies without renaming functions, task handles,
+/// cues or variables. Shared scene/audio/text ownership stays in the author's
+/// module, so page transitions keep the same running audio instances.
+fn partition_large_code(
+    source: &Program,
+    modules: &mut BTreeMap<String, ModuleIndex>,
+) -> Result<()> {
+    const GROUP_BYTES: usize = 1024 * 1024;
+    for module in modules.keys().cloned().collect::<Vec<_>>() {
+        let functions = modules[&module].functions.clone();
+        let sizes = functions
+            .keys()
+            .map(|id| {
+                Ok((
+                    id.clone(),
+                    serde_json::to_vec(&source.functions[id])?.len() + id.len() + 4,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if functions.len() < 2 || sizes.values().sum::<usize>() <= 2 * GROUP_BYTES {
+            continue;
+        }
+        // Each original module retains a real function. Prefer its entry,
+        // ensuring startup also prepares its shared static/text packages.
+        let retained = if functions.contains_key(&source.entry) {
+            source.entry.clone()
+        } else {
+            functions.keys().next().unwrap().clone()
+        };
+        modules
+            .get_mut(&module)
+            .unwrap()
+            .functions
+            .retain(|id, _| *id == retained);
+        let mut group = BTreeMap::new();
+        let mut bytes = 0;
+        let mut ordinal = 0;
+        let flush = |group: &mut BTreeMap<String, FunctionSignature>,
+                     ordinal: &mut usize,
+                     modules: &mut BTreeMap<String, ModuleIndex>| {
+            if group.is_empty() {
+                return;
+            }
+            let id = loop {
+                *ordinal += 1;
+                let id = format!("{module}.code{ordinal:04}");
+                if !modules.contains_key(&id) {
+                    break id;
+                }
+            };
+            modules.insert(
+                id,
+                ModuleIndex {
+                    functions: std::mem::take(group),
+                    texts: BTreeSet::new(),
+                    code: String::new(),
+                    static_content: String::new(),
+                    locales: BTreeMap::new(),
+                },
+            );
+        };
+        for (id, signature) in functions {
+            if id == retained {
+                continue;
+            }
+            if bytes + sizes[&id] > GROUP_BYTES {
+                flush(&mut group, &mut ordinal, modules);
+                bytes = 0;
+            }
+            bytes += sizes[&id];
+            group.insert(id, signature);
+        }
+        flush(&mut group, &mut ordinal, modules);
+    }
+    Ok(())
+}
+
 fn package_runtime(
     out: &Path,
     objects: &mut BTreeMap<String, Object>,
@@ -511,6 +667,19 @@ fn package_runtime(
     reference: &Executable,
 ) -> Result<RuntimeBuild> {
     let mut modules = module_indexes(source)?;
+    let author_function_owners: BTreeMap<String, String> = modules
+        .iter()
+        .flat_map(|(module, index)| {
+            index
+                .functions
+                .keys()
+                .map(|id| (id.clone(), module.clone()))
+        })
+        .collect();
+    let author_module_ids: BTreeSet<String> = modules.keys().cloned().collect();
+    let coalesced = coalesce_scene_templates(source, &author_module_ids)?;
+    let source = &coalesced;
+    partition_large_code(source, &mut modules)?;
     let module_ids: BTreeSet<String> = modules.keys().cloned().collect();
 
     let mut function_owners = BTreeMap::new();
@@ -552,17 +721,22 @@ fn package_runtime(
     let scene_owners: BTreeMap<String, String> = source
         .scenes
         .keys()
-        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .map(|id| Ok((id.clone(), declaration_owner(id, &author_module_ids)?)))
+        .collect::<Result<_>>()?;
+    let timeline_owners: BTreeMap<String, String> = source
+        .sprite_timelines
+        .keys()
+        .map(|id| Ok((id.clone(), declaration_owner(id, &author_module_ids)?)))
         .collect::<Result<_>>()?;
     let cue_owners: BTreeMap<String, String> = source
         .cues
         .keys()
-        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .map(|id| Ok((id.clone(), declaration_owner(id, &author_module_ids)?)))
         .collect::<Result<_>>()?;
     let choice_owners: BTreeMap<String, String> = source
         .choices
         .keys()
-        .map(|id| Ok((id.clone(), declaration_owner(id, &module_ids)?)))
+        .map(|id| Ok((id.clone(), declaration_owner(id, &author_module_ids)?)))
         .collect::<Result<_>>()?;
     let mut task_owners = BTreeMap::new();
     for (cue, definition) in &source.cues {
@@ -578,7 +752,13 @@ fn package_runtime(
         }
     }
 
-    let consumers = asset_consumers(source, &scene_owners, &cue_owners);
+    let consumers = asset_consumers(
+        source,
+        &scene_owners,
+        &cue_owners,
+        &text_owners,
+        &choice_owners,
+    );
     let roots: BTreeSet<String> = consumers.keys().cloned().collect();
     let mut catalog_groups: BTreeMap<BTreeSet<String>, BTreeMap<String, Asset>> = BTreeMap::new();
     for id in &roots {
@@ -596,11 +776,28 @@ fn package_runtime(
     let mut catalog_reports = BTreeMap::new();
     let mut catalogs = BTreeMap::new();
     let mut asset_index = BTreeMap::new();
-    for (consumer_set, assets) in catalog_groups {
-        let id = format!(
-            "catalog.{}",
-            nir_content::digest(&serde_json::to_vec(&consumer_set)?)
-        );
+    // A scene pins every catalog containing one of its assets. Keep catalogs
+    // small so a handful of active images/audio cannot pin the metadata for
+    // an entire large story alongside its code and text packages.
+    let catalog_groups = catalog_groups.into_iter().flat_map(|(consumers, assets)| {
+        const MAX_CATALOG_ASSETS: usize = 64;
+        let split = assets.len() > MAX_CATALOG_ASSETS;
+        let entries: Vec<_> = assets.into_iter().collect();
+        let chunks: Vec<BTreeMap<_, _>> = entries
+            .chunks(MAX_CATALOG_ASSETS)
+            .map(|chunk| chunk.iter().cloned().collect())
+            .collect();
+        chunks
+            .into_iter()
+            .map(move |assets| (consumers.clone(), split, assets))
+    });
+    for (consumer_set, split, assets) in catalog_groups {
+        let identity = if split {
+            serde_json::to_vec(&(&consumer_set, assets.keys().collect::<Vec<_>>()))?
+        } else {
+            serde_json::to_vec(&consumer_set)?
+        };
+        let id = format!("catalog.{}", nir_content::digest(&identity));
         let package = AssetCatalog {
             format: CONTENT_PACKAGE_VERSION,
             catalog: id.clone(),
@@ -632,6 +829,7 @@ fn package_runtime(
     }
 
     let mut module_reports = BTreeMap::new();
+    let mut interned_packages = false;
     for (module, index) in &mut modules {
         let functions = index
             .functions
@@ -643,7 +841,8 @@ fn package_runtime(
             module: module.clone(),
             functions,
         };
-        let code_bytes = serde_json::to_vec(&code)?;
+        let (code_bytes, interned) = nir_content::interned::encode(&code)?;
+        interned_packages |= interned;
         let code_hash = object(out, objects, &code_bytes, "json", "application/json")?;
 
         let scenes = source
@@ -686,12 +885,19 @@ fn package_runtime(
             format: CONTENT_PACKAGE_VERSION,
             module: module.clone(),
             scenes,
+            sprite_timelines: source
+                .sprite_timelines
+                .iter()
+                .filter(|(id, _)| timeline_owners[*id] == *module)
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             cues,
             choices,
             text_contracts: contracts,
             activation_recipes,
         };
-        let static_bytes = serde_json::to_vec(&static_package)?;
+        let (static_bytes, interned) = nir_content::interned::encode(&static_package)?;
+        interned_packages |= interned;
         let static_hash = object(out, objects, &static_bytes, "json", "application/json")?;
 
         let mut text_reports = BTreeMap::new();
@@ -720,7 +926,8 @@ fn package_runtime(
                 locale: locale.clone(),
                 texts,
             };
-            let bytes = serde_json::to_vec(&bundle)?;
+            let (bytes, interned) = nir_content::interned::encode(&bundle)?;
+            interned_packages |= interned;
             let hash = object(out, objects, &bytes, "json", "application/json")?;
             locale_objects.insert(locale.clone(), hash.clone());
             text_reports.insert(
@@ -734,6 +941,18 @@ fn package_runtime(
         index.code = code_hash.clone();
         index.static_content = static_hash.clone();
         index.locales = locale_objects;
+        let largest_text = text_reports
+            .values()
+            .map(|text| text.bytes)
+            .max()
+            .unwrap_or(0);
+        let demand_bytes = code_bytes.len() as u64 + static_bytes.len() as u64 + largest_text;
+        if demand_bytes > nir_format::MAX_INPUT_BYTES as u64 {
+            bail!(
+                "E_CONTENT_LIMIT: module {module} requires {demand_bytes} encoded bytes; split its source into smaller modules to fit the {} byte content preparation budget",
+                nir_format::MAX_INPUT_BYTES
+            );
+        }
         let owned_catalogs = catalog_reports
             .iter()
             .filter(|(_, report)| report.consumers.contains(&format!("module:{module}")))
@@ -754,12 +973,14 @@ fn package_runtime(
 
     let (module_dependencies, entry_module) =
         dependency_graph(source, &function_owners, &module_ids)?;
-    let function_index = function_owners
+    let function_index: BTreeMap<String, RuntimeFunctionIndex> = function_owners
         .iter()
         .map(|(id, module)| {
             (
                 id.clone(),
                 RuntimeFunctionIndex {
+                    execution_module: (author_function_owners[id] != *module)
+                        .then(|| author_function_owners[id].clone()),
                     module: module.clone(),
                     signature: modules[module].functions[id].clone(),
                 },
@@ -778,6 +999,7 @@ fn package_runtime(
                     contract_revision: contract.contract_revision,
                     meaning_revision: contract.meaning_revision,
                     contract_digest: contract.contract_digest.clone(),
+                    images: contract.images.clone(),
                 },
             )
         })
@@ -789,17 +1011,46 @@ fn package_runtime(
         .or_else(|| source.scenes.values().next())
         .cloned()
         .unwrap_or_default();
+    let mut requires = source.requires.clone();
+    if interned_packages {
+        requires.push(nir_content::interned::CAPABILITY.into());
+    }
+    if function_index
+        .values()
+        .any(|index| index.execution_module.is_some())
+    {
+        requires.push("story.code-packages.v1".into());
+    }
+    for (module, report) in &module_reports {
+        let first = modules[module].functions.keys().next().unwrap();
+        if let Some(scope) = &function_index[first].execution_module {
+            let shared = &module_reports[scope];
+            let bytes = report.code_bytes
+                + report.static_bytes
+                + shared.static_bytes
+                + shared
+                    .locales
+                    .values()
+                    .map(|text| text.bytes)
+                    .max()
+                    .unwrap_or(0);
+            if bytes > nir_format::MAX_INPUT_BYTES as u64 {
+                bail!("E_CONTENT_LIMIT: code package {module} and shared declaration scope {scope} require {bytes} bytes");
+            }
+        }
+    }
     let runtime = RuntimeProgram {
         format: RUNTIME_FORMAT_VERSION,
         game_id: source.game_id.clone(),
         revision: source.revision.clone(),
         entry: source.entry.clone(),
-        requires: source.requires.clone(),
+        requires,
         stage: source.stage.clone(),
         variables: source.variables.clone(),
         function_index,
         modules,
         scene_owners,
+        timeline_owners,
         cue_owners,
         choice_owners,
         text_owners,
@@ -925,6 +1176,28 @@ fn add_module_payload(
             "text",
             format!("module {module} text locale {text_locale} ({reason})"),
         )?;
+    }
+    let root = &runtime.executable.program;
+    if let Some(scope) = root
+        .module_execution_scope(module)
+        .filter(|scope| *scope != module)
+    {
+        let shared = &runtime.modules[scope];
+        closure.add_object(
+            objects,
+            &shared.static_content,
+            "static",
+            format!("code package {module} shared declarations in {scope}"),
+        )?;
+        if let Some(text) = shared.locales.get(text_locale) {
+            closure.add_object(
+                objects,
+                &text.object,
+                "text",
+                format!("code package {module} shared locale {text_locale} in {scope}"),
+            )?;
+        }
+        add_consumer_catalogs(closure, objects, runtime, &format!("module:{scope}"))?;
     }
     add_consumer_catalogs(closure, objects, runtime, &format!("module:{module}"))?;
     add_consumer_catalogs(closure, objects, runtime, &format!("locale:ui:{ui_locale}"))?;
@@ -1824,6 +2097,291 @@ pub fn default_sdk() -> PathBuf {
 mod compression_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn large_asset_catalogs_do_not_pin_the_whole_story_for_one_image() {
+        let mut source: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let mut nodes = vec![];
+        for ordinal in 0..130 {
+            let id = format!("catalog_image_{ordinal:03}");
+            source
+                .assets
+                .insert(id.clone(), source.assets["bg.station"].clone());
+            let mut node = source.scenes["station"][0].clone();
+            node.id = id.clone();
+            node.asset = Some(id);
+            nodes.push(node);
+        }
+        source.scenes.insert("catalog_images".into(), nodes);
+        for (id, asset) in &mut source.assets {
+            asset.object = nir_content::digest(id.as_bytes());
+            if asset.kind == AssetKind::Image {
+                asset.decoded_bytes = asset.width as u64 * asset.height as u64 * 4;
+            }
+        }
+        let media = source
+            .assets
+            .iter()
+            .map(|(id, a)| (id.clone(), a.object.clone()))
+            .collect();
+        for plan in source
+            .locale_config
+            .ui
+            .values_mut()
+            .chain(source.locale_config.text.values_mut())
+        {
+            plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &media);
+        }
+        let reference = crate::compile(&source).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        fs::create_dir(out.path().join("objects")).unwrap();
+        let mut objects = BTreeMap::new();
+        let runtime = package_runtime(out.path(), &mut objects, &source, &reference).unwrap();
+        let root = &runtime.executable.program;
+        let chunks: BTreeSet<_> = (0..130)
+            .map(|ordinal| {
+                root.assets[&format!("catalog_image_{ordinal:03}")]
+                    .catalog
+                    .clone()
+            })
+            .collect();
+        assert_eq!(chunks.len(), 3);
+        let keys = root.asset_catalogs(["catalog_image_000"]);
+        assert_eq!(keys.len(), 1);
+        let key = keys.into_iter().next().unwrap();
+        let digest = root.content_requirement(&key).unwrap().digest;
+        let bytes = fs::read(out.path().join(format!("objects/{digest}.json"))).unwrap();
+        let object = nir_content::parse_runtime_object(root, &key, &bytes).unwrap();
+        let RuntimeObject::Catalog(catalog) = &object else {
+            panic!("expected asset catalog")
+        };
+        assert!(catalog.assets.contains_key("catalog_image_000"));
+        assert!(catalog.assets.len() <= 64);
+        let view = nir_core::ValidatedProgram::from_runtime(root.clone())
+            .unwrap()
+            .install_batch(vec![(key, object, bytes.len() as u64)])
+            .unwrap();
+        assert_eq!(view.residency().resident_blocks, 1);
+        for report in runtime.catalogs.values() {
+            let bytes =
+                fs::read(out.path().join(format!("objects/{}.json", report.object))).unwrap();
+            let catalog: AssetCatalog = serde_json::from_slice(&bytes).unwrap();
+            assert!(catalog.assets.len() <= 64);
+            for id in catalog.assets.keys() {
+                assert_eq!(root.assets[id].catalog, catalog.catalog);
+            }
+        }
+    }
+
+    #[test]
+    fn large_code_packages_keep_shared_tasks_and_validate_each_runtime_module() {
+        let mut source: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        for (id, asset) in &mut source.assets {
+            asset.object = nir_content::digest(id.as_bytes());
+        }
+        let media = source
+            .assets
+            .iter()
+            .map(|(id, asset)| (id.clone(), asset.object.clone()))
+            .collect();
+        for plan in source
+            .locale_config
+            .ui
+            .values_mut()
+            .chain(source.locale_config.text.values_mut())
+        {
+            plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &media);
+        }
+        source
+            .variables
+            .insert("payload".into(), nir_format::Value::String(String::new()));
+        for ordinal in 0..32 {
+            let ops: Vec<_> = (0..100).map(|at| serde_json::json!({
+                "id": format!("f{ordinal}_op{at}"),
+                "operation":{"type":"assign","target":"payload","value":{"type":"const","value":{"type":"string","value":"x".repeat(1024)}}}
+            })).collect();
+            let mut function = source.functions[&source.entry].clone();
+            for block in function.blocks.values_mut() {
+                for op in &mut block.ops {
+                    op.id = format!("f{ordinal}_{}", op.id);
+                }
+            }
+            function
+                .blocks
+                .get_mut(&function.entry.clone())
+                .unwrap()
+                .ops
+                .extend(
+                    ops.into_iter()
+                        .map(|op| serde_json::from_value(op).unwrap()),
+                );
+            source
+                .functions
+                .insert(format!("large_{ordinal}"), function);
+        }
+        let reference = crate::compile(&source).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        fs::create_dir(out.path().join("objects")).unwrap();
+        let mut objects = BTreeMap::new();
+        for id in source.assets.keys() {
+            object(
+                out.path(),
+                &mut objects,
+                id.as_bytes(),
+                "bin",
+                "application/octet-stream",
+            )
+            .unwrap();
+        }
+        let runtime = package_runtime(out.path(), &mut objects, &source, &reference).unwrap();
+        let root = &runtime.executable.program;
+        assert!(root.modules.len() > 2);
+        assert_eq!(root.function_index.len(), source.functions.len());
+        assert_eq!(root.function_index[&source.entry].module, "_legacy");
+        assert!(root.task_owners.values().all(|owner| owner == "_legacy"));
+        assert!(root.text_owners.values().all(|owner| owner == "_legacy"));
+        for (module, index) in &root.modules {
+            if module != "_legacy" {
+                assert!(index.texts.is_empty());
+                assert!(runtime.modules[module].code_bytes < 2 * 1024 * 1024);
+            }
+        }
+        let child = root
+            .modules
+            .keys()
+            .find(|module| *module != "_legacy")
+            .unwrap();
+        let mut closure = ClosureBuilder::default();
+        add_module_payload(
+            &mut closure,
+            &objects,
+            &runtime,
+            child,
+            "en",
+            "en",
+            "cold code-package entry",
+        )
+        .unwrap();
+        let closure = closure.finish();
+        assert!(closure
+            .objects
+            .contains_key(&runtime.modules["_legacy"].static_content));
+        assert!(closure
+            .objects
+            .contains_key(&runtime.modules["_legacy"].locales["en"].object));
+        assert!(!closure
+            .objects
+            .contains_key(&runtime.modules["_legacy"].code));
+        validate_runtime_packages(out.path(), &runtime.executable).unwrap();
+        let root_view = nir_core::ValidatedProgram::from_runtime(root.clone()).unwrap();
+        for (module, index) in &root.modules {
+            let mut keys = std::collections::BTreeSet::from([ContentKey::Code {
+                module: module.clone(),
+            }]);
+            keys.extend(root.content_prerequisites(&ContentKey::Code {
+                module: module.clone(),
+            }));
+            let batch = keys
+                .into_iter()
+                .map(|key| {
+                    let digest = root.content_requirement(&key).unwrap().digest;
+                    let bytes =
+                        fs::read(out.path().join(format!("objects/{digest}.json"))).unwrap();
+                    let object = nir_content::parse_runtime_object(root, &key, &bytes).unwrap();
+                    (key, object, bytes.len() as u64)
+                })
+                .collect();
+            let view = root_view.install_batch(batch).unwrap();
+            assert!(index
+                .functions
+                .keys()
+                .all(|id| view.program().functions.contains_key(id)));
+        }
+    }
+
+    #[test]
+    fn identical_scene_templates_keep_activations_and_module_ownership() {
+        let mut source: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let nodes = source.scenes.values().next().unwrap().clone();
+        source.scenes = BTreeMap::from([
+            ("a.first".into(), nodes.clone()),
+            ("a.repeat".into(), nodes.clone()),
+            ("b.same".into(), nodes.clone()),
+        ]);
+        let mut changed = nodes;
+        changed[0].x += 1.;
+        source.scenes.insert("a.changed".into(), changed);
+        source.title_scene = Some("a.repeat".into());
+        let present = |scene: &str, duration| EffectDef {
+            id: "stage".into(),
+            scope: Scope::Session,
+            effect: Effect::StagePresent {
+                dialogue_visible: None,
+                inherit_images: Vec::new(),
+                inherit_image_geometry: Vec::new(),
+                scene: scene.into(),
+                transition: Default::default(),
+                duration_us: Micros(duration),
+            },
+        };
+        source.cues = BTreeMap::from([(
+            "a.show".into(),
+            Cue {
+                effects: vec![EffectDef {
+                    id: "sequence".into(),
+                    scope: Scope::Session,
+                    effect: Effect::Sequence {
+                        children: vec![present("a.first", 100), present("a.repeat", 200)],
+                    },
+                }],
+            },
+        )]);
+        let optimized =
+            coalesce_scene_templates(&source, &BTreeSet::from(["a".into(), "b".into()])).unwrap();
+        assert_eq!(optimized.scenes.len(), 3);
+        assert!(optimized.scenes.contains_key("a.changed"));
+        assert!(optimized.scenes.contains_key("b.same"));
+        assert_eq!(optimized.title_scene.as_deref(), Some("a.first"));
+        let children = optimized.cues["a.show"].effects[0]
+            .effect
+            .compose_children()
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        for (child, duration) in children.iter().zip([100, 200]) {
+            assert!(
+                matches!(&child.effect, Effect::StagePresent { scene, duration_us, .. } if scene == "a.first" && duration_us.0 == duration)
+            );
+        }
+        assert!(
+            source.scenes.contains_key("a.repeat"),
+            "author declarations stay unchanged"
+        );
+    }
+
+    #[test]
+    fn inline_only_images_belong_to_the_text_module_catalog() {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        program.texts.get_mut("intro").unwrap().images = vec![nir_format::TextImageContract {
+            id: "inline".into(),
+            asset: "inline-only".into(),
+        }];
+        let consumers = asset_consumers(
+            &program,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::from([("intro".into(), "chapter".into())]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            consumers["inline-only"],
+            BTreeSet::from(["module:chapter".into()])
+        );
+        assert!(!consumers["inline-only"].contains("bootstrap"));
+    }
 
     #[test]
     fn gzip_is_reproducible_and_preserves_object_identity() {

@@ -12,3 +12,6 @@ sha2.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+nir-content.workspace = true

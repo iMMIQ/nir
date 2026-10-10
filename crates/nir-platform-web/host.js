@@ -12,6 +12,20 @@ export function focusIdentity(action) {
     if(value.type==='menu_history_scroll'&&value.control) return JSON.stringify([value.type,value.instance,value.window,value.control,value.input.type,value.input.type==='line'?value.input.delta:null]);
     return ['menu_control','menu_value'].includes(value.type)?JSON.stringify([value.type,value.instance,value.control]):action;
 }
+// Place a host control around the current canvas controls. Authored menu
+// navigation owns its rectangles, including the top-right return button.
+export function overlayControlPosition(nodes,width,height,buttonWidth,buttonHeight) {
+    const gap=8,edge=12;
+    if(![width,height,buttonWidth,buttonHeight].every(Number.isFinite)||buttonWidth<=0||buttonHeight<=0)return null;
+    const rects=nodes.map(n=>n.rect).filter(r=>Array.isArray(r)&&r.length===4&&r.every(Number.isFinite)&&r[2]>0&&r[3]>0);
+    const right=width-edge-buttonWidth,toolbar=rects.filter(r=>r[1]<=112).slice(0,16);
+    const candidates=[[right,edge],...toolbar.map(r=>[r[0]-gap-buttonWidth,edge]),...toolbar.map(r=>[right,r[1]+r[3]+gap])];
+    for(const [x,y] of candidates){
+        if(x<edge||y<edge||x+buttonWidth>width-edge||y+buttonHeight>height-edge)continue;
+        if(rects.every(r=>x+buttonWidth+gap<=r[0]||r[0]+r[2]+gap<=x||y+buttonHeight+gap<=r[1]||r[1]+r[3]+gap<=y))return [x,y];
+    }
+    return null;
+}
 export function samePointerTarget(a,b) {
     if(!a||!b)return false;
     if(a.type==='menu_value'&&b.type==='menu_value')
@@ -726,28 +740,32 @@ export const profileKey=(gameId,profile)=>[gameId,profile];
 // union of uncommitted progress. Failures wait for a new change, not a timer.
 // Keep completion delivery on the owner through the supplied request function.
 export class PersistenceWrites {
-    constructor({request,writePreferences,mergeProfile,stored,failed}) {
-        Object.assign(this,{request,writePreferences,mergeProfile,stored,failed});
-        this.lanes=new Map(['preferences','profile'].map(kind=>[kind,{active:false,dirty:false,value:null,keys:new Set()}]));
+    constructor({request,writePreferences,mergeProfile,writeProfileValues,stored,failed}) {
+        Object.assign(this,{request,writePreferences,mergeProfile,writeProfileValues,stored,failed});
+        this.lanes=new Map(['preferences','profile','profile_values'].map(kind=>[kind,{active:false,dirty:false,value:null,keys:new Set(),patch:Object.create(null)}]));
         this.closed=false;
     }
     submit(kind,value) {
         if(this.closed)return;
         const lane=this.lanes.get(kind);if(!lane)throw new Error('E_PERSISTENCE_KIND');
         if(kind==='profile')for(const key of value)lane.keys.add(key);
+        else if(kind==='profile_values')Object.assign(lane.patch,value);
         else lane.value=value;
         lane.dirty=true;this.pump(kind,lane);
     }
     pump(kind,lane) {
         if(this.closed||lane.active||!lane.dirty)return;
         lane.active=true;lane.dirty=false;
-        const value=kind==='profile'?[...lane.keys]:lane.value;
+        const value=kind==='profile'?[...lane.keys]:kind==='profile_values'?{...lane.patch}:lane.value;
         let settled=false;
         const finish=(ok,error)=>{
             if(settled)return;settled=true;lane.active=false;
             if(this.closed)return;
             if(ok){
                 if(kind==='profile')for(const key of value)lane.keys.delete(key);
+                else if(kind==='profile_values'){
+                    for(const key of Object.keys(value))if(lane.patch[key]===value[key])delete lane.patch[key];
+                }
                 else if(!lane.dirty)lane.value=null;
             }
             try {
@@ -756,7 +774,7 @@ export class PersistenceWrites {
             } finally {this.pump(kind,lane);}
         };
         try {
-            this.request(pending=>kind==='profile'?this.mergeProfile(value,pending):this.writePreferences(value,pending),
+            this.request(pending=>kind==='profile'?this.mergeProfile(value,pending):kind==='profile_values'?this.writeProfileValues(value,pending):this.writePreferences(value,pending),
                 ()=>finish(true),error=>finish(false,error),{pending:error=>{
                     // A warning is not a terminal result. Keep this lane and
                     // its newest edits until the original transaction settles.
@@ -766,12 +784,12 @@ export class PersistenceWrites {
     }
     close() {
         this.closed=true;
-        for(const lane of this.lanes.values()){lane.value=null;lane.keys.clear();lane.dirty=false;}
+        for(const lane of this.lanes.values()){lane.value=null;lane.keys.clear();lane.patch=Object.create(null);lane.dirty=false;}
     }
     retry(kind) {
         if(this.closed)return false;
         const lane=this.lanes.get(kind);if(!lane)throw new Error('E_PERSISTENCE_KIND');
-        if(lane.active||(kind==='profile'?!lane.keys.size:lane.value===null))return false;
+        if(lane.active||(kind==='profile'?!lane.keys.size:kind==='profile_values'?!Object.keys(lane.patch).length:lane.value===null))return false;
         lane.dirty=true;this.pump(kind,lane);return true;
     }
 }
@@ -780,7 +798,20 @@ export class PersistenceWrites {
 // by fallback negotiation or a later preference/progress write.
 export function validateMetadataRecord(kind,value) {
     const invalid=()=>{throw new Error(kind==='profile'?'E_PROFILE_RECORD: unreadable progress':'E_PREFERENCES_RECORD: unreadable preferences');};
-    if(value===undefined)return kind==='profile'?[]:null;
+    if(value===undefined)return kind==='profile'?[]:kind==='profile_values'?{}:null;
+    if(kind==='profile_values'){
+        const bad=()=>{throw new Error('E_PROFILE_VALUES_RECORD: unreadable progress values');};
+        if(!value||typeof value!=='object'||Array.isArray(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value))||Object.keys(value).length>4096)bad();
+        for(const [key,item] of Object.entries(value)){
+            if(!key||new TextEncoder().encode(key).length>1024||!item||typeof item!=='object'||Array.isArray(item)||Object.keys(item).length!==2||!Object.hasOwn(item,'type')||!Object.hasOwn(item,'value'))bad();
+            if(item.type==='i32'){if(!Number.isInteger(item.value)||item.value < -2147483648||item.value > 2147483647)bad();}
+            else if(item.type==='bool'){if(typeof item.value!=='boolean')bad();}
+            else if(item.type==='string'){if(typeof item.value!=='string'||new TextEncoder().encode(item.value).length>65536)bad();}
+            else if(item.type==='f80'){if(typeof item.value!=='string'||! /^[0-9a-f]{20}$/.test(item.value))bad();const bits=BigInt('0x'+item.value),exp=Number((bits>>64n)&32767n),integer=Number((bits>>63n)&1n);if(exp===32767||(integer!==0)!==(exp!==0))bad();}
+            else bad();
+        }
+        return value;
+    }
     if(kind==='profile'){
         if(!Array.isArray(value))invalid();
         for(const key of value)if(typeof key!=='string')invalid(); // Includes sparse holes.
@@ -824,7 +855,8 @@ export function readMetadataRecord(db,kind,key,{timeoutMs=3000,signal}={}) {
         const abort=()=>finish(signal.reason||new Error('E_STORAGE_ABORT: metadata read cancelled'));
         signal?.addEventListener('abort',abort,{once:true});
         try{
-            tx=db.transaction(kind,'readonly');r=tx.objectStore(kind).get(key);
+            const storeKind=kind==='profile_values'?'profile':kind;
+            tx=db.transaction(storeKind,'readonly');r=tx.objectStore(storeKind).get(kind==='profile_values'?[...key,'values']:key);
             r.onsuccess=()=>{
                 if(settled)return;
                 try{value=validateMetadataRecord(kind,r.result);received=true;}catch(error){finish(error);}
@@ -842,7 +874,7 @@ export async function readStartupMetadata(db,key,options) {
     }));
     return {preferences,profile,failures};
 }
-function writeMetadataRecord(db,kind,key,value,{timeoutMs=3000,signal,onPending}={}) {
+export function writeMetadataRecord(db,kind,key,value,{timeoutMs=3000,signal,onPending}={}) {
     return new Promise((resolve,reject)=>{
         if(!Number.isSafeInteger(timeoutMs)||timeoutMs<=0||timeoutMs>0x7fffffff){reject(new RangeError('Invalid metadata write timeout'));return;}
         if(signal?.aborted){reject(signal.reason||new Error('E_STORAGE_ABORT: metadata write cancelled'));return;}
@@ -879,13 +911,15 @@ function writeMetadataRecord(db,kind,key,value,{timeoutMs=3000,signal,onPending}
         const abort=()=>stop(signal.reason||new Error('E_STORAGE_ABORT: metadata write cancelled'));
         signal?.addEventListener('abort',abort,{once:true});
         try{
-            tx=db.transaction(kind,'readwrite');const store=tx.objectStore(kind);r=store.get(key);
+            const storeKind=kind==='profile_values'?'profile':kind,recordKey=kind==='profile_values'?[...key,'values']:key;
+            tx=db.transaction(storeKind,'readwrite');const store=tx.objectStore(storeKind);r=store.get(recordKey);
             r.onsuccess=()=>{
                 if(settled||blocked)return;
                 try{
                     const prior=validateMetadataRecord(kind,r.result);
-                    const next=kind==='profile'?[...new Set([...prior,...value])].sort():value;
-                    put=store.put(next,key);written=true;
+                    const next=kind==='profile'?[...new Set([...prior,...value])].sort():kind==='profile_values'?{...prior,...value}:value;
+                    validateMetadataRecord(kind,next);
+                    put=store.put(next,recordKey);written=true;
                     put.onsuccess=()=>{if(!settled)putSucceeded=true;};
                 }catch(error){stop(error);}
             };
@@ -1378,6 +1412,10 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     const startup=await storage.run(db=>readStartupMetadata(db,sharedKey)).catch(error=>({
         preferences:null,profile:[],failures:['preferences','profile'].map(kind=>({kind,message:String(error)})),
     }));
+    if(program.requires?.includes('story.profile-value.v1')){
+        try{startup.profileValues=await storage.run(db=>readMetadataRecord(db,'profile_values',sharedKey));}
+        catch(error){startup.profileValues={};startup.failures.push({kind:'profile_values',message:String(error)});}
+    }
     const metadataReadFailures=new Map(startup.failures.map(f=>[f.kind,f.message])),metadataWriteFailures=new Set(),metadataPendingWrites=new Set();
     let preferences=initialRuntimePreferences(program,startup.preferences,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches);
     observe('preferences_loaded');
@@ -1443,6 +1481,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     engine.set_profiling(trace.enabled);
     // Apply metadata before exposing input or submitting boot presentation.
     engine.host_event('profile',stringifyPlayerData(startup.profile));
+    if(startup.profileValues)engine.host_event('profile_values',stringifyPlayerData(startup.profileValues));
     for(const failure of startup.failures)engine.host_event('persistence_read_failed',stringifyPlayerData(failure));
     if(engine.remote)await engine.sync();
     preferences=JSON.parse(engine.state()).preferences;
@@ -1657,6 +1696,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
                 if(row.error){failed(row.kind,row.error);continue;}
                 metadataReadFailures.delete(row.kind);
                 if(row.kind==='preferences')hostEvent('preferences_recovered',initialRuntimePreferences(program,row.value,navigator.languages||[],matchMedia('(prefers-reduced-motion: reduce)').matches));
+                else if(row.kind==='profile_values'){hostEvent('profile_values_recovered',row.value);persistence.retry('profile_values');}
                 else {hostEvent('profile_recovered',row.value);persistence.retry('profile');}
             }}finally{finish();}
         },error=>{try{for(const kind of kinds)failed(kind,error);}finally{finish();}},{group:'metadata-retry'});
@@ -2017,6 +2057,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             return storage.run(db=>writePreferencesRecord(db,sharedKey,value,{onPending}));
         },
         mergeProfile:(keys,onPending)=>storage.run(db=>mergeProfileRecord(db,sharedKey,keys,{onPending})),
+        writeProfileValues:(values,onPending)=>storage.run(db=>writeMetadataRecord(db,'profile_values',sharedKey,values,{onPending})),
         stored:kind=>{metadataPendingWrites.delete(kind);metadataWriteFailures.delete(kind);hostEvent('persistence_stored',{kind});updateMetadataRecovery();},
         failed:(kind,error)=>{if(error?.code==='E_STORAGE_UNCERTAIN')metadataPendingWrites.add(kind);else metadataPendingWrites.delete(kind);metadataWriteFailures.add(kind);hostEvent('persistence_failed',{kind,message:String(error)});updateMetadataRecovery();},
     });
@@ -2057,6 +2098,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             case 'apply_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=v.eventGain*(preferences[`${v.bus}_volume`]??.5)*(v.bus==='voice'?characterVoiceGain(preferences,v.character):1);break;
             case 'persist_preferences':preferences=c.preferences;for(const v of voices.values())v.gain.gain.value=v.eventGain*(preferences[`${v.bus}_volume`]??.5)*(v.bus==='voice'?characterVoiceGain(preferences,v.character):1);persistence.submit('preferences',preferences);break;
             case 'persist_profile':persistence.submit('profile',c.keys);break;
+            case 'persist_profile_values':persistence.submit('profile_values',c.values);break;
             case 'export':{
                 let url;
                 try {
@@ -2108,6 +2150,12 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             audioRecoveryPanel.style.maxHeight=`${Math.max(0,height-top-16)}px`;
         }
         historyButton.hidden=state().screen!=='Menu'||state().menu_depth>0;
+        if(!historyButton.hidden){
+            const size=historyButton.getBoundingClientRect();
+            const position=overlayControlPosition(view.nodes,width,height,size.width,size.height);
+            if(position){historyButton.style.right=`${width-position[0]-size.width}px`;historyButton.style.top=`${position[1]}px`;}
+            else historyButton.hidden=true;
+        }
         document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
         if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=focusIdentity(document.activeElement?.dataset?.action);nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.setAttribute('aria-label',n.label);b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;if(['range','scrollbar'].includes(n.value?.type)){b.setAttribute('role','slider');b.setAttribute('aria-valuemin',n.value.min??0);b.setAttribute('aria-valuemax',n.value.max);b.setAttribute('aria-valuenow',n.value.value);if(n.value.type==='scrollbar')b.setAttribute('aria-orientation','vertical');}else if(n.value?.type==='toggle'){b.setAttribute('role','switch');b.setAttribute('aria-checked',String(n.value.checked));}b.dataset.action=JSON.stringify(n.action);b.dataset.control=String(n.id);b.dataset.rect=JSON.stringify(n.rect);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,{...context,loading:state().loading});b.onfocus=()=>{deliver(()=>{mutateEngine(()=>engine.focus_control(n.id));mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2));},'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>{document.querySelector('#focus-ring').style.display='none';deliver(()=>mutateEngine(()=>engine.focus_control(undefined)),'input');};nav.append(b);if(focusIdentity(b.dataset.action)===focused)b.focus({preventScroll:true});}}
         if(pendingFocusId!==null){const target=pendingFocusId;pendingFocusId=null;if(target.session===s.session&&target.interaction===s.interaction&&target.screen===s.screen)document.querySelector(`#actions button[data-control="${target.id}"]`)?.focus({preventScroll:true});}
@@ -2186,7 +2234,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         down=null;
     };
     let hoverTarget;
-    const moveAsync=async(e,valid)=>{if(barPointer===e.pointerId){barGesture(1,e.clientX,e.clientY);return;}if(!['Title','Menu'].includes(state().screen)){hoverTarget=undefined;return;}const target=await engine.hit(e.clientX,e.clientY);if(!valid())return;if(target===hoverTarget&&!state().history_scrollbar)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
+    const moveAsync=async(e,valid)=>{if(barPointer===e.pointerId){barGesture(1,e.clientX,e.clientY);return;}if(!['Title','Menu','Story'].includes(state().screen)){hoverTarget=undefined;return;}const target=await engine.hit(e.clientX,e.clientY);if(!valid())return;if(target===hoverTarget&&!state().history_scrollbar)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
     const pointerQueue=new SerialInputQueue(error=>reportHostFailure(error,'pointer'));
     const pointerEvent=(fn,e)=>{const s=state(),context={session:s.session,interaction:s.interaction,screen:s.screen,loading:s.loading};const data={button:e.button,pointerId:e.pointerId,clientX:e.clientX,clientY:e.clientY,context};pointerQueue.push(fn,data,fn===moveAsync?`move:${e.pointerId}`:null);};
     const onDown=e=>{const blocked=audioBlocked;unlock();if(blocked)cancelPointer();pointerEvent(async(data,valid)=>{
@@ -2195,7 +2243,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     },e);};
     const onUp=e=>pointerEvent(upAsync,e);
     const onMove=e=>pointerEvent(moveAsync,e);
-    const onLeave=()=>pointerQueue.push(()=>{if(barPointer!==null)return;down=null;hoverTarget=undefined;if(['Title','Menu'].includes(state().screen))deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');},null);
+    const onLeave=()=>pointerQueue.push(()=>{if(barPointer!==null)return;down=null;hoverTarget=undefined;if(['Title','Menu','Story'].includes(state().screen))deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');},null);
     const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action(scrollAction(view,e.deltaY>0?1:-1));}};
     const heldControls=new Set();
     const releaseHeld=()=>{if(!heldControls.size)return;heldControls.clear();action({type:'hold_skip',pressed:false});};

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization;
@@ -80,14 +81,32 @@ struct Fragment {
     #[serde(default)]
     scenes: BTreeMap<String, Vec<Node>>,
     #[serde(default)]
+    sprite_timelines: BTreeMap<String, SpriteTimeline>,
+    #[serde(default)]
     cues: BTreeMap<String, Cue>,
     #[serde(default)]
     choices: BTreeMap<String, Choice>,
+}
+pub(crate) fn validate_generated_fragment(fragment: &serde_json::Value) -> Result<()> {
+    let fragment: Fragment =
+        serde_json::from_value(fragment.clone()).context("E_SCHEMA: generated story fragment")?;
+    let mut operations = BTreeMap::new();
+    for (function, body) in &fragment.functions {
+        for (block, body) in &body.blocks {
+            for op in &body.ops {
+                if let Some(previous) = operations.insert(&op.id, (function, block)) {
+                    bail!("E_DUPLICATE: generated operation {} at {function}/{block}; previously at {}/{}", op.id, previous.0, previous.1);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 struct ModuleFragments {
     module: Module,
     functions: BTreeMap<String, Function>,
     scenes: BTreeMap<String, Vec<Node>>,
+    sprite_timelines: BTreeMap<String, SpriteTimeline>,
     cues: BTreeMap<String, Cue>,
     choices: BTreeMap<String, Choice>,
 }
@@ -157,11 +176,25 @@ pub(crate) fn forward_slashes(path: &Path) -> String {
         .join("/")
 }
 fn read(path: &Path) -> Result<Vec<u8>> {
+    read_limited(path, 64 * 1024 * 1024)
+}
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let len = fs::metadata(path)?.len();
-    if len > 64 * 1024 * 1024 {
-        bail!("E_LIMIT: source file {} exceeds 64 MiB", path.display());
+    if len > limit {
+        bail!(
+            "E_LIMIT: source file {} exceeds {limit} bytes",
+            path.display()
+        );
     }
-    let b = fs::read(path)?;
+    // Check the actual read as well, in case the source grows after metadata.
+    let mut b = Vec::with_capacity(len as usize);
+    fs::File::open(path)?.take(limit + 1).read_to_end(&mut b)?;
+    if b.len() as u64 > limit {
+        bail!(
+            "E_LIMIT: source file {} exceeds {limit} bytes",
+            path.display()
+        );
+    }
     if b.starts_with(b"version https://git-lfs.github.com/spec/v1") {
         bail!(
             "E_LFS_POINTER: fetch the media bytes for {}",
@@ -283,6 +316,7 @@ fn qualify_cue_refs(module: &str, cue: &mut Cue, namespaced: bool) {
         match &mut def.effect {
             Effect::AudioStop { target, .. } => *target = format!("{module}.{target}"),
             Effect::StagePresent { scene, .. } => *scene = format!("{module}.{scene}"),
+            Effect::SpriteTimeline { timeline, .. } => *timeline = format!("{module}.{timeline}"),
             Effect::Dialogue { text, speaker, .. } => {
                 *text = format!("{module}.{text}");
                 if !speaker.is_empty() {
@@ -422,6 +456,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         functions: BTreeMap::new(),
         modules: BTreeMap::new(),
         scenes: BTreeMap::new(),
+        sprite_timelines: BTreeMap::new(),
         cues: BTreeMap::new(),
         choices: BTreeMap::new(),
         texts: texts.contracts,
@@ -447,6 +482,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         }
         if !f.functions.is_empty()
             || !f.scenes.is_empty()
+            || !f.sprite_timelines.is_empty()
             || !f.cues.is_empty()
             || !f.choices.is_empty()
         {
@@ -461,6 +497,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             module: module.clone(),
             functions: BTreeMap::new(),
             scenes: BTreeMap::new(),
+            sprite_timelines: BTreeMap::new(),
             cues: BTreeMap::new(),
             choices: BTreeMap::new(),
         };
@@ -493,6 +530,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             }
             merge(&mut loaded.functions, f.functions, &path)?;
             merge(&mut loaded.scenes, f.scenes, &path)?;
+            merge(&mut loaded.sprite_timelines, f.sprite_timelines, &path)?;
             merge(&mut loaded.cues, f.cues, &path)?;
             merge(&mut loaded.choices, f.choices, &path)?;
         }
@@ -549,8 +587,27 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 .functions
                 .insert(id, FunctionSignature::from(&function));
         }
-        for (id, nodes) in loaded.scenes {
+        for (id, mut timeline) in loaded.sprite_timelines {
             let key = module_key(&loaded.module.id, &id, namespaced);
+            if timeline.id != id {
+                bail!("E_TIMELINE: declaration identity mismatch");
+            }
+            timeline.id = key.clone();
+            if program
+                .sprite_timelines
+                .insert(key.clone(), timeline)
+                .is_some()
+            {
+                bail!("E_DUPLICATE: sprite timeline {key}");
+            }
+        }
+        for (id, mut nodes) in loaded.scenes {
+            let key = module_key(&loaded.module.id, &id, namespaced);
+            for node in &mut nodes {
+                if let Some(timeline) = node.timeline_binding.as_mut() {
+                    *timeline = module_key(&loaded.module.id, timeline, namespaced);
+                }
+            }
             if program.scenes.insert(key.clone(), nodes).is_some() {
                 bail!("E_DUPLICATE: scene {key}");
             }
@@ -639,7 +696,14 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                     bail!("E_PATH_COLLISION: {old} / {local}");
                 }
             }
-            let mut bytes = read(&source_path)?;
+            // Imported PCM is an offline intermediate. Allow the bounded
+            // 128 MiB payload plus WAV headers without increasing script,
+            // image, font or runtime admission limits.
+            let mut bytes = if source.kind == AssetKind::Audio {
+                read_limited(&source_path, 128 * 1024 * 1024 + 64 * 1024)?
+            } else {
+                read(&source_path)?
+            };
             if let Some(recipe) = &source.font {
                 if source.kind != AssetKind::Font {
                     bail!("E_FONT_RECIPE: font recipe requires kind = font");
@@ -823,6 +887,76 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         program.requires.retain(|cap| cap != "task.compose.v1");
     }
     if !program
+        .scenes
+        .values()
+        .flatten()
+        .any(|node| node.sprite_transform.is_some())
+        && !program
+            .sprite_timelines
+            .values()
+            .flat_map(|t| &t.tracks)
+            .flat_map(|t| &t.frames)
+            .any(|f| f.transform.is_some())
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.sprite-transform.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .any(|b| {
+            matches!(
+                b.terminator,
+                Terminator::Await {
+                    on_advance: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        program.requires.retain(|c| c != "control.advance-wait.v1");
+    }
+    if program.sprite_timelines.is_empty()
+        && !program
+            .scenes
+            .values()
+            .flatten()
+            .any(|n| n.timeline_binding.is_some())
+        && !program.cues.values().flat_map(|c| &c.effects).any(|d| {
+            d.effect
+                .effect_tree_any(&|e| matches!(e, Effect::SpriteTimeline { .. }))
+        })
+    {
+        program.requires.retain(|c| c != "stage.sprite-timeline.v1");
+    }
+    if !program
+        .scenes
+        .values()
+        .flatten()
+        .any(|node| node.inherit_existence)
+        && !program
+            .cues
+            .values()
+            .flat_map(|cue| &cue.effects)
+            .any(|def| {
+                def.effect.effect_tree_any(&|effect| {
+                    matches!(
+                        effect,
+                        Effect::SpriteTimeline {
+                            delete_on_finish: true,
+                            ..
+                        }
+                    )
+                })
+            })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.sprite-lifecycle.v1");
+    }
+    if !program
         .functions
         .values()
         .flat_map(|f| f.blocks.values())
@@ -885,6 +1019,16 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                 }
             )
         })
+        && !program
+            .cues
+            .values()
+            .flat_map(|cue| &cue.effects)
+            .any(|def| {
+                def.effect.effect_tree_any(&|effect| {
+                    matches!(effect, Effect::StagePresent {
+                dialogue_visible: Some(_), duration_us, .. } if duration_us.0 > 0)
+                })
+            })
     {
         program
             .requires
@@ -900,8 +1044,280 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
             .requires
             .retain(|cap| cap != "player.hide-policy.v1");
     }
-    if program.theme.dialogue.shadow.is_none() {
+    if program.theme.dialogue.shadow.is_none()
+        && program
+            .theme
+            .dialogue_styles
+            .values()
+            .all(|style| style.dialogue.shadow.is_none())
+    {
         program.requires.retain(|cap| cap != "text.shadow.v1");
+    }
+    if !program
+        .locales
+        .values()
+        .flat_map(|texts| texts.values())
+        .flat_map(|text| &text.spans)
+        .any(|s| matches!(s, nir_format::Span::Pause { .. }))
+    {
+        program.requires.retain(|c| c != "text.pause.v1");
+    }
+    if !program
+        .locales
+        .values()
+        .flat_map(|texts| texts.values())
+        .flat_map(|text| &text.spans)
+        .any(|s| matches!(s, nir_format::Span::Ruby { .. }))
+    {
+        program.requires.retain(|c| c != "text.ruby.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op.operation, Operation::ProfileRead { .. }))
+    {
+        program.requires.retain(|c| c != "story.profile-read.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| {
+            matches!(
+                op.operation,
+                Operation::ProfileValueRead { .. } | Operation::ProfileValueAssign { .. }
+            )
+        })
+    {
+        program.requires.retain(|c| c != "story.profile-value.v1");
+    }
+    if !program
+        .scenes
+        .values()
+        .flatten()
+        .any(|n| n.bitmap_text.is_some())
+    {
+        program.requires.retain(|c| c != "stage.bitmap-text.v1");
+    }
+    if !program
+        .scenes
+        .values()
+        .flatten()
+        .any(|n| !n.preserve_pose.is_empty())
+    {
+        program
+            .requires
+            .retain(|c| c != "stage.sprite-continuity.v1");
+    }
+    if !program.uses_float80() {
+        program.requires.retain(|c| c != "story.float80.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::DialogueShake { .. }))
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.dialogue-shake.v1");
+    }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def|
+        def.effect.effect_tree_any(&|effect| matches!(effect, Effect::StagePresent { inherit_images, .. } if !inherit_images.is_empty()))) {
+        program.requires.retain(|cap| cap != "stage.inherit-image.v1");
+    }
+    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def|
+        def.effect.effect_tree_any(&|effect| matches!(effect, Effect::StagePresent { inherit_image_geometry, .. } if !inherit_image_geometry.is_empty()))) {
+        program.requires.retain(|cap| cap != "stage.inherit-image-geometry.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::SpriteShake { .. }))
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.sprite-shake.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect.effect_tree_any(&|effect| {
+                matches!(
+                    effect,
+                    Effect::SpriteShake {
+                        mode: nir_format::SpriteShakeMode::Quake,
+                        ..
+                    }
+                )
+            })
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.sprite-quake.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::SourceMotion { .. }))
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.source-motion.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect.effect_tree_any(&|effect| {
+                matches!(
+                    effect,
+                    Effect::SourceMotion {
+                        property: nir_format::Property::Opacity,
+                        ..
+                    }
+                )
+            })
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "stage.source-opacity.v1");
+    }
+    if program.theme.dialogue_styles.is_empty() {
+        program.requires.retain(|cap| cap != "dialogue.style.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::DialogueDecoration { .. }))
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "dialogue.decoration.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::StoryModal { .. }))
+        })
+    {
+        program.requires.retain(|cap| cap != "ui.story-modal.v1");
+    }
+    if !program.texts.values().any(|t| !t.images.is_empty()) {
+        program.requires.retain(|c| c != "text.inline-image.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect.effect_tree_any(&|effect| {
+                matches!(
+                    effect,
+                    Effect::StagePresent {
+                        dialogue_visible: Some(_),
+                        ..
+                    }
+                )
+            })
+        })
+    {
+        program.requires.retain(|cap| cap != "stage.window-flip.v1");
+    }
+    if !program
+        .cues
+        .values()
+        .flat_map(|cue| &cue.effects)
+        .any(|def| {
+            def.effect
+                .effect_tree_any(&|effect| matches!(effect, Effect::SpriteWave { .. }))
+        })
+        && !program
+            .scenes
+            .values()
+            .flatten()
+            .any(|node| node.offset != [0.; 2])
+    {
+        program.requires.retain(|cap| cap != "stage.sprite-wave.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op.operation, Operation::MenuAccess { .. }))
+    {
+        program.requires.retain(|c| c != "player.menu-access.v1");
+    }
+    if program.theme.image_menus.len() <= 64 {
+        program.requires.retain(|c| c != "ui.menu-pages.v1");
+    }
+    if !program
+        .choices
+        .values()
+        .flat_map(|c| &c.options)
+        .any(|o| o.image.is_some())
+    {
+        program.requires.retain(|c| c != "choice.image.v1");
+    }
+    if !program
+        .choices
+        .values()
+        .flat_map(|choice| &choice.options)
+        .any(|option| {
+            option
+                .image
+                .as_ref()
+                .is_some_and(|image| image.disabled_asset.is_some())
+        })
+    {
+        program
+            .requires
+            .retain(|cap| cap != "choice.disabled-image.v1");
+    }
+    if program.theme.dialogue.text_rect.is_none()
+        && program
+            .theme
+            .dialogue_styles
+            .values()
+            .all(|style| style.dialogue.text_rect.is_none())
+    {
+        program.requires.retain(|cap| cap != "text.rect.v1");
+    }
+    if !program
+        .functions
+        .values()
+        .flat_map(|f| f.blocks.values())
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op.operation, Operation::AudioPause { .. }))
+    {
+        program.requires.retain(|cap| cap != "audio.pause.v1");
     }
     if !program.cues.values().flat_map(|c| &c.effects).any(
         |d| matches!(&d.effect,Effect::StagePresent {transition,..} if transition.capability()==Some("stage.wipe.v1")),
@@ -1177,6 +1593,16 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
             .values()
             .flat_map(nir_format::ImageMenu::effect_assets),
     );
+    for image in p
+        .choices
+        .values()
+        .flat_map(|choice| &choice.options)
+        .filter_map(|option| option.image.as_ref())
+    {
+        roots.insert(image.asset.clone());
+        roots.extend(image.hover_asset.iter().cloned());
+        roots.extend(image.disabled_asset.iter().cloned());
+    }
     // Every scene declaration is shipped in one module Static package, so its
     // media identity must be in the root index even when the scene is not the
     // current title scene. Media bytes remain lazy at runtime.
@@ -1189,6 +1615,12 @@ pub fn runtime_roots(p: &Program) -> BTreeSet<String> {
                 roots.extend(transition.asset().map(str::to_owned));
             }
             effect.effect.collect_audio_assets(&mut roots);
+            effect
+                .effect
+                .collect_text_image_assets(&p.texts, &mut roots);
+            effect
+                .effect
+                .collect_dialogue_style_assets(&p.theme, &mut roots);
         }
     }
     // Window reveal masks are committed by mid-block operations, not cue

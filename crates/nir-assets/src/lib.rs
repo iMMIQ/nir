@@ -82,6 +82,37 @@ pub struct Reservation {
     ids: BTreeSet<String>,
 }
 impl Reservation {
+    /// Resize a resource owned exclusively by this one-resource lease.
+    /// Admission failure preserves the previous cost and all pins.
+    pub fn resize_single(&mut self, bytes: u64) -> Result<()> {
+        let mut ledger = self.ledger.0.borrow_mut();
+        let id = self
+            .ids
+            .iter()
+            .next()
+            .filter(|_| self.ids.len() == 1)
+            .ok_or_else(|| Diagnostic::new("E_BUDGET", "resize", "expected one owned resource"))?;
+        let entry = &ledger.items[id];
+        if entry.pins != 1 {
+            return Err(Diagnostic::new(
+                "E_BUDGET",
+                "resize",
+                "resource has shared owners",
+            ));
+        }
+        let old = entry.bytes;
+        let extra = bytes.saturating_sub(old);
+        if extra > ledger.limit.saturating_sub(ledger.used) {
+            return Err(Diagnostic::new(
+                "E_BUDGET",
+                "resize",
+                "surface extent exceeds available memory",
+            ));
+        }
+        ledger.used = ledger.used - old + bytes;
+        ledger.items.get_mut(id).unwrap().bytes = bytes;
+        Ok(())
+    }
     /// Release this lease's pins on resources no longer used by the owner.
     /// Other active/preparation leases retain their independent pins.
     pub fn retain(&mut self, assets: &BTreeSet<String>) {
@@ -172,6 +203,34 @@ impl PrepareJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exclusive_resize_admits_atomically_and_releases_the_updated_cost() {
+        let ledger = BudgetLedger::new(100);
+        let mut surface = ledger
+            .reserve(&BTreeMap::from([("surface".into(), 30)]))
+            .unwrap();
+        let media = ledger
+            .reserve(&BTreeMap::from([("music".into(), 60)]))
+            .unwrap();
+        surface.resize_single(40).unwrap();
+        assert_eq!(ledger.used(), 100);
+        assert!(surface.resize_single(41).is_err());
+        assert_eq!(ledger.used(), 100);
+        assert_eq!(ledger.pins(), 2);
+        surface.resize_single(20).unwrap();
+        assert_eq!(ledger.used(), 80);
+        let shared = ledger
+            .reserve(&BTreeMap::from([("surface".into(), 20)]))
+            .unwrap();
+        assert!(surface.resize_single(10).is_err());
+        assert_eq!(ledger.used(), 80);
+        drop(shared);
+        drop(surface);
+        assert_eq!(ledger.used(), 60);
+        drop(media);
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn trimming_one_lease_preserves_other_owners() {
         let ledger = BudgetLedger::new(100);

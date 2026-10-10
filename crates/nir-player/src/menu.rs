@@ -398,6 +398,7 @@ impl Player {
                     }),
                     speaker: h.speaker.clone(),
                     text: h.text.clone(),
+                    images: h.images.clone(),
                     locale: h.locale.clone(),
                     font_plan_digest: h.font_plan_digest.clone(),
                     font_assets: core.program().locale_config.text[&h.locale].fonts.clone(),
@@ -672,6 +673,7 @@ impl Player {
                             }),
                             speaker: h.speaker.clone(),
                             text: h.text.clone(),
+                            images: h.images.clone(),
                             locale: h.locale.clone(),
                             font_plan_digest: h.font_plan_digest.clone(),
                             font_assets: self.core.program().locale_config.text[&h.locale]
@@ -1192,7 +1194,69 @@ impl Player {
         false
     }
 
-    pub(super) fn commit_close(&mut self, cancelled_slot_restore: bool) -> Result<()> {
+    pub(super) fn story_modal(&self) -> Option<(u32, u32, nir_format::StoryModalTarget)> {
+        self.core.state().tasks.values().find_map(|task| {
+            if task.state != nir_core::TaskState::Running {
+                return None;
+            }
+            if let Effect::StoryModal { target } = &task.effect {
+                Some((task.id, task.modal_interaction?, target.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(super) fn open_story_modal(&mut self) -> Result<()> {
+        if self.screen != Screen::Story || self.core.state().fault.is_some() {
+            return Ok(());
+        }
+        let Some((_, _, target)) = self.story_modal() else {
+            return Ok(());
+        };
+        self.return_screen = Screen::Story;
+        self.held_skip = false;
+        self.set_interface_hidden(false);
+        self.menu_session.menu.clear();
+        self.overlay_menu = None;
+        self.screen = match target {
+            nir_format::StoryModalTarget::ImageMenu { menu } => {
+                self.overlay_menu = Some(menu);
+                Screen::Menu
+            }
+            nir_format::StoryModalTarget::LoadSaves | nir_format::StoryModalTarget::SaveSaves => {
+                Screen::Saves
+            }
+        };
+        self.pauses.insert_barrier("menu".into());
+        if self.screen == Screen::Saves {
+            self.commands.push(AppCommand::ListSaves);
+        }
+        Ok(())
+    }
+
+    pub(super) fn story_modal_load(&self) -> bool {
+        self.story_modal()
+            .is_some_and(|(_, _, target)| matches!(target, nir_format::StoryModalTarget::LoadSaves))
+    }
+
+    pub(super) fn finish_story_modal(&mut self, budget: &mut u32) -> Result<()> {
+        if let Some((task, interaction, _)) = self.story_modal() {
+            self.step(CoreInput::ModalClosed { task, interaction }, budget)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_close(
+        &mut self,
+        cancelled_slot_restore: bool,
+        budget: &mut u32,
+    ) -> Result<()> {
+        // Complete the owner while the old page is still visible. Its
+        // continuation may request content, but cannot reopen the old modal.
+        if self.return_screen == Screen::Story {
+            self.finish_story_modal(budget)?;
+        }
         self.cancel_menu_preparation();
         self.screen = self.return_screen;
         self.pauses.remove("menu");
@@ -1235,9 +1299,10 @@ impl Player {
         match kind {
             DeferredExitKind::CloseScreen {
                 cancelled_slot_restore,
-            } => self.commit_close(cancelled_slot_restore)?,
+            } => self.commit_close(cancelled_slot_restore, budget)?,
             DeferredExitKind::ReadingClose { mode } => {
                 let toggle = self.commit_reading_close(mode)?;
+                self.finish_story_modal(budget)?;
                 self.action(toggle, interaction, sequence, budget)?;
             }
         }

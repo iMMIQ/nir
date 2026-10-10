@@ -38,10 +38,13 @@ pub struct DialogueView {
     pub font_plan_digest: String,
     pub font_assets: Vec<String>,
     pub emphasis: Vec<(usize, usize)>,
+    pub ruby: Vec<(usize, usize, String)>,
+    pub images: Vec<InlineImagePlacement>,
 }
 #[derive(Debug, Clone)]
 pub struct ChoiceView {
     pub id: String,
+    pub image: Option<nir_format::ChoiceImage>,
     pub label: String,
     pub enabled: bool,
     /// Semantic selection cursor of a typed-result interaction. Hover and
@@ -58,6 +61,7 @@ pub struct HistoryView {
     pub choice: Option<HistoryChoiceKind>,
     pub speaker: String,
     pub text: String,
+    pub images: Vec<InlineImagePlacement>,
     pub locale: String,
     pub font_plan_digest: String,
     pub font_assets: Vec<String>,
@@ -141,6 +145,7 @@ pub struct UiModel {
     pub stage: [f32; 2],
     pub dialogue: Option<DialogueView>,
     pub hidden_dialogue: bool,
+    pub advance_wait: bool,
     /// In-flight message-window reveal; `None` (including under reduced
     /// motion) keeps the committed hidden/visible state with no interpolation.
     pub window_transition: Option<WindowTransition>,
@@ -154,6 +159,10 @@ pub struct UiModel {
     pub menu_element_animations: std::collections::BTreeMap<String, ElementAnimation>,
     pub interface_hidden: bool,
     pub dialogue_appearance: nir_format::DialogueAppearance,
+    pub dialogue_decorations: std::collections::BTreeMap<
+        nir_format::DialogueDecorationSlot,
+        nir_format::DialogueDecoration,
+    >,
     pub choices: Vec<ChoiceView>,
     /// The pending interaction declares an explicit cancel target.
     pub choice_cancellable: bool,
@@ -184,6 +193,7 @@ pub struct UiModel {
     pub save_confirmation: Option<(u32, u32)>,
     pub busy_slots: std::collections::BTreeSet<u32>,
     pub can_save: bool,
+    pub menu_disabled: bool,
     /// A live replay owns the session: replay entries close, the exit opens,
     /// and storage services hide until the frozen session returns.
     pub replay_active: bool,
@@ -205,6 +215,7 @@ pub struct UiModel {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Quad {
     pub rect: [f32; 4],
+    pub corners: Option<[[f32; 2]; 4]>,
     pub color: [f32; 4],
     pub asset: Option<String>,
     pub clip: Option<[f32; 4]>,
@@ -223,6 +234,8 @@ pub struct TextRun {
     pub line_height: f32,
     pub color: [f32; 4],
     pub emphasis: Vec<(usize, usize)>,
+    pub images: Vec<InlineImagePlacement>,
+    pub image_scale: f32,
     pub scroll: f32,
     pub clip: Option<[f32; 4]>,
     pub region: Option<ScrollRegion>,
@@ -516,6 +529,7 @@ impl DrawPacket {
 
     fn rect(&mut self, r: [f32; 4], c: [f32; 4]) {
         self.quads.push(Quad {
+            corners: None,
             rect: r,
             color: c,
             asset: None,
@@ -534,6 +548,8 @@ impl DrawPacket {
             line_height: size * 1.5,
             color: c,
             emphasis: vec![],
+            images: vec![],
+            image_scale: 1.,
             scroll: 0.,
             clip: None,
             region: None,
@@ -633,8 +649,8 @@ fn scene_layout(
             .collect();
         siblings.sort_by_key(|(i, n)| (n.order, *i));
         for (_, n) in siblings {
-            let x = t.x + n.x * t.scale;
-            let y = t.y + n.y * t.scale;
+            let x = t.x + (n.x + n.offset[0]) * t.scale;
+            let y = t.y + (n.y + n.offset[1]) * t.scale;
             let scale = t.scale * n.scale;
             let opacity = t.opacity * n.opacity;
             let clip = intersect(
@@ -655,6 +671,11 @@ fn scene_layout(
                     n.id.clone(),
                     Quad {
                         rect: [x, y, n.width * scale, n.height * scale],
+                        corners: n.sprite_transform.map(|transform| {
+                            transform
+                                .corners(n.width, n.height)
+                                .map(|[cx, cy]| [x + cx * scale, y + cy * scale])
+                        }),
                         color,
                         asset: n.asset.clone(),
                         clip,
@@ -769,6 +790,7 @@ fn menu_value_visual(
         let mut color = color;
         color[3] *= alpha;
         p.quads.push(Quad {
+            corners: None,
             rect,
             color,
             asset,
@@ -908,6 +930,12 @@ fn menu_node(
         color,
         order: 0,
         clip: e.clip,
+        timeline_binding: None,
+        inherit_existence: false,
+        sprite_transform: None,
+        bitmap_text: None,
+        preserve_pose: vec![],
+        offset: [0.; 2],
     }
 }
 fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel, messages: &Messages) {
@@ -1157,6 +1185,18 @@ fn menu_elements(packet: &mut DrawPacket, menu: &ImageMenu, m: &UiModel, message
                         run.locale = entry.locale.clone();
                         run.font_assets = entry.font_assets.clone();
                         run.font_plan_digest = entry.font_plan_digest.clone();
+                        run.images = entry
+                            .images
+                            .iter()
+                            .cloned()
+                            .map(|mut i| {
+                                if !entry.speaker.is_empty() {
+                                    i.offset += (entry.speaker.len() + 5) as u32;
+                                }
+                                i
+                            })
+                            .collect();
+                        run.image_scale = scale;
                         if let Some(mut rect) = voice_rect {
                             rect[0] += x;
                             rect[1] += ry;
@@ -1353,7 +1393,28 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
         &PanelOffsets::default(),
     );
     divert_menu_page(&mut p, m);
+    apply_dialogue_offset(&mut p, m);
     p
+}
+
+fn apply_dialogue_offset(packet: &mut DrawPacket, model: &UiModel) {
+    let offset = model.dialogue_appearance.text_offset;
+    if model.screen != Screen::Story || offset == [0.; 2] {
+        return;
+    }
+    let scale = (packet.width / model.stage[0]).min(packet.height / model.stage[1]);
+    for run in packet
+        .texts
+        .iter_mut()
+        .filter(|run| run.region == Some(ScrollRegion::Dialogue))
+    {
+        // The surface is stationary. Only content moves inside its original
+        // clip; scrolling, shaping, controls and the background keep geometry.
+        run.clip
+            .get_or_insert([run.x, run.y, run.width, run.height]);
+        run.x += offset[0] * scale;
+        run.y += offset[1] * scale;
+    }
 }
 
 /// Diverts the authored menu page into the offscreen page root while a
@@ -1386,6 +1447,7 @@ pub(crate) fn divert_menu_page(p: &mut DrawPacket, m: &UiModel) {
     let tail = p.quads.split_off(end);
     let quads = p.quads.split_off(start);
     p.quads.push(Quad {
+        corners: None,
         rect: [0., 0., p.width, p.height],
         color: [1., 1., 1., 1.],
         asset: Some("@menu".into()),
@@ -1546,6 +1608,7 @@ fn project_measured(
         p.transition_layers = Some((a.quads, b.quads, *progress));
         p.transition_style = m.transition_style.clone();
         p.quads.push(Quad {
+            corners: None,
             rect: [0., 0., width, height],
             color: [1., 1., 1., 1.],
             asset: Some("@transition".into()),
@@ -1568,6 +1631,7 @@ fn project_measured(
             let fade_flows = p.history_flow.is_some();
             let fade_bars = p.history_bar_view.is_some();
             p.quads.push(Quad {
+                corners: None,
                 rect: [ox, oy, m.stage[0] * scale, m.stage[1] * scale],
                 color: [1.; 4],
                 asset: Some(menu.background.clone()),
@@ -1601,6 +1665,7 @@ fn project_measured(
                     1.
                 };
                 p.quads.push(Quad {
+                    corners: None,
                     rect,
                     color: [dim, dim, dim, 1.],
                     asset: Some(asset.clone()),
@@ -1795,7 +1860,7 @@ fn project_measured(
         }
         Screen::Story => {
             let toolbar_bottom = 16. + if narrow { 52. } else { 0. } + 44.;
-            if m.hidden_dialogue {
+            if m.hidden_dialogue || m.advance_wait {
                 p.semantics.push(SemanticNode {
                     value: None,
                     id: p.semantics.len() as u32,
@@ -1841,14 +1906,19 @@ fn project_measured(
                 let padding = t.dialogue.padding * scale;
                 if let Some(asset) = &t.dialogue.background {
                     p.quads.push(Quad {
+                        corners: None,
                         rect: [left, top, box_width, h],
                         color: [1., 1., 1., t.dialogue.opacity],
                         asset: Some(asset.clone()),
                         clip: None,
                     });
                 } else {
-                    p.rect([left, top, box_width, h], t.panel);
-                    p.rect([left, top, 3., h], t.accent);
+                    let mut panel = t.panel;
+                    panel[3] *= t.dialogue.opacity;
+                    p.rect([left, top, box_width, h], panel);
+                    let mut accent = t.accent;
+                    accent[3] *= t.dialogue.opacity;
+                    p.rect([left, top, 3., h], accent);
                 }
                 if !d.speaker.is_empty() {
                     p.text(
@@ -1900,6 +1970,8 @@ fn project_measured(
                     line_height: size * t.dialogue.line_height,
                     color: t.text,
                     emphasis: d.emphasis.clone(),
+                    images: d.images.clone(),
+                    image_scale: scale,
                     scroll: 0.,
                     clip: None,
                     region: Some(ScrollRegion::Dialogue),
@@ -1915,6 +1987,20 @@ fn project_measured(
                     shadow.offset[1] *= scale;
                     shadow
                 });
+                if let Some(rect) = t.dialogue.text_rect {
+                    let run = p.texts.last_mut().unwrap();
+                    run.x = (width - m.stage[0] * scale) / 2. + rect[0] * scale;
+                    run.y = (height - m.stage[1] * scale) / 2. + rect[1] * scale;
+                    run.width = rect[2] * scale;
+                    run.height = rect[3] * scale;
+                }
+                if !d.ruby.is_empty() {
+                    let run = p.texts.last_mut().unwrap();
+                    let annotation_height = run.size * 0.6;
+                    run.y += annotation_height;
+                    run.height = (run.height - annotation_height).max(0.);
+                    run.line_height = run.line_height.max(run.size * 1.6);
+                }
                 p.announcement = d.full_text.clone();
                 p.announcement_locale = d.locale.clone();
                 {
@@ -1956,6 +2042,27 @@ fn project_measured(
                 for text in &mut p.texts[first_text..] {
                     text.color[3] *= appearance.opacity * appearance.text_opacity;
                 }
+                // Fixed stage geometry belongs to the dialogue visibility
+                // root, independent of text scrolling and font preferences.
+                let scale = (width / m.stage[0]).min(height / m.stage[1]);
+                let origin = [
+                    (width - m.stage[0] * scale) / 2.,
+                    (height - m.stage[1] * scale) / 2.,
+                ];
+                for image in m.dialogue_decorations.values() {
+                    p.quads.push(Quad {
+                        corners: None,
+                        rect: [
+                            origin[0] + image.rect[0] * scale,
+                            origin[1] + image.rect[1] * scale,
+                            image.rect[2] * scale,
+                            image.rect[3] * scale,
+                        ],
+                        color: [1., 1., 1., appearance.opacity],
+                        asset: Some(image.asset.clone()),
+                        clip: None,
+                    });
+                }
                 match m.window_transition.as_ref() {
                     // Uniform coverage is the dissolve ramp: fold it into the
                     // existing per-item opacity multiply.
@@ -1981,6 +2088,7 @@ fn project_measured(
                         let quads = p.quads.split_off(first_quad);
                         p.dialogue_hint_quad = None;
                         p.quads.push(Quad {
+                            corners: None,
                             rect: [0., 0., width, height],
                             color: [1., 1., 1., 1.],
                             asset: Some("@window".into()),
@@ -2001,12 +2109,60 @@ fn project_measured(
                     id: 0,
                     label: msg("continue"),
                     action: UiAction::Advance,
-                    enabled: !d.gate,
+                    enabled: !d.gate || m.advance_wait,
                     rect: [left, top, box_width, h],
                     locale: m.ui_locale.clone(),
                 });
             }
-            if !m.choices.is_empty() {
+            if !m.choices.is_empty() && m.choices.iter().all(|c| c.image.is_some()) {
+                let scale = (width / m.stage[0]).min(height / m.stage[1]);
+                let left = (width - m.stage[0] * scale) / 2.;
+                let top = (height - m.stage[1] * scale) / 2.;
+                for c in &m.choices {
+                    let image = c.image.as_ref().unwrap();
+                    let [x, y, w, h] = image.rect;
+                    let rect = [left + x * scale, top + y * scale, w * scale, h * scale];
+                    p.quads.push(Quad {
+                        corners: None,
+                        rect,
+                        color: [1.; 4],
+                        clip: None,
+                        asset: Some(
+                            if !c.enabled {
+                                image.disabled_asset.as_ref().unwrap_or(&image.asset)
+                            } else if c.selected
+                                || m.hovered_image.as_deref() == Some(c.id.as_str())
+                            {
+                                image.hover_asset.as_ref().unwrap_or(&image.asset)
+                            } else {
+                                &image.asset
+                            }
+                            .clone(),
+                        ),
+                    });
+                    p.semantics.push(SemanticNode {
+                        value: None,
+                        id: 0,
+                        label: c.label.clone(),
+                        action: UiAction::Choose {
+                            option: c.id.clone(),
+                        },
+                        enabled: c.enabled,
+                        rect,
+                        locale: c.locale.clone(),
+                    });
+                }
+                if m.choice_cancellable {
+                    let w = 160f32.min((width - 40.).max(80.));
+                    p.button(
+                        msg("cancel"),
+                        UiAction::CancelChoice,
+                        [(width - w) / 2., (height - 112.).max(0.), w, 44.],
+                        false,
+                        t,
+                    );
+                }
+            } else if !m.choices.is_empty() {
                 let w = t.choice.width.min((width - 40.).max(80.));
                 let gap = match t.slots.choice {
                     ChoiceComponent::Standard => 14.,
@@ -2097,6 +2253,9 @@ fn project_measured(
             let item_count = items.len();
             let columns = if narrow { 3 } else { item_count };
             for (i, (label, action)) in items.into_iter().enumerate() {
+                if m.menu_disabled && matches!(action, UiAction::Menu | UiAction::History) {
+                    continue;
+                }
                 let row = i / columns;
                 let column = i % columns;
                 let row_count = (item_count - row * columns).min(columns);
@@ -2650,8 +2809,9 @@ fn project_measured(
                             false,
                             t,
                         );
-                        p.semantics.last_mut().unwrap().enabled =
-                            slot.error.is_none() && !m.busy_slots.contains(&slot.slot);
+                        p.semantics.last_mut().unwrap().enabled = m.can_save
+                            && slot.error.is_none()
+                            && !m.busy_slots.contains(&slot.slot);
                         p.button(
                             msg(if slot.error.is_some() {
                                 "retry"
@@ -2748,6 +2908,18 @@ fn project_measured(
                             line_height: if narrow { 24. } else { 27. },
                             color: t.text,
                             emphasis: vec![],
+                            images: entry
+                                .images
+                                .iter()
+                                .cloned()
+                                .map(|mut i| {
+                                    if !entry.speaker.is_empty() {
+                                        i.offset += (entry.speaker.len() + 5) as u32;
+                                    }
+                                    i
+                                })
+                                .collect(),
+                            image_scale: 1.,
                             scroll: 0.,
                             clip: (scrollable_entry == Some(i)).then_some([
                                 x,
@@ -2871,6 +3043,8 @@ fn project_measured(
             line_height: 22.5,
             color: t.text,
             emphasis: vec![],
+            images: vec![],
+            image_scale: 1.,
             scroll: 0.,
             clip: None,
             region: None,
@@ -3141,7 +3315,7 @@ impl TextEngine {
     }
     pub fn key(run: &TextRun) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}:{:?}:{}",
             run.size.to_bits(),
             run.line_height.to_bits(),
             run.width.to_bits(),
@@ -3151,12 +3325,14 @@ impl TextEngine {
             run.font_assets,
             run.emphasis,
             run.text,
-            run.monochrome
+            run.monochrome,
+            run.images,
+            run.image_scale.to_bits()
         )
     }
     /// Original UTF-8 offsets for the exact paragraph splitter used by shaping.
     pub fn line_offsets(run: &TextRun) -> Vec<usize> {
-        let mut offsets: Vec<_> = if run.emphasis.is_empty() {
+        let mut offsets: Vec<_> = if run.emphasis.is_empty() && run.images.is_empty() {
             cosmic_text::LineIter::new(&run.text)
                 .map(|(range, _)| range.start)
                 .collect()
@@ -3240,7 +3416,74 @@ impl TextEngine {
                     Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
                     None => cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif),
                 };
-                if r.emphasis.is_empty() {
+                if !r.images.is_empty() {
+                    // The object-replacement character is a layout slot, never
+                    // a font glyph. Measure its advance in this exact font plan
+                    // and reserve the authored image width with rich metrics.
+                    let mut probe = cosmic_text::Buffer::new(
+                        &mut self.fonts,
+                        cosmic_text::Metrics::new(1., 1.),
+                    );
+                    probe.set_text(
+                        &mut self.fonts,
+                        "\u{fffc}",
+                        &attrs,
+                        cosmic_text::Shaping::Advanced,
+                    );
+                    probe.shape_until_scroll(&mut self.fonts, false);
+                    let unit_width = probe
+                        .layout_runs()
+                        .flat_map(|line| line.glyphs.iter())
+                        .map(|glyph| glyph.w)
+                        .sum::<f32>();
+                    let mut cuts = vec![0, r.text.len()];
+                    for &(start, end) in &r.emphasis {
+                        cuts.extend([start, end]);
+                    }
+                    for image in &r.images {
+                        cuts.extend([image.offset as usize, image.offset as usize + 3]);
+                    }
+                    cuts.sort_unstable();
+                    cuts.dedup();
+                    let mut spans = vec![];
+                    for range in cuts.windows(2) {
+                        let [start, end] = [range[0], range[1]];
+                        let Some(value) = r.text.get(start..end) else {
+                            continue;
+                        };
+                        let attr = if let Some(placement) = r
+                            .images
+                            .iter()
+                            .find(|i| i.offset as usize == start && end == start + 3)
+                        {
+                            let image = &placement.image;
+                            let width = (image.width + image.margins[0] + image.margins[1]) as f32
+                                * r.image_scale;
+                            let height = (image.height + image.margins[2] + image.margins[3])
+                                as f32
+                                * r.image_scale;
+                            attrs
+                                .clone()
+                                .metrics(cosmic_text::Metrics::new(1., height.max(r.line_height)))
+                                .letter_spacing(width - unit_width)
+                                .color(cosmic_text::Color::rgba(0, 0, 0, 0))
+                        } else if !r.monochrome
+                            && r.emphasis.iter().any(|&(a, b)| a <= start && end <= b)
+                        {
+                            attrs.clone().color(cosmic_text::Color::rgb(224, 202, 153))
+                        } else {
+                            attrs.clone()
+                        };
+                        spans.push((value, attr));
+                    }
+                    b.set_rich_text(
+                        &mut self.fonts,
+                        spans,
+                        &attrs,
+                        cosmic_text::Shaping::Advanced,
+                        None,
+                    );
+                } else if r.emphasis.is_empty() {
                     b.set_text(
                         &mut self.fonts,
                         &r.text,
@@ -3330,12 +3573,14 @@ mod scene_tests {
             stage_size: [1280, 720],
             transition_layers: Some((
                 vec![Quad {
+                    corners: None,
                     rect: [1., 2., 30., 40.],
                     color: [0.1, 0.2, 0.3, 1.],
                     asset: Some("old-bg".into()),
                     clip: None,
                 }],
                 vec![Quad {
+                    corners: None,
                     rect: [4., 5., 60., 70.],
                     color: [0.4, 0.5, 0.6, 1.],
                     asset: Some("new-bg".into()),
@@ -3653,7 +3898,60 @@ mod scene_tests {
             color: [1.; 4],
             order,
             clip: None,
+            timeline_binding: None,
+            inherit_existence: false,
+            sprite_transform: None,
+            bitmap_text: None,
+            preserve_pose: vec![],
+            offset: [0.; 2],
         }
+    }
+    #[test]
+    fn leaf_sprite_rotation_composes_with_ancestor_pose_and_fixed_parent_clip() {
+        let mut group = node("group", None, 0);
+        group.width = 0.;
+        group.height = 0.;
+        group.x = 10.;
+        group.y = 20.;
+        group.scale = 2.;
+        group.clip = Some([0., 0., 50., 50.]);
+        let mut child = node("sprite", Some("group"), 0);
+        child.width = 32.;
+        child.height = 24.;
+        child.x = 3.;
+        child.y = 4.;
+        child.offset = [5., -2.];
+        child.sprite_transform = Some(nir_format::SpriteTransform {
+            origin: [24., 0.],
+            basis_x: [0., 1.],
+            basis_y: [-1., 0.],
+        });
+        let packet = DrawPacket {
+            width: 1280.,
+            height: 720.,
+            ..Default::default()
+        };
+        let quads = scene_layout(&packet, &[group, child], [1280., 720.], 1.);
+        assert_eq!(quads.len(), 1);
+        assert_eq!(
+            quads[0].1.corners,
+            Some([[74., 24.], [74., 88.], [26., 24.], [26., 88.]])
+        );
+        assert_eq!(quads[0].1.clip, Some([10., 20., 100., 100.]));
+        let changed = DrawPacket {
+            width: 1280.,
+            height: 720.,
+            quads: quads.iter().map(|(_, q)| q.clone()).collect(),
+            ..Default::default()
+        };
+        let mut other = DrawPacket {
+            width: 1280.,
+            height: 720.,
+            quads: changed.quads.clone(),
+            ..Default::default()
+        };
+        other.quads[0].corners.as_mut().unwrap()[0][0] += 1.;
+        assert!(!changed.visual_eq(&other));
     }
     #[test]
     fn group_order_and_nested_clip_are_composed() {

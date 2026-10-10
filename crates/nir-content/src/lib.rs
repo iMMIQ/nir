@@ -8,6 +8,7 @@ use serde::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+pub mod interned;
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -96,7 +97,7 @@ pub fn parse_runtime_object(
     verify(bytes, &requirement.digest)?;
     match key {
         ContentKey::Static { module } => {
-            let package: ModuleStatic = parse(bytes, module)?;
+            let package: ModuleStatic = parse_package(root, bytes, module)?;
             if package.format != RUNTIME_FORMAT_VERSION || package.module != *module {
                 return Err(Diagnostic::new(
                     "E_STATIC",
@@ -133,7 +134,7 @@ pub fn parse_runtime_object(
             Ok(RuntimeObject::Static(package))
         }
         ContentKey::Code { module } => {
-            let package: ModuleCode = parse(bytes, module)?;
+            let package: ModuleCode = parse_package(root, bytes, module)?;
             let index = root.modules.get(module).unwrap();
             if package.format != RUNTIME_FORMAT_VERSION
                 || package.module != *module
@@ -157,7 +158,7 @@ pub fn parse_runtime_object(
             Ok(RuntimeObject::Code(package))
         }
         ContentKey::Text { module, locale } => {
-            let package: ModuleTexts = parse(bytes, module)?;
+            let package: ModuleTexts = parse_package(root, bytes, module)?;
             let index = root.modules.get(module).unwrap();
             if package.format != RUNTIME_FORMAT_VERSION
                 || package.module != *module
@@ -173,7 +174,7 @@ pub fn parse_runtime_object(
             Ok(RuntimeObject::Text(package))
         }
         ContentKey::Catalog { catalog } => {
-            let package: AssetCatalog = parse(bytes, catalog)?;
+            let package: AssetCatalog = parse_package(root, bytes, catalog)?;
             let expected: BTreeSet<_> = root
                 .assets
                 .iter()
@@ -343,6 +344,31 @@ impl<'de> Deserialize<'de> for Strict {
         de.deserialize_any(V)
     }
 }
+fn parse_package<T: DeserializeOwned>(root: &RuntimeProgram, bytes: &[u8], at: &str) -> Result<T> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(Diagnostic::new("E_LIMIT", at, "input exceeds 16 MiB"));
+    }
+    #[derive(Deserialize)]
+    struct EncodingProbe {
+        #[serde(default)]
+        package_encoding: Option<String>,
+    }
+    // Ignored fields are scanned without constructing the pool. The typed
+    // decoder validates its entire envelope, including duplicate fields.
+    let pooled = serde_json::from_slice::<EncodingProbe>(bytes)
+        .is_ok_and(|probe| probe.package_encoding.is_some());
+    if pooled {
+        if !root.requires.iter().any(|cap| cap == interned::CAPABILITY) {
+            return Err(Diagnostic::new("E_CAPABILITY", at, interned::CAPABILITY));
+        }
+        interned::decode_bytes(bytes, at)
+    } else {
+        let value: serde_json::Value = parse(bytes, at)?;
+        serde_json::from_value(value)
+            .map_err(|e| Diagnostic::new("E_JSON_SCHEMA", at, e.to_string()))
+    }
+}
+
 pub fn parse<T: DeserializeOwned>(bytes: &[u8], at: &str) -> Result<T> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(Diagnostic::new("E_LIMIT", at, "input exceeds 16 MiB"));
@@ -428,13 +454,15 @@ pub fn cue_assets(p: &Program, cue: &str) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     if let Some(c) = p.cues.get(cue) {
         for def in &c.effects {
+            def.effect.collect_text_image_assets(&p.texts, &mut set);
+            def.effect.collect_dialogue_style_assets(&p.theme, &mut set);
             match &def.effect {
                 Effect::StagePresent {
                     scene, transition, ..
                 } => {
                     set.extend(transition.asset().map(str::to_owned));
                     if let Some(nodes) = p.scenes.get(scene) {
-                        set.extend(nodes.iter().filter_map(|n| n.asset.clone()));
+                        set.extend(def.effect.stage_image_assets(nodes).cloned());
                     }
                 }
                 Effect::Audio { asset, .. } => {

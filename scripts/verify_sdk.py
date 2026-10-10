@@ -82,7 +82,9 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
     text = "こんにちは。"
     glyphs = b"".join(b"\x01" + u32(0xffffffff) * 2 + u32(0) +
                       struct.pack("<H", int.from_bytes(c.encode("cp932"), "big")) + u32(0) for c in text)
-    word = b"TpWord105" + u32(0) * 3 + u32(len(text)) + glyphs
+    # Glyph style 0 must reference a declared style, even without ruby.
+    style = bytes(22) + cp932("") + cp932("") + bytes(8)
+    word = b"TpWord105" + u32(1) + style + u32(0) * 2 + u32(len(text)) + glyphs
     target = u32(1) + b"\x01" + cp932("____arg") + u32(1) + b"\x04" + cp932("message")
     legacy = root / "legacy"
     legacy.mkdir()

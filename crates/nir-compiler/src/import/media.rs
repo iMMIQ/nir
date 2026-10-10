@@ -4,7 +4,7 @@ use image::{ImageEncoder, RgbaImage};
 use std::io::{Cursor, Read};
 
 const MAX_PIXELS: usize = 16 * 1024 * 1024;
-const MAX_AUDIO: usize = 64 * 1024 * 1024;
+const MAX_AUDIO: usize = 128 * 1024 * 1024;
 
 struct Bytes<'a> {
     data: &'a [u8],
@@ -57,6 +57,46 @@ fn inflate(data: &[u8], max: usize) -> Result<Vec<u8>> {
 }
 
 pub(super) fn gal_size(data: &[u8]) -> Result<(u32, u32)> {
+    if data.starts_with(b"GaleX200") {
+        let mut input = Bytes::new(data);
+        input.take(8)?;
+        let xml = galx_directory(input.blob()?)?;
+        let doc = roxmltree::Document::parse_with_options(
+            &xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: 16_384,
+            },
+        )?;
+        let root = doc.root_element();
+        ensure!(
+            root.tag_name().name() == "Frames"
+                && root.attribute("Version") == Some("200")
+                && root.attribute("Count") == Some("1"),
+            "E_IMPORT_GAL_FRAMES: expected static GaleX200"
+        );
+        ensure!(
+            root.attribute("Randomized") == Some("0"),
+            "E_IMPORT_GAL_ENCRYPTION: encrypted GAL is unsupported"
+        );
+        let width: u32 = root
+            .attribute("Width")
+            .context("E_IMPORT_GAL_XML: Width")?
+            .parse()?;
+        let height: u32 = root
+            .attribute("Height")
+            .context("E_IMPORT_GAL_XML: Height")?
+            .parse()?;
+        ensure!(
+            width > 0
+                && height > 0
+                && width <= 8192
+                && height <= 8192
+                && width as usize * height as usize <= MAX_PIXELS,
+            "E_IMPORT_GAL_SIZE: unsupported dimensions"
+        );
+        return Ok((width, height));
+    }
     ensure!(
         data.starts_with(b"Gale105") || data.starts_with(b"Gale106"),
         "E_IMPORT_GAL_VERSION: expected Gale105/106"
@@ -112,6 +152,9 @@ pub(super) fn tile(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaIma
 /// Single-frame GAL 105/106. Multiple visible layers are composited with their
 /// origin, opacity and color key. Unresolved forward block references fail.
 pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
+    if data.starts_with(b"GaleX200") {
+        return gal(&galx_container(data)?);
+    }
     let (width, height) = gal_size(data)?;
     let mut r = Bytes::new(data);
     r.take(7)?;
@@ -127,7 +170,7 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
     );
     let compression = header[22];
     ensure!(
-        compression <= 1,
+        compression <= 2,
         "E_IMPORT_GAL_COMPRESSION: unsupported compression"
     );
     let bw = int(header, 28)? as usize;
@@ -180,17 +223,38 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
         let packed = r.blob()?;
         let packed_alpha = r.blob()?;
         let limit = stride * fh + fw * fh * 8;
-        let unpacked;
-        let packed = if compression == 0 {
-            unpacked = inflate(packed, limit)?;
-            unpacked.as_slice()
+        let pixels = if compression == 2 {
+            use image::ImageDecoder;
+            ensure!(bpp == 24, "E_IMPORT_GAL_JPEG: expected RGB depth");
+            let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(packed))?;
+            ensure!(
+                decoder.dimensions() == (width, height),
+                "E_IMPORT_GAL_JPEG: inconsistent dimensions"
+            );
+            decoder.set_limits(image::Limits::default())?;
+            let rgb = image::DynamicImage::from_decoder(decoder)?.to_rgb8();
+            let mut output = vec![0u8; stride * fh];
+            for y in 0..fh {
+                for x in 0..fw {
+                    let c = rgb.get_pixel(x as u32, y as u32).0;
+                    output[y * stride + x * 3..y * stride + x * 3 + 3]
+                        .copy_from_slice(&[c[2], c[1], c[0]]);
+                }
+            }
+            output
         } else {
-            packed
+            let unpacked;
+            let packed = if compression == 0 {
+                unpacked = inflate(packed, limit)?;
+                unpacked.as_slice()
+            } else {
+                packed
+            };
+            blocks(packed, fw, fh, bpp / 8, bw, bh, &previous)?
         };
-        let pixels = blocks(packed, fw, fh, bpp / 8, bw, bh, &previous)?;
         let alpha = if has_alpha {
             let raw;
-            let packed_alpha = if compression == 0 {
+            let packed_alpha = if matches!(compression, 0 | 2) {
                 raw = inflate(packed_alpha, alpha_stride * fh + fw * fh * 8)?;
                 raw.as_slice()
             } else {
@@ -263,6 +327,165 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
         "E_IMPORT_GAL_TRAILING: unexpected bytes"
     );
     Ok(output)
+}
+
+/// GaleX200 uses a zlib XML directory and the same bounded pixel blocks as
+/// GAL106. Normalize its static directory, then reuse the raster compositor.
+/// Format references: pylivemaker galimage and GARbro LiveMaker ImageGALX.
+fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
+    let mut input = Bytes::new(data);
+    ensure!(
+        input.take(8)? == b"GaleX200",
+        "E_IMPORT_GAL_VERSION: expected GaleX200"
+    );
+    let clean = galx_directory(input.blob()?)?;
+    let doc = roxmltree::Document::parse_with_options(
+        &clean,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 16_384,
+        },
+    )
+    .context("E_IMPORT_GAL_XML: invalid XML")?;
+    let root = doc.root_element();
+    ensure!(root.tag_name().name() == "Frames", "E_IMPORT_GAL_XML: root");
+    let number = |node: roxmltree::Node<'_, '_>, name: &str| -> Result<i32> {
+        node.attribute(name)
+            .with_context(|| format!("E_IMPORT_GAL_XML: missing {name}"))?
+            .parse()
+            .with_context(|| format!("E_IMPORT_GAL_XML: invalid {name}"))
+    };
+    ensure!(
+        number(root, "Version")? == 200 && number(root, "Count")? == 1,
+        "E_IMPORT_GAL_FRAMES: expected static GaleX200"
+    );
+    ensure!(
+        number(root, "Randomized")? == 0,
+        "E_IMPORT_GAL_ENCRYPTION: encrypted GAL is unsupported"
+    );
+    let compression = number(root, "CompType")?;
+    ensure!(
+        (0..=2).contains(&compression),
+        "E_IMPORT_GAL_COMPRESSION: unsupported compression"
+    );
+    let width = number(root, "Width")?;
+    let height = number(root, "Height")?;
+    ensure!(
+        width > 0
+            && height > 0
+            && width <= 8192
+            && height <= 8192
+            && width as usize * height as usize <= MAX_PIXELS,
+        "E_IMPORT_GAL_SIZE: unsupported dimensions"
+    );
+    let frames: Vec<_> = root.children().filter(|n| n.is_element()).collect();
+    ensure!(
+        frames.len() == 1 && frames[0].tag_name().name() == "Frame",
+        "E_IMPORT_GAL_XML: frames"
+    );
+    let directories: Vec<_> = frames[0].children().filter(|n| n.is_element()).collect();
+    ensure!(
+        directories.len() == 1 && directories[0].tag_name().name() == "Layers",
+        "E_IMPORT_GAL_XML: layers"
+    );
+    let layers = directories[0];
+    let count = number(layers, "Count")?;
+    let bpp = number(layers, "Bpp")?;
+    ensure!(
+        (1..=64).contains(&count) && matches!(bpp, 8 | 24 | 32),
+        "E_IMPORT_GAL_LAYERS: count/depth"
+    );
+    ensure!(
+        number(layers, "Width")? == width
+            && number(layers, "Height")? == height
+            && number(root, "Bpp")? == bpp,
+        "E_IMPORT_GAL_SIZE: inconsistent frame dimensions"
+    );
+    let mut header = vec![0u8; 36];
+    for (offset, value) in [
+        (4, width),
+        (8, height),
+        (12, bpp),
+        (16, 1),
+        (28, number(root, "BlockWidth")?),
+        (32, number(root, "BlockHeight")?),
+    ] {
+        ensure!(value >= 0, "E_IMPORT_GAL_XML: negative header field");
+        header[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
+    }
+    header[22] = compression as u8;
+    let blob = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    };
+    let mut out = b"Gale106".to_vec();
+    blob(&mut out, &header);
+    blob(&mut out, b"");
+    out.extend_from_slice(&[0; 13]);
+    for value in [count, width, height, bpp] {
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    }
+    if bpp == 8 {
+        let rgb = layers
+            .children()
+            .find(|n| n.has_tag_name("RGB"))
+            .and_then(|n| n.text())
+            .context("E_IMPORT_GAL_PALETTE: missing palette")?;
+        ensure!(
+            rgb.len() <= 256 * 6 && rgb.len().is_multiple_of(6) && rgb.is_ascii(),
+            "E_IMPORT_GAL_PALETTE: size"
+        );
+        let mut palette = vec![0u8; 1024];
+        for (index, color) in rgb.as_bytes().as_chunks::<6>().0.iter().enumerate() {
+            let hex = std::str::from_utf8(color)?;
+            let c = u32::from_str_radix(hex, 16)?;
+            palette[index * 4..index * 4 + 4].copy_from_slice(&[
+                c as u8,
+                (c >> 8) as u8,
+                (c >> 16) as u8,
+                0,
+            ]);
+        }
+        out.extend_from_slice(&palette);
+    }
+    let entries: Vec<_> = layers
+        .children()
+        .filter(|n| n.has_tag_name("Layer"))
+        .collect();
+    ensure!(
+        entries.len() == count as usize,
+        "E_IMPORT_GAL_LAYERS: inconsistent directory"
+    );
+    for entry in entries {
+        for name in ["Left", "Top"] {
+            out.extend_from_slice(&number(entry, name)?.to_le_bytes());
+        }
+        let flag = |name| -> Result<u8> {
+            let n = number(entry, name)?;
+            ensure!(matches!(n, 0 | 1), "E_IMPORT_GAL_XML: invalid flag");
+            Ok(n as u8)
+        };
+        out.push(flag("Visible")?);
+        out.extend_from_slice(&number(entry, "TransColor")?.to_le_bytes());
+        let alpha = number(entry, "Alpha")?;
+        ensure!((0..=255).contains(&alpha), "E_IMPORT_GAL_ALPHA: opacity");
+        out.extend_from_slice(&alpha.to_le_bytes());
+        let alpha_on = flag("AlphaOn")?;
+        out.push(alpha_on);
+        blob(&mut out, b"");
+        blob(&mut out, input.blob()?);
+        let alpha_data = input.blob()?;
+        ensure!(
+            alpha_on != 0 || alpha_data.is_empty(),
+            "E_IMPORT_GAL_ALPHA: unexpected disabled alpha payload"
+        );
+        blob(&mut out, alpha_data);
+    }
+    ensure!(
+        input.at == data.len(),
+        "E_IMPORT_GAL_TRAILING: unexpected GaleX bytes"
+    );
+    Ok(out)
 }
 
 fn blocks(
@@ -351,7 +574,7 @@ pub(super) fn audio(data: &[u8], gain: f32) -> Result<Vec<u8>> {
         gain.is_finite() && (0.0..=4.0).contains(&gain),
         "E_IMPORT_AUDIO_GAIN: invalid volume"
     );
-    let (channels, rate, mut samples) = if data.starts_with(b"OggS") {
+    if data.starts_with(b"OggS") {
         let mut decoder = lewton::inside_ogg::OggStreamReader::new(Cursor::new(data))?;
         let channels = decoder.ident_hdr.audio_channels as usize;
         let rate = decoder.ident_hdr.audio_sample_rate;
@@ -359,7 +582,7 @@ pub(super) fn audio(data: &[u8], gain: f32) -> Result<Vec<u8>> {
             matches!(channels, 1 | 2) && (8000..=192000).contains(&rate),
             "E_IMPORT_OGG_FORMAT: expected mono/stereo Vorbis"
         );
-        let mut samples = vec![];
+        let mut out = wave_header(channels, rate, 0);
         let serial = decoder.stream_serial();
         while let Some(packet) = decoder.read_dec_packet_itl()? {
             ensure!(
@@ -367,15 +590,24 @@ pub(super) fn audio(data: &[u8], gain: f32) -> Result<Vec<u8>> {
                 "E_IMPORT_OGG_CHAIN: chained streams unsupported"
             );
             ensure!(
-                samples.len() + packet.len() <= MAX_AUDIO / 2,
-                "E_IMPORT_AUDIO_LIMIT: decoded audio exceeds 64 MiB"
+                packet.len() % channels == 0 && packet.len() <= (MAX_AUDIO - (out.len() - 44)) / 2,
+                "E_IMPORT_AUDIO_LIMIT: decoded audio exceeds 128 MiB"
             );
-            samples.extend(packet);
+            let needed = out.len() + packet.len() * 2;
+            if needed > out.capacity() {
+                let capacity = needed.next_power_of_two().min(MAX_AUDIO + 44);
+                out.reserve_exact(capacity - out.len());
+            }
+            for sample in packet {
+                out.extend(quantize(sample as f32 * gain).to_le_bytes());
+            }
         }
-        (channels, rate, samples)
-    } else {
-        pcm(data)?
-    };
+        let bytes = (out.len() - 44) as u32;
+        out[4..8].copy_from_slice(&(bytes + 36).to_le_bytes());
+        out[40..44].copy_from_slice(&bytes.to_le_bytes());
+        return Ok(out);
+    }
+    let (channels, rate, mut samples) = pcm(data)?;
     ensure!(
         matches!(channels, 1 | 2 | 6)
             && (8000..=192000).contains(&rate)
@@ -399,22 +631,27 @@ pub(super) fn audio(data: &[u8], gain: f32) -> Result<Vec<u8>> {
     for sample in &mut samples {
         *sample = quantize(*sample as f32 * gain);
     }
-    let mut out = b"RIFF".to_vec();
-    out.extend((36 + samples.len() as u32 * 2).to_le_bytes());
-    out.extend(b"WAVEfmt ");
-    out.extend(16u32.to_le_bytes());
-    out.extend(1u16.to_le_bytes());
-    out.extend((output_channels as u16).to_le_bytes());
-    out.extend(rate.to_le_bytes());
-    out.extend((rate * output_channels as u32 * 2).to_le_bytes());
-    out.extend((output_channels as u16 * 2).to_le_bytes());
-    out.extend(16u16.to_le_bytes());
-    out.extend(b"data");
-    out.extend((samples.len() as u32 * 2).to_le_bytes());
+    let mut out = wave_header(output_channels, rate, samples.len() as u32 * 2);
+    out.reserve_exact(samples.len() * 2);
     for sample in samples {
         out.extend(sample.to_le_bytes());
     }
     Ok(out)
+}
+fn wave_header(channels: usize, rate: u32, bytes: u32) -> Vec<u8> {
+    let mut out = b"RIFF".to_vec();
+    out.extend((36 + bytes).to_le_bytes());
+    out.extend(b"WAVEfmt ");
+    out.extend(16u32.to_le_bytes());
+    out.extend(1u16.to_le_bytes());
+    out.extend((channels as u16).to_le_bytes());
+    out.extend(rate.to_le_bytes());
+    out.extend((rate * channels as u32 * 2).to_le_bytes());
+    out.extend((channels as u16 * 2).to_le_bytes());
+    out.extend(16u16.to_le_bytes());
+    out.extend(b"data");
+    out.extend(bytes.to_le_bytes());
+    out
 }
 fn quantize(sample: f32) -> i16 {
     sample.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
@@ -463,9 +700,120 @@ fn pcm(data: &[u8]) -> Result<(usize, u32, Vec<i16>)> {
     ))
 }
 
+fn galx_directory(compressed: &[u8]) -> Result<String> {
+    let xml = inflate(compressed, 1024 * 1024)?;
+    let xml = std::str::from_utf8(&xml).context("E_IMPORT_GAL_XML: UTF-8")?;
+    // GraphicsGale writes a duplicate Count attribute on Frame. Its editor
+    // rectangles don't affect a static raster. Remove only this tag's
+    // attributes; retain all root, layer and pixel metadata for validation.
+    let mut clean = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(at) = rest.find("<Frame ") {
+        clean.push_str(&rest[..at]);
+        let end = rest[at..]
+            .find('>')
+            .context("E_IMPORT_GAL_XML: frame tag")?
+            + at;
+        ensure!(
+            !rest[at + 1..end].contains('<'),
+            "E_IMPORT_GAL_XML: frame tag"
+        );
+        clean.push_str("<Frame>");
+        rest = &rest[end + 1..];
+    }
+    clean.push_str(rest);
+    Ok(clean)
+}
+
+/// Layout discovery reads only the GAL directory, never the pixel payload.
+/// Export still decodes and validates every referenced pixel/layer block.
+pub(super) fn gal_file_static_size(path: &std::path::Path) -> Result<(u32, u32)> {
+    let size = gal_file_size(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0u8; 31];
+    file.read_exact(&mut prefix)?;
+    if !prefix.starts_with(b"GaleX200") {
+        ensure!(
+            i32::from_le_bytes(prefix[27..31].try_into()?) == 1,
+            "E_IMPORT_GAL_FRAMES: animated GAL requires animation adaptation"
+        );
+    }
+    Ok(size)
+}
+
+pub(super) fn gal_file_size(path: &std::path::Path) -> Result<(u32, u32)> {
+    let mut file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.len() <= 32 * 1024 * 1024,
+        "E_IMPORT_LIMIT: source file exceeds 32 MiB"
+    );
+    let mut prefix = [0u8; 12];
+    file.read_exact(&mut prefix)?;
+    let mut directory = prefix.to_vec();
+    let length = if prefix.starts_with(b"GaleX200") {
+        let length = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
+        ensure!(
+            length <= 2 * 1024 * 1024,
+            "E_IMPORT_GAL_XML: compressed directory exceeds limit"
+        );
+        length
+    } else {
+        11
+    };
+    let mut remainder = vec![0u8; length];
+    file.read_exact(&mut remainder)?;
+    directory.extend(remainder);
+    gal_size(&directory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "private long Vorbis fixture; set NIR_IMPORT_AUDIO_SOURCE and NIR_IMPORT_AUDIO_FRAMES"]
+    fn external_long_vorbis_preserves_complete_frames_header_gain_and_clipping() {
+        let data = std::fs::read(std::env::var("NIR_IMPORT_AUDIO_SOURCE").unwrap()).unwrap();
+        let frames: usize = std::env::var("NIR_IMPORT_AUDIO_FRAMES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let gain = 2.;
+        let wav = audio(&data, gain).unwrap();
+        let mut decoder = lewton::inside_ogg::OggStreamReader::new(Cursor::new(&data)).unwrap();
+        let channels = decoder.ident_hdr.audio_channels as usize;
+        assert_eq!(wav.len(), 44 + frames * channels * 2);
+        assert_eq!(
+            u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize,
+            wav.len() - 8
+        );
+        assert_eq!(
+            u32::from_le_bytes(wav[24..28].try_into().unwrap()),
+            decoder.ident_hdr.audio_sample_rate
+        );
+        assert_eq!(
+            u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize,
+            wav.len() - 44
+        );
+        let mut at = 44;
+        while let Some(packet) = decoder.read_dec_packet_itl().unwrap() {
+            for sample in packet {
+                let expected = (f32::from(sample) * gain).round().clamp(-32768., 32767.) as i16;
+                assert_eq!(
+                    i16::from_le_bytes(wav[at..at + 2].try_into().unwrap()),
+                    expected
+                );
+                at += 2;
+            }
+        }
+        assert_eq!(at, wav.len());
+        println!(
+            "LONG_AUDIO_OK frames={frames} channels={channels} pcmBytes={}",
+            wav.len() - 44
+        );
+        if let Ok(output) = std::env::var("NIR_IMPORT_AUDIO_OUTPUT") {
+            std::fs::write(output, audio(&data, 1.).unwrap()).unwrap();
+        }
+    }
     fn gal_fixture(compressed: bool, alpha: bool) -> Vec<u8> {
         use std::io::Write;
         fn blob(out: &mut Vec<u8>, b: &[u8]) {
@@ -518,6 +866,18 @@ mod tests {
         out
     }
     #[test]
+    fn static_file_discovery_reads_directory_and_rejects_animated_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("neutral.gal");
+        let mut bytes = gal_fixture(false, false);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(gal_file_static_size(&path).unwrap(), (2, 1));
+        bytes[27..31].copy_from_slice(&2i32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(gal_file_size(&path).unwrap(), (2, 1));
+        assert!(gal_file_static_size(&path).is_err());
+    }
+    #[test]
     fn gal_raw_and_deflate_preserve_color_and_alpha() {
         for compressed in [false, true] {
             for alpha in [false, true] {
@@ -534,6 +894,95 @@ mod tests {
                     image
                 );
             }
+        }
+    }
+    #[test]
+    fn galx_static_directory_preserves_pixels_and_rejects_invalid_containers() {
+        use std::io::Write;
+        let deflate = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        };
+        for compression in [0, 1, 2] {
+            let xml = format!(
+                r#"<Frames Version="200" Width="2" Height="1" Bpp="24" Count="1" Randomized="0" CompType="{compression}" BlockWidth="0" BlockHeight="0"><Frame Name="test" Count="0" Count="1"><Layers Count="1" Width="2" Height="1" Bpp="24"><Layer Left="0" Top="0" Visible="1" TransColor="-1" Alpha="255" AlphaOn="1"/></Layers></Frame></Frames>"#
+            );
+            let make = |xml: &str| {
+                let mut out = b"GaleX200".to_vec();
+                let mut blob = |bytes: &[u8]| {
+                    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(bytes);
+                };
+                blob(&deflate(xml.as_bytes()));
+                for (index, bytes) in [&[0, 0, 255, 0, 255, 0, 0, 0][..], &[128, 255, 0, 0][..]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if compression == 2 && index == 0 {
+                        let mut jpeg = Vec::new();
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+                            .encode(
+                                &[80, 80, 80, 160, 160, 160],
+                                2,
+                                1,
+                                image::ExtendedColorType::Rgb8,
+                            )
+                            .unwrap();
+                        blob(&jpeg);
+                    } else if compression != 1 {
+                        blob(&deflate(bytes));
+                    } else {
+                        blob(bytes);
+                    }
+                }
+                out
+            };
+            let data = make(&xml);
+            let directory_end = 12 + u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+            let directory = &data[..directory_end];
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("directory.gal");
+            std::fs::write(&path, directory).unwrap();
+            assert_eq!(gal_file_size(&path).unwrap(), (2, 1));
+            assert!(
+                gal(directory).is_err(),
+                "layout discovery must not replace complete pixel validation"
+            );
+            let image = gal(&data).unwrap();
+            assert_eq!(gal_size(&data).unwrap(), (2, 1));
+            if compression == 2 {
+                for (x, expected) in [(0, 80i16), (1, 160)] {
+                    let pixel = image.get_pixel(x, 0).0;
+                    assert!(pixel[..3]
+                        .iter()
+                        .all(|value| (*value as i16 - expected).abs() <= 2));
+                }
+                assert_eq!(image.get_pixel(0, 0).0[3], 128);
+                assert_eq!(image.get_pixel(1, 0).0[3], 255);
+                assert!(gal(&make(&xml.replace("Width=\"2\"", "Width=\"3\""))).is_err());
+            } else {
+                assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 128]);
+                assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 255]);
+            }
+            for (from, to) in [
+                ("Count=\"1\" Randomized", "Count=\"2\" Randomized"),
+                ("Randomized=\"0\"", "Randomized=\"1\""),
+                ("Alpha=\"255\"", "Alpha=\"256\""),
+                ("Width=\"2\"", "Width=\"999999\""),
+                ("</Frames>", "</Frames><unexpected/>"),
+            ] {
+                assert!(gal(&make(&xml.replace(from, to))).is_err());
+            }
+            for length in 0..data.len() {
+                assert!(gal(&data[..length]).is_err());
+            }
+            let dtd = format!("<!DOCTYPE Frames [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>{xml}");
+            assert!(gal(&make(&dtd)).is_err());
+            let mut tail = data.clone();
+            tail.push(0);
+            assert!(gal(&tail).is_err());
         }
     }
     #[test]

@@ -59,6 +59,14 @@ pub struct FrozenSpan {
     pub text: String,
     pub emphasis: bool,
     pub gate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pause: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_timeout_us: Option<Micros>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruby: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<InlineImage>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +104,20 @@ pub struct Dialogue {
     pub reveal_interval_us: Option<Micros>,
 }
 impl Dialogue {
+    pub fn inline_images(&self) -> Vec<InlineImagePlacement> {
+        let mut offset = 0;
+        self.spans
+            .iter()
+            .filter_map(|span| {
+                let at = offset;
+                offset += span.text.len() as u32;
+                span.image.as_ref().map(|image| InlineImagePlacement {
+                    offset: at,
+                    image: image.clone(),
+                })
+            })
+            .collect()
+    }
     pub fn full_text(&self) -> String {
         self.spans.iter().map(|s| s.text.as_str()).collect()
     }
@@ -115,6 +137,12 @@ impl Dialogue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_interaction: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shake: Option<crate::ShakeCapture>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sprite_shakes: BTreeMap<String, crate::ShakeCapture>,
     pub id: u32,
     pub name: String,
     pub frame: u32,
@@ -215,6 +243,14 @@ pub struct Waiting {
     pub next: String,
     pub on_cancelled: String,
     pub on_failed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<AdvanceContinuation>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvanceContinuation {
+    pub interaction: u32,
+    pub next: String,
 }
 /// In-flight message-window reveal. Coverage interpolates linearly from the
 /// captured `from_coverage` toward the hidden/visible endpoint so a reversing
@@ -315,12 +351,19 @@ pub struct HistoryEntry {
     pub speaker_id: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<InlineImagePlacement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub voices: Vec<HistoryVoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choice: Option<HistoryChoice>,
 }
 fn history_bytes(entry: &HistoryEntry) -> usize {
     entry.text.len()
+        + entry
+            .images
+            .iter()
+            .map(|i| i.image.asset.len() + 64)
+            .sum::<usize>()
         + entry.speaker.len()
         + entry.speaker_id.len()
         + entry
@@ -360,12 +403,20 @@ pub struct Snapshot {
     pub choice: Option<OfferedChoice>,
     #[serde(default)]
     pub dialogue_hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue_style: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dialogue_decorations: BTreeMap<DialogueDecorationSlot, DialogueDecoration>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub menu_disabled: bool,
     /// Deferred visibility flip: while set, `dialogue_hidden` still holds the
     /// pre-op value and the window's committed state lands at the deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_reveal: Option<WindowReveal>,
     #[serde(default)]
     pub dialogue_appearance: DialogueAppearance,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub audio_paused: BTreeSet<AudioBus>,
     pub history: Vec<HistoryEntry>,
     pub locale: String,
     pub next_id: u32,
@@ -377,6 +428,10 @@ pub struct Snapshot {
 }
 #[derive(Debug, Clone)]
 pub enum CoreInput {
+    ModalClosed {
+        task: u32,
+        interaction: u32,
+    },
     None,
     Advance {
         interaction: u32,
@@ -461,6 +516,10 @@ pub enum CoreIntent {
     ProfileMerge {
         key: String,
     },
+    ProfileValueAssign {
+        key: String,
+        value: Value,
+    },
     Checkpoint,
     Trace {
         event: String,
@@ -486,6 +545,8 @@ pub struct Core {
     work_remaining: u32,
     remaining_time_us: u64,
     text_speed: f32,
+    profile_facts: BTreeSet<String>,
+    profile_values: BTreeMap<String, Value>,
 }
 impl Core {
     pub fn new(program: ValidatedProgram, release: String, locale: String) -> Result<Self> {
@@ -540,8 +601,12 @@ impl Core {
             waiting: None,
             choice: None,
             dialogue_hidden: false,
+            dialogue_style: None,
+            dialogue_decorations: BTreeMap::new(),
+            menu_disabled: false,
             window_reveal: None,
             dialogue_appearance: DialogueAppearance::default(),
+            audio_paused: BTreeSet::new(),
             history: vec![],
             locale,
             next_id: 2,
@@ -558,6 +623,8 @@ impl Core {
             work_remaining: 0,
             remaining_time_us: 0,
             text_speed: 1.,
+            profile_facts: BTreeSet::new(),
+            profile_values: BTreeMap::new(),
         })
     }
     /// Player preference captured by the next dialogue; never scales Story time.
@@ -568,8 +635,24 @@ impl Core {
         self.text_speed = speed;
         Ok(())
     }
+    /// Facts are independent of Story snapshots and may only accumulate.
+    pub fn merge_profile_facts(&mut self, facts: &BTreeSet<String>) -> Result<()> {
+        if facts.iter().any(|k| k.is_empty() || k.len() > 1024) {
+            return Err(self.error("E_PROFILE", "profile fact limit"));
+        }
+        self.profile_facts.extend(facts.iter().cloned());
+        Ok(())
+    }
     pub fn state(&self) -> &Snapshot {
         &self.state
+    }
+    /// Profile data is supplied by the owner, separately from a Story save.
+    pub fn set_profile_values(&mut self, values: &BTreeMap<String, Value>) -> Result<()> {
+        if !valid_profile_values(values) {
+            return Err(self.error("E_PROFILE", "profile value limit"));
+        }
+        self.profile_values = values.clone();
+        Ok(())
     }
     pub fn program(&self) -> &RuntimeProgramView {
         self.program.program()
@@ -625,20 +708,45 @@ impl Core {
                     .get(&frame.function)
                     .map(|index| index.module.as_str())
                     .ok_or_else(|| missing("active function index"))?;
-                for key in [
-                    ContentKey::Static {
-                        module: module.to_owned(),
-                    },
-                    ContentKey::Code {
-                        module: module.to_owned(),
-                    },
-                ] {
+                let code_key = ContentKey::Code {
+                    module: module.into(),
+                };
+                let mut keys = root.content_prerequisites(&code_key);
+                keys.insert(code_key);
+                for key in keys {
                     if self.program.contains_content_body(&key) && !program.is_resident(&key) {
                         return Err(missing(&format!("active frame body missing: {key:?}")));
                     }
                 }
                 if program.program().functions.get(&frame.function).is_none() {
                     return Err(missing("active function body missing"));
+                }
+            }
+            for nodes in std::iter::once(&self.state.scene)
+                .chain(std::iter::once(&self.state.draft))
+                .chain(
+                    self.state
+                        .tasks
+                        .values()
+                        .flat_map(|t| [&t.source, &t.target]),
+                )
+            {
+                for binding in nodes.iter().filter_map(|n| n.timeline_binding.as_deref()) {
+                    if program.program().sprite_timelines.get(binding).is_none() {
+                        return Err(missing("frozen scene timeline body missing"));
+                    }
+                }
+            }
+            for task in self
+                .state
+                .tasks
+                .values()
+                .filter(|t| t.state == TaskState::Running)
+            {
+                if let Effect::SpriteTimeline { timeline, .. } = &task.effect {
+                    if program.program().sprite_timelines.get(timeline).is_none() {
+                        return Err(missing("active timeline body missing"));
+                    }
                 }
             }
             if let Some(pending) = &self.state.pending {
@@ -817,6 +925,19 @@ impl Core {
         match e {
             Expr::Const { value } => Ok(value.clone()),
             Expr::Var { name } => self.read(name),
+            Expr::ToF80 { value } => match self.eval(value)? {
+                I32(v) => Ok(F80(Float80::from_i32(v))),
+                F80(v) => Ok(F80(v)),
+                _ => Err(self.error("E_TYPE", "to_f80 requires numeric input")),
+            },
+            Expr::ToI32 { value } => match self.eval(value)? {
+                I32(v) => Ok(I32(v)),
+                F80(v) => v
+                    .to_i32()
+                    .map(I32)
+                    .ok_or_else(|| self.error("E_ARITHMETIC", "integer conversion overflow")),
+                _ => Err(self.error("E_TYPE", "to_i32 requires numeric input")),
+            },
             Expr::Not { value } => match self.eval(value)? {
                 Bool(b) => Ok(Bool(!b)),
                 _ => Err(self.error("E_TYPE", "not")),
@@ -837,6 +958,13 @@ impl Core {
                     (Mul, I32(a), I32(b)) => a.checked_mul(b).map(I32).ok_or_else(overflow),
                     (Div, I32(a), I32(b)) => a.checked_div(b).map(I32).ok_or_else(overflow),
                     (Rem, I32(a), I32(b)) => a.checked_rem(b).map(I32).ok_or_else(overflow),
+                    (op @ (Add | Sub | Mul | Div | Rem), F80(a), F80(b)) => {
+                        a.checked_binary(*op, b).map(F80).ok_or_else(overflow)
+                    }
+                    (Lt, F80(a), F80(b)) => Ok(Bool(a < b)),
+                    (Le, F80(a), F80(b)) => Ok(Bool(a <= b)),
+                    (Gt, F80(a), F80(b)) => Ok(Bool(a > b)),
+                    (Ge, F80(a), F80(b)) => Ok(Bool(a >= b)),
                     (Eq, a, b) => Ok(Bool(a == b)),
                     (Ne, a, b) => Ok(Bool(a != b)),
                     (Lt, I32(a), I32(b)) => Ok(Bool(a < b)),
@@ -873,35 +1001,82 @@ impl Core {
             .iter()
             .map(|s| {
                 Ok(match s {
+                    Span::Image { id, image } => FrozenSpan {
+                        id: id.clone(),
+                        text: "\u{fffc}".into(),
+                        emphasis: false,
+                        gate: false,
+                        pause: false,
+                        pause_timeout_us: None,
+                        ruby: None,
+                        image: Some(image.clone()),
+                    },
+                    Span::Ruby { id, text, reading } => FrozenSpan {
+                        id: id.clone(),
+                        text: text.clone(),
+                        emphasis: false,
+                        gate: false,
+                        pause: false,
+                        pause_timeout_us: None,
+                        ruby: Some(reading.clone()),
+                        image: None,
+                    },
                     Span::Text { id, text, emphasis } => FrozenSpan {
                         id: id.clone(),
                         text: text.clone(),
                         emphasis: *emphasis,
                         gate: false,
+                        pause: false,
+                        pause_timeout_us: None,
+                        ruby: None,
+                        image: None,
                     },
                     Span::Break { id } => FrozenSpan {
                         id: id.clone(),
                         text: "\n".into(),
                         emphasis: false,
                         gate: false,
+                        pause: false,
+                        pause_timeout_us: None,
+                        ruby: None,
+                        image: None,
                     },
                     Span::Gate { id } => FrozenSpan {
                         id: id.clone(),
                         text: String::new(),
                         emphasis: false,
                         gate: true,
+                        pause: false,
+                        pause_timeout_us: None,
+                        ruby: None,
+                        image: None,
+                    },
+                    Span::Pause { id, timeout_us } => FrozenSpan {
+                        id: id.clone(),
+                        text: String::new(),
+                        emphasis: false,
+                        gate: false,
+                        pause: true,
+                        pause_timeout_us: *timeout_us,
+                        ruby: None,
+                        image: None,
                     },
                     Span::Param { id, name } => {
                         let v = match self.read(name)? {
                             Value::String(v) => v,
                             Value::I32(v) => v.to_string(),
                             Value::Bool(v) => v.to_string(),
+                            Value::F80(v) => v.to_string(),
                         };
                         FrozenSpan {
                             id: id.clone(),
                             text: format!("\u{2068}{v}\u{2069}"),
                             emphasis: false,
                             gate: false,
+                            pause: false,
+                            pause_timeout_us: None,
+                            ruby: None,
+                            image: None,
                         }
                     }
                 })
@@ -1063,6 +1238,17 @@ impl Core {
                     self.intents.push(CoreIntent::Checkpoint);
                 }
             }
+            CoreInput::ModalClosed { task, interaction } => {
+                if self.state.tasks.get(&task).is_some_and(|t| {
+                    t.state == TaskState::Running
+                        && matches!(t.effect, Effect::StoryModal { .. })
+                        && t.modal_interaction == Some(interaction)
+                }) {
+                    self.finish_task(task, TaskState::Finished)?;
+                    self.state.unsuspended_ops = 0;
+                    self.intents.push(CoreIntent::Checkpoint);
+                }
+            }
             CoreInput::AudioEnded { task } => {
                 if self.state.tasks.get(&task).is_some_and(|t| {
                     matches!(t.effect, Effect::Audio { looped: false, .. })
@@ -1134,6 +1320,7 @@ impl Core {
             speaker: String::new(),
             speaker_id: String::new(),
             text: choice.display_text(),
+            images: vec![],
             voices: vec![],
             choice: Some(choice),
         })
@@ -1203,10 +1390,12 @@ impl Core {
             let module = root
                 .function_module(&frame.function)
                 .ok_or_else(|| self.error("E_CONTENT_INDEX", &frame.function))?;
-            if !self.program.is_resident(&ContentKey::Static {
+            for prerequisite in root.content_prerequisites(&ContentKey::Code {
                 module: module.into(),
             }) {
-                return Ok(Some(module.into()));
+                if !self.program.is_resident(&prerequisite) {
+                    return Ok(Some(module.into()));
+                }
             }
         }
         let Some(function) = p.functions.get(&frame.function) else {
@@ -1278,6 +1467,14 @@ impl Core {
     }
     fn execute_op(&mut self, op: &Operation) -> Result<()> {
         match op {
+            Operation::MenuAccess { enabled } => self.state.menu_disabled = !enabled,
+            Operation::AudioPause { bus, paused } => {
+                if *paused {
+                    self.state.audio_paused.insert(*bus);
+                } else {
+                    self.state.audio_paused.remove(bus);
+                }
+            }
             Operation::Assign { target, value } => {
                 let v = self.eval(value)?;
                 self.write(target, v)?;
@@ -1344,9 +1541,43 @@ impl Core {
                     }
                 }
             }
-            Operation::ProfileMerge { key } => self
-                .intents
-                .push(CoreIntent::ProfileMerge { key: key.clone() }),
+            Operation::ProfileRead { target, key } => {
+                self.write(
+                    target,
+                    Value::I32(i32::from(self.profile_facts.contains(key))),
+                )?;
+            }
+            Operation::ProfileValueRead { target, key } => {
+                let default = self
+                    .program()
+                    .variables
+                    .get(target)
+                    .ok_or_else(|| self.error("E_PROFILE", "unknown profile target"))?;
+                let value = self.profile_values.get(key).unwrap_or(default).clone();
+                if value.ty() != default.ty() {
+                    return Err(self.error("E_PROFILE", "stored profile value has wrong type"));
+                }
+                self.write(target, value)?;
+            }
+            Operation::ProfileValueAssign { target, key, value } => {
+                let value = self.eval(value)?;
+                let mut values = self.profile_values.clone();
+                values.insert(key.clone(), value.clone());
+                if !valid_profile_values(&values) {
+                    return Err(self.error("E_PROFILE", "profile value limit"));
+                }
+                self.write(target, value.clone())?;
+                self.profile_values = values;
+                self.intents.push(CoreIntent::ProfileValueAssign {
+                    key: key.clone(),
+                    value,
+                });
+            }
+            Operation::ProfileMerge { key } => {
+                self.merge_profile_facts(&BTreeSet::from([key.clone()]))?;
+                self.intents
+                    .push(CoreIntent::ProfileMerge { key: key.clone() });
+            }
             Operation::TaskControl { task, action } => {
                 let id = *self
                     .state
@@ -1641,6 +1872,7 @@ impl Core {
                 next,
                 on_cancelled,
                 on_failed,
+                on_advance,
             } => {
                 let conditions = conditions
                     .iter()
@@ -1653,11 +1885,19 @@ impl Core {
                             .ok_or_else(|| self.error("E_TASK", &c.task))
                     })
                     .collect::<Result<_>>()?;
+                let advance = match on_advance {
+                    Some(next) => Some(AdvanceContinuation {
+                        interaction: self.id()?,
+                        next,
+                    }),
+                    None => None,
+                };
                 self.state.waiting = Some(Waiting {
                     conditions,
                     next,
                     on_cancelled,
                     on_failed,
+                    advance,
                 });
                 self.state.unsuspended_ops = 0;
             }
@@ -1788,7 +2028,7 @@ impl Core {
         self.jump(p.next);
         self.trace(format!("activate:{}", p.cue));
         self.intents.push(CoreIntent::Checkpoint);
-        let ids:Vec<_>=self.state.tasks.values().filter(|t|t.state==TaskState::Running&&matches!(t.effect,Effect::StagePresent{duration_us,..}|Effect::Clip{duration_us,..}|Effect::Tween{duration_us,..}|Effect::Delay{duration_us}|Effect::AudioStop{duration_us,..} if duration_us.0==0)).map(|t|t.id).collect();
+        let ids:Vec<_>=self.state.tasks.values().filter(|t|t.state==TaskState::Running&&(matches!(t.effect,Effect::DialogueStyle{..}|Effect::DialogueDecoration{..})||matches!(t.effect,Effect::StagePresent{duration_us,..}|Effect::Clip{duration_us,..}|Effect::SourceMotion{duration_us,..}|Effect::Tween{duration_us,..}|Effect::Delay{duration_us}|Effect::AudioStop{duration_us,..} if duration_us.0==0))).map(|t|t.id).collect();
         for id in ids {
             self.finish_task(id, TaskState::Finished)?;
         }
@@ -1853,7 +2093,202 @@ impl Core {
         let mut captured = 0.;
         let mut base = 0.;
         let mut target_task = None;
+        let mut shake = None;
+        let mut sprite_shakes = BTreeMap::new();
         match &def.effect {
+            Effect::StoryModal { .. } => {
+                if self.state.choice.is_some()
+                    || self.state.tasks.values().any(|task| {
+                        task.state == TaskState::Running
+                            && (task.dialogue.is_some()
+                                || matches!(task.effect, Effect::StoryModal { .. }))
+                    })
+                {
+                    return Err(
+                        self.error("E_OWNERSHIP", "story modal requires exclusive interaction")
+                    );
+                }
+            }
+            Effect::DialogueStyle { style } => {
+                if !self.program().theme.dialogue_styles.contains_key(style) {
+                    return Err(self.error("E_DIALOGUE_STYLE", style));
+                }
+                if self
+                    .state
+                    .tasks
+                    .values()
+                    .any(|task| task.state == TaskState::Running && task.dialogue.is_some())
+                {
+                    return Err(
+                        self.error("E_OWNERSHIP", "dialogue style requires completed reading")
+                    );
+                }
+                if self.state.window_reveal.is_some()
+                    || self.state.tasks.values().any(|task| {
+                        task.state == TaskState::Running
+                            && task
+                                .effect
+                                .scalar_track(task.captured, task.base)
+                                .is_some_and(|(target, _, _)| {
+                                    matches!(target, TweenTarget::DialogueRoot { .. })
+                                })
+                    })
+                {
+                    return Err(self.error("E_OWNERSHIP", "dialogue animation owns the window"));
+                }
+                self.state.dialogue_style = Some(style.clone());
+                for task in self.state.tasks.values_mut() {
+                    task.dialogue = None;
+                }
+                self.state.dialogue_appearance = DialogueAppearance::default();
+            }
+            Effect::DialogueDecoration { slot, image } => {
+                if let Some(image) = image {
+                    if !image.valid()
+                        || self.program().asset(&image.asset).is_none_or(|asset| {
+                            asset.kind != AssetKind::Image
+                                || [asset.width, asset.height] != image.size
+                        })
+                    {
+                        return Err(self.error("E_DIALOGUE_DECORATION", "image metadata mismatch"));
+                    }
+                    let point = match image.placement {
+                        DialogueDecorationPlacement::Absolute { point } => point,
+                        DialogueDecorationPlacement::TextOrigin { offset } => {
+                            let theme = &self.program().theme;
+                            let dialogue = self
+                                .state
+                                .dialogue_style
+                                .as_ref()
+                                .and_then(|id| theme.dialogue_styles.get(id))
+                                .map(|style| &style.dialogue)
+                                .unwrap_or(&theme.dialogue);
+                            let rect = dialogue.text_rect.ok_or_else(|| {
+                                self.error(
+                                    "E_DIALOGUE_DECORATION",
+                                    "explicit text rectangle required",
+                                )
+                            })?;
+                            [rect[0] + offset[0], rect[1] + offset[1]]
+                        }
+                    };
+                    let decoration = DialogueDecoration {
+                        asset: image.asset.clone(),
+                        rect: [
+                            point[0],
+                            point[1],
+                            image.size[0] as f32,
+                            image.size[1] as f32,
+                        ],
+                    };
+                    if !decoration.valid() {
+                        return Err(self
+                            .error("E_DIALOGUE_DECORATION", "resolved rectangle exceeds bounds"));
+                    }
+                    self.state.dialogue_decorations.insert(*slot, decoration);
+                } else {
+                    self.state.dialogue_decorations.remove(slot);
+                }
+            }
+            Effect::SpriteTimeline {
+                timeline,
+                root,
+                duration_us,
+                ..
+            } => {
+                crate::validate::validate_timeline_bindings(&self.state.scene, root, |id| {
+                    self.program().sprite_timelines.get(id)
+                })?;
+                let resource = self
+                    .program()
+                    .sprite_timelines
+                    .get(timeline)
+                    .ok_or_else(|| self.error("E_CONTENT_MISSING", timeline))?;
+                if resource.duration_us != *duration_us
+                    || !self.state.scene.iter().any(|n| {
+                        &n.id == root && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                    })
+                {
+                    return Err(self.error("E_TIMELINE", "timeline root identity mismatch"));
+                }
+                let track_nodes: BTreeSet<_> =
+                    resource.tracks.iter().map(|t| t.node.as_str()).collect();
+                if self.state.tasks.values().any(|t| t.state == TaskState::Running
+                    && self.track_is_current(t, &TweenTarget::SceneNode { node: String::new(), property: Property::X })
+                    && t.effect.scalar_track(0.,0.).is_some_and(|(a,_,_)|
+                        matches!(a, TweenTarget::SceneNode { node, .. } if track_nodes.contains(node.as_str())))) {
+                    return Err(self.error("E_OWNERSHIP", "timeline owns descendant poses"));
+                }
+                let old: Vec<_> = self.state.tasks.values().filter(|t| t.state == TaskState::Running
+                    && matches!(&t.effect, Effect::SpriteTimeline { root: old, .. } if old == root)).map(|t|t.id).collect();
+                for id in old {
+                    self.end_task(id, TaskEndReason::Replaced)?;
+                }
+                let resource = self.program().sprite_timelines.shared(timeline).unwrap();
+                resource.apply(&mut self.state.scene, 0);
+            }
+            Effect::SpriteWave { nodes, spec } => {
+                for node in nodes {
+                    if !self.state.scene.iter().any(|n| &n.id == node) {
+                        return Err(self.error("E_NODE", node));
+                    }
+                    if self.state.tasks.values().any(|task| {
+                        task.state == TaskState::Running
+                            && matches!(&task.effect, Effect::SpriteWave { nodes: old, .. } | Effect::SpriteShake { nodes: old, .. }
+                                if old.contains(node))
+                    }) {
+                        return Err(self.error("E_OWNERSHIP", "sprite wave owns translation"));
+                    }
+                }
+                shake = Some(crate::ShakeCapture::wave(*spec));
+            }
+            Effect::SpriteShake { nodes, mode, spec } => {
+                for node in nodes {
+                    if !self.state.scene.iter().any(|n| &n.id == node) {
+                        return Err(self.error("E_NODE", node));
+                    }
+                    if self.state.tasks.values().any(|task| task.state == TaskState::Running
+                        && matches!(&task.effect,Effect::SpriteWave { nodes: old, .. } | Effect::SpriteShake { nodes: old, .. } if old.contains(node))) {
+                        return Err(self.error("E_OWNERSHIP","sprite shake owns translation"));
+                    }
+                }
+                sprite_shakes = crate::ShakeCapture::sprite_group(*mode, *spec, nodes, |upper| {
+                    let width = upper as u64;
+                    let zone = (1u64 << 32) / width * width;
+                    loop {
+                        let value = self.state.rng.next_u32() as u64;
+                        if value < zone {
+                            break (value % width) as u32;
+                        }
+                    }
+                });
+            }
+            Effect::DialogueShake { spec } => {
+                let from = self.sample_dialogue_appearance().text_offset;
+                let old: Vec<_> = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|task| {
+                        task.state == TaskState::Running
+                            && matches!(task.effect, Effect::DialogueShake { .. })
+                    })
+                    .map(|task| task.id)
+                    .collect();
+                for id in old {
+                    self.end_task(id, TaskEndReason::Replaced)?;
+                }
+                shake = Some(crate::ShakeCapture::capture(*spec, from, |upper| {
+                    let width = upper as u64;
+                    let zone = (1u64 << 32) / width * width;
+                    loop {
+                        let value = self.state.rng.next_u32() as u64;
+                        if value < zone {
+                            break (value % width) as u32;
+                        }
+                    }
+                }));
+            }
             Effect::AudioStop { target, .. } => {
                 let target_id = *self
                     .state
@@ -1872,18 +2307,95 @@ impl Core {
                 target_task = Some(target_id);
                 captured = audio.audio_envelope;
             }
-            Effect::StagePresent { scene, .. } => {
+            Effect::StagePresent {
+                scene,
+                inherit_images,
+                inherit_image_geometry,
+                dialogue_visible,
+                transition,
+                duration_us,
+            } => {
                 if self.state.tasks.values().any(|t| {
                     t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { .. })
                 }) {
                     return Err(self.error("E_OWNERSHIP", "stage transition owns root"));
                 }
                 source = self.sample_scene();
-                target = if !self.state.draft.is_empty() {
-                    std::mem::take(&mut self.state.draft)
+                let mut recipe = if !self.state.draft.is_empty() {
+                    self.state.draft.clone()
                 } else {
                     self.program().scenes[scene].clone()
                 };
+                let absent: Vec<_> = recipe
+                    .iter()
+                    .filter(|node| {
+                        node.inherit_existence && !source.iter().any(|old| old.id == node.id)
+                    })
+                    .map(|node| node.id.clone())
+                    .collect();
+                for root in absent {
+                    crate::bitmap::remove_tree(&mut recipe, &root);
+                }
+                for id in inherit_images {
+                    let image = source
+                        .iter()
+                        .find(|node| &node.id == id)
+                        .and_then(|node| node.asset.as_ref())
+                        .ok_or_else(|| {
+                            self.error("E_STAGE_INHERIT", "committed image is missing")
+                        })?;
+                    let node = recipe
+                        .iter_mut()
+                        .find(|node| &node.id == id)
+                        .ok_or_else(|| self.error("E_STAGE_INHERIT", "recipe node is missing"))?;
+                    node.asset = Some(image.clone());
+                }
+                for id in inherit_image_geometry {
+                    let old = source.iter().find(|node| &node.id == id).ok_or_else(|| {
+                        self.error("E_STAGE_INHERIT", "committed image rectangle is missing")
+                    })?;
+                    let node = recipe
+                        .iter_mut()
+                        .find(|node| &node.id == id)
+                        .ok_or_else(|| {
+                            self.error("E_STAGE_INHERIT", "recipe rectangle is missing")
+                        })?;
+                    [node.x, node.y, node.width, node.height] =
+                        [old.x, old.y, old.width, old.height];
+                }
+                target = crate::bitmap::materialize(&recipe, &self.state.variables)
+                    .map_err(|message| self.error("E_BITMAP_TEXT", message))?;
+                let next_generation = self
+                    .state
+                    .scene_generation
+                    .checked_add(1)
+                    .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
+                let mut preserved = BTreeMap::new();
+                for node in target
+                    .iter_mut()
+                    .filter(|node| !node.preserve_pose.is_empty())
+                {
+                    if let Some(old) = source.iter().find(|old| old.id == node.id) {
+                        for property in &node.preserve_pose.clone() {
+                            node.set(*property, old.get(*property));
+                            preserved
+                                .entry(node.id.clone())
+                                .or_insert_with(BTreeSet::new)
+                                .insert(*property);
+                        }
+                    }
+                }
+                crate::validate::validate_timeline_bindings(&target, scene, |id| {
+                    self.program().sprite_timelines.get(id)
+                })?;
+                self.state.draft.clear();
+                let removed: Vec<_> = self.state.tasks.values().filter(|t|t.state == TaskState::Running
+                    && matches!(&t.effect, Effect::SpriteTimeline { timeline, root, .. }
+                        if !target.iter().any(|n| &n.id == root && n.timeline_binding.as_deref() == Some(timeline.as_str()))))
+                    .map(|t|t.id).collect();
+                for id in removed {
+                    self.end_task(id, TaskEndReason::ScopeExited)?;
+                }
                 let ids: Vec<_> = self
                     .state
                     .tasks
@@ -1894,12 +2406,39 @@ impl Core {
                 for id in ids {
                     self.end_task(id, TaskEndReason::ScopeExited)?;
                 }
+                for task in self.state.tasks.values_mut() {
+                    if task.state == TaskState::Running
+                        && task.scene_generation == self.state.scene_generation
+                    {
+                        if let Effect::SpriteTimeline { timeline, root, .. } = &task.effect {
+                            if target.iter().any(|n| {
+                                &n.id == root
+                                    && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                            }) {
+                                task.scene_generation = next_generation;
+                            }
+                        }
+                        if let Some((TweenTarget::SceneNode { node, property }, _, _)) =
+                            task.effect.scalar_track(task.captured, task.base)
+                        {
+                            if preserved
+                                .get(&node)
+                                .is_some_and(|props| props.contains(&property))
+                            {
+                                task.scene_generation = next_generation;
+                            }
+                        }
+                    }
+                }
                 self.state.scene = target.clone();
-                self.state.scene_generation = self
-                    .state
-                    .scene_generation
-                    .checked_add(1)
-                    .ok_or_else(|| self.error("E_LIMIT", "scene generations"))?;
+                self.state.scene_generation = next_generation;
+                if let Some(visible) = dialogue_visible {
+                    self.execute_op(&Operation::DialogueVisibility {
+                        visible: *visible,
+                        transition: Some(transition.clone()),
+                        duration_us: *duration_us,
+                    })?;
+                }
             }
             Effect::Dialogue { .. } => {
                 let old: Vec<_> = self
@@ -1924,6 +2463,12 @@ impl Core {
         if let Some((address, _, replace)) = def.effect.scalar_track(0., 0.) {
             match &address {
                 TweenTarget::SceneNode { node, property } => {
+                    if self.state.tasks.values().any(|t| t.state == TaskState::Running
+                        && t.scene_generation == self.state.scene_generation
+                        && matches!(&t.effect, Effect::SpriteTimeline { timeline, .. }
+                            if self.program().sprite_timelines.get(timeline).is_some_and(|r| r.tracks.iter().any(|track| &track.node == node)))) {
+                        return Err(self.error("E_OWNERSHIP", "timeline owns descendant poses"));
+                    }
                     if self.state.tasks.values().any(|t| t.state == TaskState::Running && matches!(t.effect, Effect::StagePresent { duration_us, .. } if duration_us.0 > 0)) {
                         return Err(self.error("E_OWNERSHIP", "transition owns root"));
                     }
@@ -2029,6 +2574,7 @@ impl Core {
                 speaker: d.speaker.clone(),
                 speaker_id: d.speaker_id.clone(),
                 text: d.full_text(),
+                images: d.inline_images(),
                 voices: vec![],
                 choice: None,
             });
@@ -2052,6 +2598,13 @@ impl Core {
             });
         }
         let task = Task {
+            modal_interaction: if matches!(def.effect, Effect::StoryModal { .. }) {
+                Some(self.id()?)
+            } else {
+                None
+            },
+            shake,
+            sprite_shakes,
             id,
             name: def.id.clone(),
             frame: self.frame().id,
@@ -2207,6 +2760,7 @@ impl Core {
         // stop whose target already ended completes immediately.
         let finish_now = match &self.state.tasks[&child].effect {
             Effect::Clip { duration_us, .. }
+            | Effect::SourceMotion { duration_us, .. }
             | Effect::Tween { duration_us, .. }
             | Effect::Delay { duration_us } => duration_us.0 == 0,
             Effect::AudioStop {
@@ -2263,6 +2817,16 @@ impl Core {
         if sequence <= self.state.last_input {
             return Ok(());
         }
+        if let Some(advance) = self.state.waiting.as_ref().and_then(|w| w.advance.as_ref()) {
+            if advance.interaction != interaction {
+                return Ok(());
+            }
+            let next = advance.next.clone();
+            self.state.last_input = sequence;
+            self.state.waiting = None;
+            self.jump(next);
+            return Ok(());
+        }
         let Some(id) = self
             .state
             .tasks
@@ -2279,7 +2843,9 @@ impl Core {
         };
         self.state.last_input = sequence;
         let d = self.state.tasks[&id].dialogue.as_ref().unwrap();
-        if d.awaiting_advance {
+        if d.awaiting_advance && d.spans.get(d.span).is_some_and(|s| s.pause) {
+            self.resume_text_pause(id)?;
+        } else if d.awaiting_advance {
             let voices: BTreeSet<_> = if !stop_voice {
                 BTreeSet::new()
             } else if let Some(reading) = &d.reading {
@@ -2362,6 +2928,61 @@ impl Core {
                 }
             }
         }
+        if let Effect::SpriteTimeline {
+            timeline,
+            duration_us,
+            root,
+            delete_on_finish,
+        } = &t.effect
+        {
+            if t.scene_generation == self.state.scene_generation {
+                let resource = self
+                    .program()
+                    .sprite_timelines
+                    .shared(timeline)
+                    .ok_or_else(|| self.error("E_CONTENT_MISSING", timeline))?;
+                resource.apply(
+                    &mut self.state.scene,
+                    if status == TaskState::Finished {
+                        duration_us.0
+                    } else {
+                        t.elapsed_us.0
+                    },
+                );
+                if *delete_on_finish
+                    && reason == TaskEndReason::Completed
+                    && self.state.scene.iter().any(|n| {
+                        &n.id == root && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                    })
+                {
+                    let removed = crate::bitmap::tree_ids(&self.state.scene, root);
+                    let owners: Vec<_> = self.state.tasks.values().filter(|owner|
+                        owner.id != id && owner.state == TaskState::Running
+                        && owner.scene_generation == self.state.scene_generation
+                        && owner.effect.scalar_track(owner.captured, owner.base).is_some_and(|(address, _, _)|
+                            matches!(address, TweenTarget::SceneNode { node, .. } if removed.contains(&node))))
+                        .map(|owner| owner.id).collect();
+                    for owner in owners {
+                        self.end_task(owner, TaskEndReason::ScopeExited)?;
+                    }
+                    crate::bitmap::remove_tree(&mut self.state.scene, root);
+                    for owner in self.state.tasks.values_mut().filter(|owner| {
+                        owner.state == TaskState::Running
+                            && matches!(owner.effect, Effect::StagePresent { .. })
+                    }) {
+                        if owner.target.iter().any(|n| {
+                            &n.id == root
+                                && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                        }) {
+                            crate::bitmap::remove_tree(&mut owner.target, root);
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(t.effect, Effect::DialogueShake { .. }) {
+            self.state.dialogue_appearance.text_offset = [0.; 2];
+        }
         if let Some((address, track, _)) = t.effect.scalar_track(t.captured, t.base) {
             // Envelope commits follow the device clock when one was observed,
             // like timed stops; story-owned targets use the story clock.
@@ -2405,9 +3026,9 @@ impl Core {
         }
         if status == TaskState::Finished {
             if let Some(d) = &t.dialogue {
-                self.intents.push(CoreIntent::ProfileMerge {
-                    key: format!("read:{}:{}", d.text_id, d.meaning_revision),
-                });
+                let key = format!("read:{}:{}", d.text_id, d.meaning_revision);
+                self.profile_facts.insert(key.clone());
+                self.intents.push(CoreIntent::ProfileMerge { key });
             }
         }
         let task = self.state.tasks.get_mut(&id).unwrap();
@@ -2504,6 +3125,7 @@ impl Core {
                             easing: Easing::Linear,
                             finish: FinishPolicy::CommitEnd,
                             cancel: CancelPolicy::CommitCurrent,
+                            source_curve: None,
                         }
                         .sample(elapsed);
                         return (value, 0., Micros(remaining));
@@ -2525,6 +3147,7 @@ impl Core {
                             easing,
                             finish: FinishPolicy::CommitEnd,
                             cancel: CancelPolicy::CommitCurrent,
+                            source_curve: None,
                         }
                         .sample(elapsed);
                         return (value, to, Micros(remaining));
@@ -2563,6 +3186,27 @@ impl Core {
                 )
             })
     }
+    fn resume_text_pause(&mut self, id: u32) -> Result<()> {
+        let now = self.state.tick_us;
+        let d = self
+            .state
+            .tasks
+            .get_mut(&id)
+            .unwrap()
+            .dialogue
+            .as_mut()
+            .unwrap();
+        d.awaiting_advance = false;
+        d.span += 1;
+        d.cluster = 0;
+        d.last_reveal_us = now;
+        if let Some(reading) = &mut d.reading {
+            reading.revision = reading.revision.checked_add(1).ok_or_else(|| {
+                Diagnostic::new("E_LIMIT", "dialogue", "reading revision overflow")
+            })?;
+        }
+        Ok(())
+    }
     fn reveal(&mut self, id: u32, until_gate: bool) -> Result<()> {
         let now = self.state.tick_us;
         let task = self.state.tasks.get_mut(&id).unwrap();
@@ -2576,6 +3220,10 @@ impl Core {
                 break;
             }
             let s = &d.spans[d.span];
+            if s.pause {
+                d.awaiting_advance = true;
+                break;
+            }
             if s.gate {
                 d.at_gate = true;
                 task.milestones.insert(Milestone::Marker(s.id.clone()));
@@ -2625,13 +3273,34 @@ impl Core {
                 .values()
                 .filter(|t| t.state == TaskState::Running)
             {
+                if self.task_audio_paused(t) {
+                    continue;
+                }
                 let due = match &t.effect {
-                    Effect::Clip { duration_us, .. }
+                    Effect::DialogueShake { spec }
+                    | Effect::SpriteWave { spec, .. }
+                    | Effect::SpriteShake { spec, .. } => {
+                        Some(t.started_us.0.saturating_add(spec.duration_us.0))
+                    }
+                    Effect::SpriteTimeline { duration_us, .. }
+                    | Effect::Clip { duration_us, .. }
+                    | Effect::SourceMotion { duration_us, .. }
                     | Effect::Tween { duration_us, .. }
                     | Effect::Delay { duration_us }
                     | Effect::AudioStop { duration_us, .. }
                     | Effect::StagePresent { duration_us, .. } => {
                         Some(t.started_us.0.saturating_add(duration_us.0))
+                    }
+                    Effect::Dialogue { .. }
+                        if t.dialogue.as_ref().is_some_and(|d| {
+                            d.awaiting_advance && d.spans.get(d.span).is_some_and(|s| s.pause)
+                        }) =>
+                    {
+                        t.dialogue.as_ref().and_then(|d| {
+                            d.spans[d.span]
+                                .pause_timeout_us
+                                .map(|v| d.last_reveal_us.0.saturating_add(v.0))
+                        })
                     }
                     Effect::Dialogue { reveal_us, .. } => t
                         .dialogue
@@ -2660,12 +3329,22 @@ impl Core {
                 next = next.min(due);
             }
             self.state.tick_us = Micros(next);
+            let frozen: BTreeSet<_> = self
+                .state
+                .tasks
+                .values()
+                .filter(|t| self.task_audio_paused(t))
+                .map(|t| t.id)
+                .collect();
             for t in self
                 .state
                 .tasks
                 .values_mut()
                 .filter(|t| t.state == TaskState::Running)
             {
+                if frozen.contains(&t.id) {
+                    t.started_us.0 += next - now;
+                }
                 t.elapsed_us = Micros(next - t.started_us.0);
             }
             let ids: Vec<_> = self
@@ -2677,8 +3356,20 @@ impl Core {
                 .collect();
             for id in ids {
                 let t = &self.state.tasks[&id];
+                if self.task_audio_paused(t) {
+                    continue;
+                }
                 match t.effect {
-                    Effect::Clip { duration_us, .. }
+                    Effect::DialogueShake { spec }
+                    | Effect::SpriteWave { spec, .. }
+                    | Effect::SpriteShake { spec, .. }
+                        if t.elapsed_us.0 >= spec.duration_us.0 =>
+                    {
+                        self.finish_task(id, TaskState::Finished)?
+                    }
+                    Effect::SpriteTimeline { duration_us, .. }
+                    | Effect::Clip { duration_us, .. }
+                    | Effect::SourceMotion { duration_us, .. }
                     | Effect::Tween { duration_us, .. }
                     | Effect::Delay { duration_us }
                     | Effect::AudioStop { duration_us, .. }
@@ -2686,6 +3377,19 @@ impl Core {
                         if t.elapsed_us.0 >= duration_us.0 =>
                     {
                         self.finish_task(id, TaskState::Finished)?
+                    }
+                    Effect::Dialogue { .. }
+                        if t.dialogue.as_ref().is_some_and(|d| {
+                            d.awaiting_advance
+                                && d.spans.get(d.span).is_some_and(|s| {
+                                    s.pause
+                                        && s.pause_timeout_us.is_some_and(|v| {
+                                            next >= d.last_reveal_us.0.saturating_add(v.0)
+                                        })
+                                })
+                        }) =>
+                    {
+                        self.resume_text_pause(id)?;
                     }
                     Effect::Dialogue { reveal_us, .. }
                         if t.dialogue.as_ref().is_some_and(|d| {
@@ -2738,14 +3442,59 @@ impl Core {
         !matches!(target, TweenTarget::SceneNode { .. })
             || task.scene_generation == self.state.scene_generation
     }
+    fn sample_timelines(&self, nodes: &mut [Node]) {
+        for task in self.state.tasks.values().filter(|t| {
+            t.state == TaskState::Running && t.scene_generation == self.state.scene_generation
+        }) {
+            if let Effect::SpriteTimeline { timeline, root, .. } = &task.effect {
+                if nodes.iter().any(|n| {
+                    &n.id == root && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                }) {
+                    if let Some(resource) = self.program().sprite_timelines.get(timeline) {
+                        resource.apply(nodes, task.elapsed_us.0);
+                    }
+                }
+            }
+        }
+    }
     pub fn sample_scene(&self) -> Vec<Node> {
         let mut nodes = self.state.scene.clone();
+        self.sample_timelines(&mut nodes);
         for task in self
             .state
             .tasks
             .values()
             .filter(|t| t.state == TaskState::Running)
         {
+            if let (
+                Effect::SpriteWave {
+                    nodes: targets,
+                    spec,
+                },
+                Some(shake),
+            ) = (&task.effect, &task.shake)
+            {
+                if task.scene_generation == self.state.scene_generation {
+                    let offset = shake.sample(*spec, task.elapsed_us);
+                    for node in &mut nodes {
+                        if targets.contains(&node.id) {
+                            node.offset[0] += offset[0];
+                            node.offset[1] += offset[1];
+                        }
+                    }
+                }
+            }
+            if let Effect::SpriteShake { spec, .. } = &task.effect {
+                if task.scene_generation == self.state.scene_generation {
+                    for node in &mut nodes {
+                        if let Some(capture) = task.sprite_shakes.get(&node.id) {
+                            let offset = capture.sample(*spec, task.elapsed_us);
+                            node.offset[0] += offset[0];
+                            node.offset[1] += offset[1];
+                        }
+                    }
+                }
+            }
             if let Some((address, track, _)) = task.effect.scalar_track(task.captured, task.base) {
                 if self.track_is_current(task, &address) {
                     if let TweenTarget::SceneNode { node, property } = address {
@@ -2766,6 +3515,9 @@ impl Core {
             .values()
             .filter(|t| t.state == TaskState::Running)
         {
+            if let (Effect::DialogueShake { spec }, Some(shake)) = (&task.effect, &task.shake) {
+                appearance.text_offset = shake.sample(*spec, task.elapsed_us);
+            }
             if let Some((TweenTarget::DialogueRoot { property }, track, _)) =
                 task.effect.scalar_track(task.captured, task.base)
             {
@@ -2773,6 +3525,13 @@ impl Core {
             }
         }
         appearance
+    }
+    pub fn advance_wait(&self) -> Option<u32> {
+        self.state
+            .waiting
+            .as_ref()
+            .and_then(|w| w.advance.as_ref())
+            .map(|a| a.interaction)
     }
     pub fn dialogue(&self) -> Option<(u32, &Dialogue)> {
         self.state.tasks.values().rev().find_map(|t| {
@@ -2797,13 +3556,35 @@ impl Core {
             })
             .unwrap_or_default()
     }
-    pub fn transition(&self) -> Option<(&[Node], f32)> {
+    pub fn transition(&self) -> Option<(Vec<Node>, f32)> {
         self.state.tasks.values().find_map(|t| {
             if t.state == TaskState::Running {
                 if let Effect::StagePresent { duration_us, .. } = t.effect {
                     if duration_us.0 > 0 {
+                        let mut source = t.source.clone();
+                        self.sample_timelines(&mut source);
+                        let current = if t.target.iter().any(|node| !node.preserve_pose.is_empty())
+                        {
+                            self.sample_scene()
+                        } else {
+                            vec![]
+                        };
+                        for node in t
+                            .target
+                            .iter()
+                            .filter(|node| !node.preserve_pose.is_empty())
+                        {
+                            if let (Some(old), Some(now)) = (
+                                source.iter_mut().find(|n| n.id == node.id),
+                                current.iter().find(|n| n.id == node.id),
+                            ) {
+                                for property in &node.preserve_pose {
+                                    old.set(*property, now.get(*property));
+                                }
+                            }
+                        }
                         return Some((
-                            t.source.as_slice(),
+                            source,
                             (t.elapsed_us.0 as f64 / duration_us.0 as f64).min(1.) as f32,
                         ));
                     }
@@ -2812,6 +3593,16 @@ impl Core {
             } else {
                 None
             }
+        })
+    }
+    pub fn transition_progress(&self) -> Option<f32> {
+        self.state.tasks.values().find_map(|task| {
+            if let Effect::StagePresent { duration_us, .. } = task.effect {
+                if task.state == TaskState::Running && duration_us.0 > 0 {
+                    return Some((task.elapsed_us.0 as f64 / duration_us.0 as f64).min(1.) as f32);
+                }
+            }
+            None
         })
     }
     /// In-flight message-window reveal: (style, direction, linear progress).
@@ -2923,11 +3714,12 @@ impl Core {
             || self.state.window_reveal.is_some()
             || self.state.tasks.values().any(|t| {
                 t.state == TaskState::Running
+                    && !self.task_audio_paused(t)
                     && match t.effect {
                         Effect::Dialogue { .. } => t
                             .dialogue
                             .as_ref()
-                            .is_some_and(|d| !d.at_gate && !d.awaiting_advance),
+                            .is_some_and(|d| !d.at_gate && (!d.awaiting_advance || d.spans.get(d.span).is_some_and(|s| s.pause && s.pause_timeout_us.is_some()))),
                         // Audio advances on the device even when text is fully
                         // revealed. Keep the Story clock alive for save offsets.
                         Effect::Audio { .. } => true,
@@ -2937,6 +3729,13 @@ impl Core {
     }
     pub fn restore(program: ValidatedProgram, s: Snapshot, release: &str) -> Result<Self> {
         Self::restore_inner(program, s, release, false)
+    }
+    fn task_audio_paused(&self, task: &Task) -> bool {
+        let target = task
+            .target_task
+            .and_then(|id| self.state.tasks.get(&id))
+            .unwrap_or(task);
+        matches!(target.effect, Effect::Audio { bus, .. } if self.state.audio_paused.contains(&bus))
     }
     pub fn restore_verified(
         program: ValidatedProgram,
@@ -2954,6 +3753,12 @@ impl Core {
     ) -> Result<Self> {
         let fail = |msg: &str| Diagnostic::new("E_SNAPSHOT", "restore", msg);
         let p = program.program();
+        if s.menu_disabled && !p.requires.iter().any(|c| c == "player.menu-access.v1") {
+            return Err(fail("menu access capability missing"));
+        }
+        if !s.audio_paused.is_empty() && !p.requires.iter().any(|c| c == "audio.pause.v1") {
+            return Err(fail("audio pause capability missing"));
+        }
         if s.format != SNAPSHOT_VERSION
             || s.game_id != p.game_id
             || s.revision != p.revision
@@ -2973,6 +3778,25 @@ impl Core {
         {
             return Err(fail("state limits/locale"));
         }
+        if s.dialogue_style
+            .as_ref()
+            .is_some_and(|style| !p.theme.dialogue_styles.contains_key(style))
+        {
+            return Err(fail("unknown dialogue style"));
+        }
+        if !s.dialogue_decorations.is_empty()
+            && (!p.requires.iter().any(|c| c == "dialogue.decoration.v1")
+                || s.dialogue_decorations.values().any(|d| {
+                    !d.valid()
+                        || p.asset(&d.asset).is_none_or(|asset| {
+                            asset.kind != AssetKind::Image
+                                || d.rect[2] != asset.width as f32
+                                || d.rect[3] != asset.height as f32
+                        })
+                }))
+        {
+            return Err(fail("invalid dialogue decoration"));
+        }
         if s.variables.len() != p.variables.len()
             || p.variables
                 .iter()
@@ -2981,6 +3805,27 @@ impl Core {
             return Err(fail("variable layout"));
         }
         for h in &s.history {
+            let identity = p
+                .text_identity(&h.text_id)
+                .ok_or_else(|| fail("unknown history text"))?;
+            if h.images.len() != identity.images.len()
+                || h.images.len() > 256
+                || h.images
+                    .iter()
+                    .zip(&identity.images)
+                    .any(|(placement, binding)| {
+                        let at = placement.offset as usize;
+                        !placement.image.valid()
+                            || placement.image.asset != binding.asset
+                            || h.text.get(at..at.saturating_add(3)) != Some("\u{fffc}")
+                    })
+                || h.images
+                    .windows(2)
+                    .any(|pair| pair[0].offset >= pair[1].offset)
+                || (h.choice.is_some() && !h.images.is_empty())
+            {
+                return Err(fail("invalid history inline images"));
+            }
             if let Some(choice) = &h.choice {
                 // Completed history is passive metadata. The root declares
                 // choice and text identities even after the old module's
@@ -3091,6 +3936,41 @@ impl Core {
             }
         }
         for (id, t) in &s.tasks {
+            if matches!(t.effect, Effect::StoryModal { .. }) {
+                if t.modal_interaction.is_none_or(|token| {
+                    token == 0 || token >= s.next_id || !instances.insert(token)
+                }) {
+                    return Err(fail("invalid story modal interaction"));
+                }
+            } else if t.modal_interaction.is_some() {
+                return Err(fail("unexpected story modal interaction"));
+            }
+            match &t.effect {
+                Effect::SpriteShake { nodes, mode, spec }
+                    if t.sprite_shakes.len() == nodes.len()
+                        && nodes.iter().all(|node| {
+                            t.sprite_shakes
+                                .get(node)
+                                .is_some_and(|capture| capture.valid_sprite(*mode, *spec))
+                        })
+                        && (*mode != nir_format::SpriteShakeMode::Quake
+                            || crate::ShakeCapture::shared_quake_phases(&t.sprite_shakes)) => {}
+                Effect::SpriteShake { .. } => {
+                    return Err(fail("invalid independent sprite trajectories"))
+                }
+                _ if !t.sprite_shakes.is_empty() => {
+                    return Err(fail("unexpected independent sprite trajectories"))
+                }
+                _ => {}
+            }
+            match (&t.effect, &t.shake) {
+                (Effect::DialogueShake { spec }, Some(shake)) if shake.valid(*spec) => {}
+                (Effect::SpriteWave { spec, .. }, Some(shake)) if shake.valid_wave(*spec) => {}
+                (Effect::DialogueShake { .. } | Effect::SpriteWave { .. }, _) | (_, Some(_)) => {
+                    return Err(fail("invalid frozen shake"))
+                }
+                _ => {}
+            }
             if *id != t.id
                 || t.id >= s.next_id
                 || !instances.insert(t.id)
@@ -3183,6 +4063,20 @@ impl Core {
                 }
             }
         }
+        if s.tasks
+            .values()
+            .filter(|t| {
+                t.state == TaskState::Running && matches!(t.effect, Effect::StoryModal { .. })
+            })
+            .count()
+            > 1
+            || (s.choice.is_some()
+                && s.tasks.values().any(|t| {
+                    t.state == TaskState::Running && matches!(t.effect, Effect::StoryModal { .. })
+                }))
+        {
+            return Err(fail("multiple story modal interactions"));
+        }
         if s.handles.values().any(|id| !s.tasks.contains_key(id))
             || s.waiting
                 .as_ref()
@@ -3249,6 +4143,7 @@ impl Core {
                 next,
                 on_cancelled,
                 on_failed,
+                on_advance,
             } = &block.terminator
             else {
                 return Err(fail("unexpected wait"));
@@ -3261,9 +4156,22 @@ impl Core {
                 || next != &w.next
                 || on_cancelled != &w.on_cancelled
                 || on_failed != &w.on_failed
+                || on_advance.as_deref() != w.advance.as_ref().map(|a| a.next.as_str())
                 || top.op != block.ops.len()
             {
                 return Err(fail("wait continuation mismatch"));
+            }
+            if w.advance.as_ref().is_some_and(|a| {
+                a.interaction == 0
+                    || a.interaction >= s.next_id
+                    || s.tasks.contains_key(&a.interaction)
+                    || s.tasks.values().any(|t| {
+                        t.dialogue
+                            .as_ref()
+                            .is_some_and(|d| d.interaction == a.interaction)
+                    })
+            }) {
+                return Err(fail("invalid advance-wait interaction"));
             }
         }
         if let Some(c) = &s.choice {
@@ -3349,6 +4257,14 @@ impl Core {
         if !s.dialogue_appearance.valid() {
             return Err(fail("invalid dialogue appearance"));
         }
+        if s.dialogue_appearance.text_offset != [0.; 2]
+            && !p
+                .requires
+                .iter()
+                .any(|cap| cap == "stage.dialogue-shake.v1")
+        {
+            return Err(fail("dialogue offset capability missing"));
+        }
         if let Some(reveal) = &s.window_reveal {
             // Structural only: the reveal is operation-committed, so unlike
             // tasks it has no cue declaration to match against.
@@ -3371,7 +4287,55 @@ impl Core {
         }
         let mut property_owners = BTreeSet::new();
         let mut envelope_owners = BTreeSet::new();
+        let mut wave_owners = BTreeSet::new();
+        let mut timeline_owners = BTreeSet::new();
         for t in s.tasks.values() {
+            if t.state == TaskState::Running {
+                match &t.effect {
+                    Effect::SpriteTimeline {
+                        timeline,
+                        root,
+                        duration_us,
+                        ..
+                    } => {
+                        let resource = p
+                            .sprite_timelines
+                            .get(timeline)
+                            .ok_or_else(|| fail("timeline not resident"))?;
+                        if resource.duration_us != *duration_us
+                            || t.elapsed_us.0 >= duration_us.0
+                            || t.scene_generation != s.scene_generation
+                            || !s.scene.iter().any(|n| {
+                                &n.id == root
+                                    && n.timeline_binding.as_deref() == Some(timeline.as_str())
+                            })
+                            || resource
+                                .tracks
+                                .iter()
+                                .any(|track| !timeline_owners.insert(track.node.as_str()))
+                        {
+                            return Err(fail("invalid live timeline identity or ownership"));
+                        }
+                    }
+                    Effect::DialogueShake { spec }
+                    | Effect::SpriteWave { spec, .. }
+                    | Effect::SpriteShake { spec, .. }
+                        if t.elapsed_us.0 >= spec.duration_us.0 =>
+                    {
+                        return Err(fail("expired shake trajectory"));
+                    }
+                    Effect::SpriteWave { nodes, .. } | Effect::SpriteShake { nodes, .. }
+                        if t.scene_generation == s.scene_generation =>
+                    {
+                        for node in nodes {
+                            if !s.scene.iter().any(|n| &n.id == node) || !wave_owners.insert(node) {
+                                return Err(fail("invalid sprite wave target ownership"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(reading) = t.dialogue.as_ref().and_then(|d| d.reading.as_ref()) {
                 if !p.requires.iter().any(|c| c == "text.voice-binding.v1")
                     || (reading.wait == VoiceWaitPolicy::SampledRemaining
@@ -3525,10 +4489,23 @@ impl Core {
                 }
             }
         }
+        if s.tasks.values().any(|t| t.state == TaskState::Running && t.scene_generation == s.scene_generation
+            && t.effect.scalar_track(0.,0.).is_some_and(|(a,_,_)|
+                matches!(a, TweenTarget::SceneNode { node, .. } if timeline_owners.contains(node.as_str())))) {
+            return Err(fail("timeline conflicts with scalar pose writer"));
+        }
         for nodes in std::iter::once(&s.scene)
             .chain(std::iter::once(&s.draft))
             .chain(s.tasks.values().flat_map(|t| [&t.source, &t.target]))
         {
+            crate::validate::validate_timeline_bindings(nodes, "snapshot", |id| {
+                p.sprite_timelines.get(id)
+            })?;
+            if nodes.iter().any(|n| n.timeline_binding.is_some())
+                && !p.requires.iter().any(|c| c == "stage.sprite-timeline.v1")
+            {
+                return Err(fail("missing timeline capability"));
+            }
             if nodes.len() > MAX_NODES {
                 return Err(fail("scene size"));
             }
@@ -3537,6 +4514,50 @@ impl Core {
                 return Err(fail("duplicate scene node"));
             }
             for n in nodes {
+                if n.inherit_existence
+                    && (!p
+                        .requires
+                        .iter()
+                        .any(|cap| cap == "stage.sprite-lifecycle.v1")
+                        || n.parent.is_some()
+                        || n.timeline_binding.is_none())
+                {
+                    return Err(fail("invalid inherited animated existence in snapshot"));
+                }
+                if let Some(transform) = n.sprite_transform {
+                    if !p
+                        .requires
+                        .iter()
+                        .any(|cap| cap == "stage.sprite-transform.v1")
+                        || !transform.valid(n.width, n.height)
+                        || n.clip.is_some()
+                        || n.bitmap_text.is_some()
+                        || nodes
+                            .iter()
+                            .any(|child| child.parent.as_deref() == Some(n.id.as_str()))
+                    {
+                        return Err(fail("invalid leaf sprite transform in snapshot"));
+                    }
+                }
+                if n.offset != [0.; 2]
+                    && (!p.requires.iter().any(|cap| cap == "stage.sprite-wave.v1")
+                        || n.offset.iter().any(|v| !v.is_finite() || v.abs() > 8192.))
+                {
+                    return Err(fail("invalid sprite offset in snapshot"));
+                }
+                if !n.preserve_pose.is_empty()
+                    && (!p
+                        .requires
+                        .iter()
+                        .any(|cap| cap == "stage.sprite-continuity.v1")
+                        || n.preserve_pose.iter().collect::<BTreeSet<_>>().len()
+                            != n.preserve_pose.len())
+                {
+                    return Err(fail("invalid preserved pose properties in snapshot"));
+                }
+                if n.bitmap_text.is_some() {
+                    return Err(fail("unmaterialized bitmap recipe in snapshot"));
+                }
                 if ![n.x, n.y, n.width, n.height, n.scale, n.opacity]
                     .iter()
                     .chain(n.color.iter())
@@ -3620,8 +4641,23 @@ impl Core {
             work_remaining: 0,
             remaining_time_us: 0,
             text_speed: 1.,
+            profile_facts: BTreeSet::new(),
+            profile_values: BTreeMap::new(),
         };
         core.state.last_input = 0;
+        let modals: Vec<_> = core
+            .state
+            .tasks
+            .values()
+            .filter(|t| {
+                t.state == TaskState::Running && matches!(t.effect, Effect::StoryModal { .. })
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in modals {
+            let token = core.id()?;
+            core.state.tasks.get_mut(&id).unwrap().modal_interaction = Some(token);
+        }
         // Restored interactions receive fresh identities, in addition to the host epoch change.
         let ids: Vec<_> = core
             .state
@@ -3651,6 +4687,22 @@ impl Core {
         if core.state.choice.is_some() {
             let token = core.id()?;
             core.state.choice.as_mut().unwrap().interaction = token;
+        }
+        if core
+            .state
+            .waiting
+            .as_ref()
+            .is_some_and(|w| w.advance.is_some())
+        {
+            let token = core.id()?;
+            core.state
+                .waiting
+                .as_mut()
+                .unwrap()
+                .advance
+                .as_mut()
+                .unwrap()
+                .interaction = token;
         }
         Ok(core)
     }
@@ -3719,20 +4771,48 @@ pub(crate) fn validate_dialogue(
     }
     for (span, source) in d.spans.iter().zip(&doc.spans) {
         let valid = match source {
+            Span::Image { id, image } => {
+                &span.id == id
+                    && span.text == "\u{fffc}"
+                    && span.image.as_ref() == Some(image)
+                    && !span.gate
+                    && !span.emphasis
+            }
             Span::Text { id, text, emphasis } => {
                 &span.id == id && &span.text == text && span.emphasis == *emphasis && !span.gate
             }
+            Span::Ruby { id, text, reading } => {
+                &span.id == id
+                    && &span.text == text
+                    && span.ruby.as_ref() == Some(reading)
+                    && !span.gate
+                    && !span.emphasis
+            }
             Span::Break { id } => &span.id == id && span.text == "\n" && !span.gate,
             Span::Gate { id } => &span.id == id && span.text.is_empty() && span.gate,
+            Span::Pause { id, timeout_us } => {
+                &span.id == id
+                    && span.text.is_empty()
+                    && span.pause
+                    && !span.gate
+                    && span.pause_timeout_us == *timeout_us
+            }
             Span::Param { id, .. } => &span.id == id && !span.gate && span.text.len() <= 128 * 1024,
         };
-        if !valid {
+        if !valid
+            || (!matches!(source, Span::Pause { .. })
+                && (span.pause || span.pause_timeout_us.is_some()))
+            || (!matches!(source, Span::Ruby { .. }) && span.ruby.is_some())
+            || (!matches!(source, Span::Image { .. }) && span.image.is_some())
+        {
             return Err(fail("frozen text contract mismatch"));
         }
     }
     if d.span < d.spans.len() && d.cluster > d.spans[d.span].text.graphemes(true).count()
         || d.at_gate && !d.spans.get(d.span).is_some_and(|s| s.gate)
-        || d.awaiting_advance && d.span != d.spans.len()
+        || d.awaiting_advance
+            && d.span != d.spans.len()
+            && !d.spans.get(d.span).is_some_and(|s| s.pause)
     {
         return Err(fail("invalid reveal cursor"));
     }

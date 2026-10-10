@@ -10,6 +10,81 @@ fn project() -> tempfile::TempDir {
     d
 }
 #[test]
+fn choice_only_image_states_survive_release_asset_pruning() {
+    let d = project();
+    let catalog = d.path().join("assets/catalog.toml");
+    let mut assets = fs::read_to_string(&catalog).unwrap();
+    for state in ["normal", "hover", "disabled"] {
+        assets.push_str(&format!("\n[[assets]]\nid = \"choice.{state}\"\nkind = \"image\"\nsource = \"source/aki.png\"\nrights = \"CC0-1.0\"\nexpected_size = [290,530]\n"));
+    }
+    fs::write(catalog, assets).unwrap();
+    let story = d.path().join("content/ch01/story.nir.json");
+    let mut fragment: serde_json::Value =
+        serde_json::from_slice(&fs::read(&story).unwrap()).unwrap();
+    for option in fragment["choices"]["route"]["options"]
+        .as_array_mut()
+        .unwrap()
+    {
+        option["image"] = serde_json::json!({"asset":"choice.normal","hover_asset":"choice.hover",
+            "disabled_asset":"choice.disabled","rect":[120,120,200,150]});
+    }
+    fs::write(story, serde_json::to_vec(&fragment).unwrap()).unwrap();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/choice-images");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    for state in ["normal", "hover", "disabled"] {
+        assert!(executable
+            .program
+            .assets
+            .contains_key(&format!("choice.{state}")));
+    }
+    assert!(executable
+        .program
+        .requires
+        .iter()
+        .any(|cap| cap == "choice.disabled-image.v1"));
+    nir_core::ValidatedProgram::from_runtime(executable.program).unwrap();
+}
+
+#[test]
+fn inherited_image_activation_recipes_match_eager_and_lazy_release_paths() {
+    let d = project();
+    let story = d.path().join("content/ch01/story.nir.json");
+    let mut fragment: serde_json::Value =
+        serde_json::from_slice(&fs::read(&story).unwrap()).unwrap();
+    fragment["cues"]["opening"]["effects"][0]["effect"]["inherit_images"] =
+        serde_json::json!(["background"]);
+    fs::write(story, serde_json::to_vec(&fragment).unwrap()).unwrap();
+    let sdk = test_sdk();
+    resolve(d.path(), sdk.path()).unwrap();
+    let out = d.path().join("dist/inherited-images");
+    let report = build(d.path(), sdk.path(), &out, true).unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    assert!(executable
+        .program
+        .requires
+        .iter()
+        .any(|cap| cap == "stage.inherit-image.v1"));
+    nir_core::ValidatedProgram::from_runtime(executable.program).unwrap();
+}
+
+#[test]
 fn authored_history_voice_is_opt_in_inferred_and_gated_in_source_and_runtime() {
     for flow in [false, true] {
         let d = project();
@@ -1395,4 +1470,60 @@ content = {type = "hit_region", label = "Resume", action = {type = "new_game"}}
         .requires
         .iter()
         .any(|c| c == "ui.menu-chrome.v1"));
+}
+
+#[test]
+fn offline_long_pcm_audio_reads_with_full_duration_and_unchanged_other_limits() {
+    use std::io::Write;
+    let d = project();
+    let path = d.path().join("assets/source/bgm.wav");
+    let payload = 72 * 1024 * 1024u32;
+    let mut file = fs::File::create(&path).unwrap();
+    let mut header = Vec::new();
+    header.extend(b"RIFF");
+    header.extend((payload + 36).to_le_bytes());
+    header.extend(b"WAVEfmt ");
+    header.extend(16u32.to_le_bytes());
+    header.extend(1u16.to_le_bytes());
+    header.extend(2u16.to_le_bytes());
+    header.extend(48000u32.to_le_bytes());
+    header.extend(192000u32.to_le_bytes());
+    header.extend(4u16.to_le_bytes());
+    header.extend(16u16.to_le_bytes());
+    header.extend(b"data");
+    header.extend(payload.to_le_bytes());
+    file.write_all(&header).unwrap();
+    file.set_len(payload as u64 + 44).unwrap();
+    drop(file);
+    let loaded = load_project(d.path()).unwrap();
+    let audio = &loaded.program.assets["audio.bgm"];
+    assert_eq!(audio.decoded_bytes, payload as u64 * 2);
+    assert_eq!(
+        audio.duration_us.0,
+        (payload as u64 / 4) * 1_000_000 / 48_000
+    );
+    drop(loaded);
+    fs::File::create(d.path().join("assets/source/station.png"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let error = load_project(d.path()).err().unwrap().to_string();
+    assert!(
+        error.contains("E_LIMIT") && error.contains("station.png"),
+        "{error}"
+    );
+}
+
+#[test]
+fn offline_audio_source_above_pcm_and_header_budget_is_rejected_before_read() {
+    let d = project();
+    fs::File::create(d.path().join("assets/source/bgm.wav"))
+        .unwrap()
+        .set_len(128 * 1024 * 1024 + 64 * 1024 + 1)
+        .unwrap();
+    let error = load_project(d.path()).err().unwrap().to_string();
+    assert!(
+        error.contains("E_LIMIT") && error.contains("bgm.wav"),
+        "{error}"
+    );
 }

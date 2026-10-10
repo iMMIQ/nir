@@ -10,6 +10,11 @@ pub struct DialogueAppearance {
     pub opacity: f32,
     pub background_opacity: f32,
     pub text_opacity: f32,
+    #[serde(default, skip_serializing_if = "offset_is_zero")]
+    pub text_offset: [f32; 2],
+}
+pub(crate) fn offset_is_zero(value: &[f32; 2]) -> bool {
+    *value == [0.; 2]
 }
 impl Default for DialogueAppearance {
     fn default() -> Self {
@@ -17,6 +22,7 @@ impl Default for DialogueAppearance {
             opacity: 1.,
             background_opacity: 1.,
             text_opacity: 1.,
+            text_offset: [0.; 2],
         }
     }
 }
@@ -39,6 +45,10 @@ impl DialogueAppearance {
         [self.opacity, self.background_opacity, self.text_opacity]
             .iter()
             .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            && self
+                .text_offset
+                .iter()
+                .all(|v| v.is_finite() && v.abs() <= 8192.)
     }
 }
 
@@ -69,9 +79,49 @@ pub struct ScalarTween {
     pub easing: Easing,
     pub finish: FinishPolicy,
     pub cancel: CancelPolicy,
+    pub source_curve: Option<SourceMotionCurve>,
+}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMotionCurve {
+    Inc,
+    Dec,
+    /// Linear integer 0..255 alpha represented as normalized rendering alpha.
+    OpacityLinear,
 }
 impl ScalarTween {
     pub fn sample(&self, elapsed_us: Micros) -> f32 {
+        if let Some(curve) = self.source_curve {
+            let duration = self.duration_us.0 / 1000;
+            let t = elapsed_us.0 / 1000;
+            if duration == 0 {
+                return self.to;
+            }
+            if t == 0 {
+                return self.from;
+            }
+            if t >= duration - 1 {
+                return self.to;
+            }
+            let p = match curve {
+                SourceMotionCurve::Inc => {
+                    1. - (((duration - t - 1) as f64 * std::f64::consts::FRAC_PI_2)
+                        / duration as f64)
+                        .sin()
+                }
+                SourceMotionCurve::Dec => {
+                    ((t as f64 * std::f64::consts::FRAC_PI_2) / duration as f64).sin()
+                }
+                SourceMotionCurve::OpacityLinear => t as f64 / duration as f64,
+            };
+            if curve == SourceMotionCurve::OpacityLinear {
+                let from = (self.from as f64 * 255.).round();
+                let to = (self.to as f64 * 255.).round();
+                return (((1. - p) * from + p * to).trunc() / 255.) as f32;
+            }
+            return ((1. - p) * self.from as f64 + p * self.to as f64).trunc() as f32;
+        }
         let progress = if self.duration_us.0 == 0 {
             1.
         } else {
@@ -97,6 +147,52 @@ impl ScalarTween {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stock_motion_uses_integer_milliseconds_endpoint_samples_and_truncation() {
+        let mut t = track();
+        t.from = 0.;
+        t.base = 0.;
+        t.to = 100.;
+        t.duration_us = Micros(1000000);
+        t.source_curve = Some(SourceMotionCurve::Dec);
+        assert_eq!(t.sample(Micros(0)), 0.);
+        assert_eq!(t.sample(Micros(500000)), 70.);
+        assert_eq!(t.sample(Micros(500999)), 70.);
+        assert_eq!(t.sample(Micros(999000)), 100.);
+        t.source_curve = Some(SourceMotionCurve::Inc);
+        assert_eq!(t.sample(Micros(0)), 0.);
+        assert_eq!(t.sample(Micros(500000)), 29.);
+        assert_eq!(t.sample(Micros(998000)), 99.);
+        assert_eq!(t.sample(Micros(999000)), 100.);
+        t.from = 100.;
+        t.to = -100.;
+        t.source_curve = Some(SourceMotionCurve::Dec);
+        assert_eq!(t.sample(Micros(500000)), -41.);
+        t.duration_us = Micros(1000);
+        assert_eq!(t.sample(Micros(0)), 100.);
+        assert_eq!(t.sample(Micros(1000)), -100.);
+        t.duration_us = Micros(0);
+        assert_eq!(t.sample(Micros(0)), -100.);
+    }
+    #[test]
+    fn stock_opacity_quantizes_byte_samples_without_treating_zero_as_opaque() {
+        let mut t = track();
+        t.from = 1.;
+        t.to = 64. / 255.;
+        t.duration_us = Micros(1000000);
+        t.source_curve = Some(SourceMotionCurve::OpacityLinear);
+        assert_eq!(t.sample(Micros(0)), 1.);
+        assert_eq!(t.sample(Micros(500000)), 159. / 255.);
+        assert_eq!(t.sample(Micros(500999)), 159. / 255.);
+        assert_eq!(t.sample(Micros(999000)), 64. / 255.);
+        t.from = 220. / 255.;
+        t.to = 150. / 255.;
+        assert_eq!(t.sample(Micros(500000)), 185. / 255.);
+        t.from = 1.;
+        t.to = 0.;
+        assert_eq!(t.sample(Micros(500000)), 127. / 255.);
+        assert_eq!(t.sample(Micros(999000)), 0.);
+    }
     fn track() -> ScalarTween {
         ScalarTween {
             from: 0.2,
@@ -106,6 +202,7 @@ mod tests {
             easing: Easing::Linear,
             finish: FinishPolicy::CommitEnd,
             cancel: CancelPolicy::CommitCurrent,
+            source_curve: None,
         }
     }
     #[test]

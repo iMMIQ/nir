@@ -21,6 +21,10 @@ pub struct AuthorTextContract {
     pub meaning_revision: u32,
     #[serde(default)]
     pub gates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pauses: Vec<TextPauseContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TextImageContract>,
     #[serde(default)]
     pub params: BTreeMap<String, ValueType>,
 }
@@ -32,6 +36,8 @@ impl AuthorTextContract {
             meaning_revision: self.meaning_revision,
             contract_digest: String::new(),
             gates: self.gates.clone(),
+            pauses: self.pauses.clone(),
+            images: self.images.clone(),
             params: self.params.clone(),
         };
         c.contract_digest = text_contract_digest(&c);
@@ -98,7 +104,13 @@ fn hash<T: Serialize>(value: &T) -> Result<String> {
     Ok(nir_content::digest(&serde_json::to_vec(value)?))
 }
 fn shape(c: &AuthorTextContract) -> Result<String> {
-    hash(&(&c.params, &c.gates))
+    if !c.images.is_empty() {
+        hash(&(&c.params, &c.gates, &c.pauses, &c.images))
+    } else if c.pauses.is_empty() {
+        hash(&(&c.params, &c.gates))
+    } else {
+        hash(&(&c.params, &c.gates, &c.pauses))
+    }
 }
 fn modules(root: &Path) -> Result<(GameManifest, Vec<(PathBuf, Module)>)> {
     let manifest: GameManifest = toml_file(&root.join("game.toml"))?;
@@ -752,6 +764,8 @@ pub fn text_migrate(root: &Path, out: &Path) -> Result<()> {
                     contract_revision: c.revision,
                     meaning_revision: c.revision,
                     gates: c.gates.clone(),
+                    pauses: vec![],
+                    images: vec![],
                     params: c.params.clone(),
                 },
             )

@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {writePreferencesRecord,mergeProfileRecord,OwnerInbox,dispatchOwnerRequest,PersistenceWrites} from '../../crates/nir-platform-web/host.js';
+import {writePreferencesRecord,mergeProfileRecord,writeMetadataRecord,OwnerInbox,dispatchOwnerRequest,PersistenceWrites} from '../../crates/nir-platform-web/host.js';
 
 const turns=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 function fixture({prior,abortThrows=false}={}) {
@@ -90,4 +90,23 @@ test('an uncertain persistence lane keeps edits, rejects retry and starts only o
   jobs[0].ok();assert.equal(jobs.length,2);jobs[1].work(()=>{});jobs[1].ok();
   assert.deepEqual(writes,[{bgm_volume:.1},{bgm_volume:.995}]);assert.deepEqual(events,['failed:preferences','stored:preferences']);
   assert.equal(q.retry('preferences'),false);
+});
+
+test('mutable progress uses a separate key and merges only assigned fields after transaction completion',async()=>{
+  const f=fixture({prior:{other:{type:'i32',value:7},diagnosis:{type:'i32',value:1}}});
+  const p=writeMetadataRecord(f.db,'profile_values',['game','release'],{diagnosis:{type:'i32',value:0}});
+  const {r,put,tx}=f.reads[0];r.onsuccess();
+  assert.deepEqual(f.writes[0],{kind:'profile',key:['game','release','values'],value:{other:{type:'i32',value:7},diagnosis:{type:'i32',value:0}}});
+  put.onsuccess();tx.oncomplete();await p;
+  const bad=fixture({prior:['old-fact']});const result=writeMetadataRecord(bad.db,'profile_values',['game','release'],{});bad.reads[0].r.onsuccess();
+  await assert.rejects(result,/E_PROFILE_VALUES_RECORD/);assert.equal(bad.writes.length,0);
+});
+
+test('extended progress keeps exact bits and rejects non-finite or noncanonical values',async()=>{
+  const f=fixture(),bits='3fff8000000000000001';
+  const p=writeMetadataRecord(f.db,'profile_values',['game','release'],{extended:{type:'f80',value:bits}});
+  const {r,put,tx}=f.reads[0];r.onsuccess();assert.equal(f.writes[0].value.extended.value,bits);put.onsuccess();tx.oncomplete();await p;
+  for(const value of ['7fff8000000000000000','00008000000000000000','3FFF8000000000000001',1]){
+    const bad=fixture();await assert.rejects(writeMetadataRecord(bad.db,'profile_values',['game','release'],{extended:{type:'f80',value}}),/E_PROFILE_VALUES_RECORD/);assert.equal(bad.reads.length,0);
+  }
 });

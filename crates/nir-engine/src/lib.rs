@@ -110,7 +110,7 @@ impl Engine {
         if executable.format != 2 {
             return Err(js("E_RUNTIME_VERSION: expected RuntimeExecutable v2"));
         }
-        let player = Player::new_runtime_with_audio_sample_rate(
+        let mut player = Player::new_runtime_with_audio_sample_rate(
             executable.program,
             release,
             title,
@@ -118,6 +118,10 @@ impl Engine {
             audio_decode_sample_rate,
         )
         .map_err(js)?;
+        let [physical_width, physical_height] = renderer.surface_extent();
+        player
+            .reserve_render_surfaces(physical_width, physical_height)
+            .map_err(js)?;
         let mut e = Self {
             player,
             renderer,
@@ -483,15 +487,25 @@ impl Engine {
             self.visual_invalidated = true;
         }
         let model = self.player.model();
-        if !model.authored_menu {
+        let image_choice = model.screen == nir_presentation::Screen::Story
+            && model.choices.iter().any(|choice| choice.image.is_some());
+        if !model.authored_menu && !image_choice {
             return Ok(());
         }
         let id = self
             .packet
             .hit_node(x, y)
             .filter(|node| node.enabled)
-            .and_then(|node| self.packet.menu_controls.get(&node.id))
-            .cloned();
+            .and_then(|node| {
+                if image_choice {
+                    match &node.action {
+                        UiAction::Choose { option } => Some(option.clone()),
+                        _ => None,
+                    }
+                } else {
+                    self.packet.menu_controls.get(&node.id).cloned()
+                }
+            });
         if id != model.hovered_image {
             self.input(UiAction::HoverImage { id }, 0)?;
         }
@@ -797,6 +811,7 @@ impl Engine {
             && !self.player.interface_hidden()
             && self.player.screen == nir_presentation::Screen::Story
             && self.player.core().state().choice.is_none()
+            && self.player.core().advance_wait().is_none()
         {
             if let Some((_, dialogue)) = self.player.core().dialogue() {
                 if (dialogue.awaiting_advance || dialogue.at_gate)
@@ -999,6 +1014,12 @@ impl Engine {
             "preferences" => AppEvent::Preferences(
                 nir_content::parse(json.as_bytes(), "preferences").map_err(js)?,
             ),
+            "profile_values" => AppEvent::ProfileValues(
+                nir_content::parse(json.as_bytes(), "profile_values").map_err(js)?,
+            ),
+            "profile_values_recovered" => AppEvent::ProfileValuesRecovered(
+                nir_content::parse(json.as_bytes(), "profile_values_recovered").map_err(js)?,
+            ),
             "profile" => {
                 AppEvent::Profile(nir_content::parse(json.as_bytes(), "profile").map_err(js)?)
             }
@@ -1184,6 +1205,9 @@ impl Engine {
             1.
         };
         if (self.width, self.height, self.dpr) != (width, height, dpr) {
+            self.player
+                .reserve_render_surfaces((width * dpr) as u32, (height * dpr) as u32)
+                .map_err(js)?;
             self.width = width;
             self.height = height;
             self.dpr = dpr;
@@ -1251,6 +1275,7 @@ impl Engine {
                         [x + w - 2., y, 2., h],
                     ] {
                         projected.quads.push(nir_presentation::Quad {
+                            corners: None,
                             rect,
                             color: [1., 0.85, 0.35, 1.],
                             asset: None,
@@ -1325,7 +1350,8 @@ impl Engine {
         let ui_plan = &c.program().locale_config.ui[&self.player.effective_ui_locale];
         let text_plan = &c.program().locale_config.text[&self.player.effective_text_locale];
         let residency = self.player.content_residency();
-        let mut state = serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.presentation_screen()),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition().map(|(_,p)|p),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()});
+        let mut state = serde_json::json!({"ready":self.ready,"session":self.player.generation.session,"device":self.player.generation.device,"interaction":self.player.current_interaction(),"sequence":c.state().last_input,"screen":format!("{:?}",self.player.presentation_screen()),"locale":self.player.effective_ui_locale,"ui_locale":self.player.effective_ui_locale,"text_locale":self.player.effective_text_locale,"ui_font_plan_digest":ui_plan.digest,"text_font_plan_digest":text_plan.digest,"ui_fonts":ui_plan.fonts,"text_fonts":text_plan.fonts,"locale_pending":self.player.locale_pending(),"locale_error":self.player.locale_error(),"preferences":self.player.preferences,"paused":self.player.paused(),"loading":self.player.is_loading(),"status":self.player.status,"error":self.player.error,"diagnostic":self.player.diagnostic,"outcome":c.state().outcome,"variables":c.state().variables,"dialogue":c.dialogue().map(|(_,d)|serde_json::json!({"id":d.text_id,"locale":d.locale,"font_plan_digest":d.font_plan_digest,"visible":d.visible_text(),"ready":d.awaiting_advance,"gate":d.at_gate})),"choice":c.state().choice,"tick_us":c.state().tick_us,"transition":c.transition_progress(),"position":c.location(),"history_count":c.state().history.len(),"frames":self.renderer.submitted,"shapes":self.renderer.text.shapes,"resident_bytes":self.player.memory_used(),"content_residency":{"resident_blocks":residency.resident_blocks,"pinned_blocks":residency.pinned_blocks,"resident_bytes":residency.resident_bytes,"pinned_bytes":residency.pinned_bytes,"budget_bytes":residency.budget_bytes,"lease_count":residency.lease_count},"wasm_memory_bytes":Option::<u32>::None,"upload_steps":self.renderer.upload_steps,"turn_upload_bytes":2*1024*1024-self.upload_remaining,"scrolls":self.packet.scrolls,"pending_events":self.player.pending_events(),"turn_work":10_000-self.work_remaining,"adapter":self.renderer.adapter_info,"backend":self.renderer.backend.as_str()});
+        state["advance_wait"] = serde_json::json!(c.advance_wait());
         state["auto"] = serde_json::json!(self.player.auto);
         state["skip"] = serde_json::json!(self.player.skipping());
         state["history_scrollbar"] = serde_json::json!(self.packet.history_bar);

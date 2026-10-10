@@ -229,6 +229,18 @@ impl HistoryLayout {
             line_height: self.style.line_height,
             color: [1.; 4],
             emphasis: vec![],
+            images: entry
+                .images
+                .iter()
+                .cloned()
+                .map(|mut i| {
+                    if !entry.speaker.is_empty() {
+                        i.offset += (entry.speaker.len() + 1) as u32;
+                    }
+                    i
+                })
+                .collect(),
+            image_scale: 1.,
             scroll: 0.,
             clip: None,
             region: None,
@@ -626,6 +638,7 @@ mod tests {
                 choice: None,
                 speaker: String::new(),
                 text: text.into(),
+                images: vec![],
                 locale: "en".into(),
                 font_plan_digest: "frozen-plan".into(),
                 font_assets: vec!["font.reader".into()],

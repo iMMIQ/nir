@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+rustc_apfloat = "=0.2.3"
 
 schemars = { workspace = true, optional = true }
 

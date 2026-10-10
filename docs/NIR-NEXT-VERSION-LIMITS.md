@@ -119,7 +119,7 @@ Story 与 Foreground UI 两个逻辑时钟；前台/Story/后台/设备丢失/�
 | --- | --- | --- |
 | 导入表达式归一化 | 指令 ≤ 64、展开节点 ≤ 256、文本 ≤ 16 KiB | crates/nir-compiler/src/import/ui_expr.rs:8-9、144-148 |
 | UI 结构分析预算 | 对象/属性 + 数据流共 4096 条 | 批次 30-31 |
-| 转换媒体总量 | ≤ 1 GiB（E_IMPORT_LIMIT） | livenovel.rs:1873 |
+| 转换媒体总量 | ≤ 8 GiB（E_IMPORT_LIMIT）；单曲离线 PCM ≤ 128 MiB，音频工程素材另留 64 KiB 头部空间 | livenovel.rs 的 export_media；import/media.rs；project.rs |
 | 来源字速 | StatusTextSpeed 0..=640 ms/字（×1000 换算 µs；0 为瞬时） | 批次 60 |
 | 生成字体子集 | ≤ 64 MiB（E_LIMIT）；缓存条目带 64 B 摘要信封 | fonts.rs:285/316 |
 | 偏好 | text_speed 0.25–4（默认 1）、auto_wait_scale 0.25–4（默认 1）、font_scale 0.8–1.5（默认 1）、三音量 0–1（默认 0.3/0.8/0.5）、reduced_motion 布尔 | nir-player/src/lib.rs:448-453（越界/非有限值钳回并补默认） |

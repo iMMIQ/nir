@@ -4,13 +4,13 @@
 
 | 类别 | 当前支持 | 边界 |
 |---|---|---|
-| 逻辑 | Bool/I32/String、局部槽、纯表达式、checked 算术、函数/返回、Branch/Switch/Goto | 无浮点剧情变量、脚本扩展或任意 JS |
-| 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、DialogueVisibility、ProfileMerge | Profile 为布尔事实的单调集合 |
+| 逻辑 | Bool/I32/String/F80、局部槽、纯表达式、checked 算术、函数/返回、Branch/Switch/Goto | F80 为软件 x87 80 位有限数，精确十六进制存档；无脚本扩展或任意 JS |
+| 操作 | Assign、Random、DraftPatch、TaskControl、DialogueContinue、DialogueVisibility、ProfileMerge、ProfileRead、ProfileValueRead/Assign | 单向标记与可修改的独立类型值分开存储 |
 | 终结 | Call/Return、Activate/Await/Interact、End/Fault | 单剧情流；跨模块通过具名导出调用 |
 | 任务 | frame/session/scene/interaction scope、锁存 Started/Marker/Finished、失败优先于取消的 All、Sequence/ParallelAll 有限组合 | 确定性逻辑并行，不是共享 WASM 多线程 |
 | 模块 | 多模块命名空间、导出链接、共享变量、函数体/正文哈希分包、执行与恢复前准备 | 静态目录与媒体按需准备、有界预取、租约保护及驱逐；无 Edition 或跨发行存档转换 |
 | 图像 | Group/Sprite、层次顺序、裁切、cut/dissolve、方向擦除/Alpha 阈值遮罩、x/y/scale/opacity 动画 | 来源 PNG，打包默认转有损 WebP（质量 92，alpha 通道无损保留）；无旋转、滤镜、视频和独立 Group 混合模式 |
-| 正文 | 注册字体、样式强调、参数隔离、换行、字素簇揭示、span Marker/Gate、已揭示长文翻阅 | 无 Ruby、NVL、富网页标记 |
+| 正文 | 注册字体、样式强调、参数隔离、换行、字素簇揭示、span Marker/Gate、已揭示长文翻阅 | Ruby 注音、静态行内图片与有界段内停顿；无 NVL、富网页标记 |
 | 翻译维护 | 源/契约/语义修订、契约摘要、已读语义身份、逐文本状态、显式复核、旧源迁移 | 简中/英文、逐模块修订；不迁移跨发行存档，详见 [文本修订](TEXT-REVISIONS.md) |
 | 字体编译 | 静态 OTF/TTF/TTC face、subset/full、UI/正文逐语言有序 FontPlan、覆盖检查、共享字体字集去重、塑形闭包、内容缓存、许可打包 | 无可变/彩色字体、运行时补字；详见 [字体说明](AUTHOR-FONTS.md) 与 [语言/字体计划](LOCALE-FONTS.md) |
 | 选项 | 稳定 OptionId、可见/可用表达式、默认超时、交互实例校验 | 按实际文字高度排版和裁切滚动；旧实例和重复输入丢弃 |
@@ -22,7 +22,7 @@
 | 恢复 | 候选先验证/准备、暂停提交、检查点回退、设备重建 | 无安全热更新 |
 | 发行 | 实际 SDK/CLI 身份锁、固定发行启动入口、stage/verify/promote/rollback、本地与 URL 校验、来源/体积报告、打包媒体优化 | 无 PWA、签名/CDN 调度 |
 | 工具 | minimal/web-basic 模板、init/resolve/config/doctor/check/dev/build/test、text status/update/review/migrate/recover、Schema、架构检查 | dev 监听、候选构建与完整重载；CLI 本次产物为 Linux x86_64 |
-| 外部引擎导入 | 同一 novelc 二进制内的 LSB 116 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单（含选择音／回想 BGM／系统菜单进出渐隐页面效果）、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
+| 外部引擎导入 | 同一 novelc 二进制内的 LSB 116/117 检查、基础控制流／对白；LiveNovel 配置支持事件、原图菜单（含选择音／回想 BGM／系统菜单进出渐隐页面效果）、回想、GAL 与 WAV/Ogg 转换 | 实验性、配置有范围限制；不支持归档解包、任意动态表达式／自定义事件、动画／视频与旧存档迁移，详见 [导入说明](IMPORT.md) |
 | 平台 | Runtime/Asset Worker、OffscreenCanvas 双后端、主线程启动回退、响应式、键盘/指针/触摸语义 | 桌面 Chromium 双后端、Firefox WebGL2 验收入口；Windows/Linux 原生构建与 CI 验收；Android 原生为实验性（交叉编译与 APK 结构/签名验证，无真机验收）；iOS/Safari 后续安排 |
 
 Web Worker 的执行边界、协议、回退及验证见 [Web 执行域](WEB-EXECUTION.md)。
@@ -127,6 +127,12 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 |---|---|---|---|---|---|
 | module.lazy.v1 | crates/nir-player/tests/runtime_content.rs（百模块增量加载） | 同文件（冷恢复、逐出重载）；crates/nir-core/tests/streaming.rs（分阶段恢复等价） | tests/browser/modules.spec.js（按需取模块/预取/跨章存档） | 待验证 | v0.1.0 基线；nir-next fixture 均为单模块 |
 | control.v1 | crates/nir-core/tests/compose_contract.rs（TaskControl 整链终态）；crates/nir-core/tests/audio_contract.rs（Cancel/Finish 终态互异） | crates/nir-core/tests/audio_contract.rs（拒绝伪造终态/旧快照版本） | tests/browser/player.spec.js（跳转/分支/赋值）；tests/browser/modules.spec.js（Call/Return 跨章） | 待验证 | v0.1.0 基线；所有规格隐式经基础控制流 |
+| stage.dialogue-shake.v1 | crates/nir-core/src/shake.rs（整数衰减、随机捕获、正弦采样）；crates/nir-player/tests/coordination.rs（正文/注音/图片共用固定裁剪） | crates/nir-core/tests/tween_contract.rs（冷恢复轨迹、RNG、音乐实例、伪造拒绝） | tests/livenovel-features/quake.spec.js（独立中性震动 fixture；Worker/主线程像素与冷恢复） | 待验证 | 有限文字内容震动；1 毫秒–60 秒内、最多 4096 步；窗口与控件静止，采样不消费随机数 |
+| stage.sprite-wave.v1 | crates/nir-core/src/shake.rs；crates/nir-presentation/src/lib.rs（独立局部平移） | crates/nir-core/tests/tween_contract.rs（立绘波动、冷恢复、音乐与运动组合） | tests/livenovel-features/sprite-wave.spec.js（Worker/主线程像素、菜单暂停、冷恢复与音乐实例） | 待验证 | 同一场景内有限非随机波动，最多 32 个目标；不覆盖原位置或移动时钟 |
+| stage.sprite-transform.v1 | crates/nir-presentation/src/lib.rs；crates/nir-render-wgpu/src/lib.rs（原纹理的四角几何） | crates/nir-core/tests/tween_contract.rs（冷恢复及无效几何拒绝） | tests/livenovel-features/sprite-transform.spec.js（Worker/主线程纹理方向、横纵缩放、父裁剪及冷恢复） | 待验证 | 仅叶节点的绘制变换，保留父级位置、缩放和裁剪；节点自身裁剪及子树变换需其他适配 |
+| stage.sprite-timeline.v1 | crates/nir-core/src/vm.rs、crates/nir-format/src/timeline.rs（共享静态关键帧，Core 时钟） | crates/nir-core/tests/timeline_contract.rs（准备屏障、换页连续、冷恢复及所有权） | tests/livenovel-features/sprite-timeline.spec.js（Worker/主线程采样及冷恢复） | 待验证 | 有限、独占后代叶节点的离散关键帧；父级移动独立，存档不包含关键帧数据；静态资源随绑定及活动任务保留 |
+| control.advance-wait.v1 | crates/nir-core/src/vm.rs、crates/nir-player/src/lib.rs（声明可由用户推进的等待） | crates/nir-core/tests/timeline_contract.rs（恢复刷新身份、旧输入拒绝、任务继续） | tests/livenovel-features/advance-wait.spec.js（Worker/主线程实际点击、暂停及冷恢复） | 待验证 | Await 的 on_advance 是显式分支，离开等待不取消原任务；普通 Await 不接收点击 |
+| stage.window-flip.v1 | crates/nir-core/src/vm.rs（资源就绪后同时提交画面和窗口） | crates/nir-core/tests/tween_contract.rs（准备屏障、淡出时钟及冷恢复） | tests/livenovel-features/window-flip.spec.js（Worker/主线程像素、同步时钟、冷恢复及音乐实例） | 待验证 | 预约窗口显示状态在 StagePresent 提交时生效，并共享切换样式和时长 |
 | stage.sprite.v1 | crates/nir-presentation/src/lib.rs（scene_tests 图层合成/嵌套裁切） | crates/nir-core/tests/semantics.rs（快照含场景节点值，37% 处恢复） | tests/browser/player.spec.js、tests/browser/backends.spec.js（精灵绘制截图） | 待验证 | v0.1.0 基线；无专属精灵图恢复测试 |
 | stage.dissolve.v1 | crates/nir-format/src/transition.rs（端点/覆盖数学）；无专属 Core 执行测试 | crates/nir-core/tests/tween_contract.rs（快照伪造转场互换被拒） | tests/browser/player.spec.js（转场中途掉线恢复）；tests/browser/backends.spec.js | 待验证 | v0.1.0 基线；默认无参转场，证据为机制级 |
 | clip.scalar.v1 | crates/nir-core/tests/semantics.rs（类型化轨道保留旧 Clip 路径）；crates/nir-core/tests/tween_contract.rs（Clip/Tween 所有权互斥） | crates/nir-core/tests/semantics.rs（动画中途恢复） | tests/browser/player.spec.js（stay 路线精灵 y 动画） | 待验证 | v0.1.0 基线 |
@@ -174,3 +180,40 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 | story.typed-result.v1 | crates/nir-core/tests/typed_result_contract.rs（写声明值后分支/超时 default/取消不写） | 同文件（游标快照恢复、篡改拒绝）；crates/nir-player/tests/coordination.rs（存读档/回退） | tests/nir-next/typed-result.spec.js | 待验证 | 批次 51；批次 52 LiveNovel 复用同核心 |
 | media.webp.v1 | crates/nir-compiler/src/optimize.rs（有损保 alpha/无损逐像素） | 无运行态（仅校验）：crates/nir-compiler/tests/project.rs（按容器裁剪 requires） | tests/nir-next/menu-elements.spec.js 等像素断言规格经 fixture 实际解码 | 待验证 | 无容器级直接断言，发行按对象出现声明 |
 | media.mp3.v1 | crates/nir-compiler/src/optimize.rs（采样率×码率编码门）；crates/nir-format/src/lame.rs（gapless 标签解析） | 无运行态（仅校验）：crates/nir-compiler/tests/project.rs | tests/browser/audio-loop.spec.js（44.1/48 kHz 解码对齐与 100 次循环）；tests/nir-next/sampled-reading.spec.js、tests/nir-next/audio.spec.js（经 fixture 解码播放） | 待验证 | 循环 BGM 同用 gapless MP3；自动转码失败报错，不回退 WAV |
+
+| audio.pause.v1 | crates/nir-core/tests/audio_contract.rs | crates/nir-core/tests/audio_contract.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 设备总线时钟暂停，恢复保留实例 |
+| text.rect.v1 | crates/nir-core/tests/semantics.rs | 无运行态：静态主题窗口 | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 固定文字窗口，裁切/行内图位置断言 |
+| text.pause.v1 | crates/nir-core/tests/semantics.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 同一对白中的点击停顿 |
+| text.ruby.v1 | crates/nir-core/tests/semantics.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 冻结基文/读音，实绘像素检查 |
+| text.inline-image.v1 | crates/nir-core/tests/semantics.rs；crates/nir-presentation/src/reading.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 静态图片绑定/排版/准备；不含交互图片 |
+| player.menu-access.v1 | crates/nir-player/tests/coordination.rs | 快照冻结 menu_disabled；crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 剧情禁止菜单/历史/直接保存 |
+| ui.menu-pages.v1 | crates/nir-core/tests/streaming.rs | 无运行态：声明页数校验 | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 扩展有界页数；Web fixture 的 66 页为间接覆盖 |
+| choice.image.v1 | crates/nir-core/tests/typed_result_contract.rs | crates/nir-core/tests/typed_result_contract.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 图片坐标/悬停/命中；不混合文字选项 |
+| story.profile-read.v1 | crates/nir-core/tests/semantics.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 独立单向标记；旧存档保留当前交互的变量，下一次读取获取最新标记 |
+| story.profile-value.v1 | crates/nir-core/tests/semantics.rs | crates/nir-core/tests/semantics.rs、crates/nir-player/src/replay.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 可修改的独立类型值，正文存档不回退它；回想修改隔离；独立持久化键 |
+| story.float80.v1 | crates/nir-format/src/float80.rs、crates/nir-core/tests/semantics.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 WebGL2） | 待验证 | 有限 x87 软件运算，位值存档；显式 I32/F80 转换、除零和越界拒绝 |
+
+| story.code-packages.v1 | crates/nir-compiler/src/release.rs、crates/nir-core/tests/streaming.rs | crates/nir-player/tests/runtime_content.rs | tests/livenovel-features/playback.spec.js | 待验证 | 代码按需加载，共享原声明域；任务和音频实例保持身份 |
+| content.interned-json.v1 | crates/nir-content/src/interned.rs、crates/nir-compiler/src/release.rs（有界池、包校验及内容驻留） | crates/nir-core/tests/streaming.rs（编码/原JSON恢复等价，保留BGM实例） | tests/livenovel-features/interned-content.spec.js（Worker/主线程，换页音乐不重启，冷恢复） | 待验证 | 不可变 JSON 子树复用；身份、任务和执行顺序不变；编码内容仍受16MiB输入与驻留预算限制，逻辑展开另受64MiB及128层上限约束 |
+| stage.bitmap-text.v1 | crates/nir-core/src/bitmap.rs、crates/nir-compiler/src/import/livenovel_bitmap.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 atlas 实绘及恢复） | 待验证 | 显式捕获 I32/String；固定横向图集；提交后为普通冻结图片节点 |
+| stage.sprite-continuity.v1 | crates/nir-core/tests/tween_contract.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/tween_contract.rs | tests/livenovel-features/playback.spec.js（Worker/主线程冷加载恢复、位置实绘） | 待验证 | 按节点属性保留局部姿态，session/frame 动画保留实例与时钟；过渡两层同步 |
+
+| choice.disabled-image.v1 | crates/nir-core/src/validate.rs、crates/nir-presentation/src/lib.rs | crates/nir-core/tests/typed_result_contract.rs | tests/livenovel-features/preview-filters.spec.js | 待验证 | 不可选图片选项使用原专用图片，拒绝悬停替换；媒体闭包包含全部状态 |
+
+| stage.inherit-image.v1 | crates/nir-core/src/vm.rs、crates/nir-core/src/validate.rs | crates/nir-core/tests/timeline_contract.rs | tests/livenovel-features/image-inheritance.spec.js | 待验证 | 画面提交时捕获指定普通图层的已绑定图片；媒体准备不请求旧模板图片，渐变与冷恢复保留各路线的真实图片 |
+| stage.inherit-image-geometry.v1 | crates/nir-core/tests/timeline_contract.rs、crates/nir-compiler/src/import/livenovel.rs | crates/nir-core/tests/timeline_contract.rs | tests/livenovel-features/image-inheritance.spec.js（Worker/主线程，两个不同矩形路线、渐变冷恢复实绘） | 待验证 | 未改动的普通图层沿用已提交的局部矩形；源布局读取保留分支区别，显式换图重新计算尺寸与锚点 |
+
+| stage.sprite-shake.v1 | crates/nir-core/src/shake.rs、crates/nir-compiler/src/import/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（独立轨迹、冷恢复、时间分割一致性及篡改拒绝） | tests/livenovel-features/sprite-shake.spec.js（Worker/主线程独立像素、暂停、冷恢复、结束归零与音乐实例） | 待验证 | 有限 WAVE/BOUND，最多 32 个目标；随机强度按目标和坐标轴独立冻结 |
+
+| stage.sprite-quake.v1 | crates/nir-core/src/shake.rs、crates/nir-compiler/src/import/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（共用方向、独立强度、冷恢复、时间分割一致性、篡改拒绝和能力门） | tests/livenovel-features/sprite-shake.spec.js（NIR_TEST_SPRITE_QUAKE；Worker/主线程实绘、暂停、冷恢复和音乐实例） | 待验证 | 有限 QUAKE，最多 32 个目标；每个阶段共用随机方向，按源目标顺序独立捕获各轴强度；结束归零 |
+
+| stage.source-motion.v1 | crates/nir-format/src/tween.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（整数毫秒、原点/终点、跨场景与冷恢复） | tests/livenovel-features/stock-motion.spec.js（Worker/主线程 INC/DEC 位置实绘、暂停、冷恢复、音乐身份） | 待验证 | 有界整数 X/Y 移动，共用既有标量写入所有权；原加减速正弦与截断坐标 |
+
+| stage.source-opacity.v1 | crates/nir-format/src/tween.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（逐毫秒字节采样、能力门、渐变与冷恢复） | tests/livenovel-features/source-opacity.spec.js（Worker/主线程实际透明度、暂停与冷恢复） | 待验证 | source_motion 的线性 0–255 透明度；保留整数截断和精确终点，0 表示完全透明 |
+
+| dialogue.style.v1 | crates/nir-format/src/lib.rs、crates/nir-core/src/vm.rs、crates/nir-player/src/lib.rs | crates/nir-core/tests/dialogue_style_contract.rs | tests/livenovel-features/dialogue-style.spec.js | 待验证 | 准备新背景后原子切换对白窗口、文字区域、字号和颜色；音乐不重启，冷恢复保留样式 |
+| dialogue.decoration.v1 | crates/nir-format/src/lib.rs、crates/nir-core/src/vm.rs、crates/nir-player/src/lib.rs、crates/nir-presentation/src/reading.rs | crates/nir-core/tests/dialogue_decoration_contract.rs（准备/尺寸校验、阅读与音乐时钟、冷恢复） | tests/livenovel-features/dialogue-decoration.spec.js（Worker/主线程实绘、隐藏、清除及恢复，音乐实例不变） | 待验证 | 两个静态对白装饰槽：头像与姓名图片；提交时捕获固定舞台坐标或当前文字区域原点，保留字号独立的几何位置；不支持动画头像与自动重排 |
+
+| ui.story-modal.v1 | crates/nir-core/tests/story_modal_contract.rs、crates/nir-player/src/menu.rs | crates/nir-player/tests/coordination.rs | tests/livenovel-features/story-modal.spec.js | 待验证 | 剧情内读档、存档或图片菜单作为有限暂停任务；关闭后继续，冷恢复刷新输入身份；读取页面禁用保存 |
+
+| stage.sprite-lifecycle.v1 | crates/nir-core/src/vm.rs、crates/nir-compiler/src/import/livenovel.rs | crates/nir-core/tests/timeline_contract.rs（自然结束删除整棵图层树、渐变目标同步、冷恢复、不复活、取消保留与显式重建） | tests/livenovel-features/sprite-lifecycle.spec.js（Worker/主线程实绘、读档与后续页面） | 待验证 | 有限动画自然结束后删除绑定图层；后续模板可保留缺席，显式创建重新显示；SCRAP 导入目前限 Motion111 |

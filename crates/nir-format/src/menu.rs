@@ -1379,7 +1379,7 @@ impl ImageMenu {
                 let value = match variables.get(variable)? {
                     Value::Bool(v) => MenuValue::Bool(*v),
                     Value::I32(v) => MenuValue::Int(*v),
-                    Value::String(_) => return None,
+                    Value::String(_) | Value::F80(_) => return None,
                 };
                 Some((alias.clone(), value))
             })

@@ -475,19 +475,16 @@ impl Player {
             });
         }
         if let Some(frame) = snapshot.frames.last() {
-            if let Some(index) = root.function_index.get(&frame.function) {
-                if root
-                    .modules
-                    .get(&index.module)
-                    .is_some_and(|module| !module.texts.is_empty())
-                {
-                    by_module
-                        .entry(index.module.clone())
-                        .or_default()
-                        .insert(ContentKey::Text {
-                            module: index.module.clone(),
-                            locale: self.effective_text_locale.clone(),
-                        });
+            if let Some(scope) = root.function_execution_module(&frame.function) {
+                if !root.modules[scope].texts.is_empty() {
+                    let keys = by_module.entry(scope.into()).or_default();
+                    keys.insert(ContentKey::Static {
+                        module: scope.into(),
+                    });
+                    keys.insert(ContentKey::Text {
+                        module: scope.into(),
+                        locale: self.effective_text_locale.clone(),
+                    });
                 }
             }
         }
@@ -515,10 +512,41 @@ impl Player {
                     module: module.clone(),
                 });
         }
+        // Unlike frozen task definitions, shared keyframes must remain resident
+        // after the defining function has returned, including the settled pose.
+        let mut timelines = BTreeSet::new();
+        for nodes in std::iter::once(&snapshot.scene)
+            .chain(std::iter::once(&snapshot.draft))
+            .chain(snapshot.tasks.values().flat_map(|t| [&t.source, &t.target]))
+        {
+            timelines.extend(nodes.iter().filter_map(|n| n.timeline_binding.as_deref()));
+        }
+        for task in snapshot
+            .tasks
+            .values()
+            .filter(|t| t.state == TaskState::Running)
+        {
+            if let Effect::SpriteTimeline { timeline, .. } = &task.effect {
+                timelines.insert(timeline);
+            }
+        }
+        for timeline in timelines {
+            let module = root.timeline_owners.get(timeline).ok_or_else(|| {
+                Diagnostic::new("E_SNAPSHOT", "restore", "unknown timeline owner")
+            })?;
+            by_module
+                .entry(module.clone())
+                .or_default()
+                .insert(ContentKey::Static {
+                    module: module.clone(),
+                });
+        }
         let mut batches = VecDeque::new();
         let mut current = Vec::new();
+        let mut seen = BTreeSet::new();
         for keys in by_module.values() {
-            let required = self.requests_for_keys(keys.iter().cloned())?;
+            let mut required = self.requests_for_keys(keys.iter().cloned())?;
+            required.retain(|request| seen.insert(request.key.clone()));
             if required.is_empty() {
                 continue;
             }
@@ -528,6 +556,9 @@ impl Player {
             current.extend(required);
         }
         for request in self.requests_for_keys(self.snapshot_voice_timer_catalogs(snapshot))? {
+            if !seen.insert(request.key.clone()) {
+                continue;
+            }
             if current.len() == 128 {
                 batches.push_back(std::mem::take(&mut current));
             }
@@ -611,6 +642,24 @@ impl Player {
                     });
                 }
             }
+            if code {
+                if let Some(scope) = root
+                    .module_execution_scope(module)
+                    .filter(|scope| *scope != module)
+                {
+                    keys.push(ContentKey::Static {
+                        module: scope.into(),
+                    });
+                    if let Some(locale) = locale {
+                        if !root.modules[scope].texts.is_empty() {
+                            keys.push(ContentKey::Text {
+                                module: scope.into(),
+                                locale: locale.into(),
+                            });
+                        }
+                    }
+                }
+            }
             return self.requests_for_keys(keys);
         }
         let p = self.validated.program();
@@ -664,7 +713,11 @@ impl Player {
             return Ok(vec![]);
         };
         let mut objects = vec![];
-        for key in keys.into_iter().collect::<BTreeSet<_>>() {
+        let mut keys: BTreeSet<_> = keys.into_iter().collect();
+        for key in keys.clone() {
+            keys.extend(root.content_prerequisites(&key));
+        }
+        for key in keys {
             if self.validated.is_resident(&key) {
                 continue;
             }
@@ -723,6 +776,11 @@ impl Player {
         for frame in &snapshot.frames {
             if let Some(index) = root.function_index.get(&frame.function) {
                 modules.insert(index.module.clone());
+                modules.insert(
+                    root.function_execution_module(&frame.function)
+                        .unwrap()
+                        .into(),
+                );
                 keys.insert(ContentKey::Code {
                     module: index.module.clone(),
                 });
@@ -731,7 +789,10 @@ impl Player {
         if let Some(frame) = snapshot.frames.last() {
             if let Some(index) = root.function_index.get(&frame.function) {
                 keys.insert(ContentKey::Text {
-                    module: index.module.clone(),
+                    module: root
+                        .function_execution_module(&frame.function)
+                        .unwrap_or(&index.module)
+                        .into(),
                     locale: locale.to_owned(),
                 });
             }
@@ -744,6 +805,27 @@ impl Player {
         if let Some(choice) = &snapshot.choice {
             if let Some(module) = root.choice_owners.get(&choice.id) {
                 modules.insert(module.clone());
+            }
+        }
+        for nodes in std::iter::once(&snapshot.scene)
+            .chain(std::iter::once(&snapshot.draft))
+            .chain(snapshot.tasks.values().flat_map(|t| [&t.source, &t.target]))
+        {
+            for binding in nodes.iter().filter_map(|n| n.timeline_binding.as_deref()) {
+                if let Some(module) = root.timeline_owners.get(binding) {
+                    modules.insert(module.clone());
+                }
+            }
+        }
+        for task in snapshot
+            .tasks
+            .values()
+            .filter(|t| t.state == TaskState::Running)
+        {
+            if let Effect::SpriteTimeline { timeline, .. } = &task.effect {
+                if let Some(module) = root.timeline_owners.get(timeline) {
+                    modules.insert(module.clone());
+                }
             }
         }
         keys.extend(
@@ -1402,6 +1484,17 @@ impl Player {
                     .get(&choice.id)
                     .ok_or_else(|| Diagnostic::new("E_SNAPSHOT", "restore", "unknown choice"))?;
                 modules.insert(owner.clone());
+            }
+            for nodes in std::iter::once(&s.scene)
+                .chain(std::iter::once(&s.draft))
+                .chain(s.tasks.values().flat_map(|t| [&t.source, &t.target]))
+            {
+                for binding in nodes.iter().filter_map(|n| n.timeline_binding.as_deref()) {
+                    let owner = root.timeline_owners.get(binding).ok_or_else(|| {
+                        Diagnostic::new("E_SNAPSHOT", "restore", "unknown frozen timeline binding")
+                    })?;
+                    modules.insert(owner.clone());
+                }
             }
             objects.extend(
                 self.requests_for_keys(

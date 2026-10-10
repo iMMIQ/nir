@@ -63,6 +63,14 @@ impl<T> ContentTable<T> {
             ),
         }
     }
+    /// Share an immutable body while mutating a separate runtime state.
+    pub fn shared<Q>(&self, key: &Q) -> Option<Arc<T>>
+    where
+        String: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.values.get(key).cloned()
+    }
     pub fn get<Q>(&self, key: &Q) -> Option<&T>
     where
         String: Borrow<Q>,
@@ -119,6 +127,7 @@ pub struct RuntimeProgramView {
     pub functions: ContentTable<Function>,
     pub modules: Arc<BTreeMap<String, ModuleIndex>>,
     pub scenes: ContentTable<Vec<Node>>,
+    pub sprite_timelines: ContentTable<SpriteTimeline>,
     pub cues: ContentTable<Cue>,
     pub choices: ContentTable<Choice>,
     pub texts: ContentTable<TextContract>,
@@ -178,6 +187,11 @@ impl RuntimeProgramView {
                     .map(|(id, _)| id.as_str())
             })
     }
+    pub fn function_execution_module(&self, id: &str) -> Option<&str> {
+        self.runtime_root()
+            .and_then(|root| root.function_execution_module(id))
+            .or_else(|| self.function_module(id))
+    }
     pub fn text_module(&self, id: &str) -> Option<&str> {
         self.text_owners.get(id).map(String::as_str).or_else(|| {
             self.modules
@@ -193,13 +207,16 @@ impl RuntimeProgramView {
         let mut set = BTreeSet::new();
         if let Some(definition) = self.cues.get(cue) {
             for effect in &definition.effects {
+                effect
+                    .effect
+                    .collect_dialogue_style_assets(&self.theme, &mut set);
                 match &effect.effect {
                     Effect::StagePresent {
                         scene, transition, ..
                     } => {
                         set.extend(transition.asset().map(str::to_owned));
                         if let Some(nodes) = self.scenes.get(scene) {
-                            set.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                            set.extend(effect.effect.stage_image_assets(nodes).cloned());
                         }
                     }
                     Effect::Audio { asset, .. } => {
@@ -210,6 +227,18 @@ impl RuntimeProgramView {
                     }
                     _ => {}
                 }
+            }
+        }
+        if let Some(definition) = self.cues.get(cue) {
+            let contracts: BTreeMap<_, _> = self
+                .texts
+                .iter()
+                .map(|(id, c)| (id.clone(), c.clone()))
+                .collect();
+            for effect in &definition.effects {
+                effect
+                    .effect
+                    .collect_text_image_assets(&contracts, &mut set);
             }
         }
         set
@@ -234,6 +263,11 @@ impl RuntimeProgramView {
                 .map(|(id, value)| (id.clone(), value.clone()))
                 .collect(),
             modules: (*self.modules).clone(),
+            sprite_timelines: self
+                .sprite_timelines
+                .iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             scenes: self
                 .scenes
                 .iter()
@@ -286,6 +320,7 @@ impl RuntimeProgramView {
                 (
                     id.clone(),
                     RuntimeFunctionIndex {
+                        execution_module: None,
                         module: p.function_module(id).unwrap_or("@root").to_string(),
                         signature: FunctionSignature::from(function),
                     },
@@ -314,6 +349,7 @@ impl RuntimeProgramView {
                         contract_revision: contract.contract_revision,
                         meaning_revision: contract.meaning_revision,
                         contract_digest: contract.contract_digest.clone(),
+                        images: contract.images.clone(),
                     },
                 )
             })
@@ -337,13 +373,19 @@ impl RuntimeProgramView {
             let mut assets = BTreeSet::new();
             if let Some(definition) = p.cues.get(cue) {
                 for effect in &definition.effects {
+                    effect
+                        .effect
+                        .collect_text_image_assets(&p.texts, &mut assets);
+                    effect
+                        .effect
+                        .collect_dialogue_style_assets(&p.theme, &mut assets);
                     match &effect.effect {
                         Effect::StagePresent {
                             scene, transition, ..
                         } => {
                             assets.extend(transition.asset().map(str::to_owned));
                             if let Some(nodes) = p.scenes.get(scene) {
-                                assets.extend(nodes.iter().filter_map(|node| node.asset.clone()));
+                                assets.extend(effect.effect.stage_image_assets(nodes).cloned());
                             }
                         }
                         Effect::Audio { asset, .. } => {
@@ -395,6 +437,7 @@ impl RuntimeProgramView {
             functions: ContentTable::from_owned(p.functions),
             modules: Arc::new(p.modules),
             scenes: ContentTable::from_owned(p.scenes),
+            sprite_timelines: ContentTable::from_owned(p.sprite_timelines),
             cues: ContentTable::from_owned(p.cues),
             choices: ContentTable::from_owned(p.choices),
             texts: ContentTable::from_owned(p.texts),
@@ -424,6 +467,7 @@ impl RuntimeProgramView {
     fn from_runtime(root: RuntimeProgram) -> Result<Self> {
         let functions = ContentTable::from_index(root.function_index.keys().cloned());
         let scenes = ContentTable::from_index(root.scene_owners.keys().cloned());
+        let sprite_timelines = ContentTable::from_index(root.timeline_owners.keys().cloned());
         let cues = ContentTable::from_index(root.cue_owners.keys().cloned());
         let choices = ContentTable::from_index(root.choice_owners.keys().cloned());
         let texts = ContentTable::from_index(root.text_contracts.keys().cloned());
@@ -446,6 +490,7 @@ impl RuntimeProgramView {
             functions,
             modules: Arc::new(root.modules.clone()),
             scenes,
+            sprite_timelines,
             cues,
             choices,
             texts,
@@ -477,6 +522,7 @@ impl RuntimeProgramView {
         let mut next = self.clone();
         let mut functions = Vec::new();
         let mut scenes = Vec::new();
+        let mut sprite_timelines = Vec::new();
         let mut cues = Vec::new();
         let mut choices = Vec::new();
         let mut texts = Vec::new();
@@ -489,6 +535,12 @@ impl RuntimeProgramView {
         for object in objects {
             match object {
                 RuntimeObject::Static(package) => {
+                    sprite_timelines.extend(
+                        package
+                            .sprite_timelines
+                            .iter()
+                            .map(|(id, value)| (id.clone(), value.clone())),
+                    );
                     for (id, value) in &package.scenes {
                         scenes.push((id.clone(), value.clone()));
                     }
@@ -553,6 +605,7 @@ impl RuntimeProgramView {
         }
         next.functions = self.functions.with_values(functions);
         next.scenes = self.scenes.with_values(scenes);
+        next.sprite_timelines = self.sprite_timelines.with_values(sprite_timelines);
         next.cues = self.cues.with_values(cues);
         next.choices = self.choices.with_values(choices);
         next.texts = self.texts.with_values(texts);
@@ -581,6 +634,7 @@ impl RuntimeProgramView {
         };
         let mut next = self.clone();
         let mut scenes = BTreeSet::new();
+        let mut sprite_timelines = BTreeSet::new();
         let mut cues = BTreeSet::new();
         let mut choices = BTreeSet::new();
         let mut contracts = BTreeSet::new();
@@ -592,6 +646,12 @@ impl RuntimeProgramView {
             match key {
                 ContentKey::Static { module } => {
                     static_modules.insert(module.clone());
+                    sprite_timelines.extend(
+                        root.timeline_owners
+                            .iter()
+                            .filter(|(_, owner)| *owner == module)
+                            .map(|(id, _)| id.clone()),
+                    );
                     scenes.extend(
                         root.scene_owners
                             .iter()
@@ -641,6 +701,7 @@ impl RuntimeProgramView {
         }
         next.functions = self.functions.without_values(&functions);
         next.scenes = self.scenes.without_values(&scenes);
+        next.sprite_timelines = self.sprite_timelines.without_values(&sprite_timelines);
         next.cues = self.cues.without_values(&cues);
         next.choices = self.choices.without_values(&choices);
         next.texts = self.texts.without_values(&contracts);
@@ -1508,15 +1569,12 @@ impl ValidatedProgram {
                 }
                 continue;
             }
-            if let ContentKey::Code { module } | ContentKey::Text { module, .. } = &key {
-                let static_key = ContentKey::Static {
-                    module: module.clone(),
-                };
-                if !records.contains_key(&static_key) {
+            for prerequisite in root.content_prerequisites(&key) {
+                if !records.contains_key(&prerequisite) {
                     return Err(err(
                         "E_CONTENT_MISSING",
-                        module,
-                        "static module package must be resident before code or text",
+                        &format!("{key:?}"),
+                        "declaration scope must be resident before code or text",
                     ));
                 }
             }
@@ -1814,7 +1872,8 @@ impl ValidatedProgram {
     /// every loaded function body. Runtime roots only see admitted modules;
     /// the in-flight reveal carries its own mask for the first encounter.
     pub fn window_transition_assets(&self) -> BTreeSet<String> {
-        self.program
+        let mut assets: BTreeSet<_> = self
+            .program
             .functions
             .values()
             .flat_map(|function| function.blocks.values())
@@ -1826,7 +1885,22 @@ impl ValidatedProgram {
                 } => style.asset().map(str::to_owned),
                 _ => None,
             })
-            .collect()
+            .collect();
+        assets.extend(
+            self.program
+                .cues
+                .values()
+                .flat_map(|cue| &cue.effects)
+                .filter_map(|def| match &def.effect {
+                    Effect::StagePresent {
+                        dialogue_visible: Some(_),
+                        transition,
+                        ..
+                    } => transition.asset().map(str::to_owned),
+                    _ => None,
+                }),
+        );
+        assets
     }
 }
 
@@ -1896,7 +1970,38 @@ fn validate_image_menus(
     Ok(())
 }
 fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
+    if root
+        .title_nodes
+        .iter()
+        .any(|n| n.timeline_binding.is_some())
+    {
+        return Err(err(
+            "E_TIMELINE",
+            "title_nodes",
+            "title animation requires a separate host capability",
+        ));
+    }
+    if !root.timeline_owners.is_empty()
+        && !root
+            .requires
+            .iter()
+            .any(|c| c == "stage.sprite-timeline.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "timeline_owners",
+            "stage.sprite-timeline.v1",
+        ));
+    }
+    if root.variables.values().any(|v| v.ty() == ValueType::F80)
+        && !root.requires.iter().any(|c| c == "story.float80.v1")
+    {
+        return Err(err("E_CAPABILITY", "variables", "story.float80.v1"));
+    }
     validate_ui_config(&root.theme, &root.player)?;
+    if root.theme.image_menus.len() > 64 && !root.requires.iter().any(|c| c == "ui.menu-pages.v1") {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-pages.v1"));
+    }
     validate_menu_audio_loops(&root.theme, &root.requires, |_| None)?;
     if root.theme.image_menus.values().any(ImageMenu::uses_effects)
         && !root.requires.iter().any(|c| c == "ui.menu-effects.v1")
@@ -2123,6 +2228,16 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "ui.menu-elements.v1",
         ));
     }
+    validate_dialogue_styles(&root.theme, &root.requires)?;
+    if root.theme.dialogue.text_rect.is_some()
+        && !root.requires.iter().any(|cap| cap == "text.rect.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.dialogue.text_rect",
+            "text.rect.v1",
+        ));
+    }
     if root.theme.dialogue.shadow.is_some()
         && !root.requires.iter().any(|cap| cap == "text.shadow.v1")
     {
@@ -2245,8 +2360,58 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
             "orphan or mismatched function",
         ));
     }
+    for (module, index) in &root.modules {
+        let scope = root.module_execution_scope(module).ok_or_else(fail)?;
+        if index
+            .functions
+            .keys()
+            .any(|id| root.function_execution_module(id) != Some(scope))
+        {
+            return Err(err("E_MODULE", module, "mixed execution scopes"));
+        }
+        if scope != module {
+            if !root
+                .requires
+                .iter()
+                .any(|cap| cap == "story.code-packages.v1")
+            {
+                return Err(err("E_CAPABILITY", module, "story.code-packages.v1"));
+            }
+            if !root.modules.contains_key(scope)
+                || root.module_execution_scope(scope) != Some(scope)
+                || root.modules[scope]
+                    .functions
+                    .keys()
+                    .any(|id| root.function_index[id].execution_module.is_some())
+                || !index.texts.is_empty()
+                || [
+                    &root.scene_owners,
+                    &root.timeline_owners,
+                    &root.cue_owners,
+                    &root.choice_owners,
+                    &root.text_owners,
+                    &root.task_owners,
+                ]
+                .into_iter()
+                .any(|owners| owners.values().any(|owner| owner == module))
+            {
+                return Err(err(
+                    "E_MODULE",
+                    module,
+                    "invalid code package declaration scope",
+                ));
+            }
+        } else if index
+            .functions
+            .keys()
+            .any(|id| root.function_index[id].execution_module.is_some())
+        {
+            return Err(err("E_MODULE", module, "redundant execution scope"));
+        }
+    }
     let owner_maps = [
         &root.scene_owners,
+        &root.timeline_owners,
         &root.cue_owners,
         &root.choice_owners,
         &root.text_owners,
@@ -2266,6 +2431,23 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
                 || identity.contract_revision == 0
                 || identity.meaning_revision == 0
                 || !valid_hash(&identity.contract_digest)
+                || identity.images.len() > 256
+                || (!identity.images.is_empty()
+                    && !root.requires.iter().any(|c| c == "text.inline-image.v1"))
+                || identity.images.iter().any(|i| {
+                    i.id.is_empty()
+                        || root
+                            .assets
+                            .get(&i.asset)
+                            .is_none_or(|a| a.kind != AssetKind::Image)
+                })
+                || identity
+                    .images
+                    .iter()
+                    .map(|i| &i.id)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != identity.images.len()
         })
         || root
             .text_owners
@@ -2356,7 +2538,7 @@ fn validate_runtime_root(root: &RuntimeProgram) -> Result<()> {
         if !root.scene_owners.contains_key(title) || root.title_nodes.len() > MAX_NODES {
             return Err(err("E_SCENE", title, "invalid root title scene"));
         }
-        validate_scene_nodes(&root.title_nodes, title, &root.assets)?;
+        validate_scene_nodes(&root.title_nodes, title, root)?;
     } else if !root.title_nodes.is_empty() {
         return Err(err(
             "E_SCENE",
@@ -2402,6 +2584,16 @@ fn validate_object_key(
                     .text_contracts
                     .keys()
                     .any(|id| root.text_owners.get(id) != Some(module))
+                || package
+                    .sprite_timelines
+                    .keys()
+                    .any(|id| root.timeline_owners.get(id) != Some(module))
+                || package.sprite_timelines.len()
+                    != root
+                        .timeline_owners
+                        .values()
+                        .filter(|owner| *owner == module)
+                        .count()
                 || package.scenes.len()
                     != root
                         .scene_owners
@@ -2522,6 +2714,31 @@ fn validate_runtime_objects(view: &RuntimeProgramView, objects: &[RuntimeObject]
                         return Err(err("E_TEXT_REVISION", id, &package.locale));
                     }
                     validate_text_spans(id, contract, &document.spans)?;
+                    if !contract.images.is_empty()
+                        && (!view.requires.iter().any(|c| c == "text.inline-image.v1")
+                            || contract
+                                .images
+                                .iter()
+                                .any(|i| view.asset_kind(&i.asset) != Some(AssetKind::Image)))
+                    {
+                        return Err(err("E_TEXT_IMAGE", id, "capability or image binding"));
+                    }
+                    if document
+                        .spans
+                        .iter()
+                        .any(|s| matches!(s, Span::Pause { .. }))
+                        && !view.requires.iter().any(|c| c == "text.pause.v1")
+                    {
+                        return Err(err("E_CAPABILITY", id, "text.pause.v1"));
+                    }
+                    if document
+                        .spans
+                        .iter()
+                        .any(|s| matches!(s, Span::Ruby { .. }))
+                        && !view.requires.iter().any(|c| c == "text.ruby.v1")
+                    {
+                        return Err(err("E_CAPABILITY", id, "text.ruby.v1"));
+                    }
                 }
             }
             RuntimeObject::Catalog(package) => {
@@ -2530,9 +2747,10 @@ fn validate_runtime_objects(view: &RuntimeProgramView, objects: &[RuntimeObject]
                 // including declarations resident before this catalog arrived.
                 for (id, cue) in view.cues.iter() {
                     for definition in &cue.effects {
-                        validate_audio_loop(
+                        validate_effect_extensions(
                             &definition.effect,
                             &view.requires,
+                            &view.theme,
                             &|asset| view.asset(asset).map(|a| a.duration_us.0),
                             id,
                         )?;
@@ -2562,16 +2780,95 @@ fn validate_runtime_objects(view: &RuntimeProgramView, objects: &[RuntimeObject]
     Ok(())
 }
 
-fn validate_scene_nodes(
-    nodes: &[Node],
+pub(crate) fn validate_timeline(
     id: &str,
-    assets: &BTreeMap<String, AssetIndexEntry>,
+    timeline: &SpriteTimeline,
+    requires: &[String],
 ) -> Result<()> {
+    if !requires.iter().any(|c| c == "stage.sprite-timeline.v1") {
+        return Err(err("E_CAPABILITY", id, "stage.sprite-timeline.v1"));
+    }
+    if timeline.id != id || !timeline.valid() {
+        return Err(err("E_TIMELINE", id, "invalid immutable keyframes"));
+    }
+    if timeline
+        .tracks
+        .iter()
+        .flat_map(|t| &t.frames)
+        .any(|f| f.transform.is_some())
+        && !requires.iter().any(|c| c == "stage.sprite-transform.v1")
+    {
+        return Err(err("E_CAPABILITY", id, "stage.sprite-transform.v1"));
+    }
+    Ok(())
+}
+pub(crate) fn validate_timeline_bindings<'a>(
+    nodes: &[Node],
+    at: &str,
+    get: impl Fn(&str) -> Option<&'a SpriteTimeline>,
+) -> Result<()> {
+    let mut owned = BTreeSet::new();
+    for root in nodes.iter().filter(|n| n.timeline_binding.is_some()) {
+        let id = root.timeline_binding.as_deref().unwrap();
+        let timeline = get(id).ok_or_else(|| err("E_TIMELINE", at, "timeline is not resident"))?;
+        for track in &timeline.tracks {
+            let node = nodes
+                .iter()
+                .find(|n| n.id == track.node)
+                .ok_or_else(|| err("E_TIMELINE", at, "keyframe target missing"))?;
+            if node.id == root.id
+                || node.bitmap_text.is_some()
+                || node.timeline_binding.is_some()
+                || nodes
+                    .iter()
+                    .any(|child| child.parent.as_deref() == Some(node.id.as_str()))
+                || !owned.insert(&node.id)
+                || (node.clip.is_some() && track.frames.iter().any(|f| f.transform.is_some()))
+            {
+                return Err(err(
+                    "E_TIMELINE",
+                    at,
+                    "keyframes require exclusive descendant leaves",
+                ));
+            }
+            let mut parent = node.parent.as_deref();
+            let mut seen = BTreeSet::new();
+            while parent != Some(root.id.as_str()) {
+                let key =
+                    parent.ok_or_else(|| err("E_TIMELINE", at, "target outside timeline root"))?;
+                if !seen.insert(key) {
+                    return Err(err("E_TIMELINE", at, "cyclic timeline hierarchy"));
+                }
+                parent = nodes
+                    .iter()
+                    .find(|n| n.id == key)
+                    .and_then(|n| n.parent.as_deref());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scene_nodes(nodes: &[Node], id: &str, root: &RuntimeProgram) -> Result<()> {
     if nodes.len() > MAX_NODES {
         return Err(err("E_LIMIT", id, "too many nodes"));
     }
     let mut ids = BTreeSet::new();
     for node in nodes {
+        if node.sprite_transform.is_some()
+            && nodes
+                .iter()
+                .any(|child| child.parent.as_deref() == Some(node.id.as_str()))
+        {
+            return Err(err("E_VISUAL", id, "sprite transforms require leaf nodes"));
+        }
+        validate_bitmap_node(
+            node,
+            id,
+            &root.variables,
+            &root.requires,
+            root.title_scene.as_deref(),
+        )?;
         if !ids.insert(&node.id) {
             return Err(err("E_DUPLICATE", id, &node.id));
         }
@@ -2600,7 +2897,7 @@ fn validate_scene_nodes(
             return Err(err("E_VISUAL", id, &node.id));
         }
         if let Some(asset) = &node.asset {
-            if assets.get(asset).map(|a| a.kind) != Some(AssetKind::Image) {
+            if root.assets.get(asset).map(|a| a.kind) != Some(AssetKind::Image) {
                 return Err(err("E_ASSET_TYPE", id, asset));
             }
         }
@@ -2623,6 +2920,87 @@ fn validate_scene_nodes(
     Ok(())
 }
 
+fn validate_bitmap_node(
+    node: &Node,
+    scene: &str,
+    variables: &BTreeMap<String, Value>,
+    requires: &[String],
+    title: Option<&str>,
+) -> Result<()> {
+    if node.inherit_existence {
+        if !requires.iter().any(|c| c == "stage.sprite-lifecycle.v1") {
+            return Err(err("E_CAPABILITY", scene, "stage.sprite-lifecycle.v1"));
+        }
+        if title == Some(scene) || node.parent.is_some() || node.timeline_binding.is_none() {
+            return Err(err(
+                "E_TIMELINE",
+                scene,
+                "invalid inherited animated existence",
+            ));
+        }
+    }
+    if node.timeline_binding.is_some() {
+        if !requires.iter().any(|c| c == "stage.sprite-timeline.v1") {
+            return Err(err("E_CAPABILITY", scene, "stage.sprite-timeline.v1"));
+        }
+        if title == Some(scene) || node.bitmap_text.is_some() {
+            return Err(err("E_TIMELINE", scene, "invalid timeline binding"));
+        }
+    }
+    if let Some(transform) = node.sprite_transform {
+        if !requires
+            .iter()
+            .any(|cap| cap == "stage.sprite-transform.v1")
+        {
+            return Err(err("E_CAPABILITY", scene, "stage.sprite-transform.v1"));
+        }
+        if !transform.valid(node.width, node.height)
+            || node.clip.is_some()
+            || node.bitmap_text.is_some()
+        {
+            return Err(err("E_VISUAL", scene, "invalid leaf sprite transform"));
+        }
+    }
+    if node.offset != [0.; 2] {
+        if !requires.iter().any(|cap| cap == "stage.sprite-wave.v1") {
+            return Err(err("E_CAPABILITY", scene, "stage.sprite-wave.v1"));
+        }
+        if node
+            .offset
+            .iter()
+            .any(|n| !n.is_finite() || n.abs() > 8192.)
+        {
+            return Err(err("E_VISUAL", scene, "invalid sprite offset"));
+        }
+    }
+    if !node.preserve_pose.is_empty() {
+        if !requires
+            .iter()
+            .any(|cap| cap == "stage.sprite-continuity.v1")
+        {
+            return Err(err("E_CAPABILITY", scene, "stage.sprite-continuity.v1"));
+        }
+        if title == Some(scene)
+            || node.preserve_pose.iter().collect::<BTreeSet<_>>().len() != node.preserve_pose.len()
+        {
+            return Err(err("E_VISUAL", scene, "invalid preserved pose properties"));
+        }
+    }
+    if let Some(recipe) = &node.bitmap_text {
+        if !requires.iter().any(|cap| cap == "stage.bitmap-text.v1") {
+            return Err(err("E_CAPABILITY", scene, "stage.bitmap-text.v1"));
+        }
+        if !recipe.valid(variables) || node.asset.is_none() || title == Some(scene) {
+            return Err(err(
+                "E_BITMAP_TEXT",
+                scene,
+                "invalid bitmap recipe or title placement",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) -> Result<()> {
     let root = view.runtime_root().unwrap();
     if package
@@ -2638,8 +3016,12 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
             "activation recipe set differs from cues",
         ));
     }
+    for (id, timeline) in &package.sprite_timelines {
+        validate_timeline(id, timeline, &view.requires)?;
+    }
     for (id, nodes) in &package.scenes {
-        validate_scene_nodes(nodes, id, &root.assets)?;
+        validate_scene_nodes(nodes, id, root)?;
+        validate_timeline_bindings(nodes, id, |key| package.sprite_timelines.get(key))?;
     }
     if view
         .title_scene
@@ -2660,14 +3042,63 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
         if cue.effects.is_empty() || cue.effects.len() > MAX_TASKS {
             return Err(err("E_LIMIT", id, "invalid cue size"));
         }
+        let modal_count = cue
+            .effects
+            .iter()
+            .filter(|def| matches!(def.effect, Effect::StoryModal { .. }))
+            .count();
+        if modal_count > 1
+            || (modal_count > 0
+                && cue
+                    .effects
+                    .iter()
+                    .any(|def| matches!(def.effect, Effect::Dialogue { .. })))
+        {
+            return Err(err(
+                "E_OWNERSHIP",
+                id,
+                "story modal requires exclusive interaction",
+            ));
+        }
+        let style_count = cue
+            .effects
+            .iter()
+            .filter(|def| matches!(def.effect, Effect::DialogueStyle { .. }))
+            .count();
+        if style_count > 1
+            || (style_count > 0
+                && cue
+                    .effects
+                    .iter()
+                    .any(|def| matches!(def.effect, Effect::Dialogue { .. })))
+        {
+            return Err(err(
+                "E_OWNERSHIP",
+                id,
+                "style replacement must own the dialogue window",
+            ));
+        }
+        let mut decorations = BTreeSet::new();
+        for def in &cue.effects {
+            if let Effect::DialogueDecoration { slot, .. } = &def.effect {
+                if !decorations.insert(slot) || style_count > 0 {
+                    return Err(err(
+                        "E_OWNERSHIP",
+                        id,
+                        "conflicting dialogue decoration writers",
+                    ));
+                }
+            }
+        }
         let mut names = BTreeSet::new();
         let mut writers = BTreeSet::new();
         let mut stages = 0;
         let mut dialogues = 0;
         for def in &cue.effects {
-            validate_audio_loop(
+            validate_effect_extensions(
                 &def.effect,
                 &view.requires,
+                &view.theme,
                 &|asset| view.asset(asset).map(|a| a.duration_us.0),
                 id,
             )?;
@@ -2707,8 +3138,30 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                 }
             }
             match &def.effect {
+                Effect::SpriteTimeline {
+                    timeline,
+                    duration_us,
+                    ..
+                } => {
+                    if root.timeline_owners.get(timeline) != Some(&package.module)
+                        || view
+                            .sprite_timelines
+                            .get(timeline)
+                            .is_none_or(|t| t.duration_us != *duration_us)
+                    {
+                        return Err(err(
+                            "E_TIMELINE",
+                            id,
+                            "timeline identity or duration mismatch",
+                        ));
+                    }
+                }
                 Effect::StagePresent {
-                    scene, transition, ..
+                    scene,
+                    transition,
+                    inherit_images,
+                    inherit_image_geometry,
+                    ..
                 } => {
                     if !transition.valid() {
                         return Err(err("E_TRANSITION", id, "invalid wipe softness"));
@@ -2729,6 +3182,12 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                     {
                         return Err(err("E_SCENE", id, scene));
                     }
+                    validate_image_inheritance(
+                        view.scenes[scene].as_slice(),
+                        inherit_images,
+                        inherit_image_geometry,
+                        id,
+                    )?;
                 }
                 Effect::Dialogue { text, speaker, .. } => {
                     dialogues += 1;
@@ -2777,6 +3236,11 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                         "event gain must be finite and within 0..4",
                     ));
                 }
+                Effect::DialogueDecoration {
+                    image: Some(image), ..
+                } if view.asset_kind(&image.asset) != Some(AssetKind::Image) => {
+                    return Err(err("E_ASSET_TYPE", id, &image.asset));
+                }
                 Effect::Audio { asset, .. } if view.asset_kind(asset) != Some(AssetKind::Audio) => {
                     return Err(err("E_ASSET_TYPE", id, asset));
                 }
@@ -2815,8 +3279,29 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
             ));
         }
         let mut expected = BTreeSet::new();
+        for definition in &cue.effects {
+            definition
+                .effect
+                .collect_dialogue_style_assets(&view.theme, &mut expected);
+        }
         let mut all_scenes_known = true;
         for effect in &cue.effects {
+            let mut texts = BTreeSet::new();
+            effect.effect.collect_text_ids(&mut texts);
+            for text in texts {
+                if let Some(identity) = root.text_contracts.get(&text) {
+                    for image in &identity.images {
+                        expected.insert(image.asset.clone());
+                        if !recipe.contains(&image.asset) {
+                            return Err(err(
+                                "E_RECIPE",
+                                id,
+                                "inline image missing from activation recipe",
+                            ));
+                        }
+                    }
+                }
+            }
             if let Effect::Audio { asset, .. } = &effect.effect {
                 expected.insert(asset.clone());
                 if !recipe.contains(asset) {
@@ -2856,12 +3341,12 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
                         .then_some(view.title_nodes.as_slice())
                 });
                 if let Some(nodes) = nodes {
-                    for asset in nodes.iter().filter_map(|node| node.asset.as_ref()) {
+                    for asset in effect.effect.stage_image_assets(nodes) {
                         expected.insert(asset.clone());
                     }
-                    if nodes
-                        .iter()
-                        .filter_map(|node| node.asset.as_ref())
+                    if effect
+                        .effect
+                        .stage_image_assets(nodes)
                         .any(|asset| !recipe.contains(asset))
                     {
                         return Err(err(
@@ -2886,6 +3371,12 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
         }
     }
     for (id, choice) in &package.choices {
+        if choice.uses_float80() && !view.requires.iter().any(|c| c == "story.float80.v1") {
+            return Err(err("E_CAPABILITY", id, "story.float80.v1"));
+        }
+        validate_choice_images(id, choice, &view.requires, |asset| {
+            view.asset_index.get(asset).map(|a| a.kind)
+        })?;
         let mut ids = BTreeSet::new();
         for option in &choice.options {
             if !ids.insert(&option.id) {
@@ -2928,6 +3419,7 @@ fn validate_static_package(view: &RuntimeProgramView, package: &ModuleStatic) ->
             || contract.contract_revision != identity.contract_revision
             || contract.meaning_revision != identity.meaning_revision
             || contract.contract_digest != identity.contract_digest
+            || contract.images != identity.images
             || contract.contract_digest != text_contract_digest(contract)
             || contract
                 .params
@@ -2949,6 +3441,9 @@ fn validate_runtime_function(
     fid: &str,
     function: &Function,
 ) -> Result<()> {
+    if function.uses_float80() && !view.requires.iter().any(|c| c == "story.float80.v1") {
+        return Err(err("E_CAPABILITY", fid, "story.float80.v1"));
+    }
     if !function.blocks.contains_key(&function.entry) || function.blocks.len() > 100_000 {
         return Err(err("E_BLOCK", fid, "invalid entry/block limit"));
     }
@@ -2990,7 +3485,8 @@ fn validate_runtime_function(
                     ))) { return Err(err("E_VOICE_DURATION",&op.id,"sampled voice timer requires known asset duration")); }
                 }
                 let local = |name: &str| {
-                    root.task_owners.get(name).map(String::as_str) == view.function_module(fid)
+                    root.task_owners.get(name).map(String::as_str)
+                        == view.function_execution_module(fid)
                 };
                 let dialogue = view.task_definitions.get(task);
                 if !local(task)
@@ -3055,6 +3551,43 @@ fn validate_runtime_function(
                 }
             }
             match &op.operation {
+                Operation::MenuAccess { .. }
+                    if !view.requires.iter().any(|c| c == "player.menu-access.v1") =>
+                {
+                    return Err(err("E_CAPABILITY", &op.id, "player.menu-access.v1"));
+                }
+                Operation::AudioPause { .. }
+                    if !view.requires.iter().any(|c| c == "audio.pause.v1") =>
+                {
+                    return Err(err("E_CAPABILITY", &op.id, "audio.pause.v1"));
+                }
+                Operation::ProfileValueRead { target, key }
+                | Operation::ProfileValueAssign { target, key, .. } => {
+                    if !view.requires.iter().any(|c| c == "story.profile-value.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "story.profile-value.v1"));
+                    }
+                    if !view.variables.contains_key(target) || key.is_empty() || key.len() > 1024 {
+                        return Err(err("E_PROFILE", &op.id, "invalid profile value target/key"));
+                    }
+                    if let Operation::ProfileValueAssign { value, .. } = &op.operation {
+                        if view.variables.get(target).map(Value::ty)
+                            != Some(expr_type(value, &vars, &op.id)?)
+                        {
+                            return Err(err("E_TYPE", &op.id, target));
+                        }
+                    }
+                }
+                Operation::ProfileRead { target, key } => {
+                    if !view.requires.iter().any(|c| c == "story.profile-read.v1") {
+                        return Err(err("E_CAPABILITY", &op.id, "story.profile-read.v1"));
+                    }
+                    if view.variables.get(target).map(Value::ty) != Some(ValueType::I32)
+                        || key.is_empty()
+                        || key.len() > 1024
+                    {
+                        return Err(err("E_PROFILE", &op.id, "invalid profile flag target/key"));
+                    }
+                }
                 Operation::Assign { target, value }
                     if vars.get(target).copied() != Some(expr_type(value, &vars, &op.id)?) =>
                 {
@@ -3079,7 +3612,7 @@ fn validate_runtime_function(
             }
             Terminator::Switch { value, cases, .. } => {
                 let ty = expr_type(value, &vars, &at)?;
-                if ty == ValueType::Bool
+                if matches!(ty, ValueType::Bool | ValueType::F80)
                     || (ty == ValueType::I32 && cases.keys().any(|key| key.parse::<i32>().is_err()))
                 {
                     return Err(err("E_TYPE", &at, "switch requires I32 or String keys"));
@@ -3126,7 +3659,7 @@ fn validate_runtime_function(
                     .cue_owners
                     .get(cue)
                     .map(String::as_str)
-                    != view.function_module(fid)
+                    != view.function_execution_module(fid)
                     || view.cues.get(cue).is_none() =>
             {
                 return Err(err("E_CUE", &at, cue));
@@ -3139,7 +3672,7 @@ fn validate_runtime_function(
                             .task_owners
                             .get(&condition.task)
                             .map(String::as_str)
-                            != view.function_module(fid)
+                            != view.function_execution_module(fid)
                             || !view.task_definitions.contains_key(&condition.task)
                     }) =>
             {
@@ -3156,14 +3689,23 @@ fn validate_runtime_function(
                     .choice_owners
                     .get(choice)
                     .map(String::as_str)
-                    != view.function_module(fid)
+                    != view.function_execution_module(fid)
                     || view.choices.get(choice).is_none() =>
             {
                 return Err(err("E_CHOICE", &at, choice));
             }
             _ => {}
         }
-        if let Terminator::Await { conditions, .. } = &block.terminator {
+        if let Terminator::Await {
+            conditions,
+            on_advance,
+            ..
+        } = &block.terminator
+        {
+            if on_advance.is_some() && !view.requires.iter().any(|c| c == "control.advance-wait.v1")
+            {
+                return Err(err("E_CAPABILITY", &at, "control.advance-wait.v1"));
+            }
             for condition in conditions {
                 if let Some(definitions) = view.task_definitions.get(&condition.task) {
                     // A looped-audio leaf anywhere in a def's tree makes its
@@ -3280,7 +3822,9 @@ fn validate_runtime_function(
     for (bid, block) in &function.blocks {
         if let Some(mut assigned) = incoming.get(bid).cloned() {
             for op in &block.ops {
-                if let Operation::Assign { target, value } = &op.operation {
+                if let Operation::Assign { target, value }
+                | Operation::ProfileValueAssign { target, value, .. } = &op.operation
+                {
                     check_reads(value, &assigned, &op.id)?;
                     assigned.insert(target.clone());
                 } else if let Operation::Random { target, .. } = &op.operation {
@@ -3365,14 +3909,291 @@ struct ComposeCheck<'a> {
     err: &'a dyn Fn(&str, &str, &str) -> Diagnostic,
 }
 
-/// One composition child: scope inheritance, forbidden kinds, capabilities,
-/// assets and stop targets, exactly like a top-level effect.
-fn validate_audio_loop(
+/// Capability and bounds checks shared by inline, static, and composed effects.
+fn validate_image_inheritance(
+    nodes: &[Node],
+    inherited: &[String],
+    geometry: &[String],
+    at: &str,
+) -> Result<()> {
+    if geometry.len() > inherited.len()
+        || geometry.iter().collect::<BTreeSet<_>>().len() != geometry.len()
+        || geometry.iter().any(|id| !inherited.contains(id))
+        || inherited.len() > MAX_NODES
+        || inherited.iter().collect::<BTreeSet<_>>().len() != inherited.len()
+        || inherited.iter().any(|id| {
+            nodes.iter().find(|n| &n.id == id).is_none_or(|n| {
+                n.asset.is_none()
+                    || n.parent.is_some()
+                    || n.bitmap_text.is_some()
+                    || n.timeline_binding.is_some()
+                    || n.sprite_transform.is_some()
+            })
+        })
+    {
+        return Err(Diagnostic::new(
+            "E_STAGE_INHERIT",
+            at,
+            "requires unique ordinary image roots",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dialogue_styles(theme: &Theme, requires: &[String]) -> Result<()> {
+    for (cap, needed) in [
+        ("dialogue.style.v1", !theme.dialogue_styles.is_empty()),
+        (
+            "text.rect.v1",
+            theme
+                .dialogue_styles
+                .values()
+                .any(|style| style.dialogue.text_rect.is_some()),
+        ),
+    ] {
+        if needed && !requires.iter().any(|value| value == cap) {
+            return Err(err("E_CAPABILITY", "theme.dialogue_styles", cap));
+        }
+    }
+    if theme
+        .dialogue_styles
+        .values()
+        .any(|style| style.dialogue.shadow.is_some())
+        && !requires.iter().any(|value| value == "text.shadow.v1")
+    {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.dialogue_styles",
+            "text.shadow.v1",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_effect_extensions(
     effect: &Effect,
     requires: &[String],
+    theme: &Theme,
     duration: &impl Fn(&str) -> Option<u64>,
     at: &str,
 ) -> Result<()> {
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueDecoration { .. }))
+        && !requires.iter().any(|cap| cap == "dialogue.decoration.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "dialogue.decoration.v1",
+        ));
+    }
+    if effect.effect_tree_any(
+        &|e| matches!(e, Effect::DialogueDecoration { image: Some(image), .. } if !image.valid()),
+    ) {
+        return Err(Diagnostic::new(
+            "E_DIALOGUE_DECORATION",
+            at,
+            "invalid image placement",
+        ));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueDecoration { image: Some(image), .. }
+        if matches!(image.placement, DialogueDecorationPlacement::TextOrigin { .. })
+            && (theme.dialogue.text_rect.is_none() || theme.dialogue_styles.values().any(|style| style.dialogue.text_rect.is_none())))) {
+        return Err(Diagnostic::new("E_DIALOGUE_DECORATION", at, "text-origin placement requires explicit text rectangles"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::StoryModal { .. }))
+        && !requires.iter().any(|cap| cap == "ui.story-modal.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "ui.story-modal.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::StoryModal {
+        target: nir_format::StoryModalTarget::ImageMenu { menu }
+    } if !theme.image_menus.contains_key(menu))
+    }) {
+        return Err(Diagnostic::new("E_MENU", at, "unknown story modal menu"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueStyle { .. }))
+        && !requires.iter().any(|cap| cap == "dialogue.style.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "dialogue.style.v1"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueStyle { style } if !theme.dialogue_styles.contains_key(style))) {
+        return Err(Diagnostic::new("E_DIALOGUE_STYLE", at, "unknown dialogue style"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::SourceMotion { .. }))
+        && !requires.iter().any(|cap| cap == "stage.source-motion.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "stage.source-motion.v1",
+        ));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::SourceMotion { node, property, to, duration_us, curve }
+        if node.is_empty() || node.len() > 256
+        || match property {
+            Property::X | Property::Y => to.abs_diff(0) > 8192 || *curve == SourceMotionCurve::OpacityLinear,
+            Property::Opacity => !(0..=255).contains(to) || *curve != SourceMotionCurve::OpacityLinear,
+            _ => true,
+        }
+        || duration_us.0 > 60_000_000 || !duration_us.0.is_multiple_of(1000))
+    }) {
+        return Err(Diagnostic::new(
+            "E_MOTION",
+            at,
+            "invalid bounded integer stock motion",
+        ));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(
+            e,
+            Effect::SourceMotion {
+                property: Property::Opacity,
+                ..
+            }
+        )
+    }) && !requires.iter().any(|cap| cap == "stage.source-opacity.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "stage.source-opacity.v1",
+        ));
+    }
+    if effect.effect_tree_any(
+        &|e| matches!(e, Effect::StagePresent { inherit_images, .. } if !inherit_images.is_empty()),
+    ) && !requires.iter().any(|cap| cap == "stage.inherit-image.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "stage.inherit-image.v1",
+        ));
+    }
+    if effect.effect_tree_any(
+        &|e| matches!(e, Effect::StagePresent { inherit_image_geometry, .. } if !inherit_image_geometry.is_empty()),
+    ) && !requires.iter().any(|cap| cap == "stage.inherit-image-geometry.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "stage.inherit-image-geometry.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(
+            e,
+            Effect::StagePresent {
+                dialogue_visible: Some(_),
+                ..
+            }
+        )
+    }) && !requires.iter().any(|cap| cap == "stage.window-flip.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "stage.window-flip.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::StagePresent {
+        dialogue_visible: Some(_), duration_us, .. } if duration_us.0 > 60_000_000)
+    }) {
+        return Err(Diagnostic::new(
+            "E_TRANSITION",
+            at,
+            "reserved window flip exceeds 60 seconds",
+        ));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::StagePresent {
+        dialogue_visible: Some(_), duration_us, .. } if duration_us.0 > 0)
+    }) && !requires
+        .iter()
+        .any(|cap| cap == "text.window-transition.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "text.window-transition.v1",
+        ));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::SpriteTimeline { .. }))
+        && !requires.iter().any(|c| c == "stage.sprite-timeline.v1")
+    {
+        return Err(err("E_CAPABILITY", at, "stage.sprite-timeline.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::SpriteTimeline { timeline, root, duration_us, .. }
+        if timeline.is_empty() || timeline.len() > 256 || root.is_empty() || root.len() > 256
+            || duration_us.0 == 0 || duration_us.0 > 3_600_000_000)
+    }) {
+        return Err(err("E_TIMELINE", at, "invalid finite sprite timeline"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(
+            e,
+            Effect::SpriteTimeline {
+                delete_on_finish: true,
+                ..
+            }
+        )
+    }) && !requires.iter().any(|c| c == "stage.sprite-lifecycle.v1")
+    {
+        return Err(err("E_CAPABILITY", at, "stage.sprite-lifecycle.v1"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::SpriteWave { .. }))
+        && !requires.iter().any(|cap| cap == "stage.sprite-wave.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "stage.sprite-wave.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e, Effect::SpriteWave { nodes, spec }
+        if !spec.valid() || spec.randomize || nodes.is_empty() || nodes.len() > 32
+        || nodes.iter().any(|n| n.is_empty() || n.len() > 256)
+        || nodes.iter().collect::<BTreeSet<_>>().len() != nodes.len())
+    }) {
+        return Err(Diagnostic::new("E_SHAKE", at, "invalid finite sprite wave"));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::SpriteShake { .. }))
+        && !requires.iter().any(|cap| cap == "stage.sprite-shake.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "stage.sprite-shake.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(
+            e,
+            Effect::SpriteShake {
+                mode: nir_format::SpriteShakeMode::Quake,
+                ..
+            }
+        )
+    }) && !requires.iter().any(|cap| cap == "stage.sprite-quake.v1")
+    {
+        return Err(Diagnostic::new("E_CAPABILITY", at, "stage.sprite-quake.v1"));
+    }
+    if effect.effect_tree_any(&|e| {
+        matches!(e,Effect::SpriteShake { nodes,spec,.. }
+        if !spec.valid() || nodes.is_empty() || nodes.len()>32
+            || nodes.iter().any(|n|n.is_empty()||n.len()>256)
+            || nodes.iter().collect::<BTreeSet<_>>().len()!=nodes.len())
+    }) {
+        return Err(Diagnostic::new(
+            "E_SHAKE",
+            at,
+            "invalid independent sprite shake",
+        ));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueShake { .. }))
+        && !requires.iter().any(|cap| cap == "stage.dialogue-shake.v1")
+    {
+        return Err(Diagnostic::new(
+            "E_CAPABILITY",
+            at,
+            "stage.dialogue-shake.v1",
+        ));
+    }
+    if effect.effect_tree_any(&|e| matches!(e, Effect::DialogueShake { spec } if !spec.valid())) {
+        return Err(Diagnostic::new(
+            "E_SHAKE",
+            at,
+            "invalid finite dialogue shake",
+        ));
+    }
     if effect.effect_tree_any(&|e| {
         matches!(
             e,
@@ -3428,7 +4249,12 @@ fn check_compose_child<'a>(
     }
     if matches!(
         def.effect,
-        Effect::StagePresent { .. } | Effect::Dialogue { .. }
+        Effect::StagePresent { .. }
+            | Effect::Dialogue { .. }
+            | Effect::StoryModal { .. }
+            | Effect::DialogueStyle { .. }
+            | Effect::DialogueDecoration { .. }
+            | Effect::SpriteTimeline { .. }
     ) {
         return Err(err(
             "E_COMPOSE",
@@ -3580,6 +4406,20 @@ pub fn expr_type(e: &Expr, vars: &BTreeMap<String, ValueType>, at: &str) -> Resu
             .get(name)
             .copied()
             .ok_or_else(|| err("E_VARIABLE", at, name)),
+        Expr::ToF80 { value } | Expr::ToI32 { value } => {
+            if !matches!(expr_type(value, vars, at)?, ValueType::I32 | ValueType::F80) {
+                return Err(err(
+                    "E_TYPE",
+                    at,
+                    "numeric conversion requires numeric input",
+                ));
+            }
+            Ok(if matches!(e, Expr::ToF80 { .. }) {
+                ValueType::F80
+            } else {
+                ValueType::I32
+            })
+        }
         Expr::Not { value } => {
             if expr_type(value, vars, at)? != ValueType::Bool {
                 return Err(err("E_TYPE", at, "not requires Bool"));
@@ -3590,8 +4430,14 @@ pub fn expr_type(e: &Expr, vars: &BTreeMap<String, ValueType>, at: &str) -> Resu
             let l = expr_type(left, vars, at)?;
             let r = expr_type(right, vars, at)?;
             let result = match op {
-                Add | Sub | Mul | Div | Rem if l == ValueType::I32 && r == l => ValueType::I32,
-                Lt | Le | Gt | Ge if l == ValueType::I32 && r == l => ValueType::Bool,
+                Add | Sub | Mul | Div | Rem
+                    if matches!(l, ValueType::I32 | ValueType::F80) && r == l =>
+                {
+                    l
+                }
+                Lt | Le | Gt | Ge if matches!(l, ValueType::I32 | ValueType::F80) && r == l => {
+                    ValueType::Bool
+                }
                 Eq | Ne if l == r => ValueType::Bool,
                 And | Or if l == ValueType::Bool && r == l => ValueType::Bool,
                 Concat if l == ValueType::String && r == l => ValueType::String,
@@ -3606,7 +4452,7 @@ fn reads(e: &Expr, out: &mut BTreeSet<String>) {
         Expr::Var { name } => {
             out.insert(name.clone());
         }
-        Expr::Not { value } => reads(value, out),
+        Expr::Not { value } | Expr::ToF80 { value } | Expr::ToI32 { value } => reads(value, out),
         Expr::Binary { left, right, .. } => {
             reads(left, out);
             reads(right, out);
@@ -3636,8 +4482,12 @@ fn outgoing(t: &Terminator) -> Vec<&str> {
             next,
             on_cancelled,
             on_failed,
+            on_advance,
             ..
-        } => vec![next, on_cancelled, on_failed],
+        } => [next.as_str(), on_cancelled.as_str(), on_failed.as_str()]
+            .into_iter()
+            .chain(on_advance.iter().map(String::as_str))
+            .collect(),
         Terminator::Interact {
             branches,
             on_empty,
@@ -3662,10 +4512,20 @@ fn term_exprs(t: &Terminator) -> Vec<&Expr> {
     }
 }
 fn validate(p: &RuntimeProgramView) -> Result<()> {
+    if (p.variables.values().any(|v| v.ty() == ValueType::F80)
+        || p.functions.values().any(Function::uses_float80)
+        || p.choices.values().any(Choice::uses_float80))
+        && !p.requires.iter().any(|c| c == "story.float80.v1")
+    {
+        return Err(err("E_CAPABILITY", "program", "story.float80.v1"));
+    }
     if let Some(root) = p.runtime_root() {
         return validate_runtime_root(root);
     }
     validate_ui_config(&p.theme, &p.player)?;
+    if p.theme.image_menus.len() > 64 && !p.requires.iter().any(|c| c == "ui.menu-pages.v1") {
+        return Err(err("E_CAPABILITY", "theme.image_menus", "ui.menu-pages.v1"));
+    }
     validate_menu_audio_loops(&p.theme, &p.requires, |asset| {
         p.assets.get(asset).map(|a| a.duration_us.0)
     })?;
@@ -3865,6 +4725,14 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             "ui.menu-elements.v1",
         ));
     }
+    validate_dialogue_styles(&p.theme, &p.requires)?;
+    if p.theme.dialogue.text_rect.is_some() && !p.requires.iter().any(|cap| cap == "text.rect.v1") {
+        return Err(err(
+            "E_CAPABILITY",
+            "theme.dialogue.text_rect",
+            "text.rect.v1",
+        ));
+    }
     if p.theme.dialogue.shadow.is_some() && !p.requires.iter().any(|cap| cap == "text.shadow.v1") {
         return Err(err(
             "E_CAPABILITY",
@@ -4048,6 +4916,26 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 return Err(err("E_TEXT_REVISION", id, locale));
             }
             validate_text_spans(id, c, &d.spans)?;
+            if !c.images.is_empty()
+                && (!p.requires.iter().any(|c| c == "text.inline-image.v1")
+                    || c.images.iter().any(|i| {
+                        p.assets
+                            .get(&i.asset)
+                            .is_none_or(|a| a.kind != AssetKind::Image)
+                    }))
+            {
+                return Err(err("E_TEXT_IMAGE", id, "capability or image binding"));
+            }
+            if d.spans.iter().any(|s| matches!(s, Span::Pause { .. }))
+                && !p.requires.iter().any(|c| c == "text.pause.v1")
+            {
+                return Err(err("E_CAPABILITY", id, "text.pause.v1"));
+            }
+            if d.spans.iter().any(|s| matches!(s, Span::Ruby { .. }))
+                && !p.requires.iter().any(|c| c == "text.ruby.v1")
+            {
+                return Err(err("E_CAPABILITY", id, "text.ruby.v1"));
+            }
         }
         if texts.keys().any(|id| !p.texts.contains_key(id)) {
             return Err(err("E_TEXT_CONTRACT", locale, "unexpected text"));
@@ -4058,7 +4946,11 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             return Err(err("E_LIMIT", id, "asset too large"));
         }
     }
+    for (id, timeline) in p.sprite_timelines.iter() {
+        validate_timeline(id, timeline, &p.requires)?;
+    }
     for (id, nodes) in p.scenes.iter() {
+        validate_timeline_bindings(nodes, id, |key| p.sprite_timelines.get(key))?;
         let err = |code: &str, at: &str, message: &str| {
             err(code, at, message).classified(
                 ErrorDomain::Content,
@@ -4072,6 +4964,14 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         }
         let mut ids = BTreeSet::new();
         for n in nodes {
+            if n.sprite_transform.is_some()
+                && nodes
+                    .iter()
+                    .any(|child| child.parent.as_deref() == Some(n.id.as_str()))
+            {
+                return Err(err("E_VISUAL", id, "sprite transforms require leaf nodes"));
+            }
+            validate_bitmap_node(n, id, &p.variables, &p.requires, p.title_scene.as_deref())?;
             if !ids.insert(&n.id) {
                 return Err(err("E_DUPLICATE", id, &n.id));
             }
@@ -4121,14 +5021,63 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         if cue.effects.is_empty() || cue.effects.len() > MAX_TASKS {
             return Err(err("E_LIMIT", id, "invalid cue size"));
         }
+        let modal_count = cue
+            .effects
+            .iter()
+            .filter(|def| matches!(def.effect, Effect::StoryModal { .. }))
+            .count();
+        if modal_count > 1
+            || (modal_count > 0
+                && cue
+                    .effects
+                    .iter()
+                    .any(|def| matches!(def.effect, Effect::Dialogue { .. })))
+        {
+            return Err(err(
+                "E_OWNERSHIP",
+                id,
+                "story modal requires exclusive interaction",
+            ));
+        }
+        let style_count = cue
+            .effects
+            .iter()
+            .filter(|def| matches!(def.effect, Effect::DialogueStyle { .. }))
+            .count();
+        if style_count > 1
+            || (style_count > 0
+                && cue
+                    .effects
+                    .iter()
+                    .any(|def| matches!(def.effect, Effect::Dialogue { .. })))
+        {
+            return Err(err(
+                "E_OWNERSHIP",
+                id,
+                "style replacement must own the dialogue window",
+            ));
+        }
+        let mut decorations = BTreeSet::new();
+        for def in &cue.effects {
+            if let Effect::DialogueDecoration { slot, .. } = &def.effect {
+                if !decorations.insert(slot) || style_count > 0 {
+                    return Err(err(
+                        "E_OWNERSHIP",
+                        id,
+                        "conflicting dialogue decoration writers",
+                    ));
+                }
+            }
+        }
         let mut names = BTreeSet::new();
         let mut writers = BTreeSet::new();
         let mut stage_count = 0;
         let mut dialogue_count = 0;
         for def in &cue.effects {
-            validate_audio_loop(
+            validate_effect_extensions(
                 &def.effect,
                 &p.requires,
+                &p.theme,
                 &|asset| p.assets.get(asset).map(|a| a.duration_us.0),
                 id,
             )?;
@@ -4168,8 +5117,28 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 }
             }
             match &def.effect {
+                Effect::SpriteTimeline {
+                    timeline,
+                    duration_us,
+                    ..
+                } => {
+                    if p.sprite_timelines
+                        .get(timeline)
+                        .is_none_or(|t| t.duration_us != *duration_us)
+                    {
+                        return Err(err(
+                            "E_TIMELINE",
+                            id,
+                            "timeline identity or duration mismatch",
+                        ));
+                    }
+                }
                 Effect::StagePresent {
-                    scene, transition, ..
+                    scene,
+                    transition,
+                    inherit_images,
+                    inherit_image_geometry,
+                    ..
                 } => {
                     if !transition.valid() {
                         return Err(err("E_TRANSITION", id, "invalid wipe softness"));
@@ -4188,6 +5157,12 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     if !p.scenes.contains_key(scene) {
                         return Err(err("E_SCENE", id, scene));
                     }
+                    validate_image_inheritance(
+                        &p.scenes[scene],
+                        inherit_images,
+                        inherit_image_geometry,
+                        id,
+                    )?;
                 }
                 Effect::Dialogue { text, speaker, .. } => {
                     dialogue_count += 1;
@@ -4232,6 +5207,14 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                         "event gain must be finite and within 0..4",
                     ));
                 }
+                Effect::DialogueDecoration {
+                    image: Some(image), ..
+                } if p.assets.get(&image.asset).is_none_or(|asset| {
+                    asset.kind != AssetKind::Image || [asset.width, asset.height] != image.size
+                }) =>
+                {
+                    return Err(err("E_DIALOGUE_DECORATION", id, "image metadata mismatch"));
+                }
                 Effect::Audio { asset, .. }
                     if p.assets.get(asset).map(|a| a.kind) != Some(AssetKind::Audio) =>
                 {
@@ -4261,6 +5244,9 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
         )?;
     }
     for (id, c) in p.choices.iter() {
+        validate_choice_images(id, c, &p.requires, |asset| {
+            p.assets.get(asset).map(|a| a.kind)
+        })?;
         let mut ids = BTreeSet::new();
         for o in &c.options {
             if !ids.insert(&o.id) {
@@ -4379,6 +5365,51 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                     }
                 }
                 match &op.operation {
+                    Operation::MenuAccess { .. }
+                        if !p.requires.iter().any(|c| c == "player.menu-access.v1") =>
+                    {
+                        return Err(err("E_CAPABILITY", &op.id, "player.menu-access.v1"));
+                    }
+                    Operation::AudioPause { .. }
+                        if !p.requires.iter().any(|c| c == "audio.pause.v1") =>
+                    {
+                        return Err(err("E_CAPABILITY", &op.id, "audio.pause.v1"));
+                    }
+                    Operation::ProfileValueRead { target, key }
+                    | Operation::ProfileValueAssign { target, key, .. } => {
+                        if !p.requires.iter().any(|c| c == "story.profile-value.v1") {
+                            return Err(err("E_CAPABILITY", &op.id, "story.profile-value.v1"));
+                        }
+                        if !p.variables.contains_key(target) || key.is_empty() || key.len() > 1024 {
+                            return Err(err(
+                                "E_PROFILE",
+                                &op.id,
+                                "invalid profile value target/key",
+                            ));
+                        }
+                        if let Operation::ProfileValueAssign { value, .. } = &op.operation {
+                            if p.variables.get(target).map(Value::ty)
+                                != Some(expr_type(value, &vars, &op.id)?)
+                            {
+                                return Err(err("E_TYPE", &op.id, target));
+                            }
+                        }
+                    }
+                    Operation::ProfileRead { target, key } => {
+                        if !p.requires.iter().any(|c| c == "story.profile-read.v1") {
+                            return Err(err("E_CAPABILITY", &op.id, "story.profile-read.v1"));
+                        }
+                        if p.variables.get(target).map(Value::ty) != Some(ValueType::I32)
+                            || key.is_empty()
+                            || key.len() > 1024
+                        {
+                            return Err(err(
+                                "E_PROFILE",
+                                &op.id,
+                                "invalid profile flag target/key",
+                            ));
+                        }
+                    }
                     Operation::Assign { target, value }
                         if vars.get(target).copied() != Some(expr_type(value, &vars, &op.id)?) =>
                     {
@@ -4403,7 +5434,7 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 }
                 Terminator::Switch { value, cases, .. } => {
                     let ty = expr_type(value, &vars, &at)?;
-                    if ty == ValueType::Bool
+                    if matches!(ty, ValueType::Bool | ValueType::F80)
                         || (ty == ValueType::I32 && cases.keys().any(|s| s.parse::<i32>().is_err()))
                     {
                         return Err(err("E_TYPE", &at, "switch requires I32 or String keys"));
@@ -4445,7 +5476,16 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 Terminator::Activate { cue, .. } if !p.cues.contains_key(cue) => {
                     return Err(err("E_CUE", &at, cue));
                 }
-                Terminator::Await { conditions, .. } => {
+                Terminator::Await {
+                    conditions,
+                    on_advance,
+                    ..
+                } => {
+                    if on_advance.is_some()
+                        && !p.requires.iter().any(|c| c == "control.advance-wait.v1")
+                    {
+                        return Err(err("E_CAPABILITY", &at, "control.advance-wait.v1"));
+                    }
                     if conditions.is_empty() {
                         return Err(err("E_WAIT", &at, "empty All"));
                     }
@@ -4550,7 +5590,8 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
             if let Some(mut assigned) = incoming.get(bid).cloned() {
                 for op in &b.ops {
                     match &op.operation {
-                        Operation::Assign { target, value } => {
+                        Operation::Assign { target, value }
+                        | Operation::ProfileValueAssign { target, value, .. } => {
                             check_reads(value, &assigned, &op.id)?;
                             assigned.insert(target.clone());
                         }
@@ -4563,6 +5604,50 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 for e in term_exprs(&b.terminator) {
                     check_reads(e, &assigned, &format!("{fid}/{bid}"))?;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_choice_images(
+    id: &str,
+    choice: &Choice,
+    requires: &[String],
+    asset_kind: impl Fn(&str) -> Option<AssetKind>,
+) -> Result<()> {
+    let images: Vec<_> = choice
+        .options
+        .iter()
+        .filter_map(|o| o.image.as_ref())
+        .collect();
+    if images.is_empty() {
+        return Ok(());
+    }
+    if !requires.iter().any(|c| c == "choice.image.v1") {
+        return Err(err("E_CAPABILITY", id, "choice.image.v1"));
+    }
+    if images.len() != choice.options.len() {
+        return Err(err("E_CHOICE_IMAGE", id, "mixed image and text choices"));
+    }
+    for image in images {
+        if !image.rect.iter().all(|v| v.is_finite() && v.abs() <= 8192.)
+            || image.rect[2] <= 0.
+            || image.rect[3] <= 0.
+        {
+            return Err(err("E_CHOICE_IMAGE", id, "invalid image choice rectangle"));
+        }
+        if image.disabled_asset.is_some()
+            && !requires.iter().any(|c| c == "choice.disabled-image.v1")
+        {
+            return Err(err("E_CAPABILITY", id, "choice.disabled-image.v1"));
+        }
+        for asset in std::iter::once(&image.asset)
+            .chain(image.hover_asset.iter())
+            .chain(image.disabled_asset.iter())
+        {
+            if asset_kind(asset) != Some(AssetKind::Image) {
+                return Err(err("E_ASSET_TYPE", id, asset));
             }
         }
     }
@@ -4661,6 +5746,7 @@ mod runtime_tests {
                 (
                     id.clone(),
                     RuntimeFunctionIndex {
+                        execution_module: None,
                         module: "m".into(),
                         signature: signature.clone(),
                     },
@@ -4705,11 +5791,13 @@ mod runtime_tests {
                         contract_revision: contract.contract_revision,
                         meaning_revision: contract.meaning_revision,
                         contract_digest: contract.contract_digest.clone(),
+                        images: contract.images.clone(),
                     },
                 )
             })
             .collect();
         let root = RuntimeProgram {
+            timeline_owners: Default::default(),
             format: RUNTIME_FORMAT_VERSION,
             game_id: "runtime-test".into(),
             revision: "r1".into(),
@@ -4779,6 +5867,7 @@ mod runtime_tests {
     }
     fn empty_static() -> ModuleStatic {
         ModuleStatic {
+            sprite_timelines: Default::default(),
             format: RUNTIME_FORMAT_VERSION,
             module: "m".into(),
             scenes: BTreeMap::new(),
@@ -4795,6 +5884,8 @@ mod runtime_tests {
             meaning_revision: 1,
             contract_digest: String::new(),
             gates: vec![],
+            pauses: vec![],
+            images: vec![],
             params: BTreeMap::new(),
         };
         contract.contract_digest = text_contract_digest(&contract);
@@ -4811,6 +5902,79 @@ mod runtime_tests {
         assert!(next.is_resident(&ContentKey::Code { module: "m".into() }));
         assert!(view.program().functions.get("m.main").is_none());
         assert!(next.program().functions.get("m.main").is_some());
+    }
+
+    #[test]
+    fn immutable_timeline_bodies_obey_typed_ownership_and_eviction() {
+        let (base, mut batch) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), simple_function())]),
+            empty_static(),
+        );
+        let mut root = base.runtime_root().unwrap().clone();
+        root.requires.push("stage.sprite-timeline.v1".into());
+        root.timeline_owners.insert("m.movie".into(), "m".into());
+        let timeline = SpriteTimeline {
+            id: "m.movie".into(),
+            duration_us: Micros(1000),
+            tracks: vec![SpriteTimelineTrack {
+                node: "picture".into(),
+                frames: vec![SpriteKeyframe {
+                    at_us: Micros(0),
+                    rect: [0., 0., 32., 24.],
+                    opacity: 1.,
+                    color: [1.; 4],
+                    transform: None,
+                }],
+            }],
+        };
+        if let RuntimeObject::Static(package) = &mut batch[0].1 {
+            package
+                .sprite_timelines
+                .insert(timeline.id.clone(), timeline.clone());
+        }
+        let view = ValidatedProgram::from_runtime(root.clone()).unwrap();
+        assert!(view.program().sprite_timelines.contains_key("m.movie"));
+        assert!(view.program().sprite_timelines.get("m.movie").is_none());
+        let mut bad = batch.clone();
+        if let RuntimeObject::Static(package) = &mut bad[0].1 {
+            package.sprite_timelines.clear();
+        }
+        assert_eq!(view.install_batch(bad).unwrap_err().code, "E_CONTENT_KEY");
+        let mut bad = batch.clone();
+        if let RuntimeObject::Static(package) = &mut bad[0].1 {
+            package.sprite_timelines.get_mut("m.movie").unwrap().tracks[0].frames[0].opacity = -1.;
+        }
+        assert_eq!(view.install_batch(bad).unwrap_err().code, "E_TIMELINE");
+        let loaded = view.install_batch(batch).unwrap();
+        let body = loaded.program().sprite_timelines.shared("m.movie").unwrap();
+        assert!(Arc::ptr_eq(
+            &body,
+            &loaded
+                .clone()
+                .program()
+                .sprite_timelines
+                .shared("m.movie")
+                .unwrap()
+        ));
+        let key = ContentKey::Static { module: "m".into() };
+        let lease = loaded
+            .lease(BTreeSet::from([key.clone()]), "animation".into())
+            .unwrap();
+        assert_eq!(
+            loaded
+                .evict(BTreeSet::from([key.clone()]))
+                .unwrap_err()
+                .code,
+            "E_CONTENT_PINNED"
+        );
+        drop(lease);
+        let evicted = loaded.evict(BTreeSet::from([key])).unwrap();
+        assert!(evicted.program().sprite_timelines.contains_key("m.movie"));
+        assert!(evicted.program().sprite_timelines.get("m.movie").is_none());
+        assert_eq!(body.as_ref(), &timeline);
+        root.timeline_owners
+            .insert("m.movie".into(), "missing".into());
+        assert!(ValidatedProgram::from_runtime(root).is_err());
     }
 
     fn text_block(contract: &TextContract) -> RuntimeObject {
@@ -5294,6 +6458,7 @@ mod runtime_tests {
                     "wait".into(),
                     block(
                         Terminator::Await {
+                            on_advance: None,
                             conditions: vec![WaitCondition {
                                 task: "m.work".into(),
                                 milestone: Milestone::Marker("missing".into()),
@@ -5333,6 +6498,7 @@ mod runtime_tests {
             "m.choice".into(),
             Choice {
                 options: vec![ChoiceOption {
+                    image: None,
                     id: "yes".into(),
                     text: "m.label".into(),
                     visible: None,
@@ -5511,6 +6677,12 @@ mod runtime_tests {
                 color: [1.; 4],
                 order: 0,
                 clip: None,
+                timeline_binding: None,
+                inherit_existence: false,
+                sprite_transform: None,
+                bitmap_text: None,
+                preserve_pose: vec![],
+                offset: [0.; 2],
             }],
         );
         recipe_package.cues.insert(
@@ -5521,6 +6693,9 @@ mod runtime_tests {
                     scope: Scope::Scene,
                     effect: Effect::StagePresent {
                         scene: "m.scene".into(),
+                        dialogue_visible: None,
+                        inherit_images: Vec::new(),
+                        inherit_image_geometry: Vec::new(),
                         transition: StageTransition::default(),
                         duration_us: Micros(0),
                     },

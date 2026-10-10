@@ -46,6 +46,64 @@ fn start(p: Program) -> (Core, Vec<CoreIntent>) {
     (c, step.intents)
 }
 #[test]
+fn authored_audio_pause_freezes_offsets_survives_restore_and_resumes_same_task() {
+    let mut p = audio_program(1.);
+    p.requires.push("audio.pause.v1".into());
+    let blocks = &mut p.functions.get_mut("main").unwrap().blocks;
+    blocks.get_mut("hold").unwrap().ops.push(
+        serde_json::from_value(json!({
+            "id":"pause-voice","operation":{"type":"audio_pause","bus":"voice","paused":true}
+        }))
+        .unwrap(),
+    );
+    blocks.get_mut("hold").unwrap().terminator = serde_json::from_value(json!({
+        "type":"await","conditions":[{"task":"hold","milestone":{"type":"finished"}}],
+        "next":"resume","on_cancelled":"done","on_failed":"done"
+    }))
+    .unwrap();
+    blocks.insert("resume".into(),serde_json::from_value(json!({
+        "ops":[{"id":"resume-voice","operation":{"type":"audio_pause","bus":"voice","paused":false}}],
+        "terminator":{"type":"activate","cue":"second-hold","next":"second-wait"}
+    })).unwrap());
+    blocks.insert("second-wait".into(),serde_json::from_value(json!({
+        "terminator":{"type":"await","conditions":[{"task":"second","milestone":{"type":"finished"}}],
+        "next":"done","on_cancelled":"done","on_failed":"done"}
+    })).unwrap());
+    p.cues.insert(
+        "second-hold".into(),
+        serde_json::from_value(json!({"effects":[{
+            "id":"second","scope":"session","effect":{"type":"delay","duration_us":"1000000"}
+        }]}))
+        .unwrap(),
+    );
+    let mut without_cap = p.clone();
+    without_cap.requires.retain(|c| c != "audio.pause.v1");
+    assert_eq!(
+        ValidatedProgram::new(without_cap).unwrap_err().code,
+        "E_CAPABILITY"
+    );
+    let (mut c, _) = start(p);
+    let id = c.state().handles["sample"];
+    c.step(CoreInput::Time { delta_us: 500_000 }, 1000);
+    assert_eq!(c.state().tasks[&id].elapsed_us, Micros(0));
+    assert!(c.state().audio_paused.contains(&AudioBus::Voice));
+    let snapshot: Snapshot =
+        serde_json::from_slice(&serde_json::to_vec(&c.snapshot()).unwrap()).unwrap();
+    let mut c = Core::restore(c.validated_program().clone(), snapshot, "audio-test").unwrap();
+    let step = c.step(CoreInput::Time { delta_us: 500_000 }, 1000);
+    assert!(!c.state().audio_paused.contains(&AudioBus::Voice));
+    assert_eq!(c.state().handles["sample"], id);
+    assert!(!step.intents.iter().any(|i| matches!(
+        i,
+        CoreIntent::AudioStart { .. } | CoreIntent::AudioStop { .. }
+    )));
+    let activation = c.state().pending.as_ref().unwrap().id;
+    c.step(CoreInput::Prepared { activation }, 1000);
+    c.step(CoreInput::Time { delta_us: 100_000 }, 1000);
+    assert_eq!(c.state().tasks[&id].elapsed_us, Micros(100_000));
+    assert!(c.state().fault.is_none(), "{:?}", c.state().fault);
+}
+#[test]
 fn gain_is_playback_metadata_and_natural_end_is_not_rewritten_by_late_events() {
     let (mut c, intents) = start(audio_program(1.5));
     assert!(intents
@@ -427,6 +485,55 @@ fn natural_end_completes_a_running_gain_tween_without_stopping_it_twice() {
         .iter()
         .any(|i| matches!(i, CoreIntent::AudioEnvelope { task, .. } if *task == sound)));
     Core::restore(c.validated_program().clone(), c.snapshot(), "audio-test").unwrap();
+}
+
+#[test]
+fn interruptible_audio_wait_survives_restore_and_keeps_audio_running_after_advance() {
+    let mut p = audio_program(1.);
+    p.requires.push("control.advance-wait.v1".into());
+    let blocks = &mut p.functions.get_mut("main").unwrap().blocks;
+    blocks.get_mut("hold").unwrap().terminator = serde_json::from_value(json!({
+        "type":"await","conditions":[{"task":"sample","milestone":{"type":"finished"}}],
+        "next":"after","on_advance":"after","on_cancelled":"done","on_failed":"done"
+    }))
+    .unwrap();
+    blocks.insert("after".into(), serde_json::from_value(json!({
+        "terminator":{"type":"await","conditions":[{"task":"hold","milestone":{"type":"finished"}}],
+        "next":"done","on_cancelled":"done","on_failed":"done"}
+    })).unwrap());
+    let (mut c, _) = start(p);
+    c.step(CoreInput::Time { delta_us: 200_000 }, 1000);
+    let sound = c.state().handles["sample"];
+    let old = c.advance_wait().unwrap();
+    let mut c = Core::restore(c.validated_program().clone(), c.snapshot(), "audio-test").unwrap();
+    let current = c.advance_wait().unwrap();
+    assert_ne!(old, current);
+    c.step(
+        CoreInput::Advance {
+            interaction: old,
+            sequence: 1,
+        },
+        1000,
+    );
+    assert_eq!(c.advance_wait(), Some(current));
+    let step = c.step(
+        CoreInput::AdvanceReading {
+            interaction: current,
+            sequence: 1,
+            stop_voice: true,
+        },
+        1000,
+    );
+    assert!(c.advance_wait().is_none());
+    assert_eq!(c.state().frames.last().unwrap().block, "after");
+    assert_eq!(c.state().tasks[&sound].state, TaskState::Running);
+    assert_eq!(c.state().tasks[&sound].elapsed_us, Micros(200_000));
+    assert!(!step.intents.iter().any(|i| matches!(
+        i,
+        CoreIntent::AudioStart { .. } | CoreIntent::AudioStop { .. }
+    )));
+    c.step(CoreInput::Time { delta_us: 200_000 }, 1000);
+    assert_eq!(c.state().tasks[&sound].elapsed_us, Micros(400_000));
 }
 
 #[test]
