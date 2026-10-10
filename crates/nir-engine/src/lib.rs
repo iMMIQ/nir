@@ -1597,9 +1597,8 @@ impl Engine {
         // Include host-owned pause token changes made immediately before
         // pump, and inspect every VM pump rather than delayed host snapshots.
         self.observe_story_clock();
-        // Bare clock events cost one admission unit each inside the player
-        // and only dirty the view when the turn did work beyond admission;
-        // every other event changes evaluation state unconditionally.
+        // Non-clock events change evaluation state unconditionally. Clock
+        // pumps can reuse the projection while only audio time advances.
         let clock_only = events.iter().all(|event| {
             matches!(
                 event,
@@ -1608,6 +1607,30 @@ impl Engine {
                     | AppEvent::ContinueStoryTime { .. }
             )
         });
+        // One positive time input can spend a bookkeeping unit advancing
+        // audio-only time. Retained events, active visuals, semantic work and
+        // context changes still invalidate the projection.
+        let time_inputs = events
+            .iter()
+            .filter(|event| match event {
+                AppEvent::Tick { delta_us } | AppEvent::ContinueStoryTime { delta_us } => {
+                    *delta_us > 0
+                }
+                AppEvent::TickDomains { story_us, .. } => *story_us > 0,
+                _ => false,
+            })
+            .count() as u32;
+        let had_pending = self.player.pending_events() > 0;
+        let clock_visuals = self.player.needs_visual_clock();
+        let context = (
+            self.player.generation.session,
+            self.player.current_interaction(),
+            self.player.screen,
+            self.player.paused(),
+            self.player.error.is_some(),
+            self.player.auto,
+            self.player.skip,
+        );
         let admitted = events.len() as u32;
         let mut work = 0u32;
         let mut commands = self.player.pump(events, self.work_remaining);
@@ -1668,7 +1691,21 @@ impl Engine {
             work += used;
             self.work_remaining -= used;
         }
-        self.state_dirty |= !clock_only || work > admitted;
+        self.state_dirty |= !clock_only
+            || had_pending
+            || clock_visuals
+            || self.player.needs_visual_clock()
+            || context
+                != (
+                    self.player.generation.session,
+                    self.player.current_interaction(),
+                    self.player.screen,
+                    self.player.paused(),
+                    self.player.error.is_some(),
+                    self.player.auto,
+                    self.player.skip,
+                )
+            || work > admitted + time_inputs;
         // Foreground-owned visuals (menu page fades) complete inside
         // clock-only ticks and release their clock token at that instant;
         // without this the settled frame may never be projected.

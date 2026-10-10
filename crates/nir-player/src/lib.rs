@@ -1088,6 +1088,13 @@ impl Player {
         self.needs_story_clock()
             || (self.ui_clock_demand.active() && !self.domain_paused(TimeDomain::ForegroundUi))
     }
+    /// Clock-driven picture changes, distinct from audio position accounting.
+    pub fn needs_visual_clock(&self) -> bool {
+        (self.screen == Screen::Story
+            && self.pauses.is_empty()
+            && (self.core.needs_visual_clock() || self.auto || self.skip || self.held_skip))
+            || (self.ui_clock_demand.active() && !self.domain_paused(TimeDomain::ForegroundUi))
+    }
     fn needs_story_clock(&self) -> bool {
         self.screen == Screen::Story
             && self.pauses.is_empty()

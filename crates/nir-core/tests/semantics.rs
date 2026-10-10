@@ -1022,6 +1022,24 @@ fn checked_integer_overflow_faults() {
 }
 
 #[test]
+fn timed_choice_keeps_visual_clock_demand() {
+    let mut p = program();
+    for choice in p.choices.values_mut() {
+        choice.timeout_us = Some(Micros(1_000_000));
+        choice.default = Some(choice.options[0].id.clone());
+    }
+    let mut c = Core::new(
+        ValidatedProgram::new(p).unwrap(),
+        "test-release".into(),
+        "en".into(),
+    )
+    .unwrap();
+    drive(&mut c, None);
+    assert!(c.state().choice.as_ref().unwrap().deadline_us.is_some());
+    assert!(c.needs_visual_clock());
+}
+
+#[test]
 fn elapsed_time_and_logic_share_one_budget() {
     let mut p = program();
     let f = p.functions.get_mut("main").unwrap();
@@ -1042,6 +1060,10 @@ fn elapsed_time_and_logic_share_one_budget() {
     assert_eq!(c.state().tick_us.0, 0);
     assert_eq!(output.remaining_time_us, 250_000);
     assert!(c.state().fault.is_none());
+    assert!(
+        c.needs_visual_clock(),
+        "retained logic must refresh its picture"
+    );
 }
 
 #[test]

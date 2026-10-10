@@ -3712,20 +3712,43 @@ impl Core {
             // A reveal in flight must reach its deadline even when the VM is
             // otherwise parked at an input barrier.
             || self.state.window_reveal.is_some()
-            || self.state.tasks.values().any(|t| {
-                t.state == TaskState::Running
-                    && !self.task_audio_paused(t)
-                    && match t.effect {
-                        Effect::Dialogue { .. } => t
-                            .dialogue
-                            .as_ref()
-                            .is_some_and(|d| !d.at_gate && (!d.awaiting_advance || d.spans.get(d.span).is_some_and(|s| s.pause && s.pause_timeout_us.is_some()))),
-                        // Audio advances on the device even when text is fully
-                        // revealed. Keep the Story clock alive for save offsets.
-                        Effect::Audio { .. } => true,
-                        _ => true,
-                    }
+            || self.state.tasks.values().any(|task| self.task_needs_clock(task))
+    }
+    /// Audio keeps the Story clock alive for save offsets without changing
+    /// the projected picture. All other runnable effects remain conservative.
+    pub fn needs_visual_clock(&self) -> bool {
+        if self.state.fault.is_some() || self.state.outcome.is_some() {
+            return false;
+        }
+        // A budget yield can retain logic before the next time step. Do not
+        // mistake its semantic work for the audio time bookkeeping allowance.
+        (self.state.pending.is_none()
+            && self.state.waiting.is_none()
+            && self.state.choice.is_none())
+            || self
+                .state
+                .choice
+                .as_ref()
+                .is_some_and(|c| c.deadline_us.is_some())
+            || self.state.window_reveal.is_some()
+            || self.state.tasks.values().any(|task| {
+                !matches!(task.effect, Effect::Audio { .. }) && self.task_needs_clock(task)
             })
+    }
+    fn task_needs_clock(&self, task: &Task) -> bool {
+        task.state == TaskState::Running
+            && !self.task_audio_paused(task)
+            && match task.effect {
+                Effect::Dialogue { .. } => task.dialogue.as_ref().is_some_and(|dialogue| {
+                    !dialogue.at_gate
+                        && (!dialogue.awaiting_advance
+                            || dialogue
+                                .spans
+                                .get(dialogue.span)
+                                .is_some_and(|span| span.pause && span.pause_timeout_us.is_some()))
+                }),
+                _ => true,
+            }
     }
     pub fn restore(program: ValidatedProgram, s: Snapshot, release: &str) -> Result<Self> {
         Self::restore_inner(program, s, release, false)

@@ -46,6 +46,31 @@ fn start(p: Program) -> (Core, Vec<CoreIntent>) {
     (c, step.intents)
 }
 #[test]
+fn audio_offsets_keep_clock_demand_without_visual_clock_demand() {
+    let mut p = audio_program(1.);
+    p.cues
+        .get_mut("audio-test")
+        .unwrap()
+        .effects
+        .retain(|effect| effect.id == "sample");
+    p.functions.get_mut("main").unwrap().blocks.get_mut("hold").unwrap().terminator =
+        serde_json::from_value(json!({"type":"await","conditions":[{"task":"sample","milestone":{"type":"finished"}}],"next":"done","on_cancelled":"done","on_failed":"done"})).unwrap();
+    let (mut core, _) = start(p);
+    assert!(core.needs_clock());
+    assert!(!core.needs_visual_clock());
+    let task = core.state().handles["sample"];
+    core.step(CoreInput::Time { delta_us: 100_000 }, 1000);
+    assert_eq!(core.state().tasks[&task].elapsed_us, Micros(100_000));
+    assert!(core.needs_clock());
+    assert!(!core.needs_visual_clock());
+    let (core, _) = start(audio_program(1.));
+    assert!(
+        core.needs_visual_clock(),
+        "timed effects remain conservative"
+    );
+}
+
+#[test]
 fn authored_audio_pause_freezes_offsets_survives_restore_and_resumes_same_task() {
     let mut p = audio_program(1.);
     p.requires.push("audio.pause.v1".into());

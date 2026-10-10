@@ -1,6 +1,6 @@
 use nir_format::*;
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Index;
 use std::sync::{Arc, Mutex};
 
@@ -3724,63 +3724,11 @@ fn validate_runtime_function(
             expr_type(expr, &vars, &at)?;
         }
     }
-    let initial: BTreeSet<_> = view
-        .variables
-        .keys()
-        .chain(function.params.keys())
-        .cloned()
-        .collect();
-    let mut incoming = BTreeMap::from([(function.entry.clone(), initial)]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (bid, block) in &function.blocks {
-            let Some(mut assigned) = incoming.get(bid).cloned() else {
-                continue;
-            };
-            for op in &block.ops {
-                if let Operation::Assign { target, .. } | Operation::Random { target, .. } =
-                    &op.operation
-                {
-                    assigned.insert(target.clone());
-                }
-            }
-            if let Terminator::Call {
-                result: Some(result),
-                ..
-            } = &block.terminator
-            {
-                assigned.insert(result.clone());
-            }
-            for target in outgoing(&block.terminator) {
-                let merged = match incoming.get(target) {
-                    Some(old) => old.intersection(&assigned).cloned().collect(),
-                    None => assigned.clone(),
-                };
-                if incoming.get(target) != Some(&merged) {
-                    incoming.insert(target.to_owned(), merged);
-                    changed = true;
-                }
-            }
-        }
-    }
-    for (bid, block) in &function.blocks {
-        if let Some(mut assigned) = incoming.get(bid).cloned() {
-            for op in &block.ops {
-                if let Operation::Assign { target, value }
-                | Operation::ProfileValueAssign { target, value, .. } = &op.operation
-                {
-                    check_reads(value, &assigned, &op.id)?;
-                    assigned.insert(target.clone());
-                } else if let Operation::Random { target, .. } = &op.operation {
-                    assigned.insert(target.clone());
-                }
-            }
-            for expr in term_exprs(&block.terminator) {
-                check_reads(expr, &assigned, &format!("{fid}/{bid}"))?;
-            }
-        }
-    }
+    validate_assignments(
+        fid,
+        function,
+        view.variables.keys().chain(function.params.keys()),
+    )?;
     Ok(())
 }
 
@@ -4405,11 +4353,98 @@ fn reads(e: &Expr, out: &mut BTreeSet<String>) {
         _ => {}
     }
 }
-fn check_reads(e: &Expr, assigned: &BTreeSet<String>, at: &str) -> Result<()> {
+fn check_reads(
+    e: &Expr,
+    initialized: &BTreeSet<&str>,
+    assigned: &BTreeSet<&str>,
+    at: &str,
+) -> Result<()> {
     let mut r = BTreeSet::new();
     reads(e, &mut r);
-    if let Some(v) = r.difference(assigned).next() {
+    if let Some(v) = r
+        .iter()
+        .find(|v| !initialized.contains(v.as_str()) && !assigned.contains(v.as_str()))
+    {
         return Err(err("E_UNINITIALIZED", at, v));
+    }
+    Ok(())
+}
+
+/// Forward must-analysis shared by source and runtime validation. Globals and
+/// parameters are always initialized, so only local assignment facts flow
+/// through the graph. Revisit successors only when their incoming facts change.
+fn validate_assignments<'a>(
+    fid: &str,
+    function: &'a Function,
+    initialized: impl Iterator<Item = &'a String>,
+) -> Result<()> {
+    let initialized: BTreeSet<_> = initialized.map(String::as_str).collect();
+    let entry = function.entry.as_str();
+    let mut incoming = BTreeMap::from([(entry, BTreeSet::<&str>::new())]);
+    let mut queue = VecDeque::from([entry]);
+    let mut queued = BTreeSet::from([entry]);
+    while let Some(bid) = queue.pop_front() {
+        queued.remove(bid);
+        let block = &function.blocks[bid];
+        let mut assigned = incoming[bid].clone();
+        for op in &block.ops {
+            if let Operation::Assign { target, .. } | Operation::Random { target, .. } =
+                &op.operation
+            {
+                if !initialized.contains(target.as_str()) {
+                    assigned.insert(target.as_str());
+                }
+            }
+        }
+        if let Terminator::Call {
+            result: Some(result),
+            ..
+        } = &block.terminator
+        {
+            if !initialized.contains(result.as_str()) {
+                assigned.insert(result.as_str());
+            }
+        }
+        for target in outgoing(&block.terminator) {
+            let changed = match incoming.entry(target) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(assigned.clone());
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let old = entry.get_mut();
+                    let count = old.len();
+                    old.retain(|name| assigned.contains(name));
+                    old.len() != count
+                }
+            };
+            if changed && queued.insert(target) {
+                queue.push_back(target);
+            }
+        }
+    }
+    // Keep deterministic block order and the original diagnostic locations.
+    for (bid, block) in &function.blocks {
+        if let Some(mut assigned) = incoming.get(bid.as_str()).cloned() {
+            for op in &block.ops {
+                match &op.operation {
+                    Operation::Assign { target, value }
+                    | Operation::ProfileValueAssign { target, value, .. } => {
+                        check_reads(value, &initialized, &assigned, &op.id)?;
+                        if !initialized.contains(target.as_str()) {
+                            assigned.insert(target.as_str());
+                        }
+                    }
+                    Operation::Random { target, .. } if !initialized.contains(target.as_str()) => {
+                        assigned.insert(target.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            for expr in term_exprs(&block.terminator) {
+                check_reads(expr, &initialized, &assigned, &format!("{fid}/{bid}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -5495,62 +5530,7 @@ fn validate(p: &RuntimeProgramView) -> Result<()> {
                 _ => {}
             }
         }
-        // Forward must-analysis: entry facts flow until loop joins reach a fixed point.
-        let initial: BTreeSet<_> = p.variables.keys().chain(f.params.keys()).cloned().collect();
-        let mut incoming = BTreeMap::from([(f.entry.clone(), initial)]);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (bid, b) in &f.blocks {
-                let Some(mut assigned) = incoming.get(bid).cloned() else {
-                    continue;
-                };
-                for op in &b.ops {
-                    match &op.operation {
-                        Operation::Assign { target, .. } | Operation::Random { target, .. } => {
-                            assigned.insert(target.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                if let Terminator::Call {
-                    result: Some(r), ..
-                } = &b.terminator
-                {
-                    assigned.insert(r.clone());
-                }
-                for next in outgoing(&b.terminator) {
-                    let merged = match incoming.get(next) {
-                        Some(old) => old.intersection(&assigned).cloned().collect(),
-                        None => assigned.clone(),
-                    };
-                    if incoming.get(next) != Some(&merged) {
-                        incoming.insert(next.to_owned(), merged);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        for (bid, b) in &f.blocks {
-            if let Some(mut assigned) = incoming.get(bid).cloned() {
-                for op in &b.ops {
-                    match &op.operation {
-                        Operation::Assign { target, value }
-                        | Operation::ProfileValueAssign { target, value, .. } => {
-                            check_reads(value, &assigned, &op.id)?;
-                            assigned.insert(target.clone());
-                        }
-                        Operation::Random { target, .. } => {
-                            assigned.insert(target.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                for e in term_exprs(&b.terminator) {
-                    check_reads(e, &assigned, &format!("{fid}/{bid}"))?;
-                }
-            }
-        }
+        validate_assignments(fid, f, p.variables.keys().chain(f.params.keys()))?;
     }
     Ok(())
 }
@@ -5603,6 +5583,171 @@ fn validate_choice_images(
 mod runtime_tests {
     use super::*;
 
+    // The previous full-sweep solver is a test oracle for cyclic control flow.
+    fn reference_assignments(
+        fid: &str,
+        function: &Function,
+        initial: BTreeSet<String>,
+    ) -> Result<()> {
+        let mut incoming = BTreeMap::from([(function.entry.clone(), initial)]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (bid, block) in &function.blocks {
+                let Some(mut assigned) = incoming.get(bid).cloned() else {
+                    continue;
+                };
+                for op in &block.ops {
+                    if let Operation::Assign { target, .. } | Operation::Random { target, .. } =
+                        &op.operation
+                    {
+                        assigned.insert(target.clone());
+                    }
+                }
+                if let Terminator::Call {
+                    result: Some(result),
+                    ..
+                } = &block.terminator
+                {
+                    assigned.insert(result.clone());
+                }
+                for target in outgoing(&block.terminator) {
+                    let merged = match incoming.get(target) {
+                        Some(old) => old.intersection(&assigned).cloned().collect(),
+                        None => assigned.clone(),
+                    };
+                    if incoming.get(target) != Some(&merged) {
+                        incoming.insert(target.to_owned(), merged);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let check = |expr: &Expr, assigned: &BTreeSet<String>, at: &str| {
+            let mut used = BTreeSet::new();
+            reads(expr, &mut used);
+            used.difference(assigned)
+                .next()
+                .map_or(Ok(()), |name| Err(err("E_UNINITIALIZED", at, name)))
+        };
+        for (bid, block) in &function.blocks {
+            if let Some(mut assigned) = incoming.get(bid).cloned() {
+                for op in &block.ops {
+                    match &op.operation {
+                        Operation::Assign { target, value }
+                        | Operation::ProfileValueAssign { target, value, .. } => {
+                            check(value, &assigned, &op.id)?;
+                            assigned.insert(target.clone());
+                        }
+                        Operation::Random { target, .. } => {
+                            assigned.insert(target.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for expr in term_exprs(&block.terminator) {
+                    check(expr, &assigned, &format!("{fid}/{bid}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assignment_result(result: Result<()>) -> Option<(String, String, String)> {
+        result
+            .err()
+            .map(|error| (error.code, error.location, error.message))
+    }
+
+    #[test]
+    fn assignment_worklist_matches_sweep_on_branches_cycles_and_call_results() {
+        use rand_core::{RngCore, SeedableRng};
+        let mut random = rand_chacha::ChaCha8Rng::seed_from_u64(17);
+        let initialized = BTreeSet::from(["global".to_owned(), "parameter".to_owned()]);
+        for _ in 0..256 {
+            let mut function = simple_function();
+            function.entry = "b0".into();
+            function.blocks.clear();
+            function.locals =
+                BTreeMap::from([("x".into(), ValueType::I32), ("y".into(), ValueType::I32)]);
+            for index in 0..12 {
+                let name = format!("b{index}");
+                let target = if random.next_u32().is_multiple_of(2) {
+                    "x"
+                } else {
+                    "y"
+                };
+                let mut ops = vec![];
+                if random.next_u32().is_multiple_of(2) {
+                    let read = ["global", "parameter", "x", "y"][random.next_u32() as usize % 4];
+                    ops.push(Op {
+                        id: format!("op{index}"),
+                        operation: Operation::Assign {
+                            target: target.into(),
+                            value: Expr::Var { name: read.into() },
+                        },
+                    });
+                }
+                let next = format!("b{}", random.next_u32() % 12);
+                let terminator = match random.next_u32() % 4 {
+                    0 => Terminator::Goto { target: next },
+                    1 => Terminator::Branch {
+                        condition: Expr::Const {
+                            value: Value::Bool(true),
+                        },
+                        yes: next,
+                        no: format!("b{}", random.next_u32() % 12),
+                    },
+                    2 => Terminator::Call {
+                        function: "callee".into(),
+                        args: BTreeMap::new(),
+                        result: Some(target.into()),
+                        next,
+                    },
+                    _ => Terminator::End {
+                        outcome: "done".into(),
+                    },
+                };
+                function.blocks.insert(name, block(terminator, ops));
+            }
+            assert_eq!(
+                assignment_result(validate_assignments("f", &function, initialized.iter())),
+                assignment_result(reference_assignments("f", &function, initialized.clone())),
+                "control flow: {function:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_join_requires_every_path_and_loop_cannot_initialize_entry() {
+        let mut function: Function = serde_json::from_value(serde_json::json!({
+            "entry":"start", "locals":{"x":"i32"}, "blocks":{
+                "start":{"terminator":{"type":"branch","condition":{"type":"const","value":{"type":"bool","value":true}},"yes":"set","no":"detour"}},
+                "set":{"ops":[{"id":"write","operation":{"type":"assign","target":"x","value":{"type":"const","value":{"type":"i32","value":1}}}}],"terminator":{"type":"goto","target":"read"}},
+                "detour":{"terminator":{"type":"goto","target":"join"}},
+                "join":{"terminator":{"type":"goto","target":"read"}},
+                "read":{"ops":[{"id":"read-local","operation":{"type":"assign","target":"x","value":{"type":"var","name":"x"}}}],"terminator":{"type":"goto","target":"set"}},
+                "unreachable":{"ops":[{"id":"dead-read","operation":{"type":"assign","target":"x","value":{"type":"var","name":"x"}}}],"terminator":{"type":"end","outcome":"done"}}
+            }
+        })).unwrap();
+        let globals = BTreeSet::new();
+        assert_eq!(
+            validate_assignments("f", &function, globals.iter())
+                .unwrap_err()
+                .location,
+            "read-local"
+        );
+        function.blocks.get_mut("detour").unwrap().ops = function.blocks["set"].ops.clone();
+        validate_assignments("f", &function, globals.iter()).unwrap();
+        function.entry = "read".into();
+        assert_eq!(
+            validate_assignments("f", &function, globals.iter())
+                .unwrap_err()
+                .location,
+            "read-local"
+        );
+    }
+
     fn block(terminator: Terminator, ops: Vec<Op>) -> Block {
         Block { ops, terminator }
     }
@@ -5623,6 +5768,28 @@ mod runtime_tests {
             )]),
         }
     }
+    #[test]
+    fn runtime_admission_rejects_uninitialized_local_with_same_diagnostic() {
+        let mut function = simple_function();
+        function.locals.insert("unset".into(), ValueType::I32);
+        function.blocks.get_mut("end").unwrap().ops.push(Op {
+            id: "read-unset".into(),
+            operation: Operation::Assign {
+                target: "unset".into(),
+                value: Expr::Var {
+                    name: "unset".into(),
+                },
+            },
+        });
+        let (program, objects) = runtime_fixture(
+            BTreeMap::from([("m.main".into(), function)]),
+            empty_static(),
+        );
+        let error = program.install_batch(objects).unwrap_err();
+        assert_eq!(error.code, "E_UNINITIALIZED");
+        assert_eq!(error.location, "read-unset");
+    }
+
     fn runtime_fixture(
         functions: BTreeMap<String, Function>,
         mut static_package: ModuleStatic,
