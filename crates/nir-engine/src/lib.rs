@@ -15,6 +15,8 @@ pub struct Engine {
     messages: Messages,
     packet: DrawPacket,
     keyboard_focus: nir_presentation::KeyboardFocus,
+    hovered_control: Option<(nir_presentation::ControlTarget, (u32, u32), Screen)>,
+    pressed_control: Option<(nir_presentation::ControlTarget, (u32, u32), Screen)>,
     reading: ReadingState,
     audio_output_wait: Option<nir_player::PauseToken>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -128,6 +130,8 @@ impl Engine {
             messages: Messages::default(),
             packet: DrawPacket::default(),
             keyboard_focus: Default::default(),
+            hovered_control: None,
+            pressed_control: None,
             reading: ReadingState::default(),
             audio_output_wait: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -157,6 +161,7 @@ impl Engine {
             profile_records: VecDeque::new(),
             story_clock: story_clock::StoryClock::default(),
         };
+        e.set_touch_input(cfg!(target_os = "android"));
         e.pump(vec![])?;
         Ok(e)
     }
@@ -479,7 +484,16 @@ impl Engine {
                 .node(&self.packet, self.input_identity(), self.player.screen)?;
         Some((n.rect[0] + n.rect[2] / 2., n.rect[1] + n.rect[3] / 2.))
     }
+    pub fn set_touch_input(&mut self, touch: bool) {
+        self.visual_invalidated |= self.reading.set_touch_input(touch);
+    }
     pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), String> {
+        let hover = nir_presentation::ControlTarget::at(&self.packet, x, y)
+            .map(|target| (target, self.input_identity(), self.player.screen));
+        if self.hovered_control != hover {
+            self.hovered_control = hover;
+            self.visual_invalidated = true;
+        }
         if self.reading.hover_history_bar(x, y) {
             self.visual_invalidated = true;
         }
@@ -516,6 +530,13 @@ impl Engine {
         button: u8,
     ) -> std::result::Result<bool, String> {
         let identity = self.input_identity();
+        if phase == 2 || phase == 3 || !self.ready || self.player.is_loading() {
+            self.visual_invalidated |= self.pressed_control.take().is_some();
+        } else if phase == 0 && button == 0 {
+            self.hover(x, y)?;
+            self.pressed_control = self.hovered_control.clone();
+            self.visual_invalidated |= self.pressed_control.is_some();
+        }
         if phase == 3 || !self.ready || self.player.is_loading() {
             let consumed =
                 self.reading
@@ -1233,8 +1254,9 @@ impl Engine {
                 || self.cached_draws >= REPROJECT_SAFETY_FRAMES;
             if dirty {
                 let projection_start = self.profile_start();
+                let model = self.player.model();
                 let mut projected = self.reading.project(
-                    &self.player.model(),
+                    &model,
                     (
                         self.player.generation.session,
                         self.player.current_interaction(),
@@ -1247,6 +1269,21 @@ impl Engine {
                 if self.player.validate_history_voice_controls(&projected) {
                     self.pump(vec![])?;
                 }
+                let context = (self.input_identity(), self.player.screen);
+                let hover = self
+                    .hovered_control
+                    .as_ref()
+                    .filter(|(_, identity, screen)| (*identity, *screen) == context);
+                let pressed = self
+                    .pressed_control
+                    .as_ref()
+                    .filter(|(_, identity, screen)| (*identity, *screen) == context);
+                nir_presentation::paint_control_feedback(
+                    &mut projected,
+                    &model.theme,
+                    hover.map(|(target, _, _)| target),
+                    pressed.map(|(target, _, _)| target),
+                );
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(layout) = self.native_storage_recovery_layout() {
                     layout.paint(&mut projected, &self.player.model(), &self.messages);
@@ -1274,7 +1311,7 @@ impl Engine {
                         projected.quads.push(nir_presentation::Quad {
                             corners: None,
                             rect,
-                            color: [1., 0.85, 0.35, 1.],
+                            color: model.theme.accent,
                             asset: None,
                             clip: None,
                         });

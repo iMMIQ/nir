@@ -1551,6 +1551,7 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::Focused(focused) => runtime.visibility(Signal::Focused(focused))?,
                 WindowEvent::CursorMoved { position, .. } if !dialog_open => {
+                    runtime.engine.set_touch_input(false);
                     let scale = window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                     if runtime.recovery_pointer(RecoveryPointer::Mouse(0), RecoveryPhase::Move)? {
@@ -1617,7 +1618,8 @@ impl ApplicationHandler for App {
                                 runtime.pointer_down = None;
                                 return Ok(());
                             }
-                        } else if runtime.bar_pointer {
+                        } else {
+                            let was_bar = runtime.bar_pointer;
                             runtime.bar_pointer = false;
                             engine_result(runtime.engine.pointer_gesture(
                                 2,
@@ -1625,7 +1627,9 @@ impl ApplicationHandler for App {
                                 runtime.cursor.1,
                                 0,
                             ))?;
-                            return Ok(());
+                            if was_bar {
+                                return Ok(());
+                            }
                         }
                     }
                     let hit =
@@ -1698,6 +1702,7 @@ impl ApplicationHandler for App {
                 // delivers only Touch events (physical pixels); desktop
                 // touchscreens route here as well.
                 WindowEvent::Touch(touch) if !dialog_open => {
+                    runtime.engine.set_touch_input(true);
                     let scale = window.scale_factor().clamp(1., 2.) as f32;
                     runtime.cursor = (
                         touch.location.x as f32 / scale,
@@ -1780,14 +1785,15 @@ impl ApplicationHandler for App {
                                 return Ok(());
                             }
                             runtime.touch_id = None;
-                            if runtime.bar_pointer {
-                                runtime.bar_pointer = false;
-                                engine_result(runtime.engine.pointer_gesture(
-                                    2,
-                                    runtime.cursor.0,
-                                    runtime.cursor.1,
-                                    0,
-                                ))?;
+                            let was_bar = runtime.bar_pointer;
+                            runtime.bar_pointer = false;
+                            engine_result(runtime.engine.pointer_gesture(
+                                2,
+                                runtime.cursor.0,
+                                runtime.cursor.1,
+                                0,
+                            ))?;
+                            if was_bar {
                                 return Ok(());
                             }
                             let hit = runtime.engine.pointer_action(
@@ -1843,6 +1849,7 @@ impl ApplicationHandler for App {
                         && event.logical_key == Key::Named(NamedKey::Control)
                         && !event.repeat =>
                 {
+                    runtime.engine.set_touch_input(false);
                     let index = match event.physical_key {
                         PhysicalKey::Code(KeyCode::ControlRight) => 1,
                         _ => 0,
@@ -1865,6 +1872,7 @@ impl ApplicationHandler for App {
                         && !runtime.modifiers.alt_key()
                         && !runtime.modifiers.super_key() =>
                 {
+                    runtime.engine.set_touch_input(false);
                     if runtime.recovery_key(&event.logical_key)? {
                         window.request_redraw();
                         return Ok(());

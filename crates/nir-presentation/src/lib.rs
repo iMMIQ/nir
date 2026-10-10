@@ -5,12 +5,14 @@ use fluent_bundle::{FluentBundle, FluentResource};
 use nir_format::*;
 use serde::Serialize;
 pub mod audio_recovery;
+mod control_feedback;
 pub mod history;
 mod history_controls;
 mod input;
 mod reading;
 mod scrollbar;
 pub mod storage_recovery;
+pub use control_feedback::{paint_control_feedback, ControlTarget};
 pub use input::{
     control_value_action, pointer_action, primary_action, value_action, KeyboardFocus,
 };
@@ -343,6 +345,8 @@ pub struct MenuLayers {
 }
 #[derive(Debug, Default)]
 pub struct DrawPacket {
+    pub(crate) stage_viewport: Option<[f32; 4]>,
+    pub(crate) builtin_dialogue: Option<[f32; 4]>,
     pub(crate) history_flow: Option<reading::HistoryFlowView>,
     pub(crate) history_bar_view: Option<scrollbar::BarView>,
     pub history_bar: Option<HistoryBar>,
@@ -461,8 +465,10 @@ impl Messages {
             "scroll-back-compact",
             "scroll-forward-compact",
             "title-hint",
+            "title-hint-touch",
             "gate-hint",
             "advance-hint",
+            "advance-hint-touch",
             "reveal-hint",
             "history-back",
             "history-forward",
@@ -696,15 +702,19 @@ fn scene_layout(
             );
         }
     }
-    let scale = (packet.width / stage[0]).min(packet.height / stage[1]);
+    let [x, y, width, height] =
+        packet
+            .stage_viewport
+            .unwrap_or([0., 0., packet.width, packet.height]);
+    let scale = (width / stage[0]).min(height / stage[1]);
     let mut out = vec![];
     visit(
         &mut out,
         nodes,
         None,
         Transform {
-            x: (packet.width - stage[0] * scale) / 2.,
-            y: (packet.height - stage[1] * scale) / 2.,
+            x: x + (width - stage[0] * scale) / 2.,
+            y: y + (height - stage[1] * scale) / 2.,
             scale,
             opacity: alpha,
             clip: None,
@@ -1388,7 +1398,7 @@ pub fn project(m: &UiModel, width: f32, height: f32, messages: &Messages) -> Dra
         width,
         height,
         messages,
-        &[],
+        &LayoutMeasurements::default(),
         0.,
         &PanelOffsets::default(),
     );
@@ -1483,6 +1493,25 @@ struct PanelOffsets {
     settings: f32,
 }
 
+#[derive(Default)]
+struct LayoutMeasurements<'a> {
+    choices: &'a [f32],
+    dialogue_height: Option<f32>,
+    touch_input: bool,
+}
+
+fn dialogue_height(m: &UiModel, width: f32, height: f32, measured: Option<f32>) -> f32 {
+    measured
+        .unwrap_or_else(|| {
+            if width < 650. {
+                (height * 0.40).max(m.theme.dialogue.height).min(330.)
+            } else {
+                m.theme.dialogue.height
+            }
+        })
+        .min((height - 88.).max(80.))
+}
+
 // Paint and hit testing share the viewport. Partially visible controls may be
 // painted as context, but cannot be activated until their whole target fits.
 // A narrow settings row puts its value above the controls so neither the
@@ -1574,7 +1603,7 @@ fn project_measured(
     width: f32,
     height: f32,
     messages: &Messages,
-    choice_heights: &[f32],
+    measured: &LayoutMeasurements<'_>,
     choice_offset: f32,
     panels: &PanelOffsets,
 ) -> DrawPacket {
@@ -1591,16 +1620,40 @@ fn project_measured(
     let msg = |id| messages.text(&m.ui_locale, id);
     let narrow = width < 650.;
     let margin = if narrow { 20. } else { 48. };
+    // Responsive reader chrome may reserve space for the illustration. Fixed
+    // author windows, image choices and stage decorations keep their geometry.
+    if narrow
+        && height > width
+        && m.screen == Screen::Story
+        && m.dialogue.is_some()
+        && !m.hidden_dialogue
+        && !m.interface_hidden
+        && t.dialogue.rect.is_none()
+        && t.slots.dialogue == DialogueComponent::Bottom
+        && m.choices.is_empty()
+        && m.dialogue_decorations.is_empty()
+    {
+        let minimum_top = 128.;
+        let h = dialogue_height(m, width, height, measured.dialogue_height);
+        let available = height - margin * 0.6 - minimum_top;
+        let stage_height = (width * m.stage[1] / m.stage[0]).min(available - h - 16.);
+        if stage_height > 0. {
+            let top = minimum_top + (available - stage_height - h - 16.) / 2.;
+            p.stage_viewport = Some([0., top, width, stage_height]);
+        }
+    }
     p.rect([0., 0., width, height], t.background);
     if let Some((src, progress)) = &m.transition {
         let mut a = DrawPacket {
             width,
             height,
+            stage_viewport: p.stage_viewport,
             ..Default::default()
         };
         let mut b = DrawPacket {
             width,
             height,
+            stage_viewport: p.stage_viewport,
             ..Default::default()
         };
         scene(&mut a, src, m.stage, 1.);
@@ -1837,7 +1890,11 @@ fn project_measured(
             }
             if !narrow {
                 p.text(
-                    msg("title-hint"),
+                    msg(if measured.touch_input {
+                        "title-hint-touch"
+                    } else {
+                        "title-hint"
+                    }),
                     width - 365.,
                     height - 34.,
                     330.,
@@ -1874,12 +1931,7 @@ fn project_measured(
             if let Some(d) = &m.dialogue {
                 let first_quad = p.quads.len();
                 let first_text = p.texts.len();
-                let mut h = if narrow {
-                    (height * 0.40).max(t.dialogue.height).min(330.)
-                } else {
-                    t.dialogue.height
-                }
-                .min((height - 88.).max(80.));
+                let mut h = dialogue_height(m, width, height, measured.dialogue_height);
                 // Builtin windows share the viewport with the fixed reader
                 // toolbar. Compact layouts keep a name, one text line and an
                 // overflow-control row visible without reducing the font.
@@ -1893,6 +1945,9 @@ fn project_measured(
                     DialogueComponent::Bottom => bottom - h,
                     DialogueComponent::Top => minimum_top,
                 };
+                if let Some([_, y, _, height]) = p.stage_viewport {
+                    top = y + height + 16.;
+                }
                 let mut left = margin;
                 let mut box_width = width - margin * 2.;
                 let mut scale = 1.;
@@ -1902,6 +1957,8 @@ fn project_measured(
                     top = (height - m.stage[1] * scale) / 2. + rect[1] * scale;
                     box_width = rect[2] * scale;
                     h = rect[3] * scale;
+                } else {
+                    p.builtin_dialogue = Some([left, top, box_width, h]);
                 }
                 let padding = t.dialogue.padding * scale;
                 if let Some(asset) = &t.dialogue.background {
@@ -1957,7 +2014,11 @@ fn project_measured(
                     visible: Some(d.visible_text.len()),
                     x: left + padding,
                     y: ty,
-                    width: box_width - padding * 2.,
+                    width: if t.dialogue.rect.is_some() {
+                        box_width - padding * 2.
+                    } else {
+                        (box_width - padding * 2.).min(960.)
+                    },
                     height: (top + h
                         - if t.dialogue.rect.is_some() {
                             padding
@@ -2024,7 +2085,11 @@ fn project_measured(
                         msg(if d.gate {
                             "gate-hint"
                         } else if d.ready {
-                            "advance-hint"
+                            if measured.touch_input {
+                                "advance-hint-touch"
+                            } else {
+                                "advance-hint"
+                            }
                         } else {
                             "reveal-hint"
                         }),
@@ -2173,7 +2238,8 @@ fn project_measured(
                     .iter()
                     .enumerate()
                     .map(|(i, _)| {
-                        choice_heights
+                        measured
+                            .choices
                             .get(i)
                             .copied()
                             .unwrap_or(t.choice.item_height)
@@ -2360,6 +2426,12 @@ fn project_measured(
             } else {
                 60.
             };
+            // An enclosed reading surface keeps busy scene art out of menu
+            // labels without requiring a blur pass or additional assets.
+            p.rect(
+                [x - 12., y - 8., w + 24., (height - y - 4.).max(0.)],
+                t.background,
+            );
             let heading = match screen {
                 Screen::Menu => "menu",
                 Screen::Settings => "settings",
@@ -3137,6 +3209,7 @@ fn project_measured(
         );
     }
     p.texts.extend(m.preflight_texts.clone());
+    paint_control_feedback(&mut p, t, None, None);
     p
 }
 

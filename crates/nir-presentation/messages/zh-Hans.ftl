@@ -66,7 +66,9 @@ increase = +
 history-back = ←
 history-forward = →
 title-hint = SPACE  →  READ     ·     ESC  →  MENU
+title-hint-touch = 点击开始阅读
 advance-hint = SPACE / ↗
+advance-hint-touch = 点击继续
 gate-hint = …
 reveal-hint = · · ·
 

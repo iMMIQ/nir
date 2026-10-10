@@ -97,6 +97,88 @@ fn toolbar(action: &UiAction) -> bool {
             | UiAction::ToggleInterface
     )
 }
+
+fn reader_font() -> TextEngine {
+    let mut text = TextEngine::default();
+    text.add_font_asset(
+        "font.reader",
+        include_bytes!("../../../examples/rain-letters/assets/source/reader.otf").to_vec(),
+    )
+    .unwrap();
+    text
+}
+
+#[test]
+fn portrait_panel_fits_the_whole_sentence_and_does_not_jump_during_reveal() {
+    let mut m = model();
+    let d = m.dialogue.as_mut().unwrap();
+    d.full_text = "A quiet evening.".into();
+    d.visible_text.clear();
+    let mut reading = ReadingState::default();
+    let mut text = reader_font();
+    let messages = Messages::default();
+    let first = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+    let rect = first.builtin_dialogue.unwrap();
+    assert!(rect[3] < 220. && rect[3] >= 140., "{rect:?}");
+    let stage = first.stage_viewport.unwrap();
+    assert!(stage[1] >= 112. && stage[1] + stage[3] < rect[1]);
+    let shapes = text.shapes;
+    for prefix in ["A", "A quiet", "A quiet evening."] {
+        m.dialogue.as_mut().unwrap().visible_text = prefix.into();
+        let p = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+        assert_eq!(p.builtin_dialogue, Some(rect));
+        assert_eq!(p.stage_viewport, Some(stage));
+        assert_eq!(
+            text.shapes, shapes,
+            "reveal must reuse full-sentence shapes"
+        );
+    }
+}
+
+#[test]
+fn adaptive_reader_preserves_long_text_overflow_and_fixed_author_geometry() {
+    let mut m = model();
+    m.prefs.font_scale = 1.5;
+    let mut text = reader_font();
+    let mut reading = ReadingState::default();
+    let messages = Messages::default();
+    let p = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+    assert_eq!(p.builtin_dialogue.unwrap()[3], 330.);
+    assert!(p
+        .scrolls
+        .iter()
+        .any(|s| s.region == ScrollRegion::Dialogue && s.max > 0.));
+    m.theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    m.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    let fixed = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+    assert!(fixed.builtin_dialogue.is_none());
+    assert!(fixed.stage_viewport.is_none());
+    let body = fixed
+        .texts
+        .iter()
+        .find(|r| r.region == Some(ScrollRegion::Dialogue))
+        .unwrap();
+    let scale = 390. / 1280.;
+    assert_eq!(body.width, 880. * scale);
+    assert!((body.y - ((844. - 720. * scale) / 2. + 490. * scale)).abs() < 0.01);
+}
+
+#[test]
+fn input_hints_switch_without_changing_dialogue_geometry() {
+    let mut m = model();
+    m.dialogue.as_mut().unwrap().full_text = "A quiet evening.".into();
+    let mut reading = ReadingState::default();
+    let mut text = reader_font();
+    let messages = Messages::default();
+    let keyboard = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+    assert!(keyboard.texts.iter().any(|r| r.text == "SPACE / ↗"));
+    assert!(reading.set_touch_input(true));
+    assert!(!reading.set_touch_input(true));
+    let touch = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
+    assert!(touch.texts.iter().any(|r| r.text == "Tap to continue"));
+    assert!(!touch.texts.iter().any(|r| r.text.contains("SPACE")));
+    assert_eq!(touch.builtin_dialogue, keyboard.builtin_dialogue);
+}
 #[test]
 fn dialogue_images_keep_stage_geometry_and_share_visibility_without_background_alpha() {
     use nir_format::{DialogueDecoration, DialogueDecorationSlot};

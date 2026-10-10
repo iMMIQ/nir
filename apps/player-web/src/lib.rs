@@ -256,6 +256,9 @@ impl Engine {
     pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), JsValue> {
         self.inner.hover(x, y).map_err(js)
     }
+    pub fn set_touch_input(&mut self, touch: bool) {
+        self.inner.set_touch_input(touch);
+    }
     pub fn pointer_gesture(
         &mut self,
         phase: u8,

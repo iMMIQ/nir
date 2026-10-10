@@ -5,7 +5,7 @@ const knownRequests=new Set(),knownContent=new Set(),adapters=[];
 let contextLost=false,watchedCanvas=null;
 function watchCanvas(){if(watchedCanvas===canvas)return;const owner=watchedCanvas=canvas;owner.addEventListener('webglcontextlost',e=>{e.preventDefault();if(owner!==canvas)return;contextLost=true;dirty=true;publish();});}
 let last=performance.now(),hidden=false,scheduled=null,clockActive=false,closed=false,outstanding=false,dirty=false,commands=[],revision=0;
-const UI=new Set(['focus_control','navigate_focus','hover','pointer_gesture','pointer_action','hit','control_value_action','primary_action','focus_value_action']);
+const UI=new Set(['focus_control','navigate_focus','hover','set_touch_input','pointer_gesture','pointer_action','hit','control_value_action','primary_action','focus_value_action']);
 const ALLOWED=new Set([...UI,'action','host_event','content_ready','content_failed','content_skipped','resource','resource_decoded','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','resize']);
 const stamp=()=>performance.now();
 function collect(){const next=JSON.parse(engine.commands());for(const c of next){if(c.type==='get_assets')knownRequests.add(c.request);if(c.type==='get_content')knownContent.add(c.request);}commands.push(...next);if(commands.length>MAX_COMMANDS)throw new Error('E_WORKER_CAPACITY: output commands');dirty=true;}

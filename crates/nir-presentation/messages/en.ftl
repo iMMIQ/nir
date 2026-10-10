@@ -66,7 +66,9 @@ increase = +
 history-back = ←
 history-forward = →
 title-hint = SPACE  →  READ     ·     ESC  →  MENU
+title-hint-touch = Tap to start reading
 advance-hint = SPACE / ↗
+advance-hint-touch = Tap to continue
 gate-hint = …
 reveal-hint = · · ·
 

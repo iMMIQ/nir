@@ -52,6 +52,7 @@ struct TextView {
 }
 #[derive(Debug, Default)]
 pub struct ReadingState {
+    touch_input: bool,
     pub(crate) bar_pointer: Option<[f32; 2]>,
     pub(crate) bar_pressed: Option<(MenuScrollIdentity, String, HistoryBarPart)>,
     pub(crate) bar_gesture: Option<crate::scrollbar::BarGesture>,
@@ -65,6 +66,11 @@ pub struct ReadingState {
     panels: PanelOffsets,
 }
 impl ReadingState {
+    pub fn set_touch_input(&mut self, touch: bool) -> bool {
+        let changed = self.touch_input != touch;
+        self.touch_input = touch;
+        changed
+    }
     pub fn matches(&self, identity: (u32, u32)) -> bool {
         self.identity == Some(identity)
     }
@@ -150,15 +156,50 @@ impl ReadingState {
                     + 12.
             })
             .collect();
+        let mut measured = LayoutMeasurements {
+            choices: &heights,
+            touch_input: self.touch_input,
+            ..Default::default()
+        };
         let mut p = project_measured(
             m,
             width,
             height,
             messages,
-            &heights,
+            &measured,
             self.choice_offset,
             &self.panels,
         );
+        if width < 650. && height >= 320. {
+            if let (Some(rect), Some(run)) = (
+                p.builtin_dialogue,
+                p.texts
+                    .iter()
+                    .find(|r| r.region == Some(ScrollRegion::Dialogue)),
+            ) {
+                // Shape the complete sentence, never its currently revealed
+                // prefix, so the panel does not move as characters appear.
+                text.layout_texts(std::slice::from_ref(run));
+                let bottom = text.buffers[&TextEngine::key(run)]
+                    .layout_runs()
+                    .map(|line| line.line_top + line.line_height)
+                    .fold(0., f32::max);
+                let needed = bottom.max(run.line_height * 2.) + rect[3] - run.height;
+                let fitted = needed.max(140.).min(rect[3]);
+                if fitted < rect[3] - 0.5 {
+                    measured.dialogue_height = Some(fitted);
+                    p = project_measured(
+                        m,
+                        width,
+                        height,
+                        messages,
+                        &measured,
+                        self.choice_offset,
+                        &self.panels,
+                    );
+                }
+            }
+        }
         let paints = p.menu_paint.len();
         self.project_history_flow(&mut p, m, identity.0, messages, text);
         let added = p.menu_paint.len() - paints;

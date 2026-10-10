@@ -1357,7 +1357,7 @@ export class RemoteEngine {
     replace_gpu(gpu){this.apply(gpu.snapshot);}
     free(){this.client.close();}
 }
-for(const name of ['action','host_event','content_ready','content_failed','content_skipped','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','focus_control','hover'])RemoteEngine.prototype[name]=function(...args){this.enqueue(name,args);};
+for(const name of ['action','host_event','content_ready','content_failed','content_skipped','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','focus_control','hover','set_touch_input'])RemoteEngine.prototype[name]=function(...args){this.enqueue(name,args);};
 for(const name of ['pointer_gesture','pointer_action','navigate_focus','control_value_action','focus_value_action','primary_action','hit'])RemoteEngine.prototype[name]=function(...args){return this.query(name,args);};
 
 async function connectWorker(role,options) {
@@ -1386,6 +1386,8 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     const shell=document.querySelector('#shell');
     const replaceCanvas=()=>{const next=canvas.cloneNode(false);canvas.replaceWith(next);canvas=next;};
     const program=parseRuntimeProgram(executable);
+    const accent=program.theme.accent;
+    document.querySelector('#focus-ring').style.borderColor=`rgba(${accent.slice(0,3).map(channel=>Math.round(channel*255)).join(',')},${accent[3]})`;
     const metrics={boot:performance.now(),titleMs:null,firstLineMs:null,resourceFailures:0,frames:0,audioStarts:0,deviceRecoveries:0,peakResidentBytes:0,startInputMs:null,firstLineAfterStartMs:null,contentStagingBytes:0,peakContentStagingBytes:0,contentStagingBudgetBytes:CONTENT_STAGING_LIMIT,contentStagingReservations:0,contentStagingWaiters:0};
     const syncContentStagingMetrics=budget=>{
         metrics.contentStagingBytes=budget.used;
@@ -1394,7 +1396,13 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         metrics.contentStagingReservations=budget.reservations.size;
         metrics.contentStagingWaiters=budget.waiting.length;
     };
-    const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=innerWidth,height=innerHeight;return {width,height,dpr};};
+    let viewportOffset={left:0,top:0,right:0,bottom:0};
+    const refreshSafeArea=()=>{
+        const style=getComputedStyle(document.documentElement);
+        for(const edge of ['left','top','right','bottom'])viewportOffset[edge]=Math.max(0,parseFloat(style.getPropertyValue(`--nir-safe-${edge}`))||0);
+    };
+    refreshSafeArea();
+    const size=()=>{const dpr=Math.min(devicePixelRatio||1,2);const width=Math.max(1,innerWidth-viewportOffset.left-viewportOffset.right),height=Math.max(1,innerHeight-viewportOffset.top-viewportOffset.bottom);return {width,height,dpr};};
     let {width,height,dpr}=size();canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
     if(!['dev','release'].includes(release.profile)||!releaseDigestPattern.test(releaseDigest))throw new Error('E_RELEASE_IDENTITY');
     const sharedKey=profileKey(release.game_id,release.profile);
@@ -1643,6 +1651,8 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         void dispatchOwnerRequest(work,slot,{post,success,failure,pending});
         return slot;
     }
+    let touchInput=matchMedia('(pointer: coarse)').matches;
+    engine.set_touch_input(touchInput);
     if(engine.remote){engine.onUpdate=()=>{invalidateHostState();wake();};runtimeClient.onFailure=error=>{if(!disposed){fail(error);dispose();}};}
     if(assetClient)assetClient.onFailure=error=>{if(!disposed){fail(error);dispose();}};
     let metadataRetryPending=false,metadataRetryController=null;
@@ -2148,7 +2158,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
             else historyButton.hidden=true;
         }
         document.documentElement.lang=view.locale||'zh-Hans';const s=state();const signature=JSON.stringify([view.nodes,view.locale,view.announcement_locale,s.interaction,s.session]);
-        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=focusIdentity(document.activeElement?.dataset?.action);nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.setAttribute('aria-label',n.label);b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;if(['range','scrollbar'].includes(n.value?.type)){b.setAttribute('role','slider');b.setAttribute('aria-valuemin',n.value.min??0);b.setAttribute('aria-valuemax',n.value.max);b.setAttribute('aria-valuenow',n.value.value);if(n.value.type==='scrollbar')b.setAttribute('aria-orientation','vertical');}else if(n.value?.type==='toggle'){b.setAttribute('role','switch');b.setAttribute('aria-checked',String(n.value.checked));}b.dataset.action=JSON.stringify(n.action);b.dataset.control=String(n.id);b.dataset.rect=JSON.stringify(n.rect);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,{...context,loading:state().loading});b.onfocus=()=>{deliver(()=>{mutateEngine(()=>engine.focus_control(n.id));mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2));},'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]}px`,top:`${n.rect[1]}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>{document.querySelector('#focus-ring').style.display='none';deliver(()=>mutateEngine(()=>engine.focus_control(undefined)),'input');};nav.append(b);if(focusIdentity(b.dataset.action)===focused)b.focus({preventScroll:true});}}
+        if(signature!==semanticSignature){semanticSignature=signature;const nav=document.querySelector('#actions'),focused=focusIdentity(document.activeElement?.dataset?.action);nav.replaceChildren();for(const n of view.nodes){const b=document.createElement('button');b.textContent=n.label;b.setAttribute('aria-label',n.label);b.lang=n.locale||view.locale||'zh-Hans';b.disabled=!n.enabled;if(['range','scrollbar'].includes(n.value?.type)){b.setAttribute('role','slider');b.setAttribute('aria-valuemin',n.value.min??0);b.setAttribute('aria-valuemax',n.value.max);b.setAttribute('aria-valuenow',n.value.value);if(n.value.type==='scrollbar')b.setAttribute('aria-orientation','vertical');}else if(n.value?.type==='toggle'){b.setAttribute('role','switch');b.setAttribute('aria-checked',String(n.value.checked));}b.dataset.action=JSON.stringify(n.action);b.dataset.control=String(n.id);b.dataset.rect=JSON.stringify(n.rect);const context={interaction:s.interaction,session:s.session};b.onclick=()=>action(n.action,{...context,loading:state().loading});b.onfocus=()=>{deliver(()=>{mutateEngine(()=>engine.focus_control(n.id));mutateEngine(()=>engine.hover(n.rect[0]+n.rect[2]/2,n.rect[1]+n.rect[3]/2));},'input');const ring=document.querySelector('#focus-ring');Object.assign(ring.style,{display:'block',left:`${n.rect[0]+viewportOffset.left}px`,top:`${n.rect[1]+viewportOffset.top}px`,width:`${n.rect[2]}px`,height:`${n.rect[3]}px`});};b.onblur=()=>{document.querySelector('#focus-ring').style.display='none';deliver(()=>mutateEngine(()=>engine.focus_control(undefined)),'input');};nav.append(b);if(focusIdentity(b.dataset.action)===focused)b.focus({preventScroll:true});}}
         if(pendingFocusId!==null){const target=pendingFocusId;pendingFocusId=null;if(target.session===s.session&&target.interaction===s.interaction&&target.screen===s.screen)document.querySelector(`#actions button[data-control="${target.id}"]`)?.focus({preventScroll:true});}
         const spokenLocale=view.announcement_locale||view.locale||'zh-Hans';if(view.announcement&&(view.announcement!==announcement||spokenLocale!==announcementLocale)){announcement=view.announcement;announcementLocale=spokenLocale;const live=document.querySelector('#announcement');live.lang=spokenLocale;live.textContent=announcement;}
     }
@@ -2200,6 +2210,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         }
     }
     function schedule() {if(disposed||recovering)return;if(!raf)raf=requestAnimationFrame(()=>{raf=0;wake();});}
+    const setInputMode=touch=>{if(touchInput===touch)return;touchInput=touch;mutateEngine(()=>engine.set_touch_input(touch));schedule();};
     let down=null,barPointer=null;
     // The host retains capture until release even if a page change cancels the
     // shared gesture, so that release cannot become a click in the new page.
@@ -2215,6 +2226,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     const scrollAt=(x,y)=>state().scrolls.find(v=>x>=v.rect[0]&&x<=v.rect[0]+v.rect[2]&&y>=v.rect[1]&&y<=v.rect[1]+v.rect[3]);
     const downAsync=async(e,valid)=>{if(e.button!==0&&e.button!==2)return;pendingFocusId=null;if(document.activeElement?.closest('#actions'))document.activeElement.blur();mutateEngine(()=>engine.focus_control(undefined));unlock();if(e.button===0&&barPointer===null&&await barGesture(0,e.clientX,e.clientY)){if(!valid())return;barPointer=e.pointerId;try{canvas.setPointerCapture(e.pointerId);}catch{}down=null;return;}if(!valid())return;const context=e.context,target=JSON.parse(await engine.pointer_action(e.clientX,e.clientY,e.button));if(!valid())return;down={button:e.button,action:target,context,x:e.clientX,y:e.clientY,scroll:e.button===0?scrollAt(e.clientX,e.clientY):null};};
     const upAsync=async(e,valid)=>{
+        if(e.button===0&&barPointer!==e.pointerId)await barGesture(2,e.clientX,e.clientY);
         if(barPointer===e.pointerId&&e.button===0){barGesture(2,e.clientX,e.clientY);const id=barPointer;barPointer=null;if(canvas.hasPointerCapture(id))canvas.releasePointerCapture(id);return;}
         if(!down||e.button!==down.button)return;
         const current=state();
@@ -2225,22 +2237,24 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
         down=null;
     };
     let hoverTarget;
-    const moveAsync=async(e,valid)=>{if(barPointer===e.pointerId){barGesture(1,e.clientX,e.clientY);return;}if(!['Title','Menu','Story'].includes(state().screen)){hoverTarget=undefined;return;}const target=await engine.hit(e.clientX,e.clientY);if(!valid())return;if(target===hoverTarget&&!state().history_scrollbar)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
+    const moveAsync=async(e,valid)=>{if(e.pointerType==='mouse')setInputMode(false);if(barPointer===e.pointerId){barGesture(1,e.clientX,e.clientY);return;}const action=await engine.hit(e.clientX,e.clientY);if(!valid())return;const s=state(),target=JSON.stringify([s.session,s.interaction,s.screen,action]);if(target===hoverTarget&&!state().history_scrollbar)return;hoverTarget=target;deliver(()=>mutateEngine(()=>engine.hover(e.clientX,e.clientY)),'input');};
     const pointerQueue=new SerialInputQueue(error=>reportHostFailure(error,'pointer'));
-    const pointerEvent=(fn,e)=>{const s=state(),context={session:s.session,interaction:s.interaction,screen:s.screen,loading:s.loading};const data={button:e.button,pointerId:e.pointerId,clientX:e.clientX,clientY:e.clientY,context};pointerQueue.push(fn,data,fn===moveAsync?`move:${e.pointerId}`:null);};
+    const pointerEvent=(fn,e)=>{const s=state(),context={session:s.session,interaction:s.interaction,screen:s.screen,loading:s.loading};const data={button:e.button,pointerId:e.pointerId,clientX:e.clientX-viewportOffset.left,clientY:e.clientY-viewportOffset.top,context,pointerType:e.pointerType};pointerQueue.push(fn,data,fn===moveAsync?`move:${e.pointerId}`:null);};
     const onDown=e=>{const blocked=audioBlocked;unlock();if(blocked)cancelPointer();pointerEvent(async(data,valid)=>{
+        setInputMode(data.pointerType==='touch');
         await downAsync(data,valid);
         if(blocked&&down&&audioBlockedAction(down.action))down=null;
     },e);};
     const onUp=e=>pointerEvent(upAsync,e);
     const onMove=e=>pointerEvent(moveAsync,e);
-    const onLeave=()=>pointerQueue.push(()=>{if(barPointer!==null)return;down=null;hoverTarget=undefined;if(['Title','Menu','Story'].includes(state().screen))deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');},null);
-    const onWheel=(e)=>{const view=scrollAt(e.clientX,e.clientY);if(view&&e.deltaY){e.preventDefault();action(scrollAction(view,e.deltaY>0?1:-1));}};
+    const onLeave=()=>pointerQueue.push(()=>{if(barPointer!==null)return;down=null;hoverTarget=undefined;barGesture(3,0,0);deliver(()=>mutateEngine(()=>engine.hover(-1,-1)),'input');},null);
+    const onWheel=(e)=>{const view=scrollAt(e.clientX-viewportOffset.left,e.clientY-viewportOffset.top);if(view&&e.deltaY){e.preventDefault();action(scrollAction(view,e.deltaY>0?1:-1));}};
     const heldControls=new Set();
     const releaseHeld=()=>{if(!heldControls.size)return;heldControls.clear();action({type:'hold_skip',pressed:false});};
     const onEditingFocus=e=>{if(e.target?.isContentEditable||e.target?.matches?.('input,textarea,select'))releaseHeld();};
     const onKeyUp=e=>{if(e.key==='Control'){if(!heldControls.delete(e.code))return;if(!heldControls.size)action({type:'hold_skip',pressed:false});}};
     const handleKey=async(e)=>{
+        setInputMode(false);
         if(audioBlocked&&(e.key===' '||e.key==='Enter')){
             if(e.repeat){e.preventDefault();return;}
             if(audioRecoveryPanel.contains(document.activeElement))return;
@@ -2290,7 +2304,7 @@ export async function start({wasm,release,releaseDigest,releaseRoot,executable,f
     };
     const onKey=e=>{void handleKey(e).catch(error=>reportHostFailure(error,'keyboard'));};
     const onVisibility=()=>{const hidden=document.hidden;if(hidden){releaseHeld();cancelPointer();}deliver(()=>mutateEngine(()=>engine.hidden(hidden)),'control');};
-    const onResize=()=>{cancelPointer();schedule();};
+    const onResize=()=>{cancelPointer();refreshSafeArea();hoverTarget=undefined;schedule();};
     let glContextLost=false;
     const onCancel=()=>cancelPointer();
     // Touch releases implicit capture immediately on pointerup. Process that
