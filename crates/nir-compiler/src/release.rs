@@ -346,6 +346,7 @@ fn declaration_owner(id: &str, modules: &BTreeSet<String>) -> Result<String> {
 
 fn asset_consumers(
     program: &Program,
+    function_owners: &BTreeMap<String, String>,
     scene_owners: &BTreeMap<String, String>,
     cue_owners: &BTreeMap<String, String>,
     text_owners: &BTreeMap<String, String>,
@@ -394,26 +395,39 @@ fn asset_consumers(
     for (cue, definition) in &program.cues {
         if let Some(module) = cue_owners.get(cue) {
             for effect in &definition.effects {
+                let mut assets = BTreeSet::new();
                 if let Effect::StagePresent { transition, .. } = &effect.effect {
-                    if let Some(asset) = transition.asset() {
-                        consumers
-                            .entry(asset.to_owned())
-                            .or_default()
-                            .insert(format!("module:{module}"));
-                    }
+                    assets.extend(transition.asset().map(str::to_owned));
                 }
-                if let Effect::Audio { asset, .. } = &effect.effect {
+                effect.effect.collect_audio_assets(&mut assets);
+                effect
+                    .effect
+                    .collect_text_image_assets(&program.texts, &mut assets);
+                effect
+                    .effect
+                    .collect_dialogue_style_assets(&program.theme, &mut assets);
+                for asset in assets {
                     consumers
-                        .entry(asset.clone())
+                        .entry(asset)
                         .or_default()
                         .insert(format!("module:{module}"));
                 }
-                if effect.effect.uses_compose() {
-                    let mut child_audio = BTreeSet::new();
-                    effect.effect.collect_audio_assets(&mut child_audio);
-                    for asset in child_audio {
+            }
+        }
+    }
+    // Mid-block reveals have no cue recipe. Their catalogs follow the authored
+    // function scope even when its code is split into a generated package.
+    for (function, definition) in &program.functions {
+        if let Some(module) = function_owners.get(function) {
+            for op in definition.blocks.values().flat_map(|block| &block.ops) {
+                if let Operation::DialogueVisibility {
+                    transition: Some(transition),
+                    ..
+                } = &op.operation
+                {
+                    if let Some(asset) = transition.asset() {
                         consumers
-                            .entry(asset)
+                            .entry(asset.to_owned())
                             .or_default()
                             .insert(format!("module:{module}"));
                     }
@@ -722,6 +736,7 @@ fn package_runtime(
 
     let consumers = asset_consumers(
         source,
+        &author_function_owners,
         &scene_owners,
         &cue_owners,
         &text_owners,
@@ -2338,6 +2353,7 @@ mod compression_tests {
         }];
         let consumers = asset_consumers(
             &program,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::from([("intro".into(), "chapter".into())]),

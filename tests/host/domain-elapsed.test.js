@@ -38,3 +38,20 @@ test('output wait release discards Story time even after pause clears and keeps 
   clock.add(16000,{hidden:false,before:story,after:story});
   assert.deepEqual(clock.take(),[16000,16000]);
 });
+test('foreground pause and resume boundaries discard old time without discarding menu time',()=>{
+  const clock=new DomainElapsed(),background={...menu,foreground_paused:true};
+  for(const [before,after] of [[menu,background],[background,background],[background,menu]]){
+    clock.add(50,{hidden:false,before:menu,after:menu});
+    clock.add(30000000,{hidden:false,before,after});
+    assert.deepEqual(clock.take(),[0,0]);
+  }
+  clock.add(16000,{hidden:false,before:menu,after:menu});
+  assert.deepEqual(clock.take(),[0,16000]);
+});
+test('a foreground-only pause never freezes the independent Story clock',()=>{
+  const clock=new DomainElapsed(),paused={...story,foreground_paused:true};
+  for(const [before,after] of [[story,paused],[paused,paused],[paused,story]]){
+    clock.add(16000,{hidden:false,before,after});
+    assert.deepEqual(clock.take(),[16000,0]);
+  }
+});

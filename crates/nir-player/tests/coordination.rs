@@ -686,6 +686,79 @@ fn incompatible_restore_keeps_current_session() {
     assert!(p.error.is_some());
 }
 #[test]
+fn restore_admission_retry_keeps_candidate_after_surface_budget_shrinks() {
+    for device_recovery in [false, true] {
+        let mut program: Program =
+            serde_json::from_str(include_str!("../../../fixtures/rain.json")).unwrap();
+        let background = program.assets.get_mut("bg.station").unwrap();
+        background.width = 4096;
+        background.height = 5000;
+        let mut p = Player::new(program, "release".into(), "Test".into()).unwrap();
+        let commands = p.pump(vec![], 1000);
+        ready(&mut p, commands);
+        let commands = action(&mut p, UiAction::NewGame);
+        ready(&mut p, commands);
+        assert!(p.error.is_none());
+        let snapshot = p.core().snapshot();
+        let expected = snapshot.clone();
+        let position = p.core().location();
+        let dialogue = p
+            .core()
+            .dialogue()
+            .map(|(_, d)| (d.text_id.clone(), d.visible_text()));
+        let digest = nir_content::digest(&serde_json::to_vec(&snapshot).unwrap());
+        let commands = action(&mut p, UiAction::Title);
+        ready(&mut p, commands);
+        p.reserve_render_surfaces(3840, 2160).unwrap();
+        let session = p.generation.session;
+        p.pump(
+            vec![AppEvent::Loaded {
+                envelope: Box::new(SaveEnvelope {
+                    format: 1,
+                    slot: 0,
+                    revision: 1,
+                    snapshot,
+                    digest,
+                }),
+            }],
+            1000,
+        );
+        assert_eq!(p.diagnostic.as_ref().unwrap().code, "E_BUDGET");
+        assert_eq!(p.generation.session, session);
+        if device_recovery {
+            p.pump(vec![AppEvent::DeviceLost], 1000);
+        }
+        // Resizing releases enough media budget to make the same restore admissible.
+        p.reserve_render_surfaces(1280, 720).unwrap();
+        let commands = if device_recovery {
+            p.pump(vec![AppEvent::DeviceReady], 1000)
+        } else {
+            action(&mut p, UiAction::Retry)
+        };
+        ready(&mut p, commands);
+        assert!(p.error.is_none(), "{:?}", p.diagnostic);
+        assert!(p.generation.session > session);
+        let restored = p.core().snapshot();
+        assert_eq!(restored.variables, expected.variables);
+        assert_eq!(restored.tick_us, expected.tick_us);
+        assert_eq!(
+            serde_json::to_value(&restored.scene).unwrap(),
+            serde_json::to_value(&expected.scene).unwrap()
+        );
+        assert_eq!(p.core().location(), position);
+        assert_eq!(
+            p.core()
+                .dialogue()
+                .map(|(_, d)| (d.text_id.clone(), d.visible_text())),
+            dialogue
+        );
+        assert!(p.paused());
+        action(&mut p, UiAction::Continue);
+        assert!(!p.paused());
+    }
+}
+
+#[test]
 fn save_job_survives_new_session() {
     let mut p = playing();
     let cmds = action(&mut p, UiAction::Save { slot: 0 });
@@ -861,6 +934,65 @@ fn consecutive_rollbacks_keep_the_earlier_checkpoints() {
     assert!(p.generation.session > epoch);
     assert!(p.paused());
     assert!(p.error.is_none(), "{:?}", p.error);
+}
+
+#[test]
+fn rollback_media_retry_preserves_the_remaining_checkpoints() {
+    for device_recovery in [false, true] {
+        let mut p = playing();
+        for _ in 0..20 {
+            let commands = action(&mut p, UiAction::Advance);
+            ready(&mut p, commands);
+            let commands = p.pump(
+                vec![AppEvent::Tick {
+                    delta_us: 1_000_000,
+                }],
+                1000,
+            );
+            ready(&mut p, commands);
+            if p.core()
+                .dialogue()
+                .is_some_and(|(_, d)| d.text_id == "arrival")
+            {
+                break;
+            }
+        }
+        assert_eq!(p.core().dialogue().unwrap().1.text_id, "arrival");
+        let session = p.generation.session;
+        let commands = action(&mut p, UiAction::Rollback);
+        let request = commands
+            .iter()
+            .find_map(|command| match command {
+                AppCommand::GetAssets { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+        p.pump(
+            vec![AppEvent::AssetFailed {
+                request,
+                message: "temporary decode failure".into(),
+            }],
+            1000,
+        );
+        assert_eq!(p.generation.session, session);
+        let commands = if device_recovery {
+            p.pump(vec![AppEvent::DeviceLost], 1000);
+            p.pump(vec![AppEvent::DeviceReady], 1000)
+        } else {
+            action(&mut p, UiAction::Retry)
+        };
+        ready(&mut p, commands);
+        assert!(p.error.is_none(), "{:?}", p.diagnostic);
+        assert!(p.generation.session > session);
+        let session = p.generation.session;
+        let commands = action(&mut p, UiAction::Rollback);
+        ready(&mut p, commands);
+        assert!(
+            p.generation.session > session,
+            "retry discarded older checkpoints"
+        );
+        assert!(p.error.is_none(), "{:?}", p.diagnostic);
+    }
 }
 
 #[test]

@@ -311,10 +311,14 @@ fn qualify_cue_refs(module: &str, cue: &mut Cue, namespaced: bool) {
     if !namespaced {
         return;
     }
-    for def in &mut cue.effects {
+    fn qualify_effect(module: &str, def: &mut EffectDef) {
         def.id = format!("{module}.{}", def.id);
         match &mut def.effect {
             Effect::AudioStop { target, .. } => *target = format!("{module}.{target}"),
+            Effect::Tween {
+                target: TweenTarget::AudioInstance { task, .. },
+                ..
+            } => *task = format!("{module}.{task}"),
             Effect::StagePresent { scene, .. } => *scene = format!("{module}.{scene}"),
             Effect::SpriteTimeline { timeline, .. } => *timeline = format!("{module}.{timeline}"),
             Effect::Dialogue { text, speaker, .. } => {
@@ -323,8 +327,16 @@ fn qualify_cue_refs(module: &str, cue: &mut Cue, namespaced: bool) {
                     *speaker = format!("{module}.{speaker}");
                 }
             }
+            Effect::Sequence { children } | Effect::ParallelAll { children } => {
+                for child in children {
+                    qualify_effect(module, child);
+                }
+            }
             _ => {}
         }
+    }
+    for def in &mut cue.effects {
+        qualify_effect(module, def);
     }
 }
 

@@ -1434,6 +1434,7 @@ impl Engine {
             "screen": format!("{:?}", self.player.presentation_screen()),
             "locale": self.player.effective_ui_locale,
             "paused": self.player.paused(),
+            "foreground_paused": self.player.domain_paused(TimeDomain::ForegroundUi),
             "story_clock": self.story_clock,
             "loading": self.player.is_loading(),
             "retrying": self.player.retrying(),

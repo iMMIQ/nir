@@ -5,16 +5,27 @@ const knownRequests=new Set(),knownContent=new Set(),adapters=[];
 let contextLost=false,watchedCanvas=null;
 function watchCanvas(){if(watchedCanvas===canvas)return;const owner=watchedCanvas=canvas;owner.addEventListener('webglcontextlost',e=>{e.preventDefault();if(owner!==canvas)return;contextLost=true;dirty=true;publish();});}
 let last=performance.now(),hidden=false,scheduled=null,clockActive=false,closed=false,outstanding=false,dirty=false,commands=[],revision=0;
+let storyElapsed=0,foregroundElapsed=0;
 const UI=new Set(['focus_control','navigate_focus','hover','set_touch_input','pointer_gesture','pointer_action','hit','control_value_action','primary_action','focus_value_action']);
 const ALLOWED=new Set([...UI,'action','host_event','content_ready','content_failed','content_skipped','resource','resource_decoded','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','resize']);
 const stamp=()=>performance.now();
+function resetClock(){last=stamp();storyElapsed=foregroundElapsed=0;}
+// Retain u32 remainders independently. Story/menu boundaries must not discard
+// foreground animation time; background and session changes discard both.
+function accrueElapsed(now,before,after=before){
+ if(!clockActive){last=now;storyElapsed=foregroundElapsed=0;return;}
+ const elapsed=Math.max(0,Math.round((now-last)*1000));last=now;
+ const active=!hidden&&before.session===after.session,foreground=active&&!before.foreground_paused&&!after.foreground_paused;
+ storyElapsed=active&&!before.paused&&!after.paused&&before.screen==='Story'?storyElapsed+elapsed:0;
+ foregroundElapsed=foreground?foregroundElapsed+elapsed:0;
+}
 function collect(){const next=JSON.parse(engine.commands());for(const c of next){if(c.type==='get_assets')knownRequests.add(c.request);if(c.type==='get_content')knownContent.add(c.request);}commands.push(...next);if(commands.length>MAX_COMMANDS)throw new Error('E_WORKER_CAPACITY: output commands');dirty=true;}
 function snapshot(initial=false){for(const id of knownRequests)if(!engine.accepts_resource(id))knownRequests.delete(id);for(const id of knownContent)if(!engine.accepts_content(id))knownContent.delete(id);const host=engine.host_state();return {revision:++revision,requests:[...knownRequests],contentRequests:[...knownContent],host,state:debug||initial?engine.state():host,view,commands:commands.splice(0),retained:engine.retained_descriptors(),pending:engine.pending_events(),needsClock:engine.needs_clock(),backend:engine.backend(),gpuError:engine.gpu_error(),deviceLost:engine.device_lost()||contextLost,adapters,profile:engine.take_profile(),textCache:engine.text_cache_stats()};}
 function send(kind,id,value,transfer=[]){postMessage({protocol:PROTOCOL,build,kind,id,value},transfer);}
 function publish(){if(!engine||outstanding||!dirty||closed)return;outstanding=true;dirty=false;send('update',0,snapshot());}
 function draw(){if(engine.device_lost()||contextLost){dirty=true;return;}const w=Math.round(size.width*size.dpr),h=Math.round(size.height*size.dpr);if(canvas.width!==w)canvas.width=w;if(canvas.height!==h)canvas.height=h;view=engine.draw(size.width,size.height,size.dpr);collect();}
-function schedule(){if(closed||!engine||scheduled!==null)return;if(engine.needs_clock()||engine.pending_events()){if(!clockActive)last=stamp();clockActive=true;scheduled=setTimeout(frame,16);}else clockActive=false;}
-function frame(){scheduled=null;if(closed||!engine)return;try {if(engine.device_lost()||contextLost){clockActive=false;dirty=true;publish();return;}const now=stamp(),before=JSON.parse(engine.host_state());engine.begin_turn();const elapsed=Math.max(0,Math.round((now-last)*1000));last=now;if(!hidden)engine.tick_domains(before.paused||before.screen!=='Story'?0:Math.min(elapsed,0xffffffff),Math.min(elapsed,250000));engine.continue_turn();collect();draw();publish();schedule();}catch(error){send('fatal',0,{code:'E_WORKER_RUNTIME',message:String(error)});closed=true;}}
+function schedule(){if(closed||!engine||scheduled!==null)return;if(engine.needs_clock()||engine.pending_events()||storyElapsed||foregroundElapsed){if(!clockActive)last=stamp();clockActive=true;scheduled=setTimeout(frame,16);}else clockActive=false;}
+function frame(){scheduled=null;if(closed||!engine)return;try {if(engine.device_lost()||contextLost){resetClock();clockActive=false;dirty=true;publish();return;}const now=stamp(),before=JSON.parse(engine.host_state());engine.begin_turn();accrueElapsed(now,before);if(!hidden){const story=Math.min(storyElapsed,0xffffffff),foreground=Math.min(foregroundElapsed,0xffffffff);storyElapsed-=story;foregroundElapsed-=foreground;engine.tick_domains(story,foreground);}engine.continue_turn();collect();draw();publish();schedule();}catch(error){send('fatal',0,{code:'E_WORKER_RUNTIME',message:String(error)});closed=true;}}
 function objectUrl(raw,digest,root){const url=new URL(raw);if(url.origin!==new URL(root).origin||!/^[0-9a-f]{64}$/.test(digest)||!url.pathname.endsWith(`/objects/${digest}.js`))throw new Error('E_WORKER_IDENTITY');return url.href;}
 async function dispatch(message){
  const {kind,id,value}=message;
@@ -47,7 +58,7 @@ async function dispatch(message){
   if(engine)throw new Error('E_WORKER_OWNER');canvas=value.canvas;size=value.size;
   if(!(canvas instanceof OffscreenCanvas))throw new Error('E_CANVAS');
   watchCanvas();
-  engine=await wasm.Engine.create(value.executable,value.release,value.title,canvas,value.preferences,value.backend,value.audio_sample_rate);engine.set_profiling(value.profiling);last=stamp();
+  engine=await wasm.Engine.create(value.executable,value.release,value.title,canvas,value.preferences,value.backend,value.audio_sample_rate);engine.set_profiling(value.profiling);resetClock();
   // Actually configure/draw the requested backend before Ready, not just an API check.
   engine.begin_turn();engine.continue_turn();collect();draw();dirty=false;
   if(debug)self.__nirWorker={role:'runtime',loseContext:()=>{const extension=canvas.getContext('webgl2').getExtension('WEBGL_lose_context');if(!extension)throw new Error('E_CONTEXT_LOSS_UNAVAILABLE');extension.loseContext();},state:()=>JSON.parse(engine.state()),queues:()=>({inbox:queue.length,outbound:commands.length,unacknowledged:outstanding?1:0})};
@@ -55,7 +66,7 @@ async function dispatch(message){
  }
  if(kind==='gpu'){
   clearTimeout(scheduled);scheduled=null;
-  const replacement=value.canvas||canvas;const gpu=await wasm.create_gpu(replacement,value.backend);canvas=replacement;engine.replace_gpu(gpu);contextLost=false;watchCanvas();last=stamp();
+  const replacement=value.canvas||canvas;const gpu=await wasm.create_gpu(replacement,value.backend);canvas=replacement;engine.replace_gpu(gpu);contextLost=false;watchCanvas();resetClock();
   engine.begin_turn();engine.continue_turn();collect();draw();send('reply',id,{snapshot:snapshot()});schedule();return;
  }
  if(kind!=='batch'||!Array.isArray(value)||value.length>MAX_CALLS)throw new Error('E_WORKER_PROTOCOL');
@@ -66,12 +77,12 @@ async function dispatch(message){
   if(UI.has(call.method)&&(call.session!==current.session||call.interaction!==current.interaction)){results.push(null);continue;}
   if(call.method==='resize'){size=call.args[0];results.push(null);continue;}
   if(call.method==='simulate_device_loss')contextLost=true;
-  if(call.method==='hidden'){hidden=call.args[0];last=stamp();}
+  if(call.method==='hidden'){hidden=call.args[0];resetClock();}
   results.push(engine[call.method](...call.args));
  }
  // Input is consumed before any subsequent clock catch-up.
  engine.continue_turn();collect();draw();dirty=false;
- const after=JSON.parse(engine.host_state());if(before.session!==after.session||before.paused!==after.paused||before.foreground_paused!==after.foreground_paused||before.screen!==after.screen)last=stamp();
+ const after=JSON.parse(engine.host_state());if(before.session!==after.session||before.paused!==after.paused||before.foreground_paused!==after.foreground_paused||before.screen!==after.screen)accrueElapsed(stamp(),before,after);
  send('reply',id,{results,snapshot:snapshot()});schedule();
 }
 let queue=[],busy=false;

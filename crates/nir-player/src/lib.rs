@@ -3318,6 +3318,16 @@ impl Player {
         // their saved language; future instances use the current preference.
         candidate.set_locale(&self.effective_text_locale)?;
         let assets = self.state_assets(&candidate);
+        // Keep the validated candidate and restore kind before admission. A
+        // failed admission, media retry or device recovery must resume the
+        // same transaction, including its rollback checkpoint policy.
+        self.candidate = Some(candidate);
+        self.restore_work = Some(RestoreWork {
+            session: None,
+            proof: None,
+            active_batches: VecDeque::new(),
+            rollback,
+        });
         self.begin_prepare(
             if rollback {
                 Purpose::Rollback
@@ -3326,9 +3336,7 @@ impl Player {
             },
             0,
             assets,
-        )?;
-        self.candidate = Some(candidate);
-        Ok(())
+        )
     }
     fn action(
         &mut self,

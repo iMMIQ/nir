@@ -49,8 +49,9 @@ export function audioRecoveryConsumesKey(blocked,key,focusedAction) {
 export class DomainElapsed {
     story=0;foreground=0;
     add(elapsed,{hidden,before,after,storyBlocked=false}) {
-        const foreground=!hidden&&before.session===after.session;
-        const story=foreground&&!storyBlocked&&!before.paused&&!after.paused&&before.screen==='Story';
+        const active=!hidden&&before.session===after.session;
+        const foreground=active&&!before.foreground_paused&&!after.foreground_paused;
+        const story=active&&!storyBlocked&&!before.paused&&!after.paused&&before.screen==='Story';
         this.story=story?this.story+elapsed:0;
         this.foreground=foreground?this.foreground+elapsed:0;
     }

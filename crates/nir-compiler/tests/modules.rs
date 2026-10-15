@@ -186,6 +186,178 @@ fn assembles_namespaced_modules_and_links_export_calls_with_shared_state() {
 }
 
 #[test]
+fn module_audio_references_survive_nested_composition_and_runtime_packaging() {
+    for namespaced in [false, true] {
+        let project = project();
+        if namespaced {
+            add_second_module(project.path());
+        }
+        let story = project.path().join("content/ch01/story.nir.json");
+        let mut fragment: Json = serde_json::from_slice(&fs::read(&story).unwrap()).unwrap();
+        fragment["cues"]["stop_music"] = json!({"effects": [{
+            "id": "stop-chain", "scope": "session", "effect": {
+                "type": "sequence", "children": [{
+                    "id": "stop-group", "scope": "session", "effect": {
+                        "type": "parallel_all", "children": [{
+                            "id": "stop-child", "scope": "session", "effect": {
+                                "type": "audio_stop", "target": "music", "duration_us": "10000"
+                            }
+                        }]
+                    }
+                }]
+            }
+        }]});
+        let fade = json!({
+            "id": "fade", "scope": "session", "effect": {
+                "type": "tween", "target": {"type": "audio_instance", "task": "music", "property": "gain"},
+                "to": 0.5, "duration_us": "10000"
+            }
+        });
+        fragment["cues"]["fade_music"] = json!({"effects": [fade.clone()]});
+        fragment["cues"]["fade_composed"] = json!({"effects": [{
+            "id": "fade-chain", "scope": "session", "effect": {
+                "type": "parallel_all", "children": [{
+                    "id": "fade-group", "scope": "session", "effect": {
+                        "type": "sequence", "children": [fade]
+                    }
+                }]
+            }
+        }]});
+        fs::write(&story, serde_json::to_vec(&fragment).unwrap()).unwrap();
+
+        let loaded = load_project(project.path()).unwrap();
+        compile(&loaded.program).unwrap();
+        let prefix = if namespaced { "ch01." } else { "" };
+        let cue = &loaded.program.cues[&format!("{prefix}stop_music")];
+        let children = cue.effects[0].effect.compose_children().unwrap();
+        let child = &children[0].effect.compose_children().unwrap()[0];
+        assert_eq!(child.id, format!("{prefix}stop-child"));
+        assert!(
+            matches!(&child.effect, nir_format::Effect::AudioStop { target, .. }
+            if target == &format!("{prefix}music"))
+        );
+
+        let sdk = test_sdk();
+        build_profile(
+            project.path(),
+            sdk.path(),
+            &project.path().join("dist/audio-composition"),
+            "dev",
+            false,
+            false,
+            &OptimizeOptions::none(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn published_dialogue_images_keep_module_catalogs_and_load_into_runtime() {
+    let project = project();
+    add_second_module(project.path());
+    let catalog_path = project.path().join("assets/catalog.toml");
+    let mut catalog = fs::read_to_string(&catalog_path).unwrap();
+    for asset in ["mask.only", "portrait.only", "window.only"] {
+        catalog.push_str(&format!("\n[[assets]]\nid = \"{asset}\"\nkind = \"image\"\nsource = \"source/station.png\"\nrights = \"CC0-1.0\"\nexpected_size = [1280, 720]\n"));
+    }
+    fs::write(catalog_path, catalog).unwrap();
+    let theme_path = project.path().join("themes/rain/theme.toml");
+    let mut theme = fs::read_to_string(&theme_path).unwrap();
+    theme.push_str("\n[dialogue_styles.alternate]\ntext = [1.0, 1.0, 1.0, 1.0]\n[dialogue_styles.alternate.dialogue]\nbackground = \"window.only\"\n");
+    fs::write(theme_path, theme).unwrap();
+    let story = project.path().join("content/ch02/story.nir.json");
+    let mut fragment: Json = serde_json::from_slice(&fs::read(&story).unwrap()).unwrap();
+    fragment["functions"]["main"]["blocks"]["return"]["ops"] = json!([{
+        "id": "window.reveal", "operation": {
+            "type": "dialogue_visibility", "visible": false,
+            "transition": {"type": "mask", "asset": "mask.only", "channel": "alpha"},
+            "duration_us": "500000"
+        }
+    }]);
+    fragment["cues"]["style"] = json!({"effects": [
+        {"id": "style", "scope": "session", "effect": {"type": "dialogue_style", "style": "alternate"}}
+    ]});
+    fragment["cues"]["decorate"] = json!({"effects": [
+        {"id": "portrait", "scope": "session", "effect": {
+            "type": "dialogue_decoration", "slot": "portrait", "image": {
+                "asset": "portrait.only", "size": [1280, 720],
+                "placement": {"type": "absolute", "point": [10, 350]}
+            }
+        }}
+    ]});
+    fs::write(story, serde_json::to_vec(&fragment).unwrap()).unwrap();
+    let sdk = test_sdk();
+    let out = project.path().join("dist/dialogue-images");
+    let report = build_profile(
+        project.path(),
+        sdk.path(),
+        &out,
+        "dev",
+        false,
+        false,
+        &OptimizeOptions::none(),
+    )
+    .unwrap();
+    let release: nir_format::ReleaseManifest = serde_json::from_slice(
+        &fs::read(out.join(format!("releases/{}.json", report.release))).unwrap(),
+    )
+    .unwrap();
+    let executable: nir_format::RuntimeExecutable = serde_json::from_slice(
+        &fs::read(out.join(&release.objects[&release.program].path)).unwrap(),
+    )
+    .unwrap();
+    let root = &executable.program;
+    for asset in ["mask.only", "portrait.only", "window.only"] {
+        let catalog = &root.assets[asset].catalog;
+        assert!(report.asset_catalogs[catalog]
+            .consumers
+            .contains(&"module:ch02".to_owned()));
+        assert!(!report.asset_catalogs[catalog]
+            .consumers
+            .contains(&"module:ch01".to_owned()));
+    }
+    for asset in ["mask.only", "portrait.only"] {
+        assert_eq!(
+            report.asset_catalogs[&root.assets[asset].catalog].consumers,
+            ["module:ch02"]
+        );
+    }
+    let mut keys = root.asset_catalogs(root.assets.keys().map(String::as_str));
+    for (module, index) in &root.modules {
+        keys.insert(nir_format::ContentKey::Static {
+            module: module.clone(),
+        });
+        keys.insert(nir_format::ContentKey::Code {
+            module: module.clone(),
+        });
+        keys.extend(
+            index
+                .locales
+                .keys()
+                .map(|locale| nir_format::ContentKey::Text {
+                    module: module.clone(),
+                    locale: locale.clone(),
+                }),
+        );
+    }
+    let batch = keys
+        .into_iter()
+        .map(|key| {
+            let requirement = root.content_requirement(&key).unwrap();
+            let bytes = fs::read(out.join(&release.objects[&requirement.digest].path)).unwrap();
+            let object = nir_content::parse_runtime_object(root, &key, &bytes).unwrap();
+            (key, object, bytes.len() as u64)
+        })
+        .collect();
+    let view = ValidatedProgram::from_runtime(root.clone())
+        .unwrap()
+        .install_batch(batch)
+        .unwrap();
+    assert!(view.window_transition_assets().contains("mask.only"));
+    assert!(view.asset("portrait.only").is_some());
+}
+
+#[test]
 fn cross_module_calls_cannot_target_private_or_missing_exports() {
     let project = project();
     add_second_module(project.path());
