@@ -12,7 +12,6 @@ pub use text_engine::TextEngine;
 
 use nir_ir::*;
 use nir_vm::{LayerState, Vm};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -70,13 +69,18 @@ pub fn project_layers(
     stage_rect: [f32; 4],
     scale: f32,
 ) -> Vec<Quad> {
-    let map: BTreeMap<LayerId, &LayerState> = layers.iter().map(|l| (l.id, l)).collect();
-    let mut ordered: Vec<&LayerState> = layers.iter().collect();
-    ordered.sort_by_key(|l| (l.transform.z_order, l.id.0));
+    if layers.is_empty() {
+        return Vec::new();
+    }
+    let already_sorted = layers
+        .windows(2)
+        .all(|w| (w[0].transform.z_order, w[0].id.0) <= (w[1].transform.z_order, w[1].id.0));
+    let mut ordered_storage: Vec<&LayerState>;
+    let ordered_slice: &[LayerState];
+    let mut out = Vec::with_capacity(layers.len());
 
-    let mut out = Vec::with_capacity(ordered.len());
-    for layer in ordered {
-        // Accumulate parent transforms (bounded depth 16 to avoid cycles).
+    let project_one = |layer: &LayerState, out: &mut Vec<Quad>| {
+        // Accumulate parent transforms (bounded depth 16, linear slice scan avoids BTreeMap heap alloc).
         let mut px = layer.transform.x + layer.shake_offset[0];
         let mut py = layer.transform.y + layer.shake_offset[1];
         let mut sx = layer.transform.scale[0];
@@ -85,7 +89,7 @@ pub fn project_layers(
         let mut cur_parent = layer.parent;
         for _ in 0..16 {
             let Some(pid) = cur_parent else { break };
-            let Some(p) = map.get(&pid) else { break };
+            let Some(p) = layers.iter().find(|l| l.id == pid) else { break };
             px = p.transform.x + p.shake_offset[0] + px * p.transform.scale[0];
             py = p.transform.y + p.shake_offset[1] + py * p.transform.scale[1];
             sx *= p.transform.scale[0];
@@ -94,7 +98,7 @@ pub fn project_layers(
             cur_parent = p.parent;
         }
         if op <= 0.001 {
-            continue;
+            return;
         }
 
         let asset_meta = layer.asset.and_then(|id| program.asset(id));
@@ -184,6 +188,19 @@ pub fn project_layers(
             clip,
             special: SpecialQuad::None,
         });
+    };
+
+    if already_sorted {
+        ordered_slice = layers;
+        for layer in ordered_slice {
+            project_one(layer, &mut out);
+        }
+    } else {
+        ordered_storage = layers.iter().collect();
+        ordered_storage.sort_by_key(|l| (l.transform.z_order, l.id.0));
+        for layer in ordered_storage {
+            project_one(layer, &mut out);
+        }
     }
     out
 }
@@ -987,7 +1004,7 @@ fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
     let start = end.saturating_sub(visible_rows);
 
     let mut y = area[1];
-    for entry in &ctx.vm.history[start..end] {
+    for entry in ctx.vm.history.range(start..end) {
         let text = if entry.speaker.is_empty() {
             entry.text.clone()
         } else {

@@ -55,14 +55,15 @@ fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("sdk") => {
             fs::create_dir_all("dist/sdk")?;
-            // 1. Build Web player WASM + wasm-bindgen
+            // 1. Build Web player WASM + wasm-bindgen (+ optional wasm-opt -Os)
             run(Command::new("cargo").args([
                 "build",
                 "-p",
                 "player-web",
                 "--target",
                 "wasm32-unknown-unknown",
-                "--release",
+                "--profile",
+                "release-wasm",
             ]))?;
             let bindgen = std::env::var_os("WASM_BINDGEN")
                 .map(PathBuf::from)
@@ -82,8 +83,17 @@ fn main() -> Result<()> {
                 "web",
                 "--out-dir",
                 "dist/sdk",
-                "target/wasm32-unknown-unknown/release/player_web.wasm",
+                "target/wasm32-unknown-unknown/release-wasm/player_web.wasm",
             ]))?;
+            let wasm_opt = std::env::var_os("WASM_OPT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("wasm-opt"));
+            if Command::new(&wasm_opt).arg("--version").output().is_ok() {
+                let wasm_path = "dist/sdk/player_web_bg.wasm";
+                run(Command::new(&wasm_opt).args(["-Os", "--enable-bulk-memory", wasm_path, "-o", wasm_path]))?;
+            } else {
+                println!("SDK: wasm-opt not found on PATH; skipping WASM size pass");
+            }
             for name in ["index.html", "style.css", "app.js"] {
                 fs::copy(
                     format!("apps/player-web/host/{name}"),

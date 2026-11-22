@@ -8,20 +8,31 @@ pub use state::*;
 use nir_ir::*;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_HISTORY: usize = 500;
+const HISTORY_ROLLBACK_SLACK: usize = 32;
 const MAX_CALL_DEPTH: usize = 64;
 const MAX_FUEL_PER_STEP: u32 = 200_000;
 const RNG_SEED: [u8; 32] = [0x4E, 0x49, 0x52, 0x32, 42, 7, 13, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
 
+fn build_label_index(program: &NirProgram) -> Arc<HashMap<u32, StrId>> {
+    let mut map = HashMap::with_capacity(program.labels.len());
+    for l in &program.labels {
+        map.entry(l.pc).or_insert(l.name);
+    }
+    Arc::new(map)
+}
+
 #[derive(Clone)]
 pub struct Vm {
     program: Arc<NirProgram>,
+    label_by_pc: Arc<HashMap<u32, StrId>>,
     pub pc: u32,
-    last_label: Option<String>,
+    last_label_id: Option<StrId>,
+    last_label_fallback: Option<String>,
     stack: Vec<Value>,
     pub vars: Vec<Value>,
     frames: Vec<CallFrame>,
@@ -42,7 +53,8 @@ pub struct Vm {
     pub wait: WaitReason,
     pub audio: Vec<AudioChannelState>,
     pub audio_paused: [bool; 3],
-    pub history: Vec<HistoryEntry>,
+    pub history: VecDeque<Arc<HistoryEntry>>,
+    history_seq: u64,
     pub locale: String,
     pub profile: ProfileData,
     rng: ChaCha8Rng,
@@ -70,10 +82,13 @@ impl Vm {
         let vars = program.vars.iter().map(|v| v.default.clone()).collect();
         let entry_pc = fmeta.entry_pc;
         let locals = vec![Value::Null; fmeta.local_count as usize];
+        let label_by_pc = build_label_index(&program);
         Ok(Self {
             program,
+            label_by_pc,
             pc: entry_pc,
-            last_label: None,
+            last_label_id: None,
+            last_label_fallback: None,
             stack: Vec::with_capacity(32),
             vars,
             frames: vec![CallFrame {
@@ -96,13 +111,20 @@ impl Vm {
             wait: WaitReason::None,
             audio: Vec::new(),
             audio_paused: [false; 3],
-            history: Vec::new(),
+            history: VecDeque::new(),
+            history_seq: 0,
             locale,
             profile: ProfileData::default(),
             rng: ChaCha8Rng::from_seed(RNG_SEED),
             outcome: None,
             intents: Vec::new(),
         })
+    }
+
+    fn current_last_label(&self) -> Option<String> {
+        self.last_label_id
+            .map(|id| self.program.str(id).to_owned())
+            .or_else(|| self.last_label_fallback.clone())
     }
 
     pub fn program(&self) -> &Arc<NirProgram> {
@@ -154,7 +176,8 @@ impl Vm {
     pub fn jump_to_label(&mut self, label_name: &str) -> bool {
         if let Some(label) = self.program.find_label(label_name) {
             self.pc = label.pc;
-            self.last_label = Some(label_name.to_owned());
+            self.last_label_id = Some(label.name);
+            self.last_label_fallback = None;
             self.wait = WaitReason::None;
             self.dialogue = None;
             self.choice = None;
@@ -188,23 +211,119 @@ impl Vm {
             .collect();
 
         // Relocate PC using last visited label if possible, else clamp to new code length.
-        let new_pc = self
-            .last_label
+        let last_label_str = self.current_last_label();
+        let relocated = last_label_str
             .as_deref()
-            .and_then(|name| new_program.find_label(name))
+            .and_then(|name| new_program.find_label(name));
+        let new_pc = relocated
             .map(|l| l.pc)
             .unwrap_or_else(|| self.pc.min(new_program.ops.len().saturating_sub(1) as u32));
+        let next_label_id = relocated.map(|l| l.name);
 
+        self.label_by_pc = build_label_index(&new_program);
         self.program = new_program;
         self.vars = next_vars;
         self.pc = new_pc;
+        self.last_label_id = next_label_id;
+        self.last_label_fallback = if next_label_id.is_some() {
+            None
+        } else {
+            last_label_str
+        };
         self.wait = WaitReason::None;
         self.dialogue = None;
         self.choice = None;
         self.stack.clear();
     }
 
-    /// Captures a compact, version-resilient snapshot.
+    /// Captures a lightweight in-memory rollback checkpoint in O(1) without cloning 500 history strings!
+    pub fn checkpoint(&self) -> RollbackCheckpoint {
+        RollbackCheckpoint {
+            pc: self.pc,
+            last_label_id: self.last_label_id,
+            last_label_fallback: self.last_label_fallback.clone(),
+            vars: self.vars.clone(),
+            frames: self.frames.clone(),
+            layers: self.layers.clone(),
+            dialogue_visible: self.dialogue_visible,
+            dialogue: self.dialogue.clone(),
+            choice: self.choice.clone(),
+            wait: self.wait.clone(),
+            audio: self.audio.clone(),
+            audio_paused: self.audio_paused,
+            history_seq: self.history_seq,
+            locale: self.locale.clone(),
+            rng_word_pos: self.rng.get_word_pos(),
+            outcome: self.outcome.clone(),
+        }
+    }
+
+    /// Restores an in-memory rollback checkpoint, truncating history back to `cp.history_seq` in O(1).
+    pub fn restore_checkpoint(&mut self, cp: RollbackCheckpoint) -> Vec<VmIntent> {
+        let mut intents = Vec::new();
+        for ch in &cp.audio {
+            intents.push(VmIntent::PlayAudio {
+                channel: ch.channel,
+                bus: ch.bus,
+                asset: ch.asset,
+                gain: ch.gain * ch.envelope,
+                looped: ch.looped,
+                fade_in_us: 0,
+                loop_region: ch.loop_region,
+                character: ch.character.clone(),
+            });
+        }
+        for (idx, &paused) in cp.audio_paused.iter().enumerate() {
+            if paused {
+                let bus = match idx {
+                    0 => AudioBus::Bgm,
+                    1 => AudioBus::Voice,
+                    _ => AudioBus::Sfx,
+                };
+                intents.push(VmIntent::PauseAudioBus { bus, paused: true });
+            }
+        }
+
+        if self.history_seq > cp.history_seq {
+            let pop_count = (self.history_seq - cp.history_seq) as usize;
+            for _ in 0..pop_count {
+                if self.history.pop_back().is_none() {
+                    break;
+                }
+            }
+            self.history_seq = cp.history_seq;
+        }
+
+        self.pc = cp.pc;
+        self.last_label_id = cp.last_label_id;
+        self.last_label_fallback = cp.last_label_fallback;
+        self.stack.clear();
+        self.vars = cp.vars;
+        self.frames = cp.frames;
+        self.layers = cp.layers.clone();
+        self.pending_layers = cp.layers;
+        self.pending_dirty = false;
+        self.tweens.clear();
+        self.shakes.clear();
+        self.transition = None;
+        self.window_reveal = None;
+        self.dialogue_visible = cp.dialogue_visible;
+        self.dialogue_opacity = 1.0;
+        self.dialogue_shake = [0.0, 0.0];
+        self.dialogue = cp.dialogue;
+        self.choice = cp.choice;
+        self.wait = cp.wait;
+        self.audio = cp.audio;
+        self.audio_paused = cp.audio_paused;
+        self.locale = cp.locale;
+        self.rng = ChaCha8Rng::from_seed(RNG_SEED);
+        self.rng.set_word_pos(cp.rng_word_pos);
+        self.outcome = cp.outcome;
+        self.intents.clear();
+        intents
+    }
+
+    /// Captures a compact, version-resilient snapshot for persistent save slots.
     pub fn snapshot(&self, unix_time: u64) -> SaveSnapshot {
         let vars = self
             .program
@@ -213,6 +332,7 @@ impl Vm {
             .zip(self.vars.iter())
             .map(|(m, v)| (self.program.str(m.name).to_owned(), v.clone()))
             .collect();
+        let last_label = self.current_last_label();
         let summary = self
             .dialogue
             .as_ref()
@@ -227,8 +347,15 @@ impl Vm {
                 }
                 s
             })
-            .or_else(|| self.last_label.clone())
+            .or_else(|| last_label.clone())
             .unwrap_or_else(|| self.program.meta.title.clone());
+        let skip = self.history.len().saturating_sub(MAX_HISTORY);
+        let history: Vec<HistoryEntry> = self
+            .history
+            .iter()
+            .skip(skip)
+            .map(|e| (**e).clone())
+            .collect();
         SaveSnapshot {
             format: SAVE_FORMAT_VERSION,
             game_id: self.program.meta.game_id.clone(),
@@ -236,7 +363,7 @@ impl Vm {
             saved_at_unix: unix_time,
             summary,
             pc: self.pc,
-            last_label: self.last_label.clone(),
+            last_label,
             vars,
             frames: self.frames.clone(),
             layers: self.layers.clone(),
@@ -246,7 +373,7 @@ impl Vm {
             wait: self.wait.clone(),
             audio: self.audio.clone(),
             audio_paused: self.audio_paused,
-            history: self.history.clone(),
+            history,
             locale: self.locale.clone(),
             rng_word_pos: self.rng.get_word_pos(),
             outcome: self.outcome.clone(),
@@ -257,7 +384,7 @@ impl Vm {
     /// `last_label` if the script version changed.
     pub fn restore(
         program: Arc<NirProgram>,
-        snap: SaveSnapshot,
+        mut snap: SaveSnapshot,
         profile: ProfileData,
     ) -> Result<(Self, Vec<VmIntent>)> {
         if snap.format != SAVE_FORMAT_VERSION {
@@ -286,19 +413,29 @@ impl Vm {
             .collect();
 
         // If version matches and PC is in range, restore exact PC; otherwise relocate via label!
+        let found_lbl = snap
+            .last_label
+            .as_deref()
+            .and_then(|n| program.find_label(n));
         let pc = if snap.version == program.meta.version
             && (snap.pc as usize) <= program.ops.len()
         {
             snap.pc
-        } else if let Some(lbl) = snap
-            .last_label
-            .as_deref()
-            .and_then(|n| program.find_label(n))
-        {
+        } else if let Some(lbl) = found_lbl {
             lbl.pc
         } else {
             snap.pc.min(program.ops.len().saturating_sub(1) as u32)
         };
+        let last_label_id = found_lbl.map(|l| l.name);
+        let last_label_fallback = if last_label_id.is_some() {
+            None
+        } else {
+            snap.last_label
+        };
+
+        if let Some(dlg) = &mut snap.dialogue {
+            dlg.recompute_visible_bytes();
+        }
 
         let mut rng = ChaCha8Rng::from_seed(RNG_SEED);
         rng.set_word_pos(snap.rng_word_pos);
@@ -328,10 +465,17 @@ impl Vm {
             }
         }
 
+        let history_seq = snap.history.len() as u64;
+        let history: VecDeque<Arc<HistoryEntry>> =
+            snap.history.into_iter().map(Arc::new).collect();
+        let label_by_pc = build_label_index(&program);
+
         let vm = Self {
             program,
+            label_by_pc,
             pc,
-            last_label: snap.last_label,
+            last_label_id,
+            last_label_fallback,
             stack: Vec::with_capacity(32),
             vars,
             frames: if snap.frames.is_empty() {
@@ -358,7 +502,8 @@ impl Vm {
             wait: snap.wait,
             audio: snap.audio,
             audio_paused: snap.audio_paused,
-            history: snap.history,
+            history,
+            history_seq,
             locale: snap.locale,
             profile,
             rng,
@@ -373,16 +518,20 @@ impl Vm {
         self.intents.clear();
         let limit = budget.min(MAX_FUEL_PER_STEP);
         let mut used = 0u32;
+        // Clone cheap Arc handles once so we can borrow `&Op` and `&label_by_pc` with zero Op cloning!
+        let program = Arc::clone(&self.program);
+        let label_by_pc = Arc::clone(&self.label_by_pc);
 
         while self.outcome.is_none() && self.wait == WaitReason::None && used < limit {
             let pc = self.pc as usize;
-            let Some(op) = self.program.ops.get(pc).cloned() else {
+            let Some(op) = program.ops.get(pc) else {
                 self.outcome = Some("end".into());
                 break;
             };
-            // Track latest visited label for hot-reload / save migration.
-            if let Some(lbl) = self.program.labels.iter().find(|l| l.pc == self.pc) {
-                self.last_label = Some(self.program.str(lbl.name).to_owned());
+            // O(1) label tracking with zero String allocation!
+            if let Some(&name_id) = label_by_pc.get(&self.pc) {
+                self.last_label_id = Some(name_id);
+                self.last_label_fallback = None;
             }
             self.pc += 1;
             used += 1;
@@ -400,13 +549,13 @@ impl Vm {
         Ok(std::mem::take(&mut self.intents))
     }
 
-    fn exec_op(&mut self, op: Op) -> Result<()> {
+    fn exec_op(&mut self, op: &Op) -> Result<()> {
         match op {
             Op::PushNull => self.stack.push(Value::Null),
-            Op::PushBool(b) => self.stack.push(Value::Bool(b)),
-            Op::PushInt(n) => self.stack.push(Value::Int(n)),
-            Op::PushFloat(f) => self.stack.push(Value::Float(f)),
-            Op::PushStr(id) => self.stack.push(Value::Str(self.program.str(id).to_owned())),
+            Op::PushBool(b) => self.stack.push(Value::Bool(*b)),
+            Op::PushInt(n) => self.stack.push(Value::Int(*n)),
+            Op::PushFloat(f) => self.stack.push(Value::Float(*f)),
+            Op::PushStr(id) => self.stack.push(Value::Str(self.program.str(*id).to_owned())),
             Op::LoadVar(id) => {
                 let v = self
                     .vars
@@ -425,7 +574,7 @@ impl Vm {
                 let v = self
                     .frames
                     .last()
-                    .and_then(|f| f.locals.get(slot as usize))
+                    .and_then(|f| f.locals.get(*slot as usize))
                     .cloned()
                     .unwrap_or(Value::Null);
                 self.stack.push(v);
@@ -433,7 +582,7 @@ impl Vm {
             Op::StoreLocal(slot) => {
                 let v = self.pop()?;
                 if let Some(frame) = self.frames.last_mut() {
-                    if let Some(dst) = frame.locals.get_mut(slot as usize) {
+                    if let Some(dst) = frame.locals.get_mut(*slot as usize) {
                         *dst = v;
                     }
                 }
@@ -444,11 +593,11 @@ impl Vm {
             Op::BinOp(bop) => {
                 let rhs = self.pop()?;
                 let lhs = self.pop()?;
-                self.stack.push(eval_binop(bop, lhs, rhs)?);
+                self.stack.push(eval_binop(*bop, lhs, rhs)?);
             }
             Op::UnaryOp(uop) => {
                 let v = self.pop()?;
-                let res = match uop {
+                let res = match *uop {
                     UnaryOp::Not => Value::Bool(!v.as_bool()),
                     UnaryOp::Neg => match v {
                         Value::Int(n) => Value::Int(n.wrapping_neg()),
@@ -459,6 +608,7 @@ impl Vm {
                 self.stack.push(res);
             }
             Op::RandInt { dst, min, max } => {
+                let (min, max) = (*min, *max);
                 let val = if max <= min {
                     min
                 } else {
@@ -471,15 +621,16 @@ impl Vm {
                 }
             }
             Op::Jump(target) => {
-                self.pc = target;
+                self.pc = *target;
             }
             Op::JumpIfFalse(target) => {
                 let cond = self.pop()?;
                 if !cond.as_bool() {
-                    self.pc = target;
+                    self.pc = *target;
                 }
             }
             Op::Call { func, argc } => {
+                let (func, argc) = (*func, *argc);
                 if self.frames.len() >= MAX_CALL_DEPTH {
                     return Err(NirError::new("E_STACK", "call", "call depth exceeded"));
                 }
@@ -502,7 +653,7 @@ impl Vm {
                 self.pc = entry_pc;
             }
             Op::Ret { has_value } => {
-                let ret_val = if has_value { Some(self.pop()?) } else { None };
+                let ret_val = if *has_value { Some(self.pop()?) } else { None };
                 let frame = self.frames.pop();
                 match frame {
                     Some(f) if f.return_pc != u32::MAX => {
@@ -518,7 +669,7 @@ impl Vm {
             }
             Op::End { outcome } => {
                 self.commit_staged_if_dirty(Transition::Cut, 0, false);
-                self.outcome = Some(self.program.str(outcome).to_owned());
+                self.outcome = Some(self.program.str(*outcome).to_owned());
             }
 
             // --- Persistent Scene Graph ---
@@ -528,25 +679,27 @@ impl Vm {
                 asset,
                 transform,
             } => {
+                let (layer, parent, asset) = (*layer, *parent, *asset);
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     existing.parent = parent;
                     if asset.is_some() {
                         existing.asset = asset;
                     }
-                    existing.transform = *transform;
+                    existing.transform = (**transform).clone();
                 } else {
                     self.pending_layers.push(LayerState {
                         id: layer,
                         parent,
                         asset,
-                        transform: *transform,
+                        transform: (**transform).clone(),
                         shake_offset: [0.0, 0.0],
                     });
                 }
                 self.pending_dirty = true;
             }
             Op::LayerAsset { layer, asset } => {
+                let (layer, asset) = (*layer, *asset);
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     existing.asset = asset;
@@ -562,6 +715,7 @@ impl Vm {
                 self.pending_dirty = true;
             }
             Op::LayerPatch { layer, prop, value } => {
+                let (layer, prop, value) = (*layer, *prop, *value);
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     apply_layer_prop(&mut existing.transform, prop, value);
@@ -569,6 +723,7 @@ impl Vm {
                 }
             }
             Op::LayerRemove { layer } => {
+                let layer = *layer;
                 self.ensure_pending_synced();
                 self.pending_layers
                     .retain(|l| l.id != layer && l.parent != Some(layer));
@@ -591,7 +746,7 @@ impl Vm {
                 duration_us,
                 wait,
             } => {
-                self.commit_staged_if_dirty(transition, duration_us, wait);
+                self.commit_staged_if_dirty(*transition, *duration_us, *wait);
             }
             Op::Tween {
                 target,
@@ -601,6 +756,8 @@ impl Vm {
                 easing,
                 wait,
             } => {
+                let (target, prop, to, duration_us, easing, wait) =
+                    (*target, *prop, *to, *duration_us, *easing, *wait);
                 // Flush pending layer additions so tween finds newly created layers!
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
@@ -627,6 +784,7 @@ impl Vm {
                 }
             }
             Op::Shake { target, spec, wait } => {
+                let (target, spec, wait) = (*target, *spec, *wait);
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
                 }
@@ -654,6 +812,14 @@ impl Vm {
                 reveal_us,
                 append,
             } => {
+                let (speaker, speaker_color, text, voice, reveal_us, append) = (
+                    *speaker,
+                    *speaker_color,
+                    *text,
+                    *voice,
+                    *reveal_us,
+                    *append,
+                );
                 // Auto-commit any staged scene edits cleanly before displaying dialogue.
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
@@ -661,14 +827,13 @@ impl Vm {
                 let speaker_str = speaker
                     .map(|id| self.program.str(id).to_owned())
                     .unwrap_or_default();
-                let entry = self
-                    .program
-                    .text(&self.locale, text)
-                    .cloned()
-                    .unwrap_or_else(|| TextEntry::plain(""));
-
-                let (mut full_text, mut spans, mut pauses) = self.instantiate_text(&entry);
-                let prev_graphemes = if append {
+                let (mut full_text, mut spans, mut pauses) =
+                    if let Some(entry) = self.program.text(&self.locale, text) {
+                        self.instantiate_text(entry)
+                    } else {
+                        (String::new(), Vec::new(), Vec::new())
+                    };
+                let (prev_graphemes, prev_bytes) = if append {
                     if let Some(prev) = &self.dialogue {
                         let prefix_bytes = prev.full_text.len();
                         let prefix_graphemes = prev.total_graphemes;
@@ -688,12 +853,12 @@ impl Vm {
                         let mut combined_pauses = prev.pauses.clone();
                         combined_pauses.extend(pauses);
                         pauses = combined_pauses;
-                        prefix_graphemes
+                        (prefix_graphemes, prefix_bytes)
                     } else {
-                        0
+                        (0, 0)
                     }
                 } else {
-                    0
+                    (0, 0)
                 };
 
                 let total_graphemes = full_text.graphemes(true).count();
@@ -719,6 +884,11 @@ impl Vm {
                     );
                 }
 
+                let visible_bytes = if finished {
+                    full_text.len()
+                } else {
+                    prev_bytes
+                };
                 let dlg = DialogueState {
                     text_id: text,
                     speaker: speaker_str.clone(),
@@ -734,6 +904,7 @@ impl Vm {
                     } else {
                         prev_graphemes
                     },
+                    visible_bytes,
                     total_graphemes,
                     paused_for_click: false,
                     pause_remaining_us: 0,
@@ -756,6 +927,7 @@ impl Vm {
                 transition,
                 duration_us,
             } => {
+                let (visible, transition, duration_us) = (*visible, *transition, *duration_us);
                 if duration_us == 0 || matches!(transition, Transition::Cut) {
                     self.dialogue_visible = visible;
                     self.window_reveal = None;
@@ -777,6 +949,8 @@ impl Vm {
                 timeout_us,
                 default_idx,
             } => {
+                let (result_var, cancel_pc, timeout_us, default_idx) =
+                    (*result_var, *cancel_pc, *timeout_us, *default_idx);
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
                 }
@@ -827,6 +1001,7 @@ impl Vm {
                 duration_us,
                 skippable,
             } => {
+                let (duration_us, skippable) = (*duration_us, *skippable);
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
                 }
@@ -849,13 +1024,13 @@ impl Vm {
                 loop_region,
             } => {
                 self.play_audio_internal(
-                    channel,
-                    bus,
-                    asset,
-                    gain,
-                    looped,
-                    fade_in_us,
-                    loop_region,
+                    *channel,
+                    *bus,
+                    *asset,
+                    *gain,
+                    *looped,
+                    *fade_in_us,
+                    *loop_region,
                     None,
                 );
             }
@@ -863,6 +1038,7 @@ impl Vm {
                 channel,
                 fade_out_us,
             } => {
+                let (channel, fade_out_us) = (*channel, *fade_out_us);
                 self.audio.retain(|c| c.channel != channel);
                 self.intents.push(VmIntent::StopAudio {
                     channel,
@@ -870,10 +1046,12 @@ impl Vm {
                 });
             }
             Op::AudioPause { bus, paused } => {
+                let (bus, paused) = (*bus, *paused);
                 self.audio_paused[bus as usize] = paused;
                 self.intents.push(VmIntent::PauseAudioBus { bus, paused });
             }
             Op::VideoPlay { asset, skippable } => {
+                let (asset, skippable) = (*asset, *skippable);
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
                 }
@@ -883,20 +1061,20 @@ impl Vm {
 
             // --- Profile / Unlocks ---
             Op::ProfileSetFlag(key) => {
-                let s = self.program.str(key).to_owned();
+                let s = self.program.str(*key).to_owned();
                 if self.profile.flags.insert(s) {
                     self.intents.push(VmIntent::ProfileChanged);
                 }
             }
             Op::ProfileGetFlag { dst, key } => {
-                let flag = self.profile.flags.contains(self.program.str(key));
+                let flag = self.profile.flags.contains(self.program.str(*key));
                 if let Some(slot) = self.vars.get_mut(dst.0 as usize) {
                     *slot = Value::Bool(flag);
                 }
             }
             Op::ProfileSetVal { key } => {
                 let val = self.pop()?;
-                let k = self.program.str(key).to_owned();
+                let k = self.program.str(*key).to_owned();
                 self.profile.values.insert(k, val);
                 self.intents.push(VmIntent::ProfileChanged);
             }
@@ -904,7 +1082,7 @@ impl Vm {
                 let val = self
                     .profile
                     .values
-                    .get(self.program.str(key))
+                    .get(self.program.str(*key))
                     .cloned()
                     .unwrap_or(Value::Null);
                 if let Some(slot) = self.vars.get_mut(dst.0 as usize) {
@@ -1101,13 +1279,24 @@ impl Vm {
 
     /// Advances all active clocks (tweens, shakes, transitions, reveal, timers).
     pub fn tick(&mut self, delta_us: u64, text_speed: f32, reduced_motion: bool) -> Vec<VmIntent> {
+        self.tick_with_dirty(delta_us, text_speed, reduced_motion).0
+    }
+
+    /// Advances all active clocks and returns `(intents, visual_changed)` so `Runtime`
+    /// never rebuilds `DrawPacket` on non-visual ticks (e.g. between typewriter glyphs or `Op::Wait`).
+    pub fn tick_with_dirty(
+        &mut self,
+        delta_us: u64,
+        text_speed: f32,
+        reduced_motion: bool,
+    ) -> (Vec<VmIntent>, bool) {
         self.intents.clear();
         if delta_us == 0 || self.outcome.is_some() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
+        let mut visual_changed = false;
 
         // 1. Tweens
-        let mut completed_tweens = Vec::new();
         let mut i = 0;
         while i < self.tweens.len() {
             self.tweens[i].elapsed_us = if reduced_motion {
@@ -1126,8 +1315,11 @@ impl Vm {
             let prop = t.prop;
             let done = t.elapsed_us >= t.duration_us;
             self.write_prop(target, prop, val);
+            if !matches!(target, TweenTarget::Audio(_)) {
+                visual_changed = true;
+            }
             if done {
-                completed_tweens.push(self.tweens.remove(i));
+                self.tweens.remove(i);
             } else {
                 i += 1;
             }
@@ -1136,41 +1328,45 @@ impl Vm {
             self.wait = WaitReason::None;
         }
 
-        // 2. Shakes
-        for layer in &mut self.layers {
-            layer.shake_offset = [0.0, 0.0];
-        }
-        self.dialogue_shake = [0.0, 0.0];
-        let mut s_idx = 0;
-        while s_idx < self.shakes.len() {
-            self.shakes[s_idx].elapsed_us = if reduced_motion {
-                self.shakes[s_idx].spec.duration_us
-            } else {
-                self.shakes[s_idx].elapsed_us.saturating_add(delta_us)
-            };
-            let s = &self.shakes[s_idx];
-            if s.elapsed_us >= s.spec.duration_us {
-                self.shakes.remove(s_idx);
-            } else {
-                let offset = s.spec.sample(s.elapsed_us, s.seed);
-                match s.target {
-                    TweenTarget::Layer(lid) => {
-                        if let Some(layer) = self.layers.iter_mut().find(|l| l.id == lid) {
-                            layer.shake_offset = offset;
-                        }
-                    }
-                    TweenTarget::DialogueBox => self.dialogue_shake = offset,
-                    TweenTarget::Audio(_) => {}
-                }
-                s_idx += 1;
+        // 2. Shakes (only reset/redraw when shakes were active or clearing non-zero offsets)
+        if !self.shakes.is_empty() {
+            visual_changed = true;
+            for layer in &mut self.layers {
+                layer.shake_offset = [0.0, 0.0];
             }
-        }
-        if self.wait == WaitReason::Shake && self.shakes.is_empty() {
-            self.wait = WaitReason::None;
+            self.dialogue_shake = [0.0, 0.0];
+            let mut s_idx = 0;
+            while s_idx < self.shakes.len() {
+                self.shakes[s_idx].elapsed_us = if reduced_motion {
+                    self.shakes[s_idx].spec.duration_us
+                } else {
+                    self.shakes[s_idx].elapsed_us.saturating_add(delta_us)
+                };
+                let s = &self.shakes[s_idx];
+                if s.elapsed_us >= s.spec.duration_us {
+                    self.shakes.remove(s_idx);
+                } else {
+                    let offset = s.spec.sample(s.elapsed_us, s.seed);
+                    match s.target {
+                        TweenTarget::Layer(lid) => {
+                            if let Some(layer) = self.layers.iter_mut().find(|l| l.id == lid) {
+                                layer.shake_offset = offset;
+                            }
+                        }
+                        TweenTarget::DialogueBox => self.dialogue_shake = offset,
+                        TweenTarget::Audio(_) => {}
+                    }
+                    s_idx += 1;
+                }
+            }
+            if self.wait == WaitReason::Shake && self.shakes.is_empty() {
+                self.wait = WaitReason::None;
+            }
         }
 
         // 3. Stage transition
         if let Some(tr) = &mut self.transition {
+            visual_changed = true;
             tr.elapsed_us = if reduced_motion {
                 tr.duration_us
             } else {
@@ -1186,6 +1382,7 @@ impl Vm {
 
         // 4. Text window reveal
         if let Some(rev) = &mut self.window_reveal {
+            visual_changed = true;
             rev.elapsed_us = if reduced_motion {
                 rev.duration_us
             } else {
@@ -1197,9 +1394,11 @@ impl Vm {
             }
         }
 
-        // 5. Dialogue reveal
+        // 5. Dialogue reveal (only mark visual_changed when visible_graphemes or finished actually changes!)
         if let Some(dlg) = &mut self.dialogue {
             if !dlg.finished && !dlg.paused_for_click {
+                let prev_vis = dlg.visible_graphemes;
+                let prev_fin = dlg.finished;
                 let mut rem = delta_us;
                 if dlg.pause_remaining_us > 0 {
                     let consume = rem.min(dlg.pause_remaining_us);
@@ -1209,6 +1408,7 @@ impl Vm {
                 if rem > 0 && dlg.pause_remaining_us == 0 {
                     if text_speed <= 0.0 || dlg.reveal_us == 0 {
                         dlg.visible_graphemes = dlg.total_graphemes;
+                        dlg.visible_bytes = dlg.full_text.len();
                         dlg.finished = true;
                     } else {
                         let step_us = ((dlg.reveal_us as f64) / (text_speed as f64).max(0.1))
@@ -1216,34 +1416,41 @@ impl Vm {
                         dlg.elapsed_us = dlg.elapsed_us.saturating_add(rem);
                         let advance = (dlg.elapsed_us / step_us) as usize;
                         dlg.elapsed_us %= step_us;
-                        let target = (dlg.visible_graphemes + advance).min(dlg.total_graphemes);
-                        // Check inline pauses encountered along the way.
-                        let mut stopped = target;
-                        for pause in &mut dlg.pauses {
-                            if !pause.triggered
-                                && pause.grapheme_index > dlg.visible_graphemes
-                                && pause.grapheme_index <= target
-                            {
-                                pause.triggered = true;
-                                stopped = pause.grapheme_index;
-                                if pause.click {
-                                    dlg.paused_for_click = true;
-                                } else {
-                                    dlg.pause_remaining_us = pause.duration_us;
+                        if advance > 0 {
+                            let target = (dlg.visible_graphemes + advance).min(dlg.total_graphemes);
+                            // Check inline pauses encountered along the way.
+                            let mut stopped = target;
+                            for pause in &mut dlg.pauses {
+                                if !pause.triggered
+                                    && pause.grapheme_index > dlg.visible_graphemes
+                                    && pause.grapheme_index <= target
+                                {
+                                    pause.triggered = true;
+                                    stopped = pause.grapheme_index;
+                                    if pause.click {
+                                        dlg.paused_for_click = true;
+                                    } else {
+                                        dlg.pause_remaining_us = pause.duration_us;
+                                    }
+                                    break;
                                 }
-                                break;
                             }
-                        }
-                        dlg.visible_graphemes = stopped;
-                        if dlg.visible_graphemes >= dlg.total_graphemes && !dlg.paused_for_click {
-                            dlg.finished = true;
+                            let actual_delta = stopped.saturating_sub(dlg.visible_graphemes);
+                            dlg.visible_graphemes = stopped;
+                            if dlg.visible_graphemes >= dlg.total_graphemes && !dlg.paused_for_click {
+                                dlg.finished = true;
+                            }
+                            dlg.advance_visible_bytes(actual_delta);
                         }
                     }
+                }
+                if dlg.visible_graphemes != prev_vis || dlg.finished != prev_fin {
+                    visual_changed = true;
                 }
             }
         }
 
-        // 6. Wait timer
+        // 6. Wait timer (pure wait does NOT alter visuals until it finishes & steps VM)
         if let WaitReason::Timer {
             remaining_us,
             skippable,
@@ -1266,11 +1473,12 @@ impl Vm {
                 if choice.elapsed_us >= timeout {
                     let idx = choice.default_idx.unwrap_or(0) as usize;
                     self.choose_internal(idx);
+                    visual_changed = true;
                 }
             }
         }
 
-        std::mem::take(&mut self.intents)
+        (std::mem::take(&mut self.intents), visual_changed)
     }
 
     /// Handles player advance input (click / Space / Enter).
@@ -1286,6 +1494,7 @@ impl Vm {
                     if !dlg.finished {
                         // First click finishes revealing current text immediately!
                         dlg.visible_graphemes = dlg.total_graphemes;
+                        dlg.visible_bytes = dlg.full_text.len();
                         dlg.pause_remaining_us = 0;
                         dlg.finished = true;
                         return Vec::new();
@@ -1473,6 +1682,31 @@ impl Vm {
                         if let Some(a) = item.hover_image {
                             add(a);
                         }
+                        // Peek first 4 ops of each choice target so selecting a branch is instant!
+                        let mut bpc = item.target_pc as usize;
+                        for _ in 0..4 {
+                            let Some(bop) = self.program.ops.get(bpc) else {
+                                break;
+                            };
+                            match bop {
+                                Op::LayerSet { asset: Some(a), .. }
+                                | Op::LayerAsset { asset: Some(a), .. } => add(*a),
+                                Op::Say { voice: Some(v), .. } => add(*v),
+                                Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => {
+                                    add(*asset)
+                                }
+                                Op::StageCommit { transition, .. } => {
+                                    if let Some(m) = transition.mask_asset() {
+                                        add(m);
+                                    }
+                                }
+                                Op::Jump(_) | Op::Choice { .. } | Op::End { .. } | Op::Ret { .. } => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            bpc += 1;
+                        }
                     }
                     break;
                 }
@@ -1485,10 +1719,11 @@ impl Vm {
     }
 
     fn push_history(&mut self, entry: HistoryEntry) {
-        if self.history.len() >= MAX_HISTORY {
-            self.history.remove(0);
+        if self.history.len() >= MAX_HISTORY + HISTORY_ROLLBACK_SLACK {
+            self.history.pop_front();
         }
-        self.history.push(entry);
+        self.history.push_back(Arc::new(entry));
+        self.history_seq = self.history_seq.wrapping_add(1);
     }
 
     fn pop(&mut self) -> Result<Value> {

@@ -191,6 +191,24 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Compiles, optimizes, tree-shakes, and packs a NIR v2 project into `.nirpak`!
 pub fn compile_project(root: &Path, opt: &OptimizeConfig) -> Result<BuiltBundle> {
+    compile_project_with_compression(root, opt, flate2::Compression::default())
+}
+
+/// Ultra-fast compilation preset for `novelc dev` live hot-reload:
+/// skips transcoding, reads image headers only, and uses fast zlib compression.
+pub fn compile_project_fast(root: &Path) -> Result<BuiltBundle> {
+    let opt = OptimizeConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    compile_project_with_compression(root, &opt, flate2::Compression::fast())
+}
+
+fn compile_project_with_compression(
+    root: &Path,
+    opt: &OptimizeConfig,
+    compression: flate2::Compression,
+) -> Result<BuiltBundle> {
     let manifest_path = root.join("game.toml");
     let manifest: ProjectManifest = if manifest_path.is_file() {
         toml::from_str(&fs::read_to_string(&manifest_path)?)
@@ -294,38 +312,173 @@ pub fn compile_project(root: &Path, opt: &OptimizeConfig) -> Result<BuiltBundle>
         ui.line_height = lh;
     }
 
-    // Collect characters directly from strings + texts for HarfBuzz font subsetting
-    let temp_prog = NirProgram {
-        features: 0,
-        meta: GameMeta {
-            game_id: manifest.game.id.clone(),
-            title: manifest.game.title.clone(),
-            version: manifest.game.version.clone(),
-            stage_width: manifest.game.stage[0],
-            stage_height: manifest.game.stage[1],
-            default_locale: manifest.game.locale.clone(),
-            locales: locales.clone(),
-            entry_func: FuncId(0),
-            save_slots: manifest.game.save_slots,
-            default_reveal_us: manifest.game.default_reveal_ms as u64 * 1000,
-            title_bg: remap_opt(title_bg),
-            title_bgm: remap_opt(title_bgm),
-            ui_fonts: ui_fonts.clone(),
-            text_fonts: ui_fonts.clone(),
-        },
-        strings: compiled.strings.clone(),
-        vars: compiled.vars.clone(),
-        funcs: compiled.funcs.clone(),
-        labels: compiled.labels.clone(),
-        ops: compiled.ops.clone(),
-        texts: texts_by_locale.clone(),
-        ui: ui.clone(),
-        assets: Vec::new(),
+    // Collect characters directly without cloning NirProgram!
+    let has_fonts = kept_indices
+        .iter()
+        .any(|&idx| discovered[idx].kind == AssetKind::Font);
+    let used_chars = if opt.enabled && opt.subset_fonts && has_fonts {
+        collect_all_chars_parts(&manifest.game.title, &compiled.strings, &texts_by_locale)
+    } else {
+        std::collections::BTreeSet::new()
     };
-    let used_chars = temp_prog.collect_all_chars();
 
-    // Optimize each kept asset (with content-hash cache under `.nir/cache/`)
+    // Optimize all kept assets in parallel across CPU cores (preserving deterministic ID order)!
     let cache_dir = root.join(".nir").join("cache");
+    struct AssetWorkOutput {
+        bytes: Vec<u8>,
+        codec: MediaCodec,
+        width: u32,
+        height: u32,
+        trim: Option<SpriteTrim>,
+        duration_us: u64,
+        sample_rate: u32,
+        channels: u16,
+        loop_region: Option<AudioLoopRegion>,
+        saved_bytes: i64,
+        features: u32,
+        trimmed: bool,
+    }
+
+    let optimize_one = |orig_idx: usize| -> Result<AssetWorkOutput> {
+        let src = &discovered[orig_idx];
+        let raw = fs::read(&src.path)
+            .with_context(|| format!("reading asset {}", src.path.display()))?;
+        let mut features = 0u32;
+        let mut trimmed = false;
+        let out = match src.kind {
+            AssetKind::Image => {
+                let res = optimize_image(&raw, src.codec, opt, &cache_dir)?;
+                let saved_bytes = res.saved_bytes;
+                if res.codec == MediaCodec::Webp {
+                    features |= FEATURE_WEBP;
+                }
+                if res.trim.is_some() {
+                    features |= FEATURE_TRIMMED;
+                    trimmed = true;
+                }
+                AssetWorkOutput {
+                    bytes: res.bytes,
+                    codec: res.codec,
+                    width: res.width,
+                    height: res.height,
+                    trim: res.trim,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes,
+                    features,
+                    trimmed,
+                }
+            }
+            AssetKind::Audio => {
+                let res = optimize_audio(&raw, src.codec, opt, &cache_dir)?;
+                let saved_bytes = res.saved_bytes;
+                match res.codec {
+                    MediaCodec::Mp3 => features |= FEATURE_MP3,
+                    MediaCodec::Ogg => features |= FEATURE_OGG,
+                    _ => {}
+                }
+                AssetWorkOutput {
+                    bytes: res.bytes,
+                    codec: res.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: res.duration_us,
+                    sample_rate: res.sample_rate,
+                    channels: res.channels,
+                    loop_region: res.loop_region,
+                    saved_bytes,
+                    features,
+                    trimmed,
+                }
+            }
+            AssetKind::Font => {
+                let orig_len = raw.len() as i64;
+                let sub = subset_font(&raw, &used_chars, opt, &cache_dir)?;
+                let saved_bytes = orig_len - sub.len() as i64;
+                AssetWorkOutput {
+                    bytes: sub,
+                    codec: src.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes,
+                    features,
+                    trimmed,
+                }
+            }
+            AssetKind::Video => {
+                features |= FEATURE_VIDEO;
+                AssetWorkOutput {
+                    bytes: raw,
+                    codec: src.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: 0,
+                    features,
+                    trimmed: false,
+                }
+            }
+            AssetKind::Raw => AssetWorkOutput {
+                bytes: raw,
+                codec: src.codec,
+                width: 0,
+                height: 0,
+                trim: None,
+                duration_us: 0,
+                sample_rate: 0,
+                channels: 0,
+                loop_region: None,
+                saved_bytes: 0,
+                features: 0,
+                trimmed: false,
+            },
+        };
+        Ok(out)
+    };
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(kept_indices.len().max(1));
+
+    let results: Vec<Result<AssetWorkOutput>> = if worker_count <= 1 || kept_indices.len() <= 1 {
+        kept_indices.iter().map(|&idx| optimize_one(idx)).collect()
+    } else {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let next_task = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<AssetWorkOutput>>>> =
+            (0..kept_indices.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..worker_count {
+                s.spawn(|| loop {
+                    let i = next_task.fetch_add(1, Ordering::Relaxed);
+                    if i >= kept_indices.len() {
+                        break;
+                    }
+                    let res = optimize_one(kept_indices[i]);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap())
+            .collect()
+    };
+
     let mut strings = compiled.strings;
     let mut assets_meta = Vec::with_capacity(kept_indices.len());
     let mut media_blobs = Vec::with_capacity(kept_indices.len());
@@ -333,92 +486,64 @@ pub fn compile_project(root: &Path, opt: &OptimizeConfig) -> Result<BuiltBundle>
     let mut trimmed_sprites = 0usize;
     let mut saved_bytes = 0i64;
 
-    for (new_idx, &orig_idx) in kept_indices.iter().enumerate() {
+    for (new_idx, (&orig_idx, res)) in kept_indices.iter().zip(results.into_iter()).enumerate() {
         let src = &discovered[orig_idx];
-        let raw = fs::read(&src.path)
-            .with_context(|| format!("reading asset {}", src.path.display()))?;
+        let out = res?;
         let name_str = StrId(strings.len() as u32);
         strings.push(src.name.clone());
-
-        let (bytes, codec, w, h, trim, dur, rate, ch, loop_reg) = match src.kind {
-            AssetKind::Image => {
-                let res = optimize_image(&raw, src.codec, opt, &cache_dir)?;
-                saved_bytes += res.saved_bytes;
-                if res.codec == MediaCodec::Webp {
-                    features |= FEATURE_WEBP;
-                }
-                if res.trim.is_some() {
-                    features |= FEATURE_TRIMMED;
-                    trimmed_sprites += 1;
-                }
-                (res.bytes, res.codec, res.width, res.height, res.trim, 0, 0, 0, None)
-            }
-            AssetKind::Audio => {
-                let res = optimize_audio(&raw, src.codec, opt, &cache_dir)?;
-                saved_bytes += res.saved_bytes;
-                match res.codec {
-                    MediaCodec::Mp3 => features |= FEATURE_MP3,
-                    MediaCodec::Ogg => features |= FEATURE_OGG,
-                    _ => {}
-                }
-                (
-                    res.bytes,
-                    res.codec,
-                    0,
-                    0,
-                    None,
-                    res.duration_us,
-                    res.sample_rate,
-                    res.channels,
-                    res.loop_region,
-                )
-            }
-            AssetKind::Font => {
-                let orig_len = raw.len() as i64;
-                let sub = subset_font(&raw, &used_chars, opt, &cache_dir)?;
-                saved_bytes += orig_len - sub.len() as i64;
-                (sub, src.codec, 0, 0, None, 0, 0, 0, None)
-            }
-            AssetKind::Video => {
-                features |= FEATURE_VIDEO;
-                (raw, src.codec, 0, 0, None, 0, 0, 0, None)
-            }
-            AssetKind::Raw => (raw, src.codec, 0, 0, None, 0, 0, 0, None),
-        };
-
+        features |= out.features;
+        saved_bytes += out.saved_bytes;
+        if out.trimmed {
+            trimmed_sprites += 1;
+        }
         assets_meta.push(AssetMeta {
             id: AssetId(new_idx as u32),
             name: name_str,
             kind: src.kind,
-            codec,
-            width: w,
-            height: h,
-            trim,
-            duration_us: dur,
-            sample_rate: rate,
-            channels: ch,
-            loop_region: loop_reg,
+            codec: out.codec,
+            width: out.width,
+            height: out.height,
+            trim: out.trim,
+            duration_us: out.duration_us,
+            sample_rate: out.sample_rate,
+            channels: out.channels,
+            loop_region: out.loop_region,
             offset: 0,
-            size: bytes.len() as u64,
+            size: out.bytes.len() as u64,
         });
-        media_blobs.push(bytes);
+        media_blobs.push(out.bytes);
     }
 
     let program = NirProgram {
         features,
-        meta: temp_prog.meta,
+        meta: GameMeta {
+            game_id: manifest.game.id.clone(),
+            title: manifest.game.title.clone(),
+            version: manifest.game.version.clone(),
+            stage_width: manifest.game.stage[0],
+            stage_height: manifest.game.stage[1],
+            default_locale: manifest.game.locale.clone(),
+            locales,
+            entry_func: FuncId(0),
+            save_slots: manifest.game.save_slots,
+            default_reveal_us: manifest.game.default_reveal_ms as u64 * 1000,
+            title_bg: remap_opt(title_bg),
+            title_bgm: remap_opt(title_bgm),
+            ui_fonts: ui_fonts.clone(),
+            text_fonts: ui_fonts,
+        },
         strings,
-        vars: temp_prog.vars,
-        funcs: temp_prog.funcs,
-        labels: temp_prog.labels,
-        ops: temp_prog.ops,
-        texts: temp_prog.texts,
-        ui: temp_prog.ui,
+        vars: compiled.vars,
+        funcs: compiled.funcs,
+        labels: compiled.labels,
+        ops: compiled.ops,
+        texts: texts_by_locale,
+        ui,
         assets: assets_meta,
     };
 
     let blob_refs: Vec<&[u8]> = media_blobs.iter().map(Vec::as_slice).collect();
-    let nirpak = encode_nirpak(&program, &blob_refs)?;
+    let nirpak = encode_nirpak_with_compression(&program, &blob_refs, compression)?;
 
     let summary = BuildSummary {
         game_id: program.meta.game_id.clone(),
@@ -547,17 +672,16 @@ pub fn package_android(
         nir_apk::key::SigningIdentity::load(&key_path)?
     };
 
-    let mut entries = vec![
+    let entries = [
         (
-            "lib/arm64-v8a/libplayer.so".to_owned(),
-            nir_apk::EntrySource::File(libplayer_so.to_path_buf()),
+            "lib/arm64-v8a/libplayer.so",
+            nir_apk::EntryRef::File(libplayer_so),
         ),
         (
-            "assets/game.nirpak".to_owned(),
-            nir_apk::EntrySource::Bytes(built.nirpak.clone()),
+            "assets/game.nirpak",
+            nir_apk::EntryRef::Bytes(&built.nirpak),
         ),
     ];
-    let _ = &mut entries;
 
     let pkg_suffix: String = built
         .program
@@ -580,7 +704,7 @@ pub fn package_android(
     if let Some(parent) = out_apk.parent() {
         fs::create_dir_all(parent)?;
     }
-    nir_apk::build_apk(out_apk, &apk_spec, &entries, &key)?;
+    nir_apk::build_apk_borrowed(out_apk, &apk_spec, &entries, &key)?;
     Ok(())
 }
 
@@ -699,5 +823,27 @@ label ending:
         assert!(!nirpak_asset_slice(&built.nirpak, media_base, hero_meta)
             .unwrap()
             .is_empty());
+
+        // Second compile hits metadata-backed disk cache without losing trim/dimensions!
+        let cached = compile_project(dir.path(), &OptimizeConfig::default()).unwrap();
+        assert_eq!(cached.summary.trimmed_sprites, 1);
+        assert_eq!(cached.summary.packed_assets, 2);
+        let (cached_prog, _) = decode_nirpak_header(&cached.nirpak).unwrap();
+        let cached_hero = cached_prog
+            .assets
+            .iter()
+            .find(|a| cached_prog.str(a.name) == "char/hero")
+            .unwrap();
+        assert_eq!(cached_hero.trim, Some(trim));
+
+        // Fast dev compile reads dimensions from headers without transcoding.
+        let fast = compile_project_fast(dir.path()).unwrap();
+        let (fast_prog, _) = decode_nirpak_header(&fast.nirpak).unwrap();
+        let fast_sky = fast_prog
+            .assets
+            .iter()
+            .find(|a| fast_prog.str(a.name) == "bg/sky")
+            .unwrap();
+        assert_eq!((fast_sky.width, fast_sky.height), (64, 64));
     }
 }

@@ -7,12 +7,13 @@
 
 use nir_ir::*;
 use nir_ui::{DrawPacket, Messages, Screen, SlotSummary, UiContext};
-use nir_vm::{ProfileData, SaveSnapshot, Vm, VmIntent, WaitReason};
-use std::collections::{BTreeSet, VecDeque};
+use nir_vm::{ProfileData, RollbackCheckpoint, SaveSnapshot, Vm, VmIntent, WaitReason};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 const MAX_ROLLBACK_CHECKPOINTS: usize = 32;
 const SKIP_INTERVAL_US: u64 = 55_000;
+const PROFILE_FLUSH_INTERVAL_US: u64 = 5_000_000;
 
 /// Typed commands sent from `Runtime` to the platform host (Native / Web / Mobile).
 #[derive(Debug, Clone, PartialEq)]
@@ -74,17 +75,20 @@ pub struct Runtime {
     auto_elapsed_us: u64,
     skip_elapsed_us: u64,
     voice_playing: bool,
-    checkpoints: VecDeque<SaveSnapshot>,
+    checkpoints: VecDeque<RollbackCheckpoint>,
     pub slots: Vec<SlotSummary>,
     history_scroll: usize,
     hovered_hit: Option<u32>,
     toast: Option<(String, u64)>,
     loaded_assets: BTreeSet<AssetId>,
-    requested_assets: BTreeSet<AssetId>,
+    /// Tracks in-flight asset requests and whether they have already been promoted to `urgent`.
+    requested_assets: BTreeMap<AssetId, bool>,
     commands: Vec<HostCommand>,
     last_packet: DrawPacket,
     pub dirty: bool,
     pub paused_by_host: bool,
+    profile_dirty: bool,
+    profile_dirty_elapsed_us: u64,
     unix_clock: u64,
 }
 
@@ -136,15 +140,28 @@ impl Runtime {
             hovered_hit: None,
             toast: None,
             loaded_assets: BTreeSet::new(),
-            requested_assets: BTreeSet::new(),
+            requested_assets: BTreeMap::new(),
             commands: Vec::new(),
             last_packet: DrawPacket::default(),
             dirty: true,
             paused_by_host: false,
+            profile_dirty: false,
+            profile_dirty_elapsed_us: 0,
             unix_clock: 0,
         };
         rt.request_title_assets();
         Ok(rt)
+    }
+
+    /// Flushes any debounced persistent profile updates (`read_texts`, flags, values) to host storage.
+    /// Hosts should call this on window close, suspend, or `pagehide`.
+    pub fn flush_pending_saves(&mut self) {
+        if self.profile_dirty && self.frozen_vm.is_none() {
+            self.profile_dirty = false;
+            self.profile_dirty_elapsed_us = 0;
+            self.commands
+                .push(HostCommand::SaveProfile(self.vm.profile.clone()));
+        }
     }
 
     pub fn program(&self) -> &Arc<NirProgram> {
@@ -272,6 +289,7 @@ impl Runtime {
         self.dirty = true;
         match action {
             UiAction::NewGame => {
+                self.flush_pending_saves();
                 self.stop_all_audio();
                 self.frozen_vm = None;
                 self.checkpoints.clear();
@@ -356,17 +374,18 @@ impl Runtime {
             }
             UiAction::Rollback => {
                 if self.screen == Screen::Story {
-                    // Pop current checkpoint, restore previous one.
+                    // Pop current checkpoint, restore previous one in O(1) without cloning 500 history strings!
                     if self.checkpoints.len() >= 2 {
                         let _ = self.checkpoints.pop_back();
                         if let Some(prev) = self.checkpoints.back().cloned() {
-                            self.restore_snapshot_internal(prev);
+                            self.restore_checkpoint_internal(prev);
                         }
                     }
                 }
             }
             UiAction::OpenMenu => {
                 if self.screen == Screen::Story {
+                    self.flush_pending_saves();
                     self.auto = false;
                     self.skip = false;
                     self.return_screen = Screen::Story;
@@ -423,6 +442,7 @@ impl Runtime {
                 if self.frozen_vm.is_some() {
                     return;
                 }
+                self.flush_pending_saves();
                 let snap = self.vm.snapshot(self.unix_clock);
                 if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
                     entry.exists = true;
@@ -475,6 +495,7 @@ impl Runtime {
                 }
             }
             UiAction::ReturnTitle => {
+                self.flush_pending_saves();
                 self.stop_all_audio();
                 self.frozen_vm = None;
                 self.auto = false;
@@ -543,6 +564,7 @@ impl Runtime {
                 }
             }
             UiAction::Quit => {
+                self.flush_pending_saves();
                 self.commands.push(HostCommand::Quit);
             }
         }
@@ -550,11 +572,22 @@ impl Runtime {
 
     /// Applies a loaded save snapshot returned by the host storage layer.
     pub fn apply_loaded_snapshot(&mut self, snapshot: SaveSnapshot) {
+        self.flush_pending_saves();
         self.restore_snapshot_internal(snapshot);
         self.checkpoints.clear();
-        self.checkpoints.push_back(self.vm.snapshot(self.unix_clock));
+        self.checkpoints.push_back(self.vm.checkpoint());
         self.screen = Screen::Story;
         self.dirty = true;
+    }
+
+    fn restore_checkpoint_internal(&mut self, cp: RollbackCheckpoint) {
+        self.stop_all_audio();
+        let intents = self.vm.restore_checkpoint(cp);
+        self.auto = false;
+        self.skip = false;
+        self.interface_hidden = false;
+        self.handle_intents(intents);
+        self.request_active_and_lookahead_assets();
     }
 
     fn restore_snapshot_internal(&mut self, snapshot: SaveSnapshot) {
@@ -582,6 +615,14 @@ impl Runtime {
         }
         let delta_us = delta_us.min(250_000); // Cap frame hitch catch-up to 250ms.
 
+        // Debounced persistent profile flush (batches rapid read_texts updates into 1 write per 5s).
+        if self.profile_dirty {
+            self.profile_dirty_elapsed_us = self.profile_dirty_elapsed_us.saturating_add(delta_us);
+            if self.profile_dirty_elapsed_us >= PROFILE_FLUSH_INTERVAL_US {
+                self.flush_pending_saves();
+            }
+        }
+
         if let Some((_, rem)) = &mut self.toast {
             if delta_us >= *rem {
                 self.toast = None;
@@ -595,12 +636,11 @@ impl Runtime {
             return;
         }
 
-        let was_clocked = self.vm.needs_clock();
-        let intents = self
+        let (intents, visual_changed) = self
             .vm
-            .tick(delta_us, self.prefs.text_speed, self.prefs.reduced_motion);
+            .tick_with_dirty(delta_us, self.prefs.text_speed, self.prefs.reduced_motion);
         self.handle_intents(intents);
-        if was_clocked {
+        if visual_changed {
             self.dirty = true;
         }
 
@@ -763,10 +803,10 @@ impl Runtime {
                     self.commands.push(HostCommand::StopVideo);
                 }
                 VmIntent::ProfileChanged => {
-                    // Do not persist profile writes during isolated replay!
+                    // Debounce profile writes (flushed every 5s or on menu/save/quit/suspend)
+                    // instead of writing disk / IndexedDB on every dialogue line!
                     if self.frozen_vm.is_none() {
-                        self.commands
-                            .push(HostCommand::SaveProfile(self.vm.profile.clone()));
+                        self.profile_dirty = true;
                     }
                 }
                 VmIntent::Checkpoint => {
@@ -774,7 +814,7 @@ impl Runtime {
                         if self.checkpoints.len() >= MAX_ROLLBACK_CHECKPOINTS {
                             self.checkpoints.pop_front();
                         }
-                        self.checkpoints.push_back(self.vm.snapshot(self.unix_clock));
+                        self.checkpoints.push_back(self.vm.checkpoint());
                     }
                 }
             }
@@ -793,8 +833,20 @@ impl Runtime {
     }
 
     fn request_asset(&mut self, id: AssetId, urgent: bool) {
-        if !self.loaded_assets.contains(&id) && self.requested_assets.insert(id) {
-            self.commands.push(HostCommand::LoadAsset { id, urgent });
+        if self.loaded_assets.contains(&id) {
+            return;
+        }
+        match self.requested_assets.get(&id).copied() {
+            None => {
+                self.requested_assets.insert(id, urgent);
+                self.commands.push(HostCommand::LoadAsset { id, urgent });
+            }
+            Some(false) if urgent => {
+                // Promote an already-queued background prefetch to urgent!
+                self.requested_assets.insert(id, true);
+                self.commands.push(HostCommand::LoadAsset { id, urgent: true });
+            }
+            _ => {}
         }
     }
 
@@ -937,10 +989,23 @@ mod tests {
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第一句");
         assert!(rt.prepare_frame(1280.0, 720.0).is_some());
 
-        // Advance to line 2
+        // Advance to line 2 — profile write should be debounced (NOT emitted per line!)
         rt.dispatch(UiAction::Advance); // reveal
         rt.dispatch(UiAction::Advance); // next
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第二句");
+        assert_eq!(rt.vm().history.len(), 2);
+        let mid_cmds = rt.take_commands();
+        assert!(
+            !mid_cmds.iter().any(|c| matches!(c, HostCommand::SaveProfile(_))),
+            "SaveProfile must be debounced rather than written synchronously on every line"
+        );
+
+        // Opening menu or calling flush_pending_saves flushes the debounced profile write!
+        rt.flush_pending_saves();
+        let flushed = rt.take_commands();
+        assert!(flushed
+            .iter()
+            .any(|c| matches!(c, HostCommand::SaveProfile(_))));
 
         // Save slot 0
         rt.dispatch(UiAction::SaveSlot(0));
@@ -951,12 +1016,30 @@ mod tests {
         });
         assert!(saved.is_some());
 
-        // Rollback returns to line 1
+        // Rollback returns to line 1 and truncates history back to 1 entry in O(1)!
         rt.dispatch(UiAction::Rollback);
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第一句");
+        assert_eq!(rt.vm().history.len(), 1);
 
-        // Load slot 0 restores line 2
+        // Load slot 0 restores line 2 and its full 2-entry history
         rt.apply_loaded_snapshot(saved.unwrap());
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第二句");
+        assert_eq!(rt.vm().history.len(), 2);
+    }
+
+    #[test]
+    fn dirty_gating_ignores_sub_grapheme_and_wait_ticks() {
+        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
+            .unwrap();
+        rt.dispatch(UiAction::NewGame);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        // default_reveal_us = 10_000us; a 3_000us tick doesn't reveal a new grapheme -> no redraw!
+        rt.tick(3_000);
+        assert!(!rt.dirty);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_none());
+        // Another 8_000us crosses 10_000us -> reveals 1 grapheme -> marks dirty!
+        rt.tick(8_000);
+        assert!(rt.dirty);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
     }
 }

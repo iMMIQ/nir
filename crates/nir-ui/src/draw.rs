@@ -83,6 +83,23 @@ impl TextRun {
         self.cache_key = h.finish();
     }
 
+    /// Cache key for the shadow pass: reuses `self.cache_key` directly when `emphasis` is empty
+    /// (zero extra shaping!), or hashes without `emphasis` so shadow text stays shadow-colored.
+    pub fn shadow_cache_key(&self) -> u64 {
+        if self.emphasis.is_empty() {
+            return self.cache_key;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.text.hash(&mut h);
+        self.width.to_bits().hash(&mut h);
+        self.size.to_bits().hash(&mut h);
+        self.line_height.to_bits().hash(&mut h);
+        let empty: &[(usize, usize)] = &[];
+        empty.hash(&mut h);
+        self.font_assets.hash(&mut h);
+        h.finish()
+    }
+
     pub fn shadow_run(&self) -> Option<Self> {
         let s = self.shadow?;
         let mut r = self.clone();

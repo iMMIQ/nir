@@ -56,7 +56,7 @@ anyhow = "1"
 tempfile = "3"
 winit = "0.30"
 pollster = "0.4"
-rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3", "vorbis"] }
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "pcm", "wav", "ogg", "vorbis", "flac"] }
 rfd = { version = "0.15", default-features = false }
 android-activity = { version = "0.6", features = ["native-activity"] }
@@ -83,11 +83,15 @@ nir-import-livemaker = { path = "crates/nir-import-livemaker" }
 nir-import-krkr = { path = "crates/nir-import-krkr" }
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
 
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }

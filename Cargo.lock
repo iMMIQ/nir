@@ -1697,6 +1697,7 @@ dependencies = [
  "nir-ir",
  "nir-ui",
  "web-sys",
+ "webp",
  "wgpu",
 ]
 
@@ -2552,7 +2553,6 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
- "symphonia",
 ]
 
 [[package]]

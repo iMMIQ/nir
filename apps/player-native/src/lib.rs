@@ -1,8 +1,8 @@
 //! Unified Native Player for Windows, Linux, macOS, and Android.
 //!
-//! Combines `nir-runtime` + `nir-render` + zero-copy `memmap2` `.nirpak` +
-//! background image decoding + `rodio`/`symphonia` gapless audio + atomic local saves.
-//! Zero self-hashing (`exe_check`), zero `recovery_ui_probe`, zero OS-split crates!
+//! Combines `nir-runtime` + `nir-render` + zero-copy `memmap2` `.nirpak` (desktop & Android APK fd) +
+//! multi-worker priority image decode pool (`urgent` ahead of prefetch) + `EventLoopProxy` wakeup +
+//! streaming/LRU background `rodio`/`symphonia` audio + async indexed local saves.
 
 pub mod audio;
 pub mod pak;
@@ -14,17 +14,22 @@ use nir_ir::{AssetId, AssetKind, UiAction};
 use nir_render::{decode_image, wgpu, Renderer, RendererBackend};
 use nir_runtime::{HostCommand, Runtime};
 use pak::PakArchive;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::LocalStorage;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
+
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    ImageDecoded,
+}
 
 enum DecodedImage {
     Ok {
@@ -44,18 +49,142 @@ struct DecodeRequest {
     id: AssetId,
 }
 
+/// Priority work queue shared across background image decode worker threads:
+/// `urgent` (visible scene) requests always execute ahead of `prefetch` (lookahead) requests!
+struct DecodeQueueState {
+    urgent: VecDeque<DecodeRequest>,
+    prefetch: VecDeque<DecodeRequest>,
+    closed: bool,
+}
+
+struct DecodePool {
+    state: Arc<(Mutex<DecodeQueueState>, Condvar)>,
+}
+
+impl DecodePool {
+    fn spawn(res_tx: mpsc::Sender<DecodedImage>, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 4);
+        let state = Arc::new((
+            Mutex::new(DecodeQueueState {
+                urgent: VecDeque::new(),
+                prefetch: VecDeque::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        for idx in 0..workers {
+            let q = Arc::clone(&state);
+            let tx = res_tx.clone();
+            let p = proxy.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("nir-img-decode-{idx}"))
+                .spawn(move || loop {
+                    let req = {
+                        let (lock, cv) = &*q;
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(r) = guard.urgent.pop_front() {
+                                break r;
+                            }
+                            if let Some(r) = guard.prefetch.pop_front() {
+                                break r;
+                            }
+                            if guard.closed {
+                                return;
+                            }
+                            guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let msg = match req.pak.asset_bytes(req.id) {
+                        Some(bytes) => match decode_image(bytes) {
+                            Ok((width, height, rgba)) => DecodedImage::Ok {
+                                id: req.id,
+                                width,
+                                height,
+                                rgba,
+                            },
+                            Err(e) => DecodedImage::Err {
+                                id: req.id,
+                                error: e.to_string(),
+                            },
+                        },
+                        None => DecodedImage::Err {
+                            id: req.id,
+                            error: "asset missing from nirpak".into(),
+                        },
+                    };
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                    let _ = p.send_event(UserEvent::ImageDecoded);
+                });
+        }
+        Self { state }
+    }
+
+    fn enqueue(&self, req: DecodeRequest, urgent: bool) {
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if urgent {
+            // If already queued in prefetch, remove it from prefetch and promote to urgent!
+            if let Some(pos) = guard.prefetch.iter().position(|r| r.id == req.id) {
+                guard.prefetch.remove(pos);
+            }
+            guard.urgent.push_back(req);
+        } else {
+            guard.prefetch.push_back(req);
+        }
+        cv.notify_one();
+    }
+
+    fn promote(&self, id: AssetId) {
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = guard.prefetch.iter().position(|r| r.id == id) {
+            if let Some(req) = guard.prefetch.remove(pos) {
+                guard.urgent.push_back(req);
+                cv.notify_one();
+            }
+        }
+    }
+
+    fn clear_pending(&self) {
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.urgent.clear();
+        guard.prefetch.clear();
+    }
+}
+
+impl Drop for DecodePool {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.closed = true;
+        guard.urgent.clear();
+        guard.prefetch.clear();
+        cv.notify_all();
+    }
+}
+
 /// Runs the unified native player on Desktop (Windows / Linux / macOS).
 pub fn run_desktop(pak_path: &Path, watch_hot_reload: bool) -> Result<()> {
     let pak = Arc::new(PakArchive::open_file(pak_path)?);
-    let event_loop = EventLoop::new().context("creating winit event loop")?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("creating winit event loop")?;
     run_with_event_loop(pak, None, watch_hot_reload, event_loop)
 }
 
-/// Runs the unified native player on Android (`NativeActivity`), reading
-/// STORED `assets/game.nirpak` directly from Android `AssetManager`.
+/// Runs the unified native player on Android (`NativeActivity`), memory-mapping
+/// page-aligned STORED `assets/game.nirpak` directly from the APK via `open_file_descriptor`!
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
     use std::ffi::CString;
+    use std::fs::File;
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
     let name = CString::new("game.nirpak").unwrap();
@@ -63,10 +192,21 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
         .asset_manager()
         .open(&name)
         .context("opening assets/game.nirpak from APK AssetManager")?;
-    let bytes = asset.buffer()?.to_vec();
-    let pak = Arc::new(PakArchive::from_bytes(bytes)?);
+
+    // Zero-copy mmap directly from APK fd when stored uncompressed (4096-byte page-aligned)!
+    let pak = match asset.open_file_descriptor() {
+        Ok(opened) => {
+            let file = File::from(opened.fd);
+            match PakArchive::from_fd_region(&file, opened.offset as u64, opened.size) {
+                Ok(mapped) => Arc::new(mapped),
+                Err(_) => Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?),
+            }
+        }
+        Err(_) => Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?),
+    };
+
     let data_dir = android_app.internal_data_path();
-    let event_loop = EventLoop::builder()
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_android_app(android_app)
         .build()
         .context("creating Android event loop")?;
@@ -77,7 +217,7 @@ fn run_with_event_loop(
     pak: Arc<PakArchive>,
     storage_base: Option<PathBuf>,
     watch_hot_reload: bool,
-    event_loop: EventLoop<()>,
+    event_loop: EventLoop<UserEvent>,
 ) -> Result<()> {
     let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base)?;
     let prefs = storage.load_preferences();
@@ -88,37 +228,8 @@ fn run_with_event_loop(
     let runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
         .map_err(|e| anyhow::anyhow!("initializing runtime: {e}"))?;
 
-    // Background image decoding worker thread (keeps 60fps UI/render loop hitch-free!)
-    let (req_tx, req_rx) = mpsc::channel::<DecodeRequest>();
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
-    std::thread::Builder::new()
-        .name("nir-img-decode".into())
-        .spawn(move || {
-            while let Ok(req) = req_rx.recv() {
-                let msg = match req.pak.asset_bytes(req.id) {
-                    Some(bytes) => match decode_image(bytes) {
-                        Ok((width, height, rgba)) => DecodedImage::Ok {
-                            id: req.id,
-                            width,
-                            height,
-                            rgba,
-                        },
-                        Err(e) => DecodedImage::Err {
-                            id: req.id,
-                            error: e.to_string(),
-                        },
-                    },
-                    None => DecodedImage::Err {
-                        id: req.id,
-                        error: "asset missing from nirpak".into(),
-                    },
-                };
-                if res_tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        })
-        .context("spawning image decode worker")?;
+    let decode_pool = DecodePool::spawn(res_tx, event_loop.create_proxy());
 
     let mut app = NativeApp {
         pak,
@@ -128,9 +239,9 @@ fn run_with_event_loop(
         window: None,
         instance: wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
         renderer: None,
-        req_tx,
+        decode_pool,
         res_rx,
-        pending_decodes: BTreeSet::new(),
+        pending_decodes: BTreeMap::new(),
         last_frame: Instant::now(),
         last_reload_check: Instant::now(),
         watch_hot_reload,
@@ -140,6 +251,9 @@ fn run_with_event_loop(
         should_quit: false,
     };
     event_loop.run_app(&mut app).context("winit event loop")?;
+    app.runtime.flush_pending_saves();
+    app.process_commands();
+    app.storage.flush();
     Ok(())
 }
 
@@ -151,9 +265,10 @@ struct NativeApp {
     window: Option<Arc<Window>>,
     instance: wgpu::Instance,
     renderer: Option<Renderer>,
-    req_tx: mpsc::Sender<DecodeRequest>,
+    decode_pool: DecodePool,
     res_rx: mpsc::Receiver<DecodedImage>,
-    pending_decodes: BTreeSet<AssetId>,
+    /// Tracks in-flight image decodes and whether they have already been promoted to `urgent`.
+    pending_decodes: BTreeMap<AssetId, bool>,
     last_frame: Instant,
     last_reload_check: Instant,
     watch_hot_reload: bool,
@@ -177,6 +292,10 @@ impl NativeApp {
             .map(|a| a.id)
             .collect();
         for id in font_ids {
+            if renderer.has_font(id) {
+                self.runtime.mark_asset_loaded(id);
+                continue;
+            }
             if let Some(bytes) = self.pak.asset_bytes(id) {
                 if renderer.load_font(id, bytes.to_vec()).is_ok() {
                     self.runtime.mark_asset_loaded(id);
@@ -185,8 +304,10 @@ impl NativeApp {
         }
     }
 
-    fn drain_decoded_images(&mut self) {
+    fn drain_decoded_images(&mut self) -> bool {
+        let mut any = false;
         while let Ok(msg) = self.res_rx.try_recv() {
+            any = true;
             match msg {
                 DecodedImage::Ok {
                     id,
@@ -206,13 +327,14 @@ impl NativeApp {
                 }
             }
         }
+        any
     }
 
     fn process_commands(&mut self) {
         let cmds = self.runtime.take_commands();
         for cmd in cmds {
             match cmd {
-                HostCommand::LoadAsset { id, .. } => {
+                HostCommand::LoadAsset { id, urgent } => {
                     let Some(meta) = self.pak.program.asset(id) else {
                         continue;
                     };
@@ -220,23 +342,42 @@ impl NativeApp {
                         AssetKind::Image => {
                             if self.renderer.as_ref().is_some_and(|r| r.has_texture(id)) {
                                 self.runtime.mark_asset_loaded(id);
-                            } else if self.pending_decodes.insert(id) {
-                                let _ = self.req_tx.send(DecodeRequest {
-                                    pak: self.pak.clone(),
-                                    id,
-                                });
+                            } else {
+                                match self.pending_decodes.get(&id).copied() {
+                                    None => {
+                                        self.pending_decodes.insert(id, urgent);
+                                        self.decode_pool.enqueue(
+                                            DecodeRequest {
+                                                pak: Arc::clone(&self.pak),
+                                                id,
+                                            },
+                                            urgent,
+                                        );
+                                    }
+                                    Some(false) if urgent => {
+                                        self.pending_decodes.insert(id, true);
+                                        self.decode_pool.promote(id);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         AssetKind::Font => {
-                            if let (Some(renderer), Some(bytes)) =
-                                (&mut self.renderer, self.pak.asset_bytes(id))
-                            {
-                                let _ = renderer.load_font(id, bytes.to_vec());
+                            if let Some(renderer) = &mut self.renderer {
+                                if !renderer.has_font(id) {
+                                    if let Some(bytes) = self.pak.asset_bytes(id) {
+                                        let _ = renderer.load_font(id, bytes.to_vec());
+                                    }
+                                }
                             }
                             self.runtime.mark_asset_loaded(id);
                         }
-                        AssetKind::Audio | AssetKind::Video | AssetKind::Raw => {
-                            // Audio is decoded on PlayAudio from zero-copy mmap slice.
+                        AssetKind::Audio => {
+                            // Pre-decode short Voice/SFX clips on background audio worker!
+                            self.audio.prefetch(&self.pak, id, meta.codec.ext());
+                            self.runtime.mark_asset_loaded(id);
+                        }
+                        AssetKind::Video | AssetKind::Raw => {
                             self.runtime.mark_asset_loaded(id);
                         }
                     }
@@ -256,14 +397,15 @@ impl NativeApp {
                     loop_region,
                     ..
                 } => {
-                    if let (Some(meta), Some(bytes)) =
-                        (self.pak.program.asset(asset), self.pak.asset_bytes(asset))
-                    {
+                    if let Some(meta) = self.pak.program.asset(asset) {
                         self.audio.play(
+                            &self.pak,
+                            asset,
                             channel,
                             bus,
-                            bytes,
                             meta.codec.ext(),
+                            meta.sample_rate,
+                            meta.channels,
                             gain,
                             looped,
                             fade_in_us,
@@ -320,11 +462,15 @@ impl NativeApp {
         self.last_frame = now;
 
         // Optional live hot-reload watch on `game.nirpak`
-        if self.watch_hot_reload && now.duration_since(self.last_reload_check) >= Duration::from_millis(250) {
+        if self.watch_hot_reload
+            && now.duration_since(self.last_reload_check) >= Duration::from_millis(250)
+        {
             self.last_reload_check = now;
             if let Some(new_pak) = self.pak.check_reloaded() {
                 self.pak = new_pak;
                 self.pending_decodes.clear();
+                self.decode_pool.clear_pending();
+                self.audio.clear_cache();
                 self.upload_all_fonts();
                 self.runtime.apply_hot_reload(self.pak.program.clone());
             }
@@ -353,7 +499,19 @@ impl NativeApp {
     }
 }
 
-impl ApplicationHandler for NativeApp {
+impl ApplicationHandler<UserEvent> for NativeApp {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::ImageDecoded => {
+                if self.drain_decoded_images() {
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let sw = self.pak.program.meta.stage_width;
@@ -401,6 +559,9 @@ impl ApplicationHandler for NativeApp {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.runtime.flush_pending_saves();
+        self.process_commands();
+        self.storage.flush();
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
@@ -414,6 +575,9 @@ impl ApplicationHandler for NativeApp {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                self.runtime.flush_pending_saves();
+                self.process_commands();
+                self.storage.flush();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -509,6 +673,9 @@ impl ApplicationHandler for NativeApp {
             WindowEvent::RedrawRequested => {
                 self.tick_and_render();
                 if self.should_quit {
+                    self.runtime.flush_pending_saves();
+                    self.process_commands();
+                    self.storage.flush();
                     event_loop.exit();
                 }
             }
@@ -518,13 +685,19 @@ impl ApplicationHandler for NativeApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_decoded_images();
-        if self.runtime.dirty || self.runtime.needs_clock() || !self.pending_decodes.is_empty() {
+        // NOTE: Do NOT poll while waiting on `pending_decodes` — background workers wake us
+        // immediately via `EventLoopProxy::send_event(UserEvent::ImageDecoded)`!
+        if self.runtime.dirty || self.runtime.needs_clock() {
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
+            if self.runtime.needs_clock() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         } else if self.watch_hot_reload {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(250),

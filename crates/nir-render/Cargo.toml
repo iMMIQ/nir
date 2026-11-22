@@ -11,7 +11,10 @@ nir-ui.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 bytemuck.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 image.workspace = true
+webp.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { workspace = true, features = ["ImageBitmap"] }

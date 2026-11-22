@@ -65,6 +65,12 @@ pub enum EntrySource {
     File(PathBuf),
 }
 
+/// Borrowed content source for zero-clone APK packaging (e.g. passing `&built.nirpak`).
+pub enum EntryRef<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Path),
+}
+
 /// `android:configChanges` bitmask for the activity. Covers
 /// orientation|screenSize|smallestScreenSize|screenLayout|keyboard|
 /// keyboardHidden|navigation|density|uiMode; verified against aapt2 output
@@ -115,13 +121,33 @@ pub fn build_apk(
     entries: &[(String, EntrySource)],
     key: &key::SigningIdentity,
 ) -> Result<()> {
+    let borrowed: Vec<(&str, EntryRef<'_>)> = entries
+        .iter()
+        .map(|(name, src)| {
+            let r = match src {
+                EntrySource::Bytes(b) => EntryRef::Bytes(b.as_slice()),
+                EntrySource::File(p) => EntryRef::File(p.as_path()),
+            };
+            (name.as_str(), r)
+        })
+        .collect();
+    build_apk_borrowed(out, manifest, &borrowed, key)
+}
+
+/// Zero-clone variant of [`build_apk`] accepting borrowed byte slices and file paths.
+pub fn build_apk_borrowed(
+    out: &Path,
+    manifest: &ManifestSpec,
+    entries: &[(&str, EntryRef<'_>)],
+    key: &key::SigningIdentity,
+) -> Result<()> {
     validate_manifest(manifest)?;
     let manifest_xml = manifest_bytes(manifest)?;
     let mut names = std::collections::HashSet::new();
     for (name, _) in entries {
         validate_entry_name(name)?;
         ensure!(
-            names.insert(name.clone()),
+            names.insert(*name),
             "E_APK_ENTRY: duplicate entry {name:?}"
         );
     }
@@ -152,7 +178,7 @@ pub fn build_apk(
 fn assemble(
     temporary: &Path,
     manifest_xml: &[u8],
-    entries: &[(String, EntrySource)],
+    entries: &[(&str, EntryRef<'_>)],
     key: &key::SigningIdentity,
 ) -> Result<()> {
     let file = std::fs::File::create(temporary)
@@ -167,18 +193,14 @@ fn assemble(
         } else {
             zip::Method::Deflate
         };
-        let alignment = if is_lib {
-            LIB_ALIGNMENT
-        } else if is_pak {
-            4
-        } else {
-            0
-        };
+        // Page-align both native libs AND `.nirpak` so Android `AAsset::open_file_descriptor`
+        // can directly `mmap()` the `.nirpak` out of the APK with zero extraction!
+        let alignment = if is_lib || is_pak { LIB_ALIGNMENT } else { 0 };
         match source {
-            EntrySource::Bytes(bytes) => {
+            EntryRef::Bytes(bytes) => {
                 writer.add_bytes_aligned(name, method, bytes, alignment)?
             }
-            EntrySource::File(path) => {
+            EntryRef::File(path) => {
                 zip::add_file_aligned(&mut writer, name, method, path, alignment)?
             }
         }

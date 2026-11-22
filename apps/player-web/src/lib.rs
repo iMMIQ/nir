@@ -1,8 +1,9 @@
 //! Lean Modern Web App WASM host for NIR v2 (`player-web`).
 //!
-//! Single WASM instance (zero `asset-worker.js` duplication), WebGPU-first with
-//! automatic WebGL2 fallback, native `createImageBitmap` zero-copy GPU texture
-//! upload, exact dirty-gated rendering, and live hot-reload support.
+//! - Zero whole-`.nirpak` copy into WASM linear memory: WASM only holds the compact `NirProgram` index!
+//! - JS host serves asset byte ranges via HTTP Range streaming OR zero-copy `Uint8Array.subarray()`
+//! - WebGPU-first with automatic WebGL2 fallback + `createImageBitmap` zero-copy GPU upload
+//! - True idle-pausing `requestAnimationFrame` (`needs_frame()`) + `urgent` priority hints + audio lookahead
 #![forbid(unsafe_code)]
 
 use nir_ir::{AssetId, AssetKind, AudioBus, AudioLoopRegion, MediaCodec, Preferences};
@@ -10,18 +11,35 @@ use nir_runtime::HostCommand;
 use serde::Serialize;
 
 /// Compact JSON-serializable command bridge sent from `WebEngine` to `host/app.js`.
+/// Includes exact `(offset, size)` inside the `.nirpak` media section so JS can slice or Range-fetch directly!
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum JsHostCommand {
     DecodeImage {
         id: u32,
         mime: &'static str,
+        offset: u64,
+        size: u64,
+        urgent: bool,
+    },
+    LoadFont {
+        id: u32,
+        offset: u64,
+        size: u64,
+    },
+    PreloadAudio {
+        asset: u32,
+        mime: &'static str,
+        offset: u64,
+        size: u64,
     },
     PlayAudio {
         channel: u32,
         bus: &'static str,
         asset: u32,
         mime: &'static str,
+        offset: u64,
+        size: u64,
         gain: f32,
         looped: bool,
         fade_in_ms: f64,
@@ -43,6 +61,8 @@ pub enum JsHostCommand {
     PlayVideo {
         asset: u32,
         mime: &'static str,
+        offset: u64,
+        size: u64,
         skippable: bool,
     },
     StopVideo,
@@ -97,15 +117,28 @@ fn convert_host_command(
     pinned_out: &mut Option<std::collections::BTreeSet<AssetId>>,
 ) -> Option<JsHostCommand> {
     match cmd {
-        HostCommand::LoadAsset { id, .. } => {
+        HostCommand::LoadAsset { id, urgent } => {
             let meta = program.asset(id)?;
-            if meta.kind == AssetKind::Image {
-                Some(JsHostCommand::DecodeImage {
+            match meta.kind {
+                AssetKind::Image => Some(JsHostCommand::DecodeImage {
                     id: id.0,
                     mime: codec_mime(meta.codec),
-                })
-            } else {
-                None
+                    offset: meta.offset,
+                    size: meta.size,
+                    urgent,
+                }),
+                AssetKind::Font => Some(JsHostCommand::LoadFont {
+                    id: id.0,
+                    offset: meta.offset,
+                    size: meta.size,
+                }),
+                AssetKind::Audio => Some(JsHostCommand::PreloadAudio {
+                    asset: id.0,
+                    mime: codec_mime(meta.codec),
+                    offset: meta.offset,
+                    size: meta.size,
+                }),
+                AssetKind::Video | AssetKind::Raw => None,
             }
         }
         HostCommand::HintPinnedAssets(pinned) => {
@@ -122,10 +155,7 @@ fn convert_host_command(
             loop_region,
             ..
         } => {
-            let mime = program
-                .asset(asset)
-                .map(|m| codec_mime(m.codec))
-                .unwrap_or("audio/mpeg");
+            let meta = program.asset(asset)?;
             let (loop_start_s, loop_end_s) = match loop_region {
                 Some(AudioLoopRegion { start_us, end_us }) => {
                     (Some(start_us as f64 / 1e6), Some(end_us as f64 / 1e6))
@@ -136,7 +166,9 @@ fn convert_host_command(
                 channel: channel.0,
                 bus: bus_name(bus),
                 asset: asset.0,
-                mime,
+                mime: codec_mime(meta.codec),
+                offset: meta.offset,
+                size: meta.size,
                 gain,
                 looped,
                 fade_in_ms: fade_in_us as f64 / 1000.0,
@@ -160,13 +192,12 @@ fn convert_host_command(
             paused,
         }),
         HostCommand::PlayVideo { asset, skippable } => {
-            let mime = program
-                .asset(asset)
-                .map(|m| codec_mime(m.codec))
-                .unwrap_or("video/mp4");
+            let meta = program.asset(asset)?;
             Some(JsHostCommand::PlayVideo {
                 asset: asset.0,
-                mime,
+                mime: codec_mime(meta.codec),
+                offset: meta.offset,
+                size: meta.size,
                 skippable,
             })
         }
@@ -189,7 +220,7 @@ fn convert_host_command(
 mod wasm_host {
     use super::*;
     use js_sys::Uint8Array;
-    use nir_ir::{decode_nirpak_header, nirpak_asset_slice, ChannelId, UiAction};
+    use nir_ir::{decode_nirpak_header_only, ChannelId, UiAction};
     use nir_render::{wgpu, Renderer, RendererBackend};
     use nir_runtime::Runtime;
     use nir_ui::SlotSummary;
@@ -198,9 +229,15 @@ mod wasm_host {
     use wasm_bindgen::prelude::*;
     use web_sys::{HtmlCanvasElement, ImageBitmap};
 
+    #[derive(Serialize)]
+    struct FontAssetDesc {
+        id: u32,
+        offset: u64,
+        size: u64,
+    }
+
     #[wasm_bindgen]
     pub struct WebEngine {
-        pak_bytes: Vec<u8>,
         media_base: usize,
         runtime: Runtime,
         renderer: Renderer,
@@ -211,17 +248,19 @@ mod wasm_host {
 
     #[wasm_bindgen]
     impl WebEngine {
+        /// Initializes the engine from ONLY the `.nirpak` header+program prefix (typically ~50 KiB),
+        /// never copying the multi-hundred-MB media payload into WASM linear memory!
         #[wasm_bindgen]
         pub async fn create(
             canvas: HtmlCanvasElement,
-            nirpak_bytes: Uint8Array,
+            nirpak_header_bytes: Uint8Array,
             prefs_json: &str,
             profile_json: &str,
             slots_json: &str,
             dpr: f32,
         ) -> Result<WebEngine, JsValue> {
-            let pak_bytes = nirpak_bytes.to_vec();
-            let (program, media_base) = decode_nirpak_header(&pak_bytes)
+            let header_bytes = nirpak_header_bytes.to_vec();
+            let (program, media_base, _media_len) = decode_nirpak_header_only(&header_bytes)
                 .map_err(|e| JsValue::from_str(&format!("invalid game.nirpak: {e}")))?;
             let program = Arc::new(program);
 
@@ -241,17 +280,14 @@ mod wasm_host {
             let runtime = Runtime::new(program, prefs, profile, slots)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-            let mut engine = WebEngine {
-                pak_bytes,
+            Ok(WebEngine {
                 media_base,
                 runtime,
                 renderer,
                 logical_width: (width as f32 / dpr).max(1.0),
                 logical_height: (height as f32 / dpr).max(1.0),
                 dpr,
-            };
-            engine.upload_all_fonts();
-            Ok(engine)
+            })
         }
 
         #[wasm_bindgen]
@@ -265,15 +301,49 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
+        pub fn media_base(&self) -> f64 {
+            self.media_base as f64
+        }
+
+        #[wasm_bindgen]
         pub fn backend_info(&self) -> String {
             self.renderer.adapter_info().to_owned()
         }
 
+        /// Returns whether the engine needs another `requestAnimationFrame` tick (false = idle sleep!).
         #[wasm_bindgen]
-        pub fn asset_bytes(&self, asset_id: u32) -> Option<Uint8Array> {
-            let meta = self.runtime.program().asset(AssetId(asset_id))?;
-            let slice = nirpak_asset_slice(&self.pak_bytes, self.media_base, meta).ok()?;
-            Some(Uint8Array::from(slice))
+        pub fn needs_frame(&self) -> bool {
+            self.runtime.dirty || self.runtime.needs_clock()
+        }
+
+        /// Lists all bundled font asset byte ranges so JS can stream/slice and load them once.
+        #[wasm_bindgen]
+        pub fn font_assets_json(&self) -> String {
+            let list: Vec<FontAssetDesc> = self
+                .runtime
+                .program()
+                .assets
+                .iter()
+                .filter(|a| a.kind == AssetKind::Font)
+                .map(|a| FontAssetDesc {
+                    id: a.id.0,
+                    offset: a.offset,
+                    size: a.size,
+                })
+                .collect();
+            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        }
+
+        #[wasm_bindgen]
+        pub fn load_font(&mut self, asset_id: u32, bytes: Uint8Array) -> Result<(), JsValue> {
+            let id = AssetId(asset_id);
+            if !self.renderer.has_font(id) {
+                self.renderer
+                    .load_font(id, bytes.to_vec())
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            }
+            self.runtime.mark_asset_loaded(id);
+            Ok(())
         }
 
         #[wasm_bindgen]
@@ -346,15 +416,20 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
-        pub fn hot_reload(&mut self, new_nirpak_bytes: Uint8Array) -> Result<(), JsValue> {
-            let bytes = new_nirpak_bytes.to_vec();
-            let (program, media_base) = decode_nirpak_header(&bytes)
+        pub fn hot_reload(&mut self, new_header_bytes: Uint8Array) -> Result<(), JsValue> {
+            let bytes = new_header_bytes.to_vec();
+            let (program, media_base, _media_len) = decode_nirpak_header_only(&bytes)
                 .map_err(|e| JsValue::from_str(&format!("hot reload parse failed: {e}")))?;
-            self.pak_bytes = bytes;
             self.media_base = media_base;
             self.runtime.apply_hot_reload(Arc::new(program));
-            self.upload_all_fonts();
             Ok(())
+        }
+
+        /// Flushes any debounced persistent profile updates (call on `visibilitychange` / `pagehide`).
+        #[wasm_bindgen]
+        pub fn flush_pending_saves(&mut self) -> String {
+            self.runtime.flush_pending_saves();
+            self.drain_js_commands()
         }
 
         #[wasm_bindgen]
@@ -363,9 +438,24 @@ mod wasm_host {
             self.runtime.set_unix_time(unix_secs.max(0.0) as u64);
             self.runtime.tick(delta_us);
 
+            let cmds_json = self.drain_js_commands();
+
+            if let Some(packet) = self
+                .runtime
+                .prepare_frame(self.logical_width, self.logical_height)
+            {
+                let _ = self.renderer.render(packet, self.dpr);
+            }
+            cmds_json
+        }
+
+        fn drain_js_commands(&mut self) -> String {
             let cmds = self.runtime.take_commands();
+            if cmds.is_empty() {
+                return String::new();
+            }
             let mut pinned = None;
-            let mut js_cmds = Vec::new();
+            let mut js_cmds = Vec::with_capacity(cmds.len());
             for cmd in cmds {
                 if let HostCommand::LoadAsset { id, .. } = cmd {
                     if let Some(meta) = self.runtime.program().asset(id) {
@@ -377,15 +467,16 @@ mod wasm_host {
                                 }
                             }
                             AssetKind::Font => {
-                                if let Ok(slice) =
-                                    nirpak_asset_slice(&self.pak_bytes, self.media_base, meta)
-                                {
-                                    let _ = self.renderer.load_font(id, slice.to_vec());
+                                if self.renderer.has_font(id) {
+                                    self.runtime.mark_asset_loaded(id);
+                                    continue;
                                 }
-                                self.runtime.mark_asset_loaded(id);
-                                continue;
                             }
-                            AssetKind::Audio | AssetKind::Video | AssetKind::Raw => {
+                            AssetKind::Audio => {
+                                // Emit PreloadAudio to JS, mark loaded so Runtime doesn't block.
+                                self.runtime.mark_asset_loaded(id);
+                            }
+                            AssetKind::Video | AssetKind::Raw => {
                                 self.runtime.mark_asset_loaded(id);
                                 continue;
                             }
@@ -399,33 +490,10 @@ mod wasm_host {
             if let Some(pin) = pinned {
                 self.renderer.evict_lru(&pin);
             }
-
-            if let Some(packet) = self
-                .runtime
-                .prepare_frame(self.logical_width, self.logical_height)
-            {
-                let _ = self.renderer.render(packet, self.dpr);
-            }
-            serde_json::to_string(&js_cmds).unwrap_or_else(|_| "[]".into())
-        }
-
-        fn upload_all_fonts(&mut self) {
-            let fonts: Vec<AssetId> = self
-                .runtime
-                .program()
-                .assets
-                .iter()
-                .filter(|a| a.kind == AssetKind::Font)
-                .map(|a| a.id)
-                .collect();
-            for id in fonts {
-                if let Some(meta) = self.runtime.program().asset(id) {
-                    if let Ok(slice) = nirpak_asset_slice(&self.pak_bytes, self.media_base, meta) {
-                        if self.renderer.load_font(id, slice.to_vec()).is_ok() {
-                            self.runtime.mark_asset_loaded(id);
-                        }
-                    }
-                }
+            if js_cmds.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&js_cmds).unwrap_or_default()
             }
         }
     }

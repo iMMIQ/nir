@@ -1,7 +1,7 @@
-//! Zero-copy `.nirpak` container reader (mmap on desktop, direct buffer on Android).
+//! Zero-copy `.nirpak` container reader (mmap on desktop & Android APK fd, fallback buffer).
 
 use anyhow::{Context, Result};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use nir_ir::{decode_nirpak_header, nirpak_asset_slice, AssetId, NirProgram};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 enum Backing {
-    #[allow(dead_code)]
     Mmap(Mmap),
     Bytes(Vec<u8>),
 }
 
 impl Backing {
+    #[inline]
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Mmap(m) => m.as_ref(),
@@ -53,7 +53,24 @@ impl PakArchive {
         })
     }
 
-    /// Opens a `.nirpak` from an in-memory buffer (e.g. Android AssetManager).
+    /// Memory-maps a sub-region `[offset..offset+len]` of an open file descriptor
+    /// (used on Android to `mmap` page-aligned `assets/game.nirpak` directly from the APK!).
+    pub fn from_fd_region(file: &File, offset: u64, len: usize) -> Result<Self> {
+        // SAFETY: The APK file is immutable once installed by Android PackageManager.
+        let mmap = unsafe { MmapOptions::new().offset(offset).len(len).map(file) }
+            .context("memory-mapping APK game.nirpak region")?;
+        let (program, media_base) = decode_nirpak_header(mmap.as_ref())
+            .map_err(|e| anyhow::anyhow!("decoding nirpak header: {e}"))?;
+        Ok(Self {
+            source_path: None,
+            last_modified: None,
+            backing: Backing::Mmap(mmap),
+            media_base,
+            program: Arc::new(program),
+        })
+    }
+
+    /// Opens a `.nirpak` from an in-memory buffer (fallback when mmap is unavailable).
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let (program, media_base) = decode_nirpak_header(&bytes)
             .map_err(|e| anyhow::anyhow!("decoding nirpak header: {e}"))?;
@@ -64,6 +81,21 @@ impl PakArchive {
             media_base,
             program: Arc::new(program),
         })
+    }
+
+    /// Full backing slice (for zero-copy sub-slice readers).
+    #[inline]
+    pub fn raw_slice(&self) -> &[u8] {
+        self.backing.as_slice()
+    }
+
+    /// Byte range `(start, len)` inside `raw_slice()` for a single asset.
+    pub fn asset_range(&self, id: AssetId) -> Option<(usize, usize)> {
+        let meta = self.program.asset(id)?;
+        let start = self.media_base.checked_add(meta.offset as usize)?;
+        let len = meta.size as usize;
+        let end = start.checked_add(len)?;
+        (end <= self.backing.as_slice().len()).then_some((start, len))
     }
 
     /// Zero-copy slice for a single asset inside `.nirpak`.

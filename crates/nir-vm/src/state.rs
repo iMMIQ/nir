@@ -100,6 +100,9 @@ pub struct DialogueState {
     pub reveal_us: u64,
     pub elapsed_us: u64,
     pub visible_graphemes: usize,
+    /// Cached byte offset in `full_text` matching `visible_graphemes` (O(1) per frame!).
+    #[serde(default)]
+    pub visible_bytes: usize,
     pub total_graphemes: usize,
     pub paused_for_click: bool,
     pub pause_remaining_us: u64,
@@ -108,10 +111,59 @@ pub struct DialogueState {
 }
 
 impl DialogueState {
-    /// Byte offset in `full_text` corresponding to `visible_graphemes`.
+    /// Updates cached `visible_bytes` incrementally after advancing `visible_graphemes` by `delta`.
+    pub fn advance_visible_bytes(&mut self, delta_graphemes: usize) {
+        if self.finished || self.visible_graphemes >= self.total_graphemes {
+            self.visible_bytes = self.full_text.len();
+            return;
+        }
+        if self.visible_graphemes == 0 {
+            self.visible_bytes = 0;
+            return;
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        let base = self.visible_bytes.min(self.full_text.len());
+        if self.full_text.is_char_boundary(base) && delta_graphemes > 0 {
+            let tail = &self.full_text[base..];
+            self.visible_bytes = tail
+                .grapheme_indices(true)
+                .nth(delta_graphemes)
+                .map_or(self.full_text.len(), |(idx, _)| base + idx);
+        } else {
+            self.recompute_visible_bytes();
+        }
+    }
+
+    pub fn recompute_visible_bytes(&mut self) {
+        if self.finished || self.visible_graphemes >= self.total_graphemes {
+            self.visible_bytes = self.full_text.len();
+            return;
+        }
+        if self.visible_graphemes == 0 {
+            self.visible_bytes = 0;
+            return;
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        self.visible_bytes = self
+            .full_text
+            .grapheme_indices(true)
+            .nth(self.visible_graphemes)
+            .map_or(self.full_text.len(), |(idx, _)| idx);
+    }
+
+    /// Byte offset in `full_text` corresponding to `visible_graphemes` (O(1) cached!).
     pub fn visible_byte_len(&self) -> usize {
         if self.finished || self.visible_graphemes >= self.total_graphemes {
             return self.full_text.len();
+        }
+        if self.visible_graphemes == 0 {
+            return 0;
+        }
+        if self.visible_bytes > 0
+            && self.visible_bytes <= self.full_text.len()
+            && self.full_text.is_char_boundary(self.visible_bytes)
+        {
+            return self.visible_bytes;
         }
         use unicode_segmentation::UnicodeSegmentation;
         self.full_text
@@ -246,6 +298,27 @@ pub struct SaveSnapshot {
 }
 
 pub const SAVE_FORMAT_VERSION: u32 = 2;
+
+/// Zero-history-clone in-memory checkpoint for instant rollback without duplicating 500 strings per line.
+#[derive(Debug, Clone)]
+pub struct RollbackCheckpoint {
+    pub pc: u32,
+    pub last_label_id: Option<StrId>,
+    pub last_label_fallback: Option<String>,
+    pub vars: Vec<Value>,
+    pub frames: Vec<CallFrame>,
+    pub layers: Vec<LayerState>,
+    pub dialogue_visible: bool,
+    pub dialogue: Option<DialogueState>,
+    pub choice: Option<ChoiceState>,
+    pub wait: WaitReason,
+    pub audio: Vec<AudioChannelState>,
+    pub audio_paused: [bool; 3],
+    pub history_seq: u64,
+    pub locale: String,
+    pub rng_word_pos: u128,
+    pub outcome: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProfileData {
