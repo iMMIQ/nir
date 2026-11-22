@@ -327,11 +327,15 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
     );
     let bpp = r.u32()? as usize;
     ensure!(
-        matches!(bpp, 8 | 24 | 32),
-        "E_IMPORT_GAL_PIXEL: supported depths are 8, 24 and 32"
+        matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32),
+        "E_IMPORT_GAL_PIXEL: supported depths are 1, 4, 8, 16, 24 and 32"
     );
-    let palette = if bpp == 8 { r.take(1024)? } else { &[] };
-    let stride = (fw * (bpp / 8) + 3) & !3;
+    let palette = if bpp <= 8 {
+        r.take((1usize << bpp) * 4)?
+    } else {
+        &[]
+    };
+    let stride = (fw.saturating_mul(bpp).div_ceil(8) + 3) & !3;
     let alpha_stride = (fw + 3) & !3;
     let layer_bytes = (stride + alpha_stride)
         .checked_mul(fh)
@@ -383,7 +387,7 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
             } else {
                 packed
             };
-            blocks(packed, fw, fh, bpp / 8, bw, bh, &previous)?
+            blocks(packed, fw, fh, bpp, bw, bh, &previous)?
         };
         let alpha = if has_alpha {
             let raw;
@@ -393,7 +397,7 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
             } else {
                 packed_alpha
             };
-            blocks(packed_alpha, fw, fh, 1, bw, bh, &previous_alpha)?
+            blocks(packed_alpha, fw, fh, 8, bw, bh, &previous_alpha)?
         } else {
             vec![255; alpha_stride * fh]
         };
@@ -405,11 +409,47 @@ pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {
                     if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height as i64 {
                         continue;
                     }
-                    let at = row * stride + col * (bpp / 8);
-                    let c = if bpp == 8 {
-                        &palette[pixels[at] as usize * 4..][..4]
-                    } else {
-                        &pixels[at..at + bpp / 8]
+                    let c: [u8; 4] = match bpp {
+                        1 => {
+                            let byte = pixels[row * stride + (col >> 3)];
+                            let idx = ((byte >> (7 - (col & 7))) & 1) as usize;
+                            palette[idx * 4..idx * 4 + 4].try_into().unwrap()
+                        }
+                        4 => {
+                            let byte = pixels[row * stride + (col >> 1)];
+                            let idx = if col & 1 == 0 {
+                                (byte >> 4) & 0x0F
+                            } else {
+                                byte & 0x0F
+                            } as usize;
+                            palette[idx * 4..idx * 4 + 4].try_into().unwrap()
+                        }
+                        8 => {
+                            let idx = pixels[row * stride + col] as usize;
+                            palette[idx * 4..idx * 4 + 4].try_into().unwrap()
+                        }
+                        16 => {
+                            let at = row * stride + col * 2;
+                            let v = u16::from_le_bytes([pixels[at], pixels[at + 1]]);
+                            let b5 = (v & 0x1F) as u8;
+                            let g5 = ((v >> 5) & 0x1F) as u8;
+                            let r5 = ((v >> 10) & 0x1F) as u8;
+                            [
+                                (b5 << 3) | (b5 >> 2),
+                                (g5 << 3) | (g5 >> 2),
+                                (r5 << 3) | (r5 >> 2),
+                                255,
+                            ]
+                        }
+                        24 => {
+                            let at = row * stride + col * 3;
+                            [pixels[at], pixels[at + 1], pixels[at + 2], 255]
+                        }
+                        32 => {
+                            let at = row * stride + col * 4;
+                            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+                        }
+                        _ => unreachable!(),
                     };
                     let mut a = alpha[row * alpha_stride + col] as u32;
                     if bpp == 32 {
@@ -525,7 +565,7 @@ fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
     let count = number(layers, "Count")?;
     let bpp = number(layers, "Bpp")?;
     ensure!(
-        (1..=64).contains(&count) && matches!(bpp, 8 | 24 | 32),
+        (1..=64).contains(&count) && matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32),
         "E_IMPORT_GAL_LAYERS: count/depth"
     );
     ensure!(
@@ -558,17 +598,18 @@ fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
     for value in [count, width, height, bpp] {
         out.extend_from_slice(&(value as u32).to_le_bytes());
     }
-    if bpp == 8 {
+    if bpp <= 8 {
+        let entries = 1usize << bpp;
         let rgb = layers
             .children()
             .find(|n| n.has_tag_name("RGB"))
             .and_then(|n| n.text())
             .context("E_IMPORT_GAL_PALETTE: missing palette")?;
         ensure!(
-            rgb.len() <= 256 * 6 && rgb.len().is_multiple_of(6) && rgb.is_ascii(),
+            rgb.len() <= entries * 6 && rgb.len().is_multiple_of(6) && rgb.is_ascii(),
             "E_IMPORT_GAL_PALETTE: size"
         );
-        let mut palette = vec![0u8; 1024];
+        let mut palette = vec![0u8; entries * 4];
         for (index, color) in rgb.as_bytes().as_chunks::<6>().0.iter().enumerate() {
             let hex = std::str::from_utf8(color)?;
             let c = u32::from_str_radix(hex, 16)?;
@@ -625,12 +666,13 @@ fn blocks(
     data: &[u8],
     w: usize,
     h: usize,
-    channels: usize,
+    bpp: usize,
     bw: usize,
     bh: usize,
     previous: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let stride = (w * channels + 3) & !3;
+    let row_bytes = w.saturating_mul(bpp).div_ceil(8);
+    let stride = (row_bytes + 3) & !3;
     if bw == 0 || bh == 0 {
         ensure!(
             data.len() == stride * h,
@@ -638,6 +680,10 @@ fn blocks(
         );
         return Ok(data.to_vec());
     }
+    ensure!(
+        (bw * bpp).is_multiple_of(8),
+        "E_IMPORT_GAL_BLOCK: sub-byte block width must be byte-aligned"
+    );
     let columns = w.div_ceil(bw);
     let rows = h.div_ceil(bh);
     let mut r = Bytes::new(data);
@@ -648,10 +694,11 @@ fn blocks(
     for (index, (frame, layer)) in references.iter().copied().enumerate() {
         let x = index % columns * bw;
         let y = index / columns * bh;
-        let rw = bw.min(w - x) * channels;
+        let x_bytes = (x * bpp) / 8;
+        let rw = bw.min(w - x).saturating_mul(bpp).div_ceil(8);
         let rh = bh.min(h - y);
         for row in 0..rh {
-            let dst = (y + row) * stride + x * channels;
+            let dst = (y + row) * stride + x_bytes;
             match frame {
                 -1 => out[dst..dst + rw].copy_from_slice(r.take(rw)?),
                 -2 => {
@@ -661,11 +708,12 @@ fn blocks(
                     );
                     let sx = layer as usize % columns * bw;
                     let sy = layer as usize / columns * bh;
+                    let sx_bytes = (sx * bpp) / 8;
                     ensure!(
-                        sx * channels + rw <= w * channels && sy + rh <= h,
+                        sx_bytes + rw <= row_bytes && sy + rh <= h,
                         "E_IMPORT_GAL_REFERENCE: block exceeds raster"
                     );
-                    let src = (sy + row) * stride + sx * channels;
+                    let src = (sy + row) * stride + sx_bytes;
                     out.copy_within(src..src + rw, dst);
                 }
                 0 => {
@@ -1141,14 +1189,71 @@ mod tests {
         }
         data.extend([1, 2, 3]);
         assert_eq!(
-            blocks(&data, 2, 1, 3, 1, 1, &[]).unwrap(),
+            blocks(&data, 2, 1, 24, 1, 1, &[]).unwrap(),
             vec![1, 2, 3, 1, 2, 3, 0, 0]
         );
         data[12..16].copy_from_slice(&1i32.to_le_bytes());
-        assert!(blocks(&data, 2, 1, 3, 1, 1, &[]).is_err());
+        assert!(blocks(&data, 2, 1, 24, 1, 1, &[]).is_err());
         let mut truncated = gal_fixture(true, false);
         truncated.truncate(truncated.len() - 1);
         assert!(gal(&truncated).is_err());
+    }
+    #[test]
+    fn gal_supports_1bit_4bit_and_16bit_depths() {
+        fn build_gal(w: u32, h: u32, bpp: u32, palette: &[u8], pixels: &[u8]) -> Vec<u8> {
+            fn blob(out: &mut Vec<u8>, b: &[u8]) {
+                out.extend((b.len() as u32).to_le_bytes());
+                out.extend(b);
+            }
+            let mut out = b"Gale106".to_vec();
+            let mut header = vec![0u8; 40];
+            for (at, n) in [(4, w), (8, h), (12, bpp), (16, 1)] {
+                header[at..at + 4].copy_from_slice(&n.to_le_bytes());
+            }
+            header[22] = 1; // raw uncompressed
+            blob(&mut out, &header);
+            blob(&mut out, b"Frame1");
+            out.extend([0u8; 13]);
+            for n in [1u32, w, h, bpp] {
+                out.extend(n.to_le_bytes());
+            }
+            out.extend_from_slice(palette);
+            for n in [0u32, 0] {
+                out.extend(n.to_le_bytes());
+            }
+            out.push(1); // visible
+            out.extend(u32::MAX.to_le_bytes()); // transcolor
+            out.extend(255u32.to_le_bytes()); // opacity
+            out.push(0); // has_alpha
+            blob(&mut out, b"Layer1");
+            blob(&mut out, pixels);
+            blob(&mut out, &[]);
+            out
+        }
+
+        // 1-bit: 2-entry BGRA palette (red, blue), MSB-first bits 0b1010_0000 -> [blue, red, blue, red]
+        let pal1 = [0, 0, 255, 0, 255, 0, 0, 0];
+        let img1 = gal(&build_gal(4, 1, 1, &pal1, &[0b1010_0000, 0, 0, 0])).unwrap();
+        assert_eq!(img1.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(img1.get_pixel(1, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img1.get_pixel(2, 0).0, [0, 0, 255, 255]);
+        assert_eq!(img1.get_pixel(3, 0).0, [255, 0, 0, 255]);
+
+        // 4-bit: 16-entry BGRA palette, high nibble first -> [entry 2 (green), entry 1 (blue)]
+        let mut pal4 = vec![0u8; 64];
+        pal4[4..8].copy_from_slice(&[255, 0, 0, 0]);
+        pal4[8..12].copy_from_slice(&[0, 255, 0, 0]);
+        let img4 = gal(&build_gal(2, 1, 4, &pal4, &[0x21, 0, 0, 0])).unwrap();
+        assert_eq!(img4.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(img4.get_pixel(1, 0).0, [0, 0, 255, 255]);
+
+        // 16-bit RGB555: pure red (31 << 10) and pure green (31 << 5)
+        let mut pix16 = Vec::new();
+        pix16.extend_from_slice(&(31u16 << 10).to_le_bytes());
+        pix16.extend_from_slice(&(31u16 << 5).to_le_bytes());
+        let img16 = gal(&build_gal(2, 1, 16, &[], &pix16)).unwrap();
+        assert_eq!(img16.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img16.get_pixel(1, 0).0, [0, 255, 0, 255]);
     }
     #[test]
     fn gal_rejects_excessive_layer_storage_before_allocating_pixels() {
