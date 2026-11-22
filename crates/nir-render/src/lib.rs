@@ -4,21 +4,35 @@
 #![forbid(unsafe_code)]
 
 use bytemuck::{Pod, Zeroable};
+use flate2::read::ZlibDecoder;
 use glyphon::{
     Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use nir_ir::{AssetId, BlendMode, NirError, Result};
+use nir_ir::{AssetId, BlendMode, ImageDelta, NirError, Result};
 use nir_ui::{DrawPacket, Quad, SpecialQuad, TextEngine, TextRun};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
 };
 pub use wgpu;
 
-const DEFAULT_GPU_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
+const DESKTOP_GPU_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
+const ANDROID_GPU_CACHE_LIMIT: u64 = 128 * 1024 * 1024;
+const WEBGL2_GPU_CACHE_LIMIT: u64 = 96 * 1024 * 1024;
 const ATLAS_TRIM_INTERVAL: u64 = 64;
+
+fn default_cache_limit_for(backend: RendererBackend) -> u64 {
+    if backend == RendererBackend::WebGl2 {
+        WEBGL2_GPU_CACHE_LIMIT
+    } else if cfg!(target_os = "android") {
+        ANDROID_GPU_CACHE_LIMIT
+    } else {
+        DESKTOP_GPU_CACHE_LIMIT
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendererBackend {
@@ -72,6 +86,7 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     white_tex: GpuTexture,
     textures: HashMap<AssetId, GpuTexture>,
+    last_pinned: BTreeSet<AssetId>,
     texture_bytes: u64,
     texture_limit: u64,
     texture_epoch: u64,
@@ -200,12 +215,244 @@ pub fn decode_image(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((w, h, pixels))
 }
 
-fn mip_level_count_for(w: u32, h: u32, backend: RendererBackend) -> u32 {
+/// Composites a decoded premultiplied RGBA8 differential patch onto a premultiplied RGBA8 base.
+/// - Opaque CG mode (`tile_mask` empty): pixels with `alpha >= 128` replace `base` cleanly.
+/// - Transparent sprite mode (`tile_mask` non-empty): 16×16 tiles with bit=1 overwrite `base` verbatim,
+///   preserving exact alpha deletions and semi-transparent edges!
+pub fn composite_delta_rgba(
+    base_rgba: &[u8],
+    base_w: u32,
+    base_h: u32,
+    patch_rgba: &[u8],
+    patch_w: u32,
+    patch_h: u32,
+    delta: &ImageDelta,
+) -> Result<Vec<u8>> {
+    let bw = base_w as usize;
+    let bh = base_h as usize;
+    let pw = patch_w as usize;
+    let ph = patch_h as usize;
+    if base_rgba.len() != bw * bh * 4 || patch_rgba.len() != pw * ph * 4 {
+        return Err(rerr("delta composite buffer dimension mismatch"));
+    }
+    let mut out = base_rgba.to_vec();
+    let ox = delta.x as usize;
+    let oy = delta.y as usize;
+    if delta.tile_mask.is_empty() {
+        for y in 0..ph {
+            let dy = oy + y;
+            if dy >= bh {
+                break;
+            }
+            for x in 0..pw {
+                let dx = ox + x;
+                if dx >= bw {
+                    break;
+                }
+                let so = (y * pw + x) * 4;
+                if patch_rgba[so + 3] >= 128 {
+                    let doff = (dy * bw + dx) * 4;
+                    out[doff..doff + 3].copy_from_slice(&patch_rgba[so..so + 3]);
+                    out[doff + 3] = 255;
+                }
+            }
+        }
+    } else {
+        const TILE: usize = 16;
+        let p_tiles_x = pw.div_ceil(TILE);
+        let p_tiles_y = ph.div_ceil(TILE);
+        for pty in 0..p_tiles_y {
+            for ptx in 0..p_tiles_x {
+                let bit = pty * p_tiles_x + ptx;
+                let mask_byte = delta.tile_mask.get(bit / 8).copied().unwrap_or(0);
+                if (mask_byte & (1u8 << (bit % 8))) == 0 {
+                    continue;
+                }
+                let y0 = pty * TILE;
+                let y1 = (y0 + TILE).min(ph);
+                let x0 = ptx * TILE;
+                let x1 = (x0 + TILE).min(pw);
+                for y in y0..y1 {
+                    let dy = oy + y;
+                    if dy >= bh {
+                        break;
+                    }
+                    let copy_w = x1.min(bw.saturating_sub(ox)).saturating_sub(x0);
+                    if copy_w == 0 {
+                        continue;
+                    }
+                    let so = (y * pw + x0) * 4;
+                    let doff = (dy * bw + ox + x0) * 4;
+                    out[doff..doff + copy_w * 4]
+                        .copy_from_slice(&patch_rgba[so..so + copy_w * 4]);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decoded KTX2 GPU-compressed level-0 texture payload (BC1 / BC3 / BC7 / ASTC 4x4).
+#[derive(Debug, Clone)]
+pub struct DecodedKtx2 {
+    pub width: u32,
+    pub height: u32,
+    pub format: Ktx2BlockFormat,
+    pub premultiplied: bool,
+    pub blocks: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ktx2BlockFormat {
+    Bc1Srgb,
+    Bc3Srgb,
+    Bc7Srgb,
+    Astc4x4Srgb,
+}
+
+impl Ktx2BlockFormat {
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::Bc1Srgb => 8,
+            Self::Bc3Srgb | Self::Bc7Srgb | Self::Astc4x4Srgb => 16,
+        }
+    }
+
+    pub const fn wgpu_format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Bc1Srgb => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+            Self::Bc3Srgb => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+            Self::Bc7Srgb => wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+            Self::Astc4x4Srgb => wgpu::TextureFormat::Astc {
+                block: wgpu::AstcBlock::B4x4,
+                channel: wgpu::AstcChannel::UnormSrgb,
+            },
+        }
+    }
+
+    pub const fn required_feature(self) -> wgpu::Features {
+        match self {
+            Self::Bc1Srgb | Self::Bc3Srgb | Self::Bc7Srgb => wgpu::Features::TEXTURE_COMPRESSION_BC,
+            Self::Astc4x4Srgb => wgpu::Features::TEXTURE_COMPRESSION_ASTC,
+        }
+    }
+}
+
+/// Parses a standard KTX2 container (including ZLIB supercompression) into raw GPU blocks.
+pub fn parse_ktx2_level0(bytes: &[u8]) -> Result<DecodedKtx2> {
+    let reader = ktx2::Reader::new(bytes).map_err(|e| rerr(format!("ktx2 parse: {e:?}")))?;
+    let hdr = reader.header();
+    let width = hdr.pixel_width;
+    let height = hdr.pixel_height;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return Err(rerr("ktx2 dimensions out of range"));
+    }
+    let fmt = match hdr.format {
+        Some(ktx2::Format::BC1_RGBA_SRGB_BLOCK | ktx2::Format::BC1_RGB_SRGB_BLOCK) => {
+            Ktx2BlockFormat::Bc1Srgb
+        }
+        Some(ktx2::Format::BC3_SRGB_BLOCK) => Ktx2BlockFormat::Bc3Srgb,
+        Some(ktx2::Format::BC7_SRGB_BLOCK) => Ktx2BlockFormat::Bc7Srgb,
+        Some(ktx2::Format::ASTC_4x4_SRGB_BLOCK) => Ktx2BlockFormat::Astc4x4Srgb,
+        other => return Err(rerr(format!("unsupported ktx2 VkFormat: {other:?}"))),
+    };
+    let level = reader
+        .levels()
+        .next()
+        .ok_or_else(|| rerr("ktx2 has no mip levels"))?;
+    let blocks = match hdr.supercompression_scheme {
+        None => level.data.to_vec(),
+        Some(ktx2::SupercompressionScheme::ZLIB) => {
+            let mut out = Vec::with_capacity(level.uncompressed_byte_length as usize);
+            ZlibDecoder::new(level.data)
+                .read_to_end(&mut out)
+                .map_err(|e| rerr(format!("ktx2 zlib inflate: {e}")))?;
+            out
+        }
+        Some(other) => {
+            return Err(rerr(format!(
+                "unsupported ktx2 supercompression scheme: {other:?}"
+            )))
+        }
+    };
+    let bw = width.div_ceil(4) as usize;
+    let bh = height.div_ceil(4) as usize;
+    let expected = bw * bh * fmt.block_bytes() as usize;
+    if blocks.len() < expected {
+        return Err(rerr("ktx2 level-0 payload truncated"));
+    }
+    let premultiplied = reader.dfd_blocks().iter().any(|b| {
+        matches!(
+            b,
+            ktx2::dfd::Block::Basic(basic)
+                if basic
+                    .flags
+                    .contains(ktx2::dfd::DataFormatFlags::ALPHA_PREMULTIPLIED)
+        )
+    });
+    Ok(DecodedKtx2 {
+        width,
+        height,
+        format: fmt,
+        premultiplied,
+        blocks,
+    })
+}
+
+/// Pure-Rust CPU fallback decoder for BC1/BC3/BC7 KTX2 textures when the GPU adapter
+/// lacks hardware `TEXTURE_COMPRESSION_BC` (e.g., WebGL2 or older mobile GPUs).
+pub fn decode_ktx2_to_rgba_premultiplied(ktx: &DecodedKtx2) -> Result<Vec<u8>> {
+    let w = ktx.width as usize;
+    let h = ktx.height as usize;
+    let bw = w.div_ceil(4);
+    let bh = h.div_ceil(4);
+    let bpb = ktx.format.block_bytes() as usize;
+    let mut out = vec![0u8; w * h * 4];
+    let mut blk_rgba = [0u8; 4 * 4 * 4];
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let src_off = (by * bw + bx) * bpb;
+            let src = &ktx.blocks[src_off..src_off + bpb];
+            match ktx.format {
+                Ktx2BlockFormat::Bc1Srgb => bcdec_rs::bc1(src, &mut blk_rgba, 16),
+                Ktx2BlockFormat::Bc3Srgb => bcdec_rs::bc3(src, &mut blk_rgba, 16),
+                Ktx2BlockFormat::Bc7Srgb => bcdec_rs::bc7(src, &mut blk_rgba, 16),
+                Ktx2BlockFormat::Astc4x4Srgb => {
+                    return Err(rerr("ASTC CPU fallback decode unsupported"))
+                }
+            }
+            for py in 0..4 {
+                let dy = by * 4 + py;
+                if dy >= h {
+                    break;
+                }
+                let copy_px = 4.min(w - bx * 4);
+                let dst_off = (dy * w + bx * 4) * 4;
+                let s_off = py * 16;
+                out[dst_off..dst_off + copy_px * 4]
+                    .copy_from_slice(&blk_rgba[s_off..s_off + copy_px * 4]);
+            }
+        }
+    }
+    if ktx.format != Ktx2BlockFormat::Bc1Srgb && !ktx.premultiplied {
+        premultiply_rgba(&mut out);
+    }
+    Ok(out)
+}
+
+/// Smart on-demand mipmap count: 1:1 / upscaled 2D CGs & BGs skip unnecessary mip chains
+/// (saving 25% VRAM and 4 offscreen GPU render passes per uploaded texture!), while textures
+/// genuinely downscaled relative to the active viewport get up to 3 mip levels.
+fn mip_level_count_for(w: u32, h: u32, vp_w: u32, vp_h: u32, backend: RendererBackend) -> u32 {
     if backend == RendererBackend::WebGl2 || w.max(h) < 256 {
         return 1;
     }
+    if w <= vp_w.saturating_mul(5) / 4 && h <= vp_h.saturating_mul(5) / 4 {
+        return 1;
+    }
     let max_dim = w.max(h);
-    ((32 - max_dim.leading_zeros()).max(1)).min(5)
+    (32 - max_dim.leading_zeros()).clamp(1, 3)
 }
 
 fn mip_memory_bytes(w: u32, h: u32, mips: u32) -> u64 {
@@ -344,10 +591,14 @@ impl Renderer {
             .map_err(|e| rerr(e.to_string()))?;
         let info = adapter.get_info();
         let adapter_info = format!("{:?} / {} / {}", info.backend, info.name, info.driver);
+        let desired_compression = wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::TEXTURE_COMPRESSION_ASTC
+            | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+        let optional_features = adapter.features() & desired_compression;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("NIR v2 Renderer"),
-                required_features: wgpu::Features::empty(),
+                required_features: optional_features,
                 required_limits: match backend {
                     RendererBackend::WebGl2 => wgpu::Limits::downlevel_webgl2_defaults(),
                     _ => wgpu::Limits::downlevel_defaults(),
@@ -598,8 +849,9 @@ impl Renderer {
             sampler,
             white_tex,
             textures: HashMap::new(),
+            last_pinned: BTreeSet::new(),
             texture_bytes: 0,
-            texture_limit: DEFAULT_GPU_CACHE_LIMIT,
+            texture_limit: default_cache_limit_for(backend),
             texture_epoch: 0,
             use_clock: 0,
             scratch: None,
@@ -842,8 +1094,101 @@ impl Renderer {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn upload_image_bytes(&mut self, id: AssetId, bytes: &[u8]) -> Result<()> {
+        if bytes.len() >= 12 && bytes[0..4] == [0xAB, 0x4B, 0x54, 0x58] {
+            return self.upload_ktx2_bytes(id, bytes);
+        }
         let (w, h, pixels) = decode_image(bytes)?;
         self.upload_rgba_premultiplied(id, w, h, &pixels)
+    }
+
+    /// Uploads a KTX2 GPU-compressed texture directly to VRAM when hardware compression
+    /// (`BC1`/`BC3`/`BC7`/`ASTC`) is supported, or falls back to pure-Rust CPU decode cleanly!
+    pub fn upload_ktx2_bytes(&mut self, id: AssetId, bytes: &[u8]) -> Result<()> {
+        let ktx = parse_ktx2_level0(bytes)?;
+        self.upload_decoded_ktx2(id, &ktx)
+    }
+
+    pub fn upload_decoded_ktx2(&mut self, id: AssetId, ktx: &DecodedKtx2) -> Result<()> {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        let bw = ktx.width.div_ceil(4);
+        let bh = ktx.height.div_ceil(4);
+        let pad_w = bw * 4;
+        let pad_h = bh * 4;
+        if pad_w == 0 || pad_h == 0 || pad_w > max_dim || pad_h > max_dim {
+            return Err(rerr("ktx2 exceeds GPU texture limit"));
+        }
+        if !self.device.features().contains(ktx.format.required_feature()) {
+            let rgba = decode_ktx2_to_rgba_premultiplied(ktx)?;
+            return self.upload_rgba_premultiplied(id, ktx.width, ktx.height, &rgba);
+        }
+
+        let bpb = ktx.format.block_bytes();
+        let bytes_per_row = bw * bpb;
+        let payload_len = (bw as usize) * (bh as usize) * (bpb as usize);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ktx2_compressed"),
+            size: wgpu::Extent3d {
+                width: pad_w,
+                height: pad_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ktx.format.wgpu_format(),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &ktx.blocks[..payload_len],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(bh),
+            },
+            wgpu::Extent3d {
+                width: pad_w,
+                height: pad_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let added = payload_len as u64;
+        self.use_clock = self.use_clock.wrapping_add(1);
+        self.texture_epoch = self.texture_epoch.wrapping_add(1);
+        let tex = GpuTexture {
+            view,
+            bind,
+            _texture: texture,
+            bytes: added,
+            last_used: self.use_clock,
+        };
+        if let Some(old) = self.textures.insert(id, tex) {
+            self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
+        }
+        self.texture_bytes = self.texture_bytes.saturating_add(added);
+        self.evict_lru_keeping(Some(id));
+        Ok(())
     }
 
     pub fn upload_rgba_premultiplied(
@@ -860,7 +1205,7 @@ impl Renderer {
         if pixels.len() as u64 != w as u64 * h as u64 * 4 {
             return Err(rerr("decoded RGBA length mismatch"));
         }
-        let mips = mip_level_count_for(w, h, self.backend);
+        let mips = mip_level_count_for(w, h, self.config.width, self.config.height, self.backend);
         let mut tex = Self::create_rgba_texture_raw(
             &self.device,
             &self.queue,
@@ -882,6 +1227,7 @@ impl Renderer {
             self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
         }
         self.texture_bytes = self.texture_bytes.saturating_add(added);
+        self.evict_lru_keeping(Some(id));
         Ok(())
     }
 
@@ -898,7 +1244,7 @@ impl Renderer {
         if w == 0 || h == 0 || w > max_dim || h > max_dim {
             return Err(rerr("ImageBitmap exceeds GPU texture limit"));
         }
-        let mips = mip_level_count_for(w, h, self.backend);
+        let mips = mip_level_count_for(w, h, self.config.width, self.config.height, self.backend);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -967,18 +1313,24 @@ impl Renderer {
             self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
         }
         self.texture_bytes = self.texture_bytes.saturating_add(bytes);
+        self.evict_lru_keeping(Some(id));
         Ok(())
     }
 
     /// Graceful LRU eviction when VRAM exceeds `texture_limit`, preserving `pinned` active assets.
     pub fn evict_lru(&mut self, pinned: &BTreeSet<AssetId>) {
+        self.last_pinned = pinned.clone();
+        self.evict_lru_keeping(None);
+    }
+
+    fn evict_lru_keeping(&mut self, just_uploaded: Option<AssetId>) {
         if self.texture_bytes <= self.texture_limit {
             return;
         }
         let mut victims: Vec<(AssetId, u64)> = self
             .textures
             .iter()
-            .filter(|(id, _)| !pinned.contains(id))
+            .filter(|(&id, _)| Some(id) != just_uploaded && !self.last_pinned.contains(&id))
             .map(|(&id, tex)| (id, tex.last_used))
             .collect();
         victims.sort_by_key(|(_, age)| *age);
@@ -1337,7 +1689,7 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         self.submitted += 1;
-        if self.submitted % ATLAS_TRIM_INTERVAL == 0 {
+        if self.submitted.is_multiple_of(ATLAS_TRIM_INTERVAL) {
             self.atlas.trim();
         }
         Ok(())
@@ -1474,5 +1826,131 @@ mod tests {
         let (ww, wh, wrgba) = decode_image(&webp_bytes).unwrap();
         assert_eq!((ww, wh), (4, 3));
         assert_eq!(wrgba.len(), 4 * 3 * 4);
+    }
+
+    #[test]
+    fn composite_delta_handles_opaque_and_tile_masked_alpha_deletion() {
+        // 32x32 base filled with opaque blue
+        let mut base = vec![0u8; 32 * 32 * 4];
+        for px in base.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[20, 40, 220, 255]);
+        }
+        // 1) Opaque CG mode (empty tile_mask): 16x16 patch at (16, 0) where left half is transparent
+        //    (keep base) and right half is opaque red (overwrite base).
+        let mut cg_patch = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 8..16 {
+                let o = (y * 16 + x) * 4;
+                cg_patch[o..o + 4].copy_from_slice(&[240, 10, 10, 255]);
+            }
+        }
+        let cg_delta = nir_ir::ImageDelta {
+            base: AssetId(0),
+            x: 16,
+            y: 0,
+            tile_mask: vec![],
+        };
+        let out_cg = composite_delta_rgba(&base, 32, 32, &cg_patch, 16, 16, &cg_delta).unwrap();
+        // (16, 0) kept blue base
+        assert_eq!(&out_cg[16 * 4..16 * 4 + 4], &[20, 40, 220, 255]);
+        // (24, 0) overwritten with red
+        assert_eq!(&out_cg[24 * 4..24 * 4 + 4], &[240, 10, 10, 255]);
+
+        // 2) Sprite tile-mask mode: 32x16 patch at (0, 16), tile 0 active (deletes alpha -> 0), tile 1 inactive (keeps base)
+        let mut sp_patch = vec![0u8; 32 * 16 * 4];
+        // Put opaque green inside inactive tile 1 to prove tile_mask skips it!
+        for y in 0..16 {
+            for x in 16..32 {
+                let o = (y * 32 + x) * 4;
+                sp_patch[o..o + 4].copy_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+        let sp_delta = nir_ir::ImageDelta {
+            base: AssetId(0),
+            x: 0,
+            y: 16,
+            tile_mask: vec![0b0000_0001], // bit 0 active, bit 1 inactive
+        };
+        let out_sp = composite_delta_rgba(&base, 32, 32, &sp_patch, 32, 16, &sp_delta).unwrap();
+        // Active tile (0, 16) replaced by transparent [0,0,0,0] -> alpha deletion preserved!
+        let p_del = (16 * 32) * 4;
+        assert_eq!(&out_sp[p_del..p_del + 4], &[0, 0, 0, 0]);
+        // Inactive tile (20, 16) kept original blue base!
+        let p_keep = (16 * 32 + 20) * 4;
+        assert_eq!(&out_sp[p_keep..p_keep + 4], &[20, 40, 220, 255]);
+    }
+
+    #[test]
+    fn smart_mip_level_policy_skips_1to1_and_caps_downscaled() {
+        // 800x600 CG on 1280x720 desktop -> 1 mip (0 wasted VRAM)
+        assert_eq!(
+            mip_level_count_for(800, 600, 1280, 720, RendererBackend::Vulkan),
+            1
+        );
+        // 2560x1440 CG on 1280x720 desktop -> downscaled, capped at 3 mips
+        assert_eq!(
+            mip_level_count_for(2560, 1440, 1280, 720, RendererBackend::Vulkan),
+            3
+        );
+        // WebGL2 always uses 1 mip
+        assert_eq!(
+            mip_level_count_for(2560, 1440, 1280, 720, RendererBackend::WebGl2),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_and_cpu_decode_zlib_ktx2_bc1() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        // 1 single 4x4 BC1 block: solid bright red in RGB565 (0xF800, 0xF800, selector=0)
+        let block = [0x00u8, 0xF8, 0x00, 0xF8, 0, 0, 0, 0];
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+        z.write_all(&block).unwrap();
+        let zdata = z.finish().unwrap();
+
+        let mut dfd = Vec::new();
+        dfd.extend_from_slice(&44u32.to_le_bytes());
+        dfd.extend_from_slice(&0u32.to_le_bytes());
+        dfd.extend_from_slice(&2u16.to_le_bytes());
+        dfd.extend_from_slice(&40u16.to_le_bytes());
+        dfd.extend_from_slice(&[128, 1, 2, 0, 3, 3, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+        dfd.extend_from_slice(&0u16.to_le_bytes());
+        dfd.extend_from_slice(&[63, 0, 0, 0, 0, 0]);
+        dfd.extend_from_slice(&0u32.to_le_bytes());
+        dfd.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut ktx = Vec::new();
+        ktx.extend_from_slice(&[0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A]);
+        ktx.extend_from_slice(&134u32.to_le_bytes()); // BC1_RGBA_SRGB_BLOCK
+        ktx.extend_from_slice(&1u32.to_le_bytes());
+        ktx.extend_from_slice(&4u32.to_le_bytes());
+        ktx.extend_from_slice(&4u32.to_le_bytes());
+        ktx.extend_from_slice(&0u32.to_le_bytes());
+        ktx.extend_from_slice(&0u32.to_le_bytes());
+        ktx.extend_from_slice(&1u32.to_le_bytes());
+        ktx.extend_from_slice(&1u32.to_le_bytes());
+        ktx.extend_from_slice(&3u32.to_le_bytes()); // ZLIB
+        ktx.extend_from_slice(&104u32.to_le_bytes());
+        ktx.extend_from_slice(&(dfd.len() as u32).to_le_bytes());
+        ktx.extend_from_slice(&0u32.to_le_bytes());
+        ktx.extend_from_slice(&0u32.to_le_bytes());
+        ktx.extend_from_slice(&0u64.to_le_bytes());
+        ktx.extend_from_slice(&0u64.to_le_bytes());
+        let level_off = 104u64 + dfd.len() as u64;
+        let pad = ((16 - (level_off % 16)) % 16) as usize;
+        ktx.extend_from_slice(&(level_off + pad as u64).to_le_bytes());
+        ktx.extend_from_slice(&(zdata.len() as u64).to_le_bytes());
+        ktx.extend_from_slice(&(block.len() as u64).to_le_bytes());
+        ktx.extend_from_slice(&dfd);
+        ktx.resize(ktx.len() + pad, 0);
+        ktx.extend_from_slice(&zdata);
+
+        let parsed = parse_ktx2_level0(&ktx).unwrap();
+        assert_eq!((parsed.width, parsed.height), (4, 4));
+        assert_eq!(parsed.format, Ktx2BlockFormat::Bc1Srgb);
+        let rgba = decode_ktx2_to_rgba_premultiplied(&parsed).unwrap();
+        assert_eq!(rgba.len(), 4 * 4 * 4);
+        assert!(rgba[0] > 240 && rgba[1] < 10 && rgba[2] < 10 && rgba[3] == 255);
     }
 }

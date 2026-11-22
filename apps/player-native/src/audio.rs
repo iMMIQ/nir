@@ -1,11 +1,13 @@
-//! High-performance native audio host backed by `rodio` + `symphonia`:
-//! - Zero main-thread decoding: BGM / long tracks stream from a background decoder thread (~256 KB RAM!)
-//! - Background pre-decode LRU cache (32 MiB) for Voice & SFX honoring runtime lookahead
+//! High-performance native audio host backed by `rodio` + `symphonia` + `opus-static-sys`:
+//! - Zero main-thread decoding: BGM / long tracks stream from a reusable 6-thread worker pool (~128 KiB RAM/stream)
+//! - Background pre-decode LRU cache (32 MiB) storing compact `Vec<i16>` PCM (2x effective clip capacity!)
+//! - Full Ogg Opus decoding (RFC 7845 via `ogg` + official Xiph `libopus 1.5`) alongside MP3, OGG Vorbis, WAV, FLAC
 //! - Zero-copy `PakSliceReader` directly over `mmap` `.nirpak` (no compressed byte copy!)
-//! - Reusable `SampleBuffer<f32>` (zero per-packet heap allocation) & zero-copy LAME gapless trimming
+//! - Reusable `SampleBuffer<i16>` & zero-copy LAME gapless trimming
 
 use crate::pak::PakArchive;
 use nir_ir::{AssetId, AudioBus, AudioLoopRegion, ChannelId, Preferences};
+use ogg::reading::PacketReader;
 use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -20,12 +22,75 @@ use symphonia::core::probe::Hint;
 
 /// Compressed size threshold below which non-looped audio (SFX/Voice) is eligible for LRU caching.
 const SHORT_AUDIO_MAX_COMPRESSED: usize = 256 * 1024;
-/// Maximum RAM dedicated to decoded short audio (Voice / SFX) PCM cache.
+/// Maximum RAM dedicated to decoded short audio (Voice / SFX) PCM16 cache (~2x capacity vs f32!).
 const AUDIO_CACHE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 /// Samples per streaming chunk sent from feeder thread to rodio mixer thread (~16 KiB per chunk).
 const STREAM_CHUNK_SAMPLES: usize = 4096;
-/// Bounded streaming queue depth (8 * 16 KiB ≈ 128 KiB peak per active streaming track!).
+/// Bounded streaming queue depth (8 * 16 KiB ≈ 128 KiB peak per active streaming track).
 const STREAM_QUEUE_DEPTH: usize = 8;
+/// Persistent streaming decoder worker threads (eliminates per-click OS thread spawns during Skip!).
+const STREAM_POOL_WORKERS: usize = 6;
+
+const INV_I16_SCALE: f32 = 1.0 / 32768.0;
+
+#[inline]
+fn f32_to_i16(s: f32) -> i16 {
+    (s * 32767.0).round().clamp(-32768.0, 32767.0) as i16
+}
+
+/// Safe RAII wrapper around official Xiph `libopus` C decoder (`opus-static-sys`).
+struct LibOpusDecoder {
+    raw: *mut opus_static_sys::OpusDecoder,
+    channels: usize,
+}
+
+// SAFETY: `OpusDecoder` holds self-contained per-stream state with no thread-local storage.
+unsafe impl Send for LibOpusDecoder {}
+
+impl LibOpusDecoder {
+    fn new(channels: u16) -> Option<Self> {
+        let ch = channels.clamp(1, 2) as i32;
+        let mut err: core::ffi::c_int = 0;
+        let raw = unsafe { opus_static_sys::opus_decoder_create(48_000, ch, &mut err) };
+        if raw.is_null() || err != opus_static_sys::OPUS_OK as i32 {
+            if !raw.is_null() {
+                unsafe { opus_static_sys::opus_decoder_destroy(raw) };
+            }
+            return None;
+        }
+        Some(Self {
+            raw,
+            channels: ch as usize,
+        })
+    }
+
+    fn decode_i16(&mut self, packet: &[u8], out_pcm: &mut [i16]) -> Option<usize> {
+        let max_frames = (out_pcm.len() / self.channels) as i32;
+        let frames = unsafe {
+            opus_static_sys::opus_decode(
+                self.raw,
+                packet.as_ptr(),
+                packet.len() as i32,
+                out_pcm.as_mut_ptr(),
+                max_frames,
+                0,
+            )
+        };
+        if frames < 0 {
+            None
+        } else {
+            Some(frames as usize * self.channels)
+        }
+    }
+}
+
+impl Drop for LibOpusDecoder {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { opus_static_sys::opus_decoder_destroy(self.raw) };
+        }
+    }
+}
 
 /// Zero-copy `MediaSource` reading directly from a byte range inside `Arc<PakArchive>`.
 struct PakSliceReader {
@@ -91,9 +156,10 @@ impl MediaSource for PakSliceReader {
     }
 }
 
+/// Compact PCM16 audio cache entry (half the RAM of `Vec<f32>` -> 2x LRU clip capacity!).
 struct DecodedPcm {
-    samples: Vec<f32>,
-    /// Zero-copy gapless LAME trim range inside `samples`.
+    samples: Vec<i16>,
+    /// Zero-copy gapless LAME/Opus trim range inside `samples`.
     start: usize,
     end: usize,
     sample_rate: u32,
@@ -103,7 +169,7 @@ struct DecodedPcm {
 impl DecodedPcm {
     #[inline]
     fn bytes_len(&self) -> usize {
-        self.samples.len() * std::mem::size_of::<f32>()
+        self.samples.len() * std::mem::size_of::<i16>()
     }
 }
 
@@ -184,6 +250,18 @@ struct PrefetchJob {
     ext: &'static str,
 }
 
+struct StreamJob {
+    pak: Arc<PakArchive>,
+    start: usize,
+    len: usize,
+    ext_hint: &'static str,
+    looped: bool,
+    loop_region: Option<AudioLoopRegion>,
+    tx: mpsc::SyncSender<Vec<f32>>,
+    meta_tx: Option<mpsc::SyncSender<Option<(u32, u16)>>>,
+    cache_short: Option<(Arc<Mutex<AudioCache>>, AssetId)>,
+}
+
 struct ActiveChannel {
     sink: Sink,
     bus: AudioBus,
@@ -197,6 +275,7 @@ pub struct AudioHost {
     bus_paused: [bool; 3],
     cache: Arc<Mutex<AudioCache>>,
     prefetch_tx: mpsc::Sender<PrefetchJob>,
+    stream_tx: mpsc::Sender<StreamJob>,
 }
 
 impl AudioHost {
@@ -209,7 +288,7 @@ impl AudioHost {
             .name("nir-audio-prefetch".into())
             .spawn(move || {
                 while let Ok(job) = prefetch_rx.recv() {
-                    let decoded = decode_pcm_f32_from_pak(job.pak, job.start, job.len, job.ext);
+                    let decoded = decode_pcm_i16_from_pak(job.pak, job.start, job.len, job.ext);
                     let mut guard = worker_cache.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(pcm) = decoded {
                         guard.insert(job.id, Arc::new(pcm));
@@ -219,6 +298,25 @@ impl AudioHost {
                 }
             });
 
+        // Reusable streaming decoder worker pool (eliminates per-clip thread spawn jitter!)
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamJob>();
+        let shared_rx = Arc::new(Mutex::new(stream_rx));
+        for idx in 0..STREAM_POOL_WORKERS {
+            let rx = Arc::clone(&shared_rx);
+            let _ = std::thread::Builder::new()
+                .name(format!("nir-audio-stream-{idx}"))
+                .spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.recv()
+                    };
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    run_stream_job(job);
+                });
+        }
+
         let mut host = Self {
             stream,
             channels: HashMap::new(),
@@ -226,6 +324,7 @@ impl AudioHost {
             bus_paused: [false; 3],
             cache,
             prefetch_tx,
+            stream_tx,
         };
         host.apply_preferences(prefs);
         host
@@ -247,7 +346,7 @@ impl AudioHost {
         self.refresh_volumes();
     }
 
-    /// Asynchronously pre-decodes short Voice/SFX assets into the LRU cache (lookahead!).
+    /// Asynchronously pre-decodes short Voice/SFX assets into the PCM16 LRU cache (lookahead!).
     pub fn prefetch(&self, pak: &Arc<PakArchive>, id: AssetId, ext: &'static str) {
         if self.stream.is_none() {
             return;
@@ -260,11 +359,7 @@ impl AudioHost {
         }
         let should_queue = {
             let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.entries.contains_key(&id) || !guard.inflight.insert(id) {
-                false
-            } else {
-                true
-            }
+            !guard.entries.contains_key(&id) && guard.inflight.insert(id)
         };
         if should_queue {
             let _ = self.prefetch_tx.send(PrefetchJob {
@@ -310,7 +405,7 @@ impl AudioHost {
             sink.pause();
         }
 
-        // Fast path 1: Already decoded in LRU cache (0ms startup, zero-copy Arc share!)
+        // Fast path 1: Already decoded in PCM16 LRU cache (0ms startup, zero-copy Arc share!)
         let cached = {
             let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(asset)
@@ -333,12 +428,12 @@ impl AudioHost {
             return;
         }
 
-        // Fast path 2: Background streaming decoder (NEVER blocks the main thread, ~256 KB RAM!).
-        // If it's a short unlooped clip, also schedule it into the LRU cache for instant replays.
+        // Fast path 2: Dispatch to reusable streaming worker pool (zero thread spawn!).
         let cache_if_short = (!looped && len <= SHORT_AUDIO_MAX_COMPRESSED)
             .then(|| (Arc::clone(&self.cache), asset));
 
-        let Some(stream_src) = StreamingAudioSource::spawn(
+        let Some(stream_src) = StreamingAudioSource::dispatch(
+            &self.stream_tx,
             Arc::clone(pak),
             start,
             len,
@@ -435,7 +530,21 @@ fn bus_index(bus: AudioBus) -> usize {
     }
 }
 
-fn lame_trim_samples(pak: &PakArchive, start: usize, len: usize, ext: &str, channels: u16) -> (usize, usize) {
+fn is_opus_stream(pak: &PakArchive, start: usize, len: usize, ext: &str) -> bool {
+    if ext == "opus" {
+        return true;
+    }
+    let slice = &pak.raw_slice()[start..start + len.min(128)];
+    slice.windows(8).any(|w| w == b"OpusHead")
+}
+
+fn lame_trim_samples(
+    pak: &PakArchive,
+    start: usize,
+    len: usize,
+    ext: &str,
+    channels: u16,
+) -> (usize, usize) {
     if ext != "mp3" {
         return (0, 0);
     }
@@ -450,14 +559,59 @@ fn lame_trim_samples(pak: &PakArchive, start: usize, len: usize, ext: &str, chan
     }
 }
 
-/// Decodes a short audio asset directly from `Arc<PakArchive>` (zero input copy,
-/// reusable `SampleBuffer`, zero-copy LAME gapless slice indices!).
-fn decode_pcm_f32_from_pak(
+fn decode_ogg_opus_i16_from_pak(
+    pak: Arc<PakArchive>,
+    start: usize,
+    len: usize,
+) -> Option<DecodedPcm> {
+    let reader = PakSliceReader::new(pak, start, len);
+    let mut pr = PacketReader::new(reader);
+    let head = pr.read_packet().ok()??;
+    if !head.data.starts_with(b"OpusHead") || head.data.len() < 19 {
+        return None;
+    }
+    let channels = (head.data[9] as u16).clamp(1, 2);
+    let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as usize;
+    let _tags = pr.read_packet().ok()??;
+
+    let mut dec = LibOpusDecoder::new(channels)?;
+    let ch = channels as usize;
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut frame_buf = vec![0i16; 5760 * ch];
+
+    while let Ok(Some(pkt)) = pr.read_packet() {
+        if pkt.data.is_empty() {
+            continue;
+        }
+        if let Some(n) = dec.decode_i16(&pkt.data, &mut frame_buf) {
+            pcm.extend_from_slice(&frame_buf[..n]);
+        }
+    }
+    if pcm.is_empty() {
+        return None;
+    }
+    let lead = (pre_skip * ch).min(pcm.len());
+    let end = pcm.len();
+    Some(DecodedPcm {
+        samples: pcm,
+        start: lead,
+        end,
+        sample_rate: 48_000,
+        channels,
+    })
+}
+
+/// Decodes a short audio asset directly from `Arc<PakArchive>` into compact PCM16.
+fn decode_pcm_i16_from_pak(
     pak: Arc<PakArchive>,
     start: usize,
     len: usize,
     ext_hint: &str,
 ) -> Option<DecodedPcm> {
+    if is_opus_stream(&pak, start, len, ext_hint) {
+        return decode_ogg_opus_i16_from_pak(pak, start, len);
+    }
+
     let mut hint = Hint::new();
     if !ext_hint.is_empty() {
         hint.with_extension(ext_hint);
@@ -489,8 +643,8 @@ fn decode_pcm_f32_from_pak(
         .map(|f| (f as usize).saturating_mul(channels as usize))
         .unwrap_or(0)
         .min(8 * 1024 * 1024);
-    let mut pcm: Vec<f32> = Vec::with_capacity(est_samples);
-    let mut sbuf: Option<SampleBuffer<f32>> = None;
+    let mut pcm: Vec<i16> = Vec::with_capacity(est_samples);
+    let mut sbuf: Option<SampleBuffer<i16>> = None;
 
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
@@ -503,7 +657,7 @@ fn decode_pcm_f32_from_pak(
         let spec = *decoded.spec();
         let buf = match &mut sbuf {
             Some(b) if b.capacity() >= decoded.capacity() => b,
-            slot => slot.insert(SampleBuffer::<f32>::new(cap, spec)),
+            slot => slot.insert(SampleBuffer::<i16>::new(cap, spec)),
         };
         buf.copy_interleaved_ref(decoded);
         pcm.extend_from_slice(buf.samples());
@@ -529,8 +683,7 @@ fn decode_pcm_f32_from_pak(
     })
 }
 
-/// Low-memory background streaming source: decodes chunk-by-chunk on a feeder thread
-/// with lookbehind LAME gapless trimming and bounded ~128 KiB RAM footprint!
+/// Low-memory background streaming source backed by the reusable streaming decoder pool.
 struct StreamingAudioSource {
     rx: mpsc::Receiver<Vec<f32>>,
     current: Vec<f32>,
@@ -541,7 +694,8 @@ struct StreamingAudioSource {
 
 impl StreamingAudioSource {
     #[allow(clippy::too_many_arguments)]
-    fn spawn(
+    fn dispatch(
+        pool_tx: &mpsc::Sender<StreamJob>,
         pak: Arc<PakArchive>,
         start: usize,
         len: usize,
@@ -561,20 +715,17 @@ impl StreamingAudioSource {
             (None, None)
         };
 
-        std::thread::Builder::new()
-            .name("nir-audio-stream".into())
-            .spawn(move || {
-                stream_decode_loop(
-                    pak,
-                    start,
-                    len,
-                    ext_hint,
-                    looped,
-                    loop_region,
-                    chunk_tx,
-                    meta_tx,
-                    cache_short,
-                );
+        pool_tx
+            .send(StreamJob {
+                pak,
+                start,
+                len,
+                ext_hint,
+                looped,
+                loop_region,
+                tx: chunk_tx,
+                meta_tx,
+                cache_short,
             })
             .ok()?;
 
@@ -629,28 +780,143 @@ impl Source for StreamingAudioSource {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stream_decode_loop(
-    pak: Arc<PakArchive>,
-    start: usize,
-    len: usize,
-    ext_hint: &'static str,
-    looped: bool,
-    loop_region: Option<AudioLoopRegion>,
-    tx: mpsc::SyncSender<Vec<f32>>,
-    mut meta_tx: Option<mpsc::SyncSender<Option<(u32, u16)>>>,
-    mut cache_short: Option<(Arc<Mutex<AudioCache>>, AssetId)>,
-) {
+fn run_stream_job(job: StreamJob) {
+    if is_opus_stream(&job.pak, job.start, job.len, job.ext_hint) {
+        stream_opus_decode_loop(job);
+    } else {
+        stream_symphonia_decode_loop(job);
+    }
+}
+
+fn stream_opus_decode_loop(mut job: StreamJob) {
     let mut first_pass = true;
     let mut out_chunk = Vec::with_capacity(STREAM_CHUNK_SAMPLES);
-    let mut cache_accum: Option<Vec<f32>> = cache_short.as_ref().map(|_| Vec::new());
+    let mut cache_accum: Option<Vec<i16>> = job.cache_short.as_ref().map(|_| Vec::new());
+
+    loop {
+        let reader = PakSliceReader::new(Arc::clone(&job.pak), job.start, job.len);
+        let mut pr = PacketReader::new(reader);
+        let Ok(Some(head)) = pr.read_packet() else {
+            if let Some(m) = job.meta_tx.take() {
+                let _ = m.send(None);
+            }
+            return;
+        };
+        if !head.data.starts_with(b"OpusHead") || head.data.len() < 19 {
+            if let Some(m) = job.meta_tx.take() {
+                let _ = m.send(None);
+            }
+            return;
+        }
+        let ch = (head.data[9] as u16).clamp(1, 2);
+        let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as usize;
+        let _ = pr.read_packet(); // OpusTags
+        if let Some(m) = job.meta_tx.take() {
+            let _ = m.send(Some((48_000, ch)));
+        }
+
+        let Some(mut dec) = LibOpusDecoder::new(ch) else {
+            return;
+        };
+        let ch_usize = ch as usize;
+        let (loop_start_sample, loop_end_sample) = if let Some(r) = job.loop_region {
+            let ls = ((r.start_us as u128 * 48_000u128) / 1_000_000) as usize * ch_usize;
+            let le = ((r.end_us as u128 * 48_000u128) / 1_000_000) as usize * ch_usize;
+            if ls < le { (ls, Some(le)) } else { (0, None) }
+        } else {
+            (0, None)
+        };
+
+        let skip_after_lead = if first_pass { 0 } else { loop_start_sample };
+        let mut total_skip = pre_skip * ch_usize + skip_after_lead;
+        let mut emitted = skip_after_lead;
+        let mut frame_buf = vec![0i16; 5760 * ch_usize];
+        let mut hit_loop_end = false;
+
+        while let Ok(Some(pkt)) = pr.read_packet() {
+            if pkt.data.is_empty() {
+                continue;
+            }
+            let Some(n) = dec.decode_i16(&pkt.data, &mut frame_buf) else {
+                continue;
+            };
+            let mut slice = &frame_buf[..n];
+            if total_skip > 0 {
+                if total_skip >= slice.len() {
+                    total_skip -= slice.len();
+                    continue;
+                }
+                slice = &slice[total_skip..];
+                total_skip = 0;
+            }
+            for &s_i16 in slice {
+                if let Some(end_at) = loop_end_sample {
+                    if emitted >= end_at {
+                        hit_loop_end = true;
+                        break;
+                    }
+                }
+                emitted += 1;
+                if let Some(acc) = cache_accum.as_mut() {
+                    acc.push(s_i16);
+                }
+                out_chunk.push(s_i16 as f32 * INV_I16_SCALE);
+                if out_chunk.len() >= STREAM_CHUNK_SAMPLES {
+                    let full = std::mem::replace(
+                        &mut out_chunk,
+                        Vec::with_capacity(STREAM_CHUNK_SAMPLES),
+                    );
+                    if job.tx.send(full).is_err() {
+                        return;
+                    }
+                }
+            }
+            if hit_loop_end {
+                break;
+            }
+        }
+
+        if !job.looped {
+            if !out_chunk.is_empty() {
+                let _ = job.tx.send(out_chunk);
+            }
+            if let (Some((cache, id)), Some(samples)) =
+                (job.cache_short.take(), cache_accum.take())
+            {
+                if !samples.is_empty() {
+                    let end = samples.len();
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.insert(
+                        id,
+                        Arc::new(DecodedPcm {
+                            samples,
+                            start: 0,
+                            end,
+                            sample_rate: 48_000,
+                            channels: ch,
+                        }),
+                    );
+                }
+            }
+            return;
+        }
+        first_pass = false;
+        cache_accum = None;
+        job.cache_short = None;
+    }
+}
+
+fn stream_symphonia_decode_loop(mut job: StreamJob) {
+    let mut first_pass = true;
+    let mut out_chunk = Vec::with_capacity(STREAM_CHUNK_SAMPLES);
+    let mut cache_accum: Option<Vec<i16>> = job.cache_short.as_ref().map(|_| Vec::new());
 
     loop {
         let mut hint = Hint::new();
-        if !ext_hint.is_empty() {
-            hint.with_extension(ext_hint);
+        if !job.ext_hint.is_empty() {
+            hint.with_extension(job.ext_hint);
         }
-        let reader = PakSliceReader::new(Arc::clone(&pak), start, len);
+        let reader = PakSliceReader::new(Arc::clone(&job.pak), job.start, job.len);
         let mss = MediaSourceStream::new(Box::new(reader), Default::default());
         let Ok(probed) = symphonia::default::get_probe().format(
             &hint,
@@ -658,32 +924,32 @@ fn stream_decode_loop(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         ) else {
-            if let Some(m) = meta_tx.take() {
+            if let Some(m) = job.meta_tx.take() {
                 let _ = m.send(None);
             }
             return;
         };
         let mut format = probed.format;
         let Some(track) = format.default_track() else {
-            if let Some(m) = meta_tx.take() {
+            if let Some(m) = job.meta_tx.take() {
                 let _ = m.send(None);
             }
             return;
         };
         let Some(sample_rate) = track.codec_params.sample_rate else {
-            if let Some(m) = meta_tx.take() {
+            if let Some(m) = job.meta_tx.take() {
                 let _ = m.send(None);
             }
             return;
         };
         let Some(ch) = track.codec_params.channels.map(|c| c.count() as u16) else {
-            if let Some(m) = meta_tx.take() {
+            if let Some(m) = job.meta_tx.take() {
                 let _ = m.send(None);
             }
             return;
         };
         let track_id = track.id;
-        if let Some(m) = meta_tx.take() {
+        if let Some(m) = job.meta_tx.take() {
             let _ = m.send(Some((sample_rate, ch.max(1))));
         }
 
@@ -693,9 +959,9 @@ fn stream_decode_loop(
             return;
         };
 
-        let (lead, trail) = lame_trim_samples(&pak, start, len, ext_hint, ch);
+        let (lead, trail) = lame_trim_samples(&job.pak, job.start, job.len, job.ext_hint, ch);
         let ch_usize = ch.max(1) as usize;
-        let (loop_start_sample, loop_end_sample) = if let Some(r) = loop_region {
+        let (loop_start_sample, loop_end_sample) = if let Some(r) = job.loop_region {
             let ls = ((r.start_us as u128 * sample_rate as u128) / 1_000_000) as usize * ch_usize;
             let le = ((r.end_us as u128 * sample_rate as u128) / 1_000_000) as usize * ch_usize;
             if ls < le {
@@ -714,22 +980,23 @@ fn stream_decode_loop(
         let mut sbuf: Option<SampleBuffer<f32>> = None;
         let mut hit_loop_end = false;
 
-        let emit_sample = |s: f32,
-                           out_chunk: &mut Vec<f32>,
-                           cache_accum: &mut Option<Vec<f32>>|
-         -> bool {
-            if let Some(acc) = cache_accum.as_mut() {
-                acc.push(s);
-            }
-            out_chunk.push(s);
-            if out_chunk.len() >= STREAM_CHUNK_SAMPLES {
-                let full = std::mem::replace(out_chunk, Vec::with_capacity(STREAM_CHUNK_SAMPLES));
-                if tx.send(full).is_err() {
-                    return false;
+        let emit_sample =
+            |s: f32, out_chunk: &mut Vec<f32>, cache_accum: &mut Option<Vec<i16>>| -> bool {
+                if let Some(acc) = cache_accum.as_mut() {
+                    acc.push(f32_to_i16(s));
                 }
-            }
-            true
-        };
+                out_chunk.push(s);
+                if out_chunk.len() >= STREAM_CHUNK_SAMPLES {
+                    let full = std::mem::replace(
+                        out_chunk,
+                        Vec::with_capacity(STREAM_CHUNK_SAMPLES),
+                    );
+                    if job.tx.send(full).is_err() {
+                        return false;
+                    }
+                }
+                true
+            };
 
         while let Ok(packet) = format.next_packet() {
             if packet.track_id() != track_id {
@@ -793,13 +1060,13 @@ fn stream_decode_loop(
             }
         }
 
-        // If looping ended early at an explicit loop_region end, drain non-padding samples up to loop_end.
-        // If EOF was reached naturally, `tail_hold` holds the exact LAME trailing padding and is dropped!
-        if !looped {
+        if !job.looped {
             if !out_chunk.is_empty() {
-                let _ = tx.send(out_chunk);
+                let _ = job.tx.send(out_chunk);
             }
-            if let (Some((cache, id)), Some(samples)) = (cache_short.take(), cache_accum.take()) {
+            if let (Some((cache, id)), Some(samples)) =
+                (job.cache_short.take(), cache_accum.take())
+            {
                 if !samples.is_empty() {
                     let end = samples.len();
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -819,11 +1086,11 @@ fn stream_decode_loop(
         }
         first_pass = false;
         cache_accum = None;
-        cache_short = None;
+        job.cache_short = None;
     }
 }
 
-/// Zero-copy sample-accurate looping PCM source backed by shared `Arc<DecodedPcm>`.
+/// Zero-copy sample-accurate looping PCM16 source backed by shared `Arc<DecodedPcm>`.
 struct PcmLoopSource {
     pcm: Arc<DecodedPcm>,
     cursor: usize,
@@ -872,7 +1139,7 @@ impl Iterator for PcmLoopSource {
         }
         let sample = *self.pcm.samples.get(self.cursor)?;
         self.cursor += 1;
-        Some(sample)
+        Some(sample as f32 * INV_I16_SCALE)
     }
 }
 
@@ -895,5 +1162,41 @@ impl Source for PcmLoopSource {
                 frames as f64 / self.pcm.sample_rate as f64,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libopus_decoder_initializes_and_decodes_silence_frame() {
+        let mut dec = LibOpusDecoder::new(1).expect("mono opus decoder");
+        // Standard Opus TOC-only 1-byte DTX/silence packet (0xF8 = CELT FB 20ms mono, 1 frame)
+        let mut out = vec![0i16; 5760];
+        let decoded = dec.decode_i16(&[0xF8, 0xFF, 0xFE], &mut out);
+        assert!(decoded.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn pcm16_audio_lru_cache_accounts_bytes_and_replaces() {
+        let mut cache = AudioCache::new();
+        let mk = |n: usize| {
+            Arc::new(DecodedPcm {
+                samples: vec![0i16; n],
+                start: 0,
+                end: n,
+                sample_rate: 48_000,
+                channels: 1,
+            })
+        };
+        cache.insert(AssetId(1), mk(20)); // 40 bytes (PCM16 = 2 bytes/sample)
+        assert_eq!(cache.bytes, 40);
+        cache.insert(AssetId(2), mk(30)); // 60 bytes
+        assert_eq!(cache.bytes, 100);
+        cache.insert(AssetId(1), mk(10)); // replace 40 -> 20 bytes
+        assert_eq!(cache.bytes, 80);
+        assert!(cache.get(AssetId(1)).is_some());
+        assert!(cache.get(AssetId(2)).is_some());
     }
 }

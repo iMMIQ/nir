@@ -16,6 +16,7 @@ lewton.workspace = true
 roxmltree.workspace = true
 serde.workspace = true
 sha2.workspace = true
+zune-jpeg.workspace = true
 
 [dev-dependencies]
 nir-build.workspace = true

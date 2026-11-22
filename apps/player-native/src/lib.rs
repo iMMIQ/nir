@@ -10,11 +10,14 @@ pub mod storage;
 
 use anyhow::{Context, Result};
 use audio::AudioHost;
-use nir_ir::{AssetId, AssetKind, UiAction};
-use nir_render::{decode_image, wgpu, Renderer, RendererBackend};
+use nir_ir::{AssetId, AssetKind, MediaCodec, UiAction, FEATURE_DELTA_IMAGE};
+use nir_render::{
+    composite_delta_rgba, decode_image, parse_ktx2_level0, wgpu, DecodedKtx2, Renderer,
+    RendererBackend,
+};
 use nir_runtime::{HostCommand, Runtime};
 use pak::PakArchive;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +41,10 @@ enum DecodedImage {
         height: u32,
         rgba: Vec<u8>,
     },
+    Ktx2 {
+        id: AssetId,
+        ktx: DecodedKtx2,
+    },
     Err {
         id: AssetId,
         error: String,
@@ -47,6 +54,56 @@ enum DecodedImage {
 struct DecodeRequest {
     pak: Arc<PakArchive>,
     id: AssetId,
+}
+
+type BaseCacheEntry = (u32, u32, Arc<Vec<u8>>, u64);
+
+/// Small LRU cache of decoded premultiplied base images shared by `DecodePool` workers so
+/// flipping through 20 consecutive CG/sprite expressions decodes the base image ONCE!
+struct BaseRgbaCache {
+    entries: HashMap<AssetId, BaseCacheEntry>,
+    clock: u64,
+}
+
+impl BaseRgbaCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, id: AssetId) -> Option<(u32, u32, Arc<Vec<u8>>)> {
+        self.clock = self.clock.wrapping_add(1);
+        let tick = self.clock;
+        if let Some((w, h, px, last)) = self.entries.get_mut(&id) {
+            *last = tick;
+            return Some((*w, *h, Arc::clone(px)));
+        }
+        None
+    }
+
+    fn insert(&mut self, id: AssetId, w: u32, h: u32, px: Arc<Vec<u8>>) {
+        const MAX_BASES: usize = 8;
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(id, (w, h, px, self.clock));
+        while self.entries.len() > MAX_BASES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, _, age))| *age)
+                .map(|(&k, _)| k)
+            {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 /// Priority work queue shared across background image decode worker threads:
@@ -59,6 +116,7 @@ struct DecodeQueueState {
 
 struct DecodePool {
     state: Arc<(Mutex<DecodeQueueState>, Condvar)>,
+    base_cache: Arc<Mutex<BaseRgbaCache>>,
 }
 
 impl DecodePool {
@@ -75,8 +133,10 @@ impl DecodePool {
             }),
             Condvar::new(),
         ));
+        let base_cache = Arc::new(Mutex::new(BaseRgbaCache::new()));
         for idx in 0..workers {
             let q = Arc::clone(&state);
+            let bc = Arc::clone(&base_cache);
             let tx = res_tx.clone();
             let p = proxy.clone();
             let _ = std::thread::Builder::new()
@@ -98,31 +158,14 @@ impl DecodePool {
                             guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    let msg = match req.pak.asset_bytes(req.id) {
-                        Some(bytes) => match decode_image(bytes) {
-                            Ok((width, height, rgba)) => DecodedImage::Ok {
-                                id: req.id,
-                                width,
-                                height,
-                                rgba,
-                            },
-                            Err(e) => DecodedImage::Err {
-                                id: req.id,
-                                error: e.to_string(),
-                            },
-                        },
-                        None => DecodedImage::Err {
-                            id: req.id,
-                            error: "asset missing from nirpak".into(),
-                        },
-                    };
+                    let msg = decode_asset_for_pool(&req.pak, req.id, &bc);
                     if tx.send(msg).is_err() {
                         return;
                     }
                     let _ = p.send_event(UserEvent::ImageDecoded);
                 });
         }
-        Self { state }
+        Self { state, base_cache }
     }
 
     fn enqueue(&self, req: DecodeRequest, urgent: bool) {
@@ -156,6 +199,112 @@ impl DecodePool {
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         guard.urgent.clear();
         guard.prefetch.clear();
+        if let Ok(mut bc) = self.base_cache.lock() {
+            bc.clear();
+        }
+    }
+}
+
+fn decode_asset_for_pool(
+    pak: &PakArchive,
+    id: AssetId,
+    base_cache: &Mutex<BaseRgbaCache>,
+) -> DecodedImage {
+    let Some(meta) = pak.program.asset(id) else {
+        return DecodedImage::Err {
+            id,
+            error: "asset metadata missing".into(),
+        };
+    };
+    let Some(bytes) = pak.asset_bytes(id) else {
+        return DecodedImage::Err {
+            id,
+            error: "asset missing from nirpak".into(),
+        };
+    };
+
+    if meta.codec == MediaCodec::Ktx2 {
+        return match parse_ktx2_level0(bytes) {
+            Ok(ktx) => DecodedImage::Ktx2 { id, ktx },
+            Err(e) => DecodedImage::Err {
+                id,
+                error: e.to_string(),
+            },
+        };
+    }
+
+    if let Some(delta) = &meta.delta {
+        let base_id = delta.base;
+        let cached_base = base_cache
+            .lock()
+            .ok()
+            .and_then(|mut g| g.get(base_id));
+        let (bw, bh, base_rgba) = if let Some(hit) = cached_base {
+            hit
+        } else {
+            let Some(base_bytes) = pak.asset_bytes(base_id) else {
+                return DecodedImage::Err {
+                    id,
+                    error: "delta base asset missing from nirpak".into(),
+                };
+            };
+            match decode_image(base_bytes) {
+                Ok((w, h, rgba)) => {
+                    let arc = Arc::new(rgba);
+                    if let Ok(mut g) = base_cache.lock() {
+                        g.insert(base_id, w, h, Arc::clone(&arc));
+                    }
+                    (w, h, arc)
+                }
+                Err(e) => {
+                    return DecodedImage::Err {
+                        id,
+                        error: format!("delta base decode: {e}"),
+                    };
+                }
+            }
+        };
+        let (pw, ph, patch_rgba) = match decode_image(bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return DecodedImage::Err {
+                    id,
+                    error: format!("delta patch decode: {e}"),
+                };
+            }
+        };
+        return match composite_delta_rgba(&base_rgba, bw, bh, &patch_rgba, pw, ph, delta) {
+            Ok(rgba) => DecodedImage::Ok {
+                id,
+                width: bw,
+                height: bh,
+                rgba,
+            },
+            Err(e) => DecodedImage::Err {
+                id,
+                error: e.to_string(),
+            },
+        };
+    }
+
+    match decode_image(bytes) {
+        Ok((width, height, rgba)) => {
+            if pak.program.features & FEATURE_DELTA_IMAGE != 0 && width >= 128 && height >= 128 {
+                if let Ok(mut g) = base_cache.lock() {
+                    g.insert(id, width, height, Arc::new(rgba.clone()));
+                }
+            }
+            DecodedImage::Ok {
+                id,
+                width,
+                height,
+                rgba,
+            }
+        }
+        Err(e) => DecodedImage::Err {
+            id,
+            error: e.to_string(),
+        },
     }
 }
 
@@ -318,6 +467,13 @@ impl NativeApp {
                     self.pending_decodes.remove(&id);
                     if let Some(renderer) = &mut self.renderer {
                         let _ = renderer.upload_rgba_premultiplied(id, width, height, &rgba);
+                    }
+                    self.runtime.mark_asset_loaded(id);
+                }
+                DecodedImage::Ktx2 { id, ktx } => {
+                    self.pending_decodes.remove(&id);
+                    if let Some(renderer) = &mut self.renderer {
+                        let _ = renderer.upload_decoded_ktx2(id, &ktx);
                     }
                     self.runtime.mark_asset_loaded(id);
                 }

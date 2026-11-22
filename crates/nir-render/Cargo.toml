@@ -11,6 +11,9 @@ nir-ui.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 bytemuck.workspace = true
+flate2.workspace = true
+ktx2.workspace = true
+bcdec_rs.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 image.workspace = true

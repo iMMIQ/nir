@@ -27,10 +27,10 @@ pub trait EventBridge {
     fn register_timeline(&mut self, raw_path: &str) -> Option<TimelineId>;
     /// Returns the CG gallery unlock flag name if `asset` is listed in `CGモード.TXT`.
     fn cg_unlock_flag(&self, asset: AssetId) -> Option<StrId>;
-    /// Notes that the game uses dynamic `?var` image paths (enables dynamic asset registration).
-    fn mark_dynamic_images(&mut self);
-    /// Notes that the game uses dynamic `?var` audio paths.
-    fn mark_dynamic_audio(&mut self);
+    /// Notes that the game uses a dynamic `?var` image path via `var_name`.
+    fn mark_dynamic_image_var(&mut self, var_name: &str);
+    /// Notes that the game uses a dynamic `?var` audio path via `var_name`.
+    fn mark_dynamic_audio_var(&mut self, var_name: &str);
     /// Records an exact conversion item.
     fn record_exact(&mut self);
     /// Records an adapted conversion item.
@@ -130,8 +130,8 @@ pub fn lower_event(
             let (channel, bus) = bridge.resolve_channel(ch_name);
             let looped = mode.eq_ignore_ascii_case("REPEAT");
             if let Some(var_raw) = src.strip_prefix('?') {
-                bridge.mark_dynamic_audio();
                 let var_name = decode_lm_escaped(var_raw);
+                bridge.mark_dynamic_audio_var(&var_name);
                 let vid = bridge.resolve_var(&var_name);
                 ops.push(Op::LoadVar(vid));
                 ops.push(Op::ResolveAsset);
@@ -165,8 +165,8 @@ pub fn lower_event(
             let vol = arg(2).parse::<f32>().unwrap_or(1000.0).clamp(0.0, 2000.0) / 1000.0;
             let (channel, bus) = bridge.resolve_channel(ch_name);
             if let Some(var_raw) = src.strip_prefix('?') {
-                bridge.mark_dynamic_audio();
                 let var_name = decode_lm_escaped(var_raw);
+                bridge.mark_dynamic_audio_var(&var_name);
                 let vid = bridge.resolve_var(&var_name);
                 ops.push(Op::LoadVar(vid));
                 ops.push(Op::ResolveAsset);
@@ -368,8 +368,8 @@ pub fn lower_event(
                 ops.push(Op::SetDialoguePortrait(None));
                 bridge.record_exact();
             } else if let Some(var_raw) = src.strip_prefix('?') {
-                bridge.mark_dynamic_images();
                 let var_name = decode_lm_escaped(var_raw);
+                bridge.mark_dynamic_image_var(&var_name);
                 let vid = bridge.resolve_var(&var_name);
                 ops.push(Op::LoadVar(vid));
                 ops.push(Op::ResolveAsset);
@@ -512,8 +512,8 @@ fn lower_create_cg(args: &[String], bridge: &mut dyn EventBridge, ops: &mut Vec<
     };
 
     if let Some(var_raw) = src.strip_prefix('?') {
-        bridge.mark_dynamic_images();
         let var_name = decode_lm_escaped(var_raw);
+        bridge.mark_dynamic_image_var(&var_name);
         let vid = bridge.resolve_var(&var_name);
         ops.push(Op::LoadVar(vid));
         ops.push(Op::ResolveAsset);
@@ -618,8 +618,8 @@ fn lower_change_cg(args: &[String], bridge: &mut dyn EventBridge, ops: &mut Vec<
     let layer = bridge.resolve_layer(layer_name);
 
     if let Some(var_raw) = src.strip_prefix('?') {
-        bridge.mark_dynamic_images();
         let var_name = decode_lm_escaped(var_raw);
+        bridge.mark_dynamic_image_var(&var_name);
         let vid = bridge.resolve_var(&var_name);
         ops.push(Op::LoadVar(vid));
         ops.push(Op::ResolveAsset);

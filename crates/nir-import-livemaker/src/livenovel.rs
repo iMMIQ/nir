@@ -22,7 +22,8 @@ use crate::media;
 use anyhow::{Context, Result};
 use nir_import_core::vfs::{decode_text_bytes, normalize_vfs_path, ArchiveSource, DirArchive};
 use nir_import_core::{
-    sanitize_ident, ConversionReport, DirectImport, ImportOptions, RawAssetData, RawAssetInput,
+    file_fingerprint, sanitize_ident, ConversionReport, DecodedPixels, DirectImport, ImportOptions,
+    RawAssetData, RawAssetInput,
 };
 use nir_ir::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -293,8 +294,8 @@ pub fn import_direct(
     // 11. Backpatch all jumps & function entry PCs
     c.backpatch_all();
 
-    // 12. If any event used dynamic `?var` paths, register candidate dynamic assets into `asset_lookup`!
-    c.populate_dynamic_assets(is_livenovel);
+    // 12. If any event used dynamic `?var` paths, statically narrow prefixes & register dynamic assets!
+    c.populate_dynamic_assets(is_livenovel, &author_scripts);
 
     // 13. Register any bundled TTF/OTF fonts
     let mut fonts = Vec::new();
@@ -427,9 +428,9 @@ struct Compiler<'a> {
     temp_locals: BTreeMap<String, u16>,
     max_local_count: u16,
 
-    // Dynamic path flags & title hints
-    uses_dynamic_images: bool,
-    uses_dynamic_audio: bool,
+    // Dynamic path variable sets & title hints
+    dynamic_image_vars: BTreeSet<String>,
+    dynamic_audio_vars: BTreeSet<String>,
     first_title_bg: Option<AssetId>,
     first_title_bgm: Option<AssetId>,
     current_loc: String,
@@ -484,8 +485,8 @@ impl<'a> Compiler<'a> {
             jump_patches: Vec::new(),
             temp_locals: BTreeMap::new(),
             max_local_count: 1,
-            uses_dynamic_images: false,
-            uses_dynamic_audio: false,
+            dynamic_image_vars: BTreeSet::new(),
+            dynamic_audio_vars: BTreeSet::new(),
             first_title_bg: None,
             first_title_bgm: None,
             current_loc: String::new(),
@@ -606,26 +607,31 @@ impl<'a> Compiler<'a> {
             return Some(id);
         }
         let real_path = self.archive.real_path(vfs_path)?.to_path_buf();
+        let fp = file_fingerprint(&real_path);
         let (codec, data) = if vfs_path.ends_with(".gal") {
             let p = real_path.clone();
             (
                 MediaCodec::Png,
-                RawAssetData::Lazy(Arc::new(move || {
+                RawAssetData::LazyImage(Arc::new(move || {
                     let bytes = std::fs::read(&p)
                         .with_context(|| format!("reading GAL `{}`", p.display()))?;
-                    let img = media::gal(&bytes)
-                        .with_context(|| format!("decoding GAL `{}`", p.display()))?;
-                    media::png_fast(&img)
+                    media::gal_pixels(&bytes)
+                        .with_context(|| format!("decoding GAL `{}`", p.display()))
                 })),
             )
         } else if vfs_path.ends_with(".bmp") {
             let p = real_path.clone();
             (
                 MediaCodec::Png,
-                RawAssetData::Lazy(Arc::new(move || {
+                RawAssetData::LazyImage(Arc::new(move || {
                     let bytes = std::fs::read(&p)?;
                     let img = image::load_from_memory(&bytes)?.to_rgba8();
-                    media::png_fast(&img)
+                    let (width, height) = img.dimensions();
+                    Ok(DecodedPixels::Rgba {
+                        width,
+                        height,
+                        data: img.into_raw(),
+                    })
                 })),
             )
         } else {
@@ -649,9 +655,9 @@ impl<'a> Compiler<'a> {
             kind: AssetKind::Image,
             codec,
             data,
+            source_fingerprint: fp,
         });
         self.asset_by_vfs.insert(vfs_path.to_owned(), id);
-        self.insert_lookup_keys(vfs_path, id);
         Some(id)
     }
 
@@ -669,6 +675,7 @@ impl<'a> Compiler<'a> {
             return Some(id);
         }
         let real_path: PathBuf = self.archive.real_path(vfs_path)?.to_path_buf();
+        let fp = file_fingerprint(&real_path);
         let codec = if vfs_path.ends_with(".ogg") {
             MediaCodec::Ogg
         } else if vfs_path.ends_with(".mp3") {
@@ -683,9 +690,9 @@ impl<'a> Compiler<'a> {
             kind: AssetKind::Audio,
             codec,
             data: RawAssetData::Lazy(Arc::new(move || Ok(std::fs::read(&p)?))),
+            source_fingerprint: fp,
         });
         self.asset_by_vfs.insert(vfs_path.to_owned(), id);
-        self.insert_lookup_keys(vfs_path, id);
         Some(id)
     }
 
@@ -694,6 +701,7 @@ impl<'a> Compiler<'a> {
             return Some(id);
         }
         let real_path = self.archive.real_path(vfs_path)?.to_path_buf();
+        let fp = file_fingerprint(&real_path);
         let codec = if vfs_path.ends_with(".otf") {
             MediaCodec::Otf
         } else {
@@ -705,6 +713,7 @@ impl<'a> Compiler<'a> {
             kind: AssetKind::Font,
             codec,
             data: RawAssetData::Lazy(Arc::new(move || Ok(std::fs::read(&real_path)?))),
+            source_fingerprint: fp,
         });
         self.asset_by_vfs.insert(vfs_path.to_owned(), id);
         Some(id)
@@ -1069,28 +1078,39 @@ impl<'a> Compiler<'a> {
         items
     }
 
-    fn populate_dynamic_assets(&mut self, is_livenovel: bool) {
-        if !self.uses_dynamic_images && !self.uses_dynamic_audio {
+    fn populate_dynamic_assets(
+        &mut self,
+        is_livenovel: bool,
+        author_scripts: &BTreeMap<String, Script>,
+    ) {
+        if self.dynamic_image_vars.is_empty() && self.dynamic_audio_vars.is_empty() {
             return;
         }
+        let img_filter = analyze_dynamic_var_prefixes(&self.dynamic_image_vars, author_scripts);
+        let aud_filter = analyze_dynamic_var_prefixes(&self.dynamic_audio_vars, author_scripts);
+
         let files = self.all_files.clone();
         for f in files {
             if is_livenovel && f.starts_with("ノベルシステム/") {
                 continue;
             }
-            if self.uses_dynamic_images
+            if !self.dynamic_image_vars.is_empty()
                 && (f.ends_with(".gal")
                     || f.ends_with(".png")
                     || f.ends_with(".jpg")
                     || f.ends_with(".jpeg"))
+                && img_filter.matches(&f, "グラフィック/")
             {
                 if let Some(id) = self.register_vfs_image(&f) {
+                    self.insert_lookup_keys(&f, id);
                     self.keep_assets.insert(id);
                 }
-            } else if self.uses_dynamic_audio
+            } else if !self.dynamic_audio_vars.is_empty()
                 && (f.ends_with(".ogg") || f.ends_with(".wav") || f.ends_with(".mp3"))
+                && aud_filter.matches(&f, "サウンド/")
             {
                 if let Some(id) = self.register_vfs_audio(&f) {
+                    self.insert_lookup_keys(&f, id);
                     self.keep_assets.insert(id);
                 }
             }
@@ -2017,12 +2037,12 @@ impl EventBridge for Compiler<'_> {
         self.cg_unlock_by_asset.get(&asset).copied()
     }
 
-    fn mark_dynamic_images(&mut self) {
-        self.uses_dynamic_images = true;
+    fn mark_dynamic_image_var(&mut self, var_name: &str) {
+        self.dynamic_image_vars.insert(var_name.to_owned());
     }
 
-    fn mark_dynamic_audio(&mut self) {
-        self.uses_dynamic_audio = true;
+    fn mark_dynamic_audio_var(&mut self, var_name: &str) {
+        self.dynamic_audio_vars.insert(var_name.to_owned());
     }
 
     fn record_exact(&mut self) {
@@ -2031,6 +2051,179 @@ impl EventBridge for Compiler<'_> {
 
     fn record_adapted(&mut self, detail: String) {
         self.report.record_adapted(&self.current_loc, detail);
+    }
+}
+
+enum DynamicFilter {
+    All,
+    Prefixes(BTreeSet<String>),
+}
+
+impl DynamicFilter {
+    fn matches(&self, vfs_path: &str, default_root: &str) -> bool {
+        let Self::Prefixes(prefixes) = self else {
+            return true;
+        };
+        let low = vfs_path.to_lowercase();
+        let rel = low.strip_prefix(default_root).unwrap_or(&low);
+        let fname = low.rsplit('/').next().unwrap_or(&low);
+        prefixes.iter().any(|pref| {
+            let p_rel = pref.strip_prefix(default_root).unwrap_or(pref);
+            low.starts_with(pref.as_str())
+                || rel.starts_with(p_rel)
+                || (!p_rel.contains('/') && fname.starts_with(p_rel))
+        })
+    }
+}
+
+/// Statically analyzes string prefixes assigned to every dynamic `?var` variable across all
+/// author scripts. If every non-empty assignment to every variable in `vars` starts with a known
+/// literal prefix (>= 2 chars), narrows dynamic registration strictly to matching files;
+/// otherwise conservatively falls back to `DynamicFilter::All` so fidelity is never compromised.
+fn analyze_dynamic_var_prefixes(
+    vars: &BTreeSet<String>,
+    author_scripts: &BTreeMap<String, Script>,
+) -> DynamicFilter {
+    if vars.is_empty() {
+        return DynamicFilter::Prefixes(BTreeSet::new());
+    }
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    let mut matched_vars: BTreeSet<String> = BTreeSet::new();
+
+    let norm_prefix = |raw: &str| -> String {
+        normalize_vfs_path(raw.trim()).to_lowercase()
+    };
+
+    let eval_expr_prefix = |expr: &Expression| -> Option<Option<String>> {
+        if expr.operations.is_empty() {
+            return match &expr.literal {
+                Some(Literal::String(s)) => Some(Some(s.clone())),
+                None => Some(Some(String::new())),
+                _ => Some(None),
+            };
+        }
+        let mut ssa: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut last_dst: Option<String> = None;
+        for (op_code, dst, operands) in &expr.operations {
+            let eval_lit = |lit: &Literal, ssa: &BTreeMap<String, Option<String>>| -> Option<String> {
+                match lit {
+                    Literal::String(s) => Some(s.clone()),
+                    Literal::Variable(name) => ssa.get(name).cloned().flatten(),
+                    _ => None,
+                }
+            };
+            let val = match (*op_code, operands.as_slice()) {
+                // `+` (2) or `&` string concatenation (19)
+                (2 | 19, [lhs, rhs]) => match (eval_lit(lhs, &ssa), eval_lit(rhs, &ssa)) {
+                    (Some(lp), Some(rp)) => Some(format!("{lp}{rp}")),
+                    (Some(lp), None) if !lp.is_empty() => Some(lp),
+                    _ => None,
+                },
+                // `=` assignment (0 | 1) or unary pass-through
+                (0 | 1, [only]) => eval_lit(only, &ssa),
+                _ => None,
+            };
+            ssa.insert(dst.clone(), val);
+            last_dst = Some(dst.clone());
+        }
+        last_dst.map(|d| ssa.get(&d).cloned().flatten())
+    };
+
+    for script in author_scripts.values() {
+        // Straight-line local prefix environment within a basic block (cleared on any branch/call/indent change).
+        // 100% sound: only propagates prefixes across uninterrupted sequential assignments!
+        let mut block_env: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut prev_indent: Option<u32> = None;
+
+        for cmd in &script.commands {
+            if cmd.muted {
+                continue;
+            }
+            if prev_indent != Some(cmd.indent) {
+                block_env.clear();
+                prev_indent = Some(cmd.indent);
+            }
+            match &cmd.body {
+                Body::Variable { name, initial, .. } => {
+                    let pref = eval_expr_prefix(initial).flatten();
+                    if vars.contains(name) {
+                        if let Some(pref_opt) = eval_expr_prefix(initial) {
+                            match pref_opt {
+                                Some(s) if s.trim().is_empty() => {} // empty init resolves to nothing
+                                Some(s) => {
+                                    let p = norm_prefix(&s);
+                                    if p.chars().count() < 2 {
+                                        return DynamicFilter::All;
+                                    }
+                                    prefixes.insert(p);
+                                    matched_vars.insert(name.clone());
+                                }
+                                None => return DynamicFilter::All,
+                            }
+                        }
+                    }
+                    block_env.insert(name.clone(), pref);
+                }
+                Body::Calc(expr) => {
+                    let mut ssa: BTreeMap<String, Option<String>> = BTreeMap::new();
+                    for (op_code, dst, operands) in &expr.operations {
+                        let eval_lit = |lit: &Literal,
+                                        ssa: &BTreeMap<String, Option<String>>,
+                                        block_env: &BTreeMap<String, Option<String>>|
+                         -> Option<String> {
+                            match lit {
+                                Literal::String(s) => Some(s.clone()),
+                                Literal::Variable(name) => ssa
+                                    .get(name)
+                                    .cloned()
+                                    .flatten()
+                                    .or_else(|| block_env.get(name).cloned().flatten()),
+                                _ => None,
+                            }
+                        };
+                        let val = match (*op_code, operands.as_slice()) {
+                            (2 | 19, [lhs, rhs]) => {
+                                match (eval_lit(lhs, &ssa, &block_env), eval_lit(rhs, &ssa, &block_env)) {
+                                    (Some(lp), Some(rp)) => Some(format!("{lp}{rp}")),
+                                    (Some(lp), None) if !lp.is_empty() => Some(lp),
+                                    _ => None,
+                                }
+                            }
+                            (0 | 1, [only]) => eval_lit(only, &ssa, &block_env),
+                            _ => None,
+                        };
+                        if vars.contains(dst) {
+                            match &val {
+                                Some(s) if s.trim().is_empty() => {} // reset to ""
+                                Some(s) => {
+                                    let p = norm_prefix(s);
+                                    if p.chars().count() < 2 {
+                                        return DynamicFilter::All;
+                                    }
+                                    prefixes.insert(p);
+                                    matched_vars.insert(dst.clone());
+                                }
+                                None => return DynamicFilter::All,
+                            }
+                        }
+                        if !dst.starts_with("____") {
+                            block_env.insert(dst.clone(), val.clone());
+                        }
+                        ssa.insert(dst.clone(), val);
+                    }
+                }
+                Body::Text { .. } => {}
+                _ => {
+                    block_env.clear();
+                }
+            }
+        }
+    }
+
+    if matched_vars.len() == vars.len() && !prefixes.is_empty() {
+        DynamicFilter::Prefixes(prefixes)
+    } else {
+        DynamicFilter::All
     }
 }
 

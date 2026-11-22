@@ -10,6 +10,18 @@ use nir_ir::{AssetId, AssetKind, AudioBus, AudioLoopRegion, MediaCodec, Preferen
 use nir_runtime::HostCommand;
 use serde::Serialize;
 
+#[derive(Debug, Serialize)]
+pub struct JsDeltaDesc {
+    pub base_id: u32,
+    pub base_mime: &'static str,
+    pub base_offset: u64,
+    pub base_size: u64,
+    pub x: u32,
+    pub y: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tile_mask: Vec<u8>,
+}
+
 /// Compact JSON-serializable command bridge sent from `WebEngine` to `host/app.js`.
 /// Includes exact `(offset, size)` inside the `.nirpak` media section so JS can slice or Range-fetch directly!
 #[derive(Debug, Serialize)]
@@ -21,6 +33,8 @@ pub enum JsHostCommand {
         offset: u64,
         size: u64,
         urgent: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delta: Option<JsDeltaDesc>,
     },
     LoadFont {
         id: u32,
@@ -92,6 +106,7 @@ pub fn codec_mime(codec: MediaCodec) -> &'static str {
         MediaCodec::Ktx2 => "image/ktx2",
         MediaCodec::Mp3 => "audio/mpeg",
         MediaCodec::Ogg => "audio/ogg",
+        MediaCodec::Opus => "audio/ogg; codecs=opus",
         MediaCodec::Wav => "audio/wav",
         MediaCodec::Flac => "audio/flac",
         MediaCodec::Webm => "video/webm",
@@ -120,13 +135,28 @@ fn convert_host_command(
         HostCommand::LoadAsset { id, urgent } => {
             let meta = program.asset(id)?;
             match meta.kind {
-                AssetKind::Image => Some(JsHostCommand::DecodeImage {
-                    id: id.0,
-                    mime: codec_mime(meta.codec),
-                    offset: meta.offset,
-                    size: meta.size,
-                    urgent,
-                }),
+                AssetKind::Image => {
+                    let delta = meta.delta.as_ref().and_then(|d| {
+                        let base_meta = program.asset(d.base)?;
+                        Some(JsDeltaDesc {
+                            base_id: d.base.0,
+                            base_mime: codec_mime(base_meta.codec),
+                            base_offset: base_meta.offset,
+                            base_size: base_meta.size,
+                            x: d.x,
+                            y: d.y,
+                            tile_mask: d.tile_mask.clone(),
+                        })
+                    });
+                    Some(JsHostCommand::DecodeImage {
+                        id: id.0,
+                        mime: codec_mime(meta.codec),
+                        offset: meta.offset,
+                        size: meta.size,
+                        urgent,
+                        delta,
+                    })
+                }
                 AssetKind::Font => Some(JsHostCommand::LoadFont {
                     id: id.0,
                     offset: meta.offset,
@@ -355,6 +385,21 @@ mod wasm_host {
             let id = AssetId(asset_id);
             self.renderer
                 .upload_image_bitmap(id, bitmap)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.runtime.mark_asset_loaded(id);
+            Ok(())
+        }
+
+        #[wasm_bindgen]
+        pub fn upload_ktx2_bytes(
+            &mut self,
+            asset_id: u32,
+            bytes: Uint8Array,
+        ) -> Result<(), JsValue> {
+            let id = AssetId(asset_id);
+            let raw = bytes.to_vec();
+            self.renderer
+                .upload_ktx2_bytes(id, &raw)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
             self.runtime.mark_asset_loaded(id);
             Ok(())

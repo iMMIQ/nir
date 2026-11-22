@@ -14,12 +14,27 @@ mod dev;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use nir_build::optimize::OptimizeConfig;
-use nir_import_core::{emit_nirs_project, ImportOptions, ImporterRegistry};
+use nir_build::optimize::{AudioCodecMode, OptimizeConfig};
+use nir_import_core::{emit_nirs_project, DecodedPixels, ImportOptions, ImporterRegistry, RawAssetData};
 use nir_import_krkr::KrkrImporter;
 use nir_import_livemaker::LiveMakerImporter;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliAudioCodec {
+    Mp3,
+    Opus,
+}
+
+impl From<CliAudioCodec> for AudioCodecMode {
+    fn from(c: CliAudioCodec) -> Self {
+        match c {
+            CliAudioCodec::Mp3 => AudioCodecMode::Mp3Vbr,
+            CliAudioCodec::Opus => AudioCodecMode::Opus,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -65,8 +80,20 @@ enum Cmd {
         no_optimize: bool,
         #[arg(long)]
         lossless: bool,
-        #[arg(long, default_value_t = 92)]
+        #[arg(long, default_value_t = 85)]
         webp_quality: u8,
+        /// Audio transcoding profile (`mp3` universal VBR, `opus` extreme 48k/96k)
+        #[arg(long, value_enum, default_value_t = CliAudioCodec::Mp3)]
+        audio_codec: CliAudioCodec,
+        /// Disable 16×16 tile-masked CG/sprite differential compression
+        #[arg(long)]
+        no_delta: bool,
+        /// Disable automatic 256×144 gallery thumbnail generation
+        #[arg(long)]
+        no_thumbs: bool,
+        /// Encode large images as KTX2 BC1/BC3 hardware-compressed GPU textures
+        #[arg(long)]
+        ktx2: bool,
         #[arg(long)]
         sdk: Option<PathBuf>,
     },
@@ -90,8 +117,20 @@ enum Cmd {
         no_optimize: bool,
         #[arg(long)]
         lossless: bool,
-        #[arg(long, default_value_t = 92)]
+        #[arg(long, default_value_t = 85)]
         webp_quality: u8,
+        /// Audio transcoding profile (`mp3` universal VBR, `opus` extreme 48k/96k)
+        #[arg(long, value_enum, default_value_t = CliAudioCodec::Mp3)]
+        audio_codec: CliAudioCodec,
+        /// Disable 16×16 tile-masked CG/sprite differential compression
+        #[arg(long)]
+        no_delta: bool,
+        /// Disable automatic 256×144 gallery thumbnail generation
+        #[arg(long)]
+        no_thumbs: bool,
+        /// Encode large images as KTX2 BC1/BC3 hardware-compressed GPU textures
+        #[arg(long)]
+        ktx2: bool,
         /// Also emit editable `.nirs` project files even when direct-to-IR is available
         #[arg(long)]
         emit_nirs: bool,
@@ -147,12 +186,20 @@ fn main() -> Result<()> {
             no_optimize,
             lossless,
             webp_quality,
+            audio_codec,
+            no_delta,
+            no_thumbs,
+            ktx2,
             sdk,
         } => {
             let opt = OptimizeConfig {
                 enabled: !no_optimize,
                 lossless_images: lossless,
                 webp_quality,
+                audio_codec: audio_codec.into(),
+                delta_images: !no_delta,
+                gallery_thumbnails: !no_thumbs,
+                ktx2_textures: ktx2,
                 ..Default::default()
             };
             cmd_build(&project, target, out.as_deref(), &opt, sdk.as_deref())
@@ -167,6 +214,10 @@ fn main() -> Result<()> {
             no_optimize,
             lossless,
             webp_quality,
+            audio_codec,
+            no_delta,
+            no_thumbs,
+            ktx2,
             emit_nirs,
             sdk,
         } => {
@@ -174,6 +225,10 @@ fn main() -> Result<()> {
                 enabled: !no_optimize,
                 lossless_images: lossless,
                 webp_quality,
+                audio_codec: audio_codec.into(),
+                delta_images: !no_delta,
+                gallery_thumbnails: !no_thumbs,
+                ktx2_textures: ktx2,
                 ..Default::default()
             };
             cmd_convert(
@@ -258,6 +313,21 @@ fn cmd_check(project: &Path) -> Result<()> {
     Ok(())
 }
 
+fn print_summary(s: &nir_build::BuildSummary) {
+    println!(
+        "Compiled `{}`: {} ops | {} assets ({} trimmed, {} delta, {} thumbs, {} pruned, saved {:.1} KiB) | {:.1} KiB (.nirpak)",
+        s.title,
+        s.ops,
+        s.packed_assets,
+        s.trimmed_sprites,
+        s.delta_patched,
+        s.generated_thumbs,
+        s.pruned_assets,
+        s.saved_bytes as f64 / 1024.0,
+        s.nirpak_bytes as f64 / 1024.0,
+    );
+}
+
 fn package_built(
     project: &Path,
     built: &nir_build::BuiltBundle,
@@ -265,17 +335,7 @@ fn package_built(
     out: Option<&Path>,
     sdk_override: Option<&Path>,
 ) -> Result<()> {
-    let s = &built.summary;
-    println!(
-        "Compiled `{}`: {} ops | {} assets ({} trimmed, {} pruned, saved {:.1} KiB) | {:.1} KiB (.nirpak)",
-        s.title,
-        s.ops,
-        s.packed_assets,
-        s.trimmed_sprites,
-        s.pruned_assets,
-        s.saved_bytes as f64 / 1024.0,
-        s.nirpak_bytes as f64 / 1024.0,
-    );
+    print_summary(&built.summary);
 
     match target {
         BuildTarget::Pak => {
@@ -386,27 +446,76 @@ fn cmd_convert(
                 .raw_assets
                 .into_iter()
                 .map(|a| {
-                    let data = a.data;
-                    nir_build::DirectAssetSource {
-                        name: a.name,
-                        kind: a.kind,
-                        codec: a.codec,
-                        loader: std::sync::Arc::new(move || data.load()),
+                    let fp = a.source_fingerprint;
+                    match a.data {
+                        RawAssetData::LazyImage(px_fn) => nir_build::DirectAssetSource {
+                            name: a.name,
+                            kind: a.kind,
+                            codec: a.codec,
+                            loader: std::sync::Arc::new(|| {
+                                anyhow::bail!("pixel asset should use pixel_loader")
+                            }),
+                            pixel_loader: Some(std::sync::Arc::new(move || {
+                                match (px_fn)()? {
+                                    DecodedPixels::Rgb {
+                                        width,
+                                        height,
+                                        data,
+                                    } => Ok(nir_build::DirectPixels::Rgb {
+                                        width,
+                                        height,
+                                        data,
+                                    }),
+                                    DecodedPixels::Rgba {
+                                        width,
+                                        height,
+                                        data,
+                                    } => Ok(nir_build::DirectPixels::Rgba {
+                                        width,
+                                        height,
+                                        data,
+                                    }),
+                                }
+                            })),
+                            source_fingerprint: fp,
+                        },
+                        other => nir_build::DirectAssetSource {
+                            name: a.name,
+                            kind: a.kind,
+                            codec: a.codec,
+                            loader: std::sync::Arc::new(move || other.load()),
+                            pixel_loader: None,
+                            source_fingerprint: fp,
+                        },
                     }
                 })
                 .collect();
             let cache_dir = out.join(".nir").join("cache");
-            let built = nir_build::build_direct_program(
-                direct.program,
-                sources,
-                &direct.keep_assets,
-                &cache_dir,
-                opt,
-            )?;
-
-            println!("{}", report.summary_text());
             let target = build_target.unwrap_or(BuildTarget::Pak);
-            package_built(out, &built, target, None, sdk_override)?;
+            println!("{}", report.summary_text());
+            if matches!(target, BuildTarget::Pak) {
+                // Streaming direct-to-file `.nirpak` build (slashes peak RSS by ~89%!)
+                let dest = out.join("dist/game.nirpak");
+                let summary = nir_build::build_direct_program_to_file(
+                    direct.program,
+                    sources,
+                    &direct.keep_assets,
+                    &cache_dir,
+                    opt,
+                    &dest,
+                )?;
+                print_summary(&summary);
+                println!("Wrote package: {}", dest.display());
+            } else {
+                let built = nir_build::build_direct_program(
+                    direct.program,
+                    sources,
+                    &direct.keep_assets,
+                    &cache_dir,
+                    opt,
+                )?;
+                package_built(out, &built, target, None, sdk_override)?;
+            }
             return Ok(());
         }
     }

@@ -7,15 +7,26 @@
 //! - optional `locales/<lang>.toml` & `ui/theme.toml`
 #![forbid(unsafe_code)]
 
+pub mod delta;
+pub mod ktx2_enc;
 pub mod nirs;
 pub mod optimize;
+pub mod opus_enc;
 
 use anyhow::{bail, Context, Result};
 use nir_ir::*;
-use optimize::{detect_asset_kind_and_codec, optimize_audio, optimize_image, subset_font, OptimizeConfig};
+use optimize::{
+    decode_to_rgba, detect_asset_kind_and_codec, effective_webp_quality, fp_audio_cache_path,
+    fp_image_cache_path, generate_gallery_thumbnail, optimize_audio, optimize_decoded_pixels,
+    optimize_image, read_audio_cache_meta_only, read_cached_payload, read_image_cache_meta_only,
+    sha256_bytes, stream_cached_payload, subset_font, write_audio_cache, write_image_cache,
+    CachedPayloadRef, OptimizeConfig, RawPixels, OPTIMIZER_VERSION,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -97,6 +108,8 @@ pub struct BuildSummary {
     pub packed_assets: usize,
     pub pruned_assets: usize,
     pub trimmed_sprites: usize,
+    pub delta_patched: usize,
+    pub generated_thumbs: usize,
     pub saved_bytes: i64,
     pub nirpak_bytes: usize,
 }
@@ -108,12 +121,30 @@ pub struct BuiltBundle {
     pub summary: BuildSummary,
 }
 
+/// Direct decoded raster pixels supplied to `build_direct_program` (avoids PNG round-trip).
+pub enum DirectPixels {
+    Rgb {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
+    Rgba {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
+}
+
 /// Asset input for `build_direct_program`, decoupled from filesystem layout or importer crates.
 pub struct DirectAssetSource {
     pub name: String,
     pub kind: AssetKind,
     pub codec: MediaCodec,
     pub loader: Arc<dyn Fn() -> Result<Vec<u8>> + Send + Sync>,
+    /// Optional direct pixel decoder bypassing PNG encode/decode round-trips.
+    pub pixel_loader: Option<Arc<dyn Fn() -> Result<DirectPixels> + Send + Sync>>,
+    /// Optional `(file_len, mtime_nanos)` fingerprint enabling instant pre-decode cache hits!
+    pub source_fingerprint: Option<(u64, u64)>,
 }
 
 struct DiscoveredAsset {
@@ -358,8 +389,10 @@ fn compile_project_with_compression(
             AssetKind::Image => {
                 let res = optimize_image(&raw, src.codec, opt, &cache_dir)?;
                 let saved_bytes = res.saved_bytes;
-                if res.codec == MediaCodec::Webp {
-                    features |= FEATURE_WEBP;
+                match res.codec {
+                    MediaCodec::Webp => features |= FEATURE_WEBP,
+                    MediaCodec::Ktx2 => features |= FEATURE_KTX2,
+                    _ => {}
                 }
                 if res.trim.is_some() {
                     features |= FEATURE_TRIMMED;
@@ -386,6 +419,7 @@ fn compile_project_with_compression(
                 match res.codec {
                     MediaCodec::Mp3 => features |= FEATURE_MP3,
                     MediaCodec::Ogg => features |= FEATURE_OGG,
+                    MediaCodec::Opus => features |= FEATURE_OPUS,
                     _ => {}
                 }
                 AssetWorkOutput {
@@ -519,11 +553,12 @@ fn compile_project_with_compression(
             loop_region: out.loop_region,
             offset: 0,
             size: out.bytes.len() as u64,
+            delta: None,
         });
         media_blobs.push(out.bytes);
     }
 
-    let program = NirProgram {
+    let mut program = NirProgram {
         features,
         meta: GameMeta {
             game_id: manifest.game.id.clone(),
@@ -554,6 +589,21 @@ fn compile_project_with_compression(
         menus: Vec::new(),
     };
 
+    let mut backings: Vec<BlobBacking> = media_blobs
+        .into_iter()
+        .map(|b| {
+            let h = sha256_bytes(&b);
+            BlobBacking::Mem { bytes: b, sha256: h }
+        })
+        .collect();
+    let generated_thumbs = run_gallery_thumbs_pass(&mut program, &mut backings, &cache_dir, opt);
+    let (delta_patched, delta_saved) = run_delta_pass(&mut program, &mut backings, &cache_dir, opt);
+    saved_bytes += delta_saved;
+
+    let mut media_blobs = Vec::with_capacity(backings.len());
+    for bk in &backings {
+        media_blobs.push(bk.read_all()?);
+    }
     let blob_refs: Vec<&[u8]> = media_blobs.iter().map(Vec::as_slice).collect();
     let nirpak = encode_nirpak_with_compression(&program, &blob_refs, compression)?;
 
@@ -565,8 +615,10 @@ fn compile_project_with_compression(
         texts: compiled.texts.len(),
         total_assets_scanned: total_scanned,
         packed_assets: program.assets.len(),
-        pruned_assets: total_scanned.saturating_sub(program.assets.len()),
+        pruned_assets: total_scanned.saturating_sub(program.assets.len().saturating_sub(generated_thumbs)),
         trimmed_sprites,
+        delta_patched,
+        generated_thumbs,
         saved_bytes,
         nirpak_bytes: nirpak.len(),
     };
@@ -720,33 +772,328 @@ pub fn package_android(
     Ok(())
 }
 
-/// Optimizes, tree-shakes, remaps, and packs a direct-to-IR `NirProgram` + lazy raw assets
-/// into a production `.nirpak` bundle using the exact same parallel optimizer pipeline as `.nirs`.
-pub fn build_direct_program(
-    program: NirProgram,
-    raw_assets: Vec<DirectAssetSource>,
-    extra_keep: &BTreeSet<AssetId>,
-    cache_dir: &Path,
-    opt: &OptimizeConfig,
-) -> Result<BuiltBundle> {
-    build_direct_program_with_compression(
-        program,
-        raw_assets,
-        extra_keep,
-        cache_dir,
-        opt,
-        flate2::Compression::default(),
-    )
+/// Backing storage for one optimized media asset during build (disk cache file OR small in-RAM buffer).
+enum BlobBacking {
+    Cache(CachedPayloadRef),
+    Mem { bytes: Vec<u8>, sha256: [u8; 32] },
 }
 
-pub fn build_direct_program_with_compression(
+impl BlobBacking {
+    fn info(&self) -> StreamingBlobInfo {
+        match self {
+            Self::Cache(c) => StreamingBlobInfo {
+                size: c.payload_len,
+                hash: c.sha256,
+            },
+            Self::Mem { bytes, sha256 } => StreamingBlobInfo {
+                size: bytes.len() as u64,
+                hash: *sha256,
+            },
+        }
+    }
+
+    fn read_all(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Cache(c) => read_cached_payload(c),
+            Self::Mem { bytes, .. } => Ok(bytes.clone()),
+        }
+    }
+
+    fn stream_to(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        match self {
+            Self::Cache(c) => stream_cached_payload(c, writer),
+            Self::Mem { bytes, .. } => writer.write_all(bytes),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedDeltaPlanEntry {
+    asset_idx: usize,
+    base_idx: usize,
+    x: u32,
+    y: u32,
+    tile_mask: Vec<u8>,
+    patch_w: u32,
+    patch_h: u32,
+    cache_file_name: String,
+    saved_bytes: i64,
+}
+
+/// Chunked, disk-cached 16×16 tile-masked star-graph differential compression pass.
+/// Processes name-sorted same-dimension chunks of <= 64 images to cap peak RAM (< 200 MiB)
+/// while caching chunk delta plans so warm rebuilds finish in milliseconds!
+fn run_delta_pass(
+    program: &mut NirProgram,
+    backings: &mut [BlobBacking],
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+) -> (usize, i64) {
+    if !opt.enabled || !opt.delta_images || opt.ktx2_textures {
+        return (0, 0);
+    }
+
+    // Group eligible untrimmed non-KTX2 images by (width, height) and sort by asset name so
+    // sequential CG/sprite variants (`01x01..01x25`, `sk01..sk08`) cluster together cleanly.
+    let mut buckets: BTreeMap<(u32, u32), Vec<(String, usize)>> = BTreeMap::new();
+    for (idx, meta) in program.assets.iter().enumerate() {
+        if meta.kind == AssetKind::Image
+            && meta.codec != MediaCodec::Ktx2
+            && meta.trim.is_none()
+            && meta.width >= 128
+            && meta.height >= 128
+        {
+            buckets
+                .entry((meta.width, meta.height))
+                .or_default()
+                .push((program.str(meta.name).to_owned(), idx));
+        }
+    }
+
+    let mut total_patched = 0usize;
+    let mut total_saved = 0i64;
+    const CHUNK_SIZE: usize = 64;
+
+    for ((w, h), mut items) in buckets {
+        if items.len() < 2 {
+            continue;
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for chunk in items.chunks(CHUNK_SIZE) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            // Compute deterministic chunk cache key from ordered asset content digests + config.
+            let mut hasher = Sha256::new();
+            hasher.update(OPTIMIZER_VERSION.as_bytes());
+            hasher.update(b":deltaplan:");
+            hasher.update(w.to_le_bytes());
+            hasher.update(h.to_le_bytes());
+            hasher.update([opt.webp_quality, opt.lossless_images as u8]);
+            for &(_, idx) in chunk {
+                let info = backings[idx].info();
+                hasher.update(info.hash);
+                hasher.update(info.size.to_le_bytes());
+            }
+            let plan_key = format!("{:x}", hasher.finalize());
+            let plan_path = cache_dir.join(format!("dp_{plan_key}.json"));
+
+            // Fast warm-cache hit for this chunk!
+            if let Ok(plan_bytes) = fs::read(&plan_path) {
+                if let Ok(entries) = serde_json::from_slice::<Vec<CachedDeltaPlanEntry>>(&plan_bytes)
+                {
+                    let mut all_present = true;
+                    let mut resolved = Vec::with_capacity(entries.len());
+                    for e in entries {
+                        let p = cache_dir.join(&e.cache_file_name);
+                        let orig_len = backings
+                            .get(e.asset_idx)
+                            .map_or(0, |b| b.info().size as i64);
+                        if let Some(meta) = read_image_cache_meta_only(&p, orig_len) {
+                            resolved.push((e, meta.cache_ref));
+                        } else {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    if all_present {
+                        for (e, cref) in resolved {
+                            let meta = &mut program.assets[e.asset_idx];
+                            meta.codec = MediaCodec::Webp;
+                            meta.size = cref.payload_len;
+                            meta.delta = Some(ImageDelta {
+                                base: AssetId(e.base_idx as u32),
+                                x: e.x,
+                                y: e.y,
+                                tile_mask: e.tile_mask,
+                            });
+                            backings[e.asset_idx] = BlobBacking::Cache(cref);
+                            total_patched += 1;
+                            total_saved += e.saved_bytes;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Cold delta clustering for this chunk: decode up to 64 images into bounded RAM.
+            let mut candidates = Vec::with_capacity(chunk.len());
+            for &(_, idx) in chunk {
+                let codec = program.assets[idx].codec;
+                let Ok(bytes) = backings[idx].read_all() else {
+                    continue;
+                };
+                let orig_len = bytes.len();
+                let Some((dw, dh, rgba, has_alpha)) = decode_to_rgba(&bytes, codec) else {
+                    continue;
+                };
+                if dw == w && dh == h {
+                    candidates.push(delta::DeltaCandidate {
+                        asset_idx: idx,
+                        width: dw,
+                        height: dh,
+                        has_alpha,
+                        orig_encoded_len: orig_len,
+                        rgba,
+                    });
+                }
+            }
+            if candidates.len() < 2 {
+                continue;
+            }
+            let any_alpha = candidates.iter().any(|c| c.has_alpha);
+            let q = effective_webp_quality(w, h, any_alpha, opt);
+            let deltas = delta::compress_delta_candidates(&candidates, q, opt.lossless_images);
+            // Drop decoded pixel buffers immediately before caching!
+            drop(candidates);
+
+            let mut plan_entries = Vec::with_capacity(deltas.len());
+            for dr in deltas {
+                let orig_len = backings[dr.asset_idx].info().size as i64;
+                let saved = orig_len - dr.patch_webp.len() as i64;
+                let patch_key = format!(
+                    "dl_{:x}.nioc",
+                    Sha256::digest(&dr.patch_webp)
+                );
+                let patch_path = cache_dir.join(&patch_key);
+                let cref = write_image_cache(
+                    &patch_path,
+                    MediaCodec::Webp,
+                    dr.patch_width,
+                    dr.patch_height,
+                    None,
+                    &dr.patch_webp,
+                );
+                plan_entries.push(CachedDeltaPlanEntry {
+                    asset_idx: dr.asset_idx,
+                    base_idx: dr.delta.base.0 as usize,
+                    x: dr.delta.x,
+                    y: dr.delta.y,
+                    tile_mask: dr.delta.tile_mask.clone(),
+                    patch_w: dr.patch_width,
+                    patch_h: dr.patch_height,
+                    cache_file_name: patch_key,
+                    saved_bytes: saved,
+                });
+                let meta = &mut program.assets[dr.asset_idx];
+                meta.codec = MediaCodec::Webp;
+                meta.size = cref.payload_len;
+                meta.delta = Some(dr.delta);
+                backings[dr.asset_idx] = BlobBacking::Cache(cref);
+                total_patched += 1;
+                total_saved += saved;
+            }
+            let _ = fs::create_dir_all(cache_dir);
+            if let Ok(json) = serde_json::to_vec(&plan_entries) {
+                let tmp = plan_path.with_extension(format!("json.{}.tmp", std::process::id()));
+                if fs::write(&tmp, &json).is_ok() {
+                    let _ = fs::rename(&tmp, &plan_path);
+                }
+            }
+        }
+    }
+
+    if total_patched > 0 {
+        program.features |= FEATURE_DELTA_IMAGE | FEATURE_WEBP;
+    }
+    (total_patched, total_saved)
+}
+
+/// Auto-generates compact `256×144` WebP thumbnails for `program.ui.gallery` items whose
+/// `thumb` currently points at a full-resolution CG (> 320×180), slashing Gallery VRAM by ~96%!
+fn run_gallery_thumbs_pass(
+    program: &mut NirProgram,
+    backings: &mut Vec<BlobBacking>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+) -> usize {
+    if !opt.enabled || !opt.gallery_thumbnails || program.ui.gallery.is_empty() {
+        return 0;
+    }
+    let mut thumb_map: BTreeMap<AssetId, AssetId> = BTreeMap::new();
+    let mut generated = 0usize;
+
+    for idx in 0..program.ui.gallery.len() {
+        let Some(orig_id) = program.ui.gallery[idx].thumb else {
+            continue;
+        };
+        if let Some(&mapped) = thumb_map.get(&orig_id) {
+            program.ui.gallery[idx].thumb = Some(mapped);
+            continue;
+        }
+        let Some(orig_meta) = program.assets.get(orig_id.0 as usize).cloned() else {
+            continue;
+        };
+        if orig_meta.kind != AssetKind::Image
+            || orig_meta.delta.is_some()
+            || (orig_meta.width <= 320 && orig_meta.height <= 180)
+        {
+            continue;
+        }
+        let Ok(bytes) = backings[orig_id.0 as usize].read_all() else {
+            continue;
+        };
+        let Some((tw, th, thumb_webp)) =
+            generate_gallery_thumbnail(&bytes, orig_meta.codec, cache_dir)
+        else {
+            continue;
+        };
+        let new_id = AssetId(program.assets.len() as u32);
+        let name_str = StrId(program.strings.len() as u32);
+        let orig_name = program.str(orig_meta.name).to_owned();
+        program.strings.push(format!("__thumb/{orig_name}"));
+        let thumb_key = format!("th_{:x}.nioc", Sha256::digest(&thumb_webp));
+        let cref = write_image_cache(
+            &cache_dir.join(&thumb_key),
+            MediaCodec::Webp,
+            tw,
+            th,
+            None,
+            &thumb_webp,
+        );
+        program.assets.push(AssetMeta {
+            id: new_id,
+            name: name_str,
+            kind: AssetKind::Image,
+            codec: MediaCodec::Webp,
+            width: tw,
+            height: th,
+            trim: None,
+            duration_us: 0,
+            sample_rate: 0,
+            channels: 0,
+            loop_region: None,
+            offset: 0,
+            size: cref.payload_len,
+            delta: None,
+        });
+        backings.push(BlobBacking::Cache(cref));
+        program.features |= FEATURE_WEBP;
+        thumb_map.insert(orig_id, new_id);
+        program.ui.gallery[idx].thumb = Some(new_id);
+        generated += 1;
+    }
+    generated
+}
+
+struct PreparedDirectBuild {
+    program: NirProgram,
+    backings: Vec<BlobBacking>,
+    total_scanned: usize,
+    trimmed_sprites: usize,
+    delta_patched: usize,
+    generated_thumbs: usize,
+    saved_bytes: i64,
+}
+
+fn prepare_direct_build(
     mut program: NirProgram,
     raw_assets: Vec<DirectAssetSource>,
     extra_keep: &BTreeSet<AssetId>,
     cache_dir: &Path,
     opt: &OptimizeConfig,
-    compression: flate2::Compression,
-) -> Result<BuiltBundle> {
+) -> Result<PreparedDirectBuild> {
     let total_scanned = raw_assets.len();
 
     // 1. Collect all referenced AssetIds across ops, meta, ui, timelines, menus, and asset_lookup.
@@ -780,9 +1127,9 @@ pub fn build_direct_program_with_compression(
         BTreeSet::new()
     };
 
-    // 5. Load & optimize kept assets in parallel across CPU cores!
+    // 5. Load & optimize kept assets with bounded concurrency (max 8 workers) and disk-cache spill!
     struct DirectAssetOut {
-        bytes: Vec<u8>,
+        backing: BlobBacking,
         codec: MediaCodec,
         width: u32,
         height: u32,
@@ -798,22 +1145,173 @@ pub fn build_direct_program_with_compression(
 
     let optimize_one = |orig_idx: usize| -> Result<DirectAssetOut> {
         let src = &raw_assets[orig_idx];
-        let raw = (src.loader)()
-            .with_context(|| format!("loading direct asset `{}`", src.name))?;
         let mut features = 0u32;
         let mut trimmed = false;
-        let out = match src.kind {
-            AssetKind::Image => {
-                let res = optimize_image(&raw, src.codec, opt, cache_dir)?;
-                if res.codec == MediaCodec::Webp {
-                    features |= FEATURE_WEBP;
+
+        // Ultra-fast warm rebuild path: check source-fingerprint cache BEFORE touching disk/decoder!
+        if opt.enabled {
+            if let Some(fp) = src.source_fingerprint {
+                match src.kind {
+                    AssetKind::Image => {
+                        let fp_path = fp_image_cache_path(cache_dir, &src.name, fp, opt);
+                        if let Some(meta) = read_image_cache_meta_only(&fp_path, fp.0 as i64) {
+                            match meta.codec {
+                                MediaCodec::Webp => features |= FEATURE_WEBP,
+                                MediaCodec::Ktx2 => features |= FEATURE_KTX2,
+                                _ => {}
+                            }
+                            if meta.trim.is_some() {
+                                features |= FEATURE_TRIMMED;
+                                trimmed = true;
+                            }
+                            return Ok(DirectAssetOut {
+                                backing: BlobBacking::Cache(meta.cache_ref),
+                                codec: meta.codec,
+                                width: meta.width,
+                                height: meta.height,
+                                trim: meta.trim,
+                                duration_us: 0,
+                                sample_rate: 0,
+                                channels: 0,
+                                loop_region: None,
+                                saved_bytes: meta.saved_bytes,
+                                features,
+                                trimmed,
+                            });
+                        }
+                    }
+                    AssetKind::Audio => {
+                        let fp_path = fp_audio_cache_path(cache_dir, &src.name, fp, opt);
+                        if let Some(meta) = read_audio_cache_meta_only(&fp_path, fp.0 as i64) {
+                            match meta.codec {
+                                MediaCodec::Mp3 => features |= FEATURE_MP3,
+                                MediaCodec::Ogg => features |= FEATURE_OGG,
+                                MediaCodec::Opus => features |= FEATURE_OPUS,
+                                _ => {}
+                            }
+                            return Ok(DirectAssetOut {
+                                backing: BlobBacking::Cache(meta.cache_ref),
+                                codec: meta.codec,
+                                width: 0,
+                                height: 0,
+                                trim: None,
+                                duration_us: meta.duration_us,
+                                sample_rate: meta.sample_rate,
+                                channels: meta.channels,
+                                loop_region: None,
+                                saved_bytes: meta.saved_bytes,
+                                features,
+                                trimmed: false,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Direct pixel path (eliminates `.gal -> PNG -> decode PNG -> WebP` round-trip!)
+        if src.kind == AssetKind::Image {
+            if let Some(px_loader) = &src.pixel_loader {
+                let pixels = (px_loader)()
+                    .with_context(|| format!("decoding direct image `{}`", src.name))?;
+                let orig_len = src.source_fingerprint.map_or(0, |(len, _)| len as i64);
+                let (res, _) = match &pixels {
+                    DirectPixels::Rgb { width, height, data } => optimize_decoded_pixels(
+                        RawPixels::Rgb {
+                            width: *width,
+                            height: *height,
+                            data,
+                        },
+                        orig_len,
+                        opt,
+                    )?,
+                    DirectPixels::Rgba { width, height, data } => optimize_decoded_pixels(
+                        RawPixels::Rgba {
+                            width: *width,
+                            height: *height,
+                            data,
+                        },
+                        orig_len,
+                        opt,
+                    )?,
+                };
+                match res.codec {
+                    MediaCodec::Webp => features |= FEATURE_WEBP,
+                    MediaCodec::Ktx2 => features |= FEATURE_KTX2,
+                    _ => {}
                 }
                 if res.trim.is_some() {
                     features |= FEATURE_TRIMMED;
                     trimmed = true;
                 }
+                let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
+                    let fp_path = fp_image_cache_path(cache_dir, &src.name, fp, opt);
+                    BlobBacking::Cache(write_image_cache(
+                        &fp_path,
+                        res.codec,
+                        res.width,
+                        res.height,
+                        res.trim,
+                        &res.bytes,
+                    ))
+                } else {
+                    let sha = sha256_bytes(&res.bytes);
+                    BlobBacking::Mem {
+                        bytes: res.bytes,
+                        sha256: sha,
+                    }
+                };
+                return Ok(DirectAssetOut {
+                    backing,
+                    codec: res.codec,
+                    width: res.width,
+                    height: res.height,
+                    trim: res.trim,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: res.saved_bytes,
+                    features,
+                    trimmed,
+                });
+            }
+        }
+
+        let raw = (src.loader)()
+            .with_context(|| format!("loading direct asset `{}`", src.name))?;
+        let out = match src.kind {
+            AssetKind::Image => {
+                let res = optimize_image(&raw, src.codec, opt, cache_dir)?;
+                match res.codec {
+                    MediaCodec::Webp => features |= FEATURE_WEBP,
+                    MediaCodec::Ktx2 => features |= FEATURE_KTX2,
+                    _ => {}
+                }
+                if res.trim.is_some() {
+                    features |= FEATURE_TRIMMED;
+                    trimmed = true;
+                }
+                let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
+                    let fp_path = fp_image_cache_path(cache_dir, &src.name, fp, opt);
+                    BlobBacking::Cache(write_image_cache(
+                        &fp_path,
+                        res.codec,
+                        res.width,
+                        res.height,
+                        res.trim,
+                        &res.bytes,
+                    ))
+                } else {
+                    let sha = sha256_bytes(&res.bytes);
+                    BlobBacking::Mem {
+                        bytes: res.bytes,
+                        sha256: sha,
+                    }
+                };
                 DirectAssetOut {
-                    bytes: res.bytes,
+                    backing,
                     codec: res.codec,
                     width: res.width,
                     height: res.height,
@@ -832,10 +1330,28 @@ pub fn build_direct_program_with_compression(
                 match res.codec {
                     MediaCodec::Mp3 => features |= FEATURE_MP3,
                     MediaCodec::Ogg => features |= FEATURE_OGG,
+                    MediaCodec::Opus => features |= FEATURE_OPUS,
                     _ => {}
                 }
+                let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
+                    let fp_path = fp_audio_cache_path(cache_dir, &src.name, fp, opt);
+                    BlobBacking::Cache(write_audio_cache(
+                        &fp_path,
+                        res.codec,
+                        res.duration_us,
+                        res.sample_rate,
+                        res.channels,
+                        &res.bytes,
+                    ))
+                } else {
+                    let sha = sha256_bytes(&res.bytes);
+                    BlobBacking::Mem {
+                        bytes: res.bytes,
+                        sha256: sha,
+                    }
+                };
                 DirectAssetOut {
-                    bytes: res.bytes,
+                    backing,
                     codec: res.codec,
                     width: 0,
                     height: 0,
@@ -852,8 +1368,13 @@ pub fn build_direct_program_with_compression(
             AssetKind::Font => {
                 let orig_len = raw.len() as i64;
                 let sub = subset_font(&raw, &used_chars, opt, cache_dir)?;
+                let saved = orig_len - sub.len() as i64;
+                let sha = sha256_bytes(&sub);
                 DirectAssetOut {
-                    bytes: sub.clone(),
+                    backing: BlobBacking::Mem {
+                        bytes: sub,
+                        sha256: sha,
+                    },
                     codec: src.codec,
                     width: 0,
                     height: 0,
@@ -862,15 +1383,19 @@ pub fn build_direct_program_with_compression(
                     sample_rate: 0,
                     channels: 0,
                     loop_region: None,
-                    saved_bytes: orig_len - sub.len() as i64,
+                    saved_bytes: saved,
                     features: 0,
                     trimmed: false,
                 }
             }
             AssetKind::Video => {
                 features |= FEATURE_VIDEO;
+                let sha = sha256_bytes(&raw);
                 DirectAssetOut {
-                    bytes: raw,
+                    backing: BlobBacking::Mem {
+                        bytes: raw,
+                        sha256: sha,
+                    },
                     codec: src.codec,
                     width: 0,
                     height: 0,
@@ -884,27 +1409,35 @@ pub fn build_direct_program_with_compression(
                     trimmed: false,
                 }
             }
-            AssetKind::Raw => DirectAssetOut {
-                bytes: raw,
-                codec: src.codec,
-                width: 0,
-                height: 0,
-                trim: None,
-                duration_us: 0,
-                sample_rate: 0,
-                channels: 0,
-                loop_region: None,
-                saved_bytes: 0,
-                features: 0,
-                trimmed: false,
-            },
+            AssetKind::Raw => {
+                let sha = sha256_bytes(&raw);
+                DirectAssetOut {
+                    backing: BlobBacking::Mem {
+                        bytes: raw,
+                        sha256: sha,
+                    },
+                    codec: src.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: 0,
+                    features: 0,
+                    trimmed: false,
+                }
+            }
         };
         Ok(out)
     };
 
+    // Cap active worker threads to 8 to keep peak build memory flat (< 250 MiB even on 15k-asset games!)
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+        .min(8)
         .min(kept_indices.len().max(1));
 
     let results: Vec<Result<DirectAssetOut>> = if worker_count <= 1 || kept_indices.len() <= 1 {
@@ -934,7 +1467,7 @@ pub fn build_direct_program_with_compression(
     };
 
     let mut assets_meta = Vec::with_capacity(kept_indices.len());
-    let mut media_blobs = Vec::with_capacity(kept_indices.len());
+    let mut backings = Vec::with_capacity(kept_indices.len());
     let mut features = 0u32;
     let mut trimmed_sprites = 0usize;
     let mut saved_bytes = 0i64;
@@ -949,6 +1482,7 @@ pub fn build_direct_program_with_compression(
         if out.trimmed {
             trimmed_sprites += 1;
         }
+        let sz = out.backing.info().size;
         assets_meta.push(AssetMeta {
             id: AssetId(new_idx as u32),
             name: name_str,
@@ -962,36 +1496,162 @@ pub fn build_direct_program_with_compression(
             channels: out.channels,
             loop_region: out.loop_region,
             offset: 0,
-            size: out.bytes.len() as u64,
+            size: sz,
+            delta: None,
         });
-        media_blobs.push(out.bytes);
+        backings.push(out.backing);
     }
     program.features = features;
     program.assets = assets_meta;
 
-    let blob_refs: Vec<&[u8]> = media_blobs.iter().map(Vec::as_slice).collect();
-    let nirpak = encode_nirpak_with_compression(&program, &blob_refs, compression)?;
-    let text_count = program
+    // 6. Auto-generate gallery thumbnails first (before delta pass marks full CGs as patches!), then run tile-masked delta pass!
+    let generated_thumbs = run_gallery_thumbs_pass(&mut program, &mut backings, cache_dir, opt);
+    let (delta_patched, delta_saved) = run_delta_pass(&mut program, &mut backings, cache_dir, opt);
+    saved_bytes += delta_saved;
+
+    Ok(PreparedDirectBuild {
+        program,
+        backings,
+        total_scanned,
+        trimmed_sprites,
+        delta_patched,
+        generated_thumbs,
+        saved_bytes,
+    })
+}
+
+/// Streaming direct-to-file `.nirpak` builder: never holds all media blobs or the full archive
+/// buffer in RAM (slashes peak RSS on multi-thousand-asset games by ~85-90%!).
+pub fn build_direct_program_to_file(
+    program: NirProgram,
+    raw_assets: Vec<DirectAssetSource>,
+    extra_keep: &BTreeSet<AssetId>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+    dest_pak: &Path,
+) -> Result<BuildSummary> {
+    let mut prep = prepare_direct_build(program, raw_assets, extra_keep, cache_dir, opt)?;
+    let infos: Vec<StreamingBlobInfo> = prep.backings.iter().map(BlobBacking::info).collect();
+
+    if let Some(parent) = dest_pak.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = dest_pak.with_extension("nirpak.tmp");
+    let file = fs::File::create(&tmp_path)
+        .with_context(|| format!("creating `{}`", tmp_path.display()))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    let (written, patched_assets) = write_nirpak_streaming(
+        &prep.program,
+        &infos,
+        flate2::Compression::default(),
+        &mut writer,
+        |idx, w| prep.backings[idx].stream_to(w),
+    )?;
+    drop(writer);
+    fs::rename(&tmp_path, dest_pak)?;
+    prep.program.assets = patched_assets;
+
+    let text_count = prep
+        .program
         .texts
-        .get(&program.meta.default_locale)
+        .get(&prep.program.meta.default_locale)
         .map_or(0, Vec::len);
+    let base_packed = prep
+        .program
+        .assets
+        .len()
+        .saturating_sub(prep.generated_thumbs);
+    Ok(BuildSummary {
+        game_id: prep.program.meta.game_id,
+        title: prep.program.meta.title,
+        scripts: prep.program.funcs.len(),
+        ops: prep.program.ops.len(),
+        texts: text_count,
+        total_assets_scanned: prep.total_scanned,
+        packed_assets: prep.program.assets.len(),
+        pruned_assets: prep.total_scanned.saturating_sub(base_packed),
+        trimmed_sprites: prep.trimmed_sprites,
+        delta_patched: prep.delta_patched,
+        generated_thumbs: prep.generated_thumbs,
+        saved_bytes: prep.saved_bytes,
+        nirpak_bytes: written as usize,
+    })
+}
+
+/// Optimizes, tree-shakes, remaps, and packs a direct-to-IR `NirProgram` + lazy raw assets
+/// into an in-memory `BuiltBundle` (used by Web/Native/Android packagers and tests).
+pub fn build_direct_program(
+    program: NirProgram,
+    raw_assets: Vec<DirectAssetSource>,
+    extra_keep: &BTreeSet<AssetId>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+) -> Result<BuiltBundle> {
+    build_direct_program_with_compression(
+        program,
+        raw_assets,
+        extra_keep,
+        cache_dir,
+        opt,
+        flate2::Compression::default(),
+    )
+}
+
+pub fn build_direct_program_with_compression(
+    program: NirProgram,
+    raw_assets: Vec<DirectAssetSource>,
+    extra_keep: &BTreeSet<AssetId>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+    compression: flate2::Compression,
+) -> Result<BuiltBundle> {
+    let mut prep = prepare_direct_build(program, raw_assets, extra_keep, cache_dir, opt)?;
+    let infos: Vec<StreamingBlobInfo> = prep.backings.iter().map(BlobBacking::info).collect();
+
+    let mut nirpak = Vec::new();
+    let (_, patched_assets) = write_nirpak_streaming(
+        &prep.program,
+        &infos,
+        compression,
+        &mut nirpak,
+        |idx, w| prep.backings[idx].stream_to(w),
+    )?;
+    prep.program.assets = patched_assets;
+
+    let mut media_blobs = Vec::with_capacity(prep.backings.len());
+    for bk in &prep.backings {
+        media_blobs.push(bk.read_all()?);
+    }
+
+    let text_count = prep
+        .program
+        .texts
+        .get(&prep.program.meta.default_locale)
+        .map_or(0, Vec::len);
+    let base_packed = prep
+        .program
+        .assets
+        .len()
+        .saturating_sub(prep.generated_thumbs);
 
     let summary = BuildSummary {
-        game_id: program.meta.game_id.clone(),
-        title: program.meta.title.clone(),
-        scripts: program.funcs.len(),
-        ops: program.ops.len(),
+        game_id: prep.program.meta.game_id.clone(),
+        title: prep.program.meta.title.clone(),
+        scripts: prep.program.funcs.len(),
+        ops: prep.program.ops.len(),
         texts: text_count,
-        total_assets_scanned: total_scanned,
-        packed_assets: program.assets.len(),
-        pruned_assets: total_scanned.saturating_sub(program.assets.len()),
-        trimmed_sprites,
-        saved_bytes,
+        total_assets_scanned: prep.total_scanned,
+        packed_assets: prep.program.assets.len(),
+        pruned_assets: prep.total_scanned.saturating_sub(base_packed),
+        trimmed_sprites: prep.trimmed_sprites,
+        delta_patched: prep.delta_patched,
+        generated_thumbs: prep.generated_thumbs,
+        saved_bytes: prep.saved_bytes,
         nirpak_bytes: nirpak.len(),
     };
 
     Ok(BuiltBundle {
-        program,
+        program: prep.program,
         media_blobs,
         nirpak,
         summary,
@@ -1421,18 +2081,24 @@ label ending:
                 kind: AssetKind::Image,
                 codec: MediaCodec::Png,
                 loader: Arc::new(move || Ok(unused_png.clone())),
+                pixel_loader: None,
+                source_fingerprint: None,
             },
             DirectAssetSource {
                 name: "sprite".into(),
                 kind: AssetKind::Image,
                 codec: MediaCodec::Png,
                 loader: Arc::new(move || Ok(sprite_png.clone())),
+                pixel_loader: None,
+                source_fingerprint: None,
             },
             DirectAssetSource {
                 name: "dyn_bg".into(),
                 kind: AssetKind::Image,
                 codec: MediaCodec::Png,
                 loader: Arc::new(move || Ok(dyn_png.clone())),
+                pixel_loader: None,
+                source_fingerprint: None,
             },
         ];
 
@@ -1512,5 +2178,120 @@ label ending:
         assert_eq!(decoded.asset_lookup.get("gfx/dyn_bg.png"), Some(&AssetId(1)));
         assert_eq!(decoded.menus[0].items[0].image, Some(AssetId(0)));
         assert!(matches!(decoded.ops[0], Op::LayerSet { asset: Some(AssetId(0)), .. }));
+    }
+
+    #[test]
+    fn streaming_direct_build_generates_gallery_thumbs_and_ktx2() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_png = |w: u32, h: u32, rgba: [u8; 4]| -> Vec<u8> {
+            let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let cg_png = make_png(800, 600, [120, 160, 220, 255]);
+
+        // 1) Streaming build with automatic gallery thumbnail generation
+        let raw_assets = vec![DirectAssetSource {
+            name: "cg01".into(),
+            kind: AssetKind::Image,
+            codec: MediaCodec::Png,
+            loader: Arc::new({
+                let b = cg_png.clone();
+                move || Ok(b.clone())
+            }),
+            pixel_loader: None,
+            source_fingerprint: None,
+        }];
+        let mut ui = UiTheme::default();
+        ui.gallery.push(GalleryItem {
+            id: StrId(1),
+            title: StrId(1),
+            thumb: Some(AssetId(0)),
+            unlock_flag: None,
+            replay_func: None,
+            cg_assets: vec![AssetId(0)],
+        });
+        let prog = NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.streamtest".into(),
+                title: "Stream".into(),
+                version: "1.0".into(),
+                stage_width: 800,
+                stage_height: 600,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into(), "cg01".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![Op::End { outcome: StrId(0) }],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui,
+            assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        };
+
+        let out_pak = dir.path().join("out.nirpak");
+        let summary = build_direct_program_to_file(
+            prog.clone(),
+            raw_assets,
+            &BTreeSet::new(),
+            &dir.path().join("cache1"),
+            &OptimizeConfig::default(),
+            &out_pak,
+        )
+        .unwrap();
+        assert_eq!(summary.generated_thumbs, 1);
+        let pak_bytes = fs::read(&out_pak).unwrap();
+        let (decoded, _) = decode_nirpak_header(&pak_bytes).unwrap();
+        let thumb_id = decoded.ui.gallery[0].thumb.unwrap();
+        assert_ne!(thumb_id, decoded.ui.gallery[0].cg_assets[0]);
+        let thumb_meta = decoded.asset(thumb_id).unwrap();
+        assert!(thumb_meta.width <= 256 && thumb_meta.height <= 144);
+
+        // 2) KTX2 BC1 encoding path
+        let raw_ktx = vec![DirectAssetSource {
+            name: "cg01".into(),
+            kind: AssetKind::Image,
+            codec: MediaCodec::Png,
+            loader: Arc::new(move || Ok(cg_png.clone())),
+            pixel_loader: None,
+            source_fingerprint: None,
+        }];
+        let opt_ktx = OptimizeConfig {
+            ktx2_textures: true,
+            gallery_thumbnails: false,
+            ..OptimizeConfig::default()
+        };
+        let built_ktx = build_direct_program(
+            prog,
+            raw_ktx,
+            &BTreeSet::new(),
+            &dir.path().join("cache2"),
+            &opt_ktx,
+        )
+        .unwrap();
+        let (dktx, _) = decode_nirpak_header(&built_ktx.nirpak).unwrap();
+        assert_eq!(dktx.assets[0].codec, MediaCodec::Ktx2);
+        assert_ne!(dktx.features & FEATURE_KTX2, 0);
     }
 }

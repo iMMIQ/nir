@@ -25,13 +25,40 @@ pub use ir::{VnCharacter, VnChoice, VnConst, VnProject, VnStmt};
 pub use report::{ConversionReport, Diagnostic, Fidelity};
 pub use vfs::{decode_text_bytes, ArchiveSource, CompositeVfs, DirArchive, MemoryArchive};
 
+/// Direct uncompressed raster pixels passed from an importer straight into `nir-build`,
+/// eliminating intermediate PNG encode/decode round-trips during conversion!
+#[derive(Clone)]
+pub enum DecodedPixels {
+    Rgb {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
+    Rgba {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
+}
+
+impl std::fmt::Debug for DecodedPixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rgb { width, height, .. } => write!(f, "Rgb({width}x{height})"),
+            Self::Rgba { width, height, .. } => write!(f, "Rgba({width}x{height})"),
+        }
+    }
+}
+
 /// Lazy or in-memory raw media payload supplied by a direct-to-IR engine importer.
-/// Using `Lazy` avoids holding thousands of decoded PNGs in RAM before tree-shaking
-/// and lets `nir-build` decode & optimize assets in parallel across all CPU cores.
+/// Using `Lazy` / `LazyImage` avoids holding thousands of decoded rasters in RAM before
+/// tree-shaking and lets `nir-build` optimize assets in parallel across CPU cores.
 #[derive(Clone)]
 pub enum RawAssetData {
     Bytes(Vec<u8>),
     Lazy(Arc<dyn Fn() -> Result<Vec<u8>> + Send + Sync>),
+    /// Direct pixel decoder bypassing intermediate PNG encoding/decoding.
+    LazyImage(Arc<dyn Fn() -> Result<DecodedPixels> + Send + Sync>),
 }
 
 impl std::fmt::Debug for RawAssetData {
@@ -39,6 +66,7 @@ impl std::fmt::Debug for RawAssetData {
         match self {
             Self::Bytes(b) => f.debug_tuple("Bytes").field(&b.len()).finish(),
             Self::Lazy(_) => f.write_str("Lazy(<fn>)"),
+            Self::LazyImage(_) => f.write_str("LazyImage(<fn>)"),
         }
     }
 }
@@ -48,8 +76,30 @@ impl RawAssetData {
         match self {
             Self::Bytes(b) => Ok(b.clone()),
             Self::Lazy(func) => func(),
+            Self::LazyImage(_) => bail!("LazyImage payload must be consumed via load_pixels()"),
         }
     }
+
+    pub fn load_pixels(&self) -> Option<Result<DecodedPixels>> {
+        match self {
+            Self::LazyImage(func) => Some(func()),
+            _ => None,
+        }
+    }
+}
+
+/// Returns a fast `(byte_len, mtime_nanos)` fingerprint for a source file on disk so
+/// incremental rebuilds can hit disk cache BEFORE decoding `.gal` pixels or hashing large `.wav`s.
+pub fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Some((len, mtime))
 }
 
 /// Asset record matching `program.assets[i]` produced by a direct-to-IR engine importer.
@@ -59,6 +109,8 @@ pub struct RawAssetInput {
     pub kind: nir_ir::AssetKind,
     pub codec: nir_ir::MediaCodec,
     pub data: RawAssetData,
+    /// Optional `(byte_len, mtime_nanos)` of the original source file for fast pre-decode cache hits.
+    pub source_fingerprint: Option<(u64, u64)>,
 }
 
 /// Complete direct-to-IR conversion output ready for `nir-build`'s parallel optimizer & packager.

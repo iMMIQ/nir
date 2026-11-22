@@ -150,6 +150,138 @@ pub(super) fn tile(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaIma
     }))
 }
 
+/// Fast direct-to-pixels GAL decoder bypassing intermediate PNG encode/decode!
+/// For single-layer opaque `GaleX200`/`Gale106` `CompType=2` (embedded JPEG — 95%+ of HD GALs),
+/// decodes directly to RGB8 via SIMD `zune-jpeg` with zero RGBA expansion or pixel-by-pixel blending!
+pub(super) fn gal_pixels(data: &[u8]) -> Result<nir_import_core::DecodedPixels> {
+    if let Some(rgb) = try_fast_gal_opaque_jpeg(data)? {
+        return Ok(rgb);
+    }
+    let img = gal(data)?;
+    let (width, height) = img.dimensions();
+    Ok(nir_import_core::DecodedPixels::Rgba {
+        width,
+        height,
+        data: img.into_raw(),
+    })
+}
+
+fn try_fast_gal_opaque_jpeg(data: &[u8]) -> Result<Option<nir_import_core::DecodedPixels>> {
+    let (width, height, packed_jpeg): (u32, u32, &[u8]) = if data.starts_with(b"GaleX200") {
+        let mut input = Bytes::new(data);
+        input.take(8)?;
+        let xml = galx_directory(input.blob()?)?;
+        let doc = roxmltree::Document::parse_with_options(
+            &xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: 16_384,
+            },
+        )?;
+        let root = doc.root_element();
+        if root.attribute("Version") != Some("200")
+            || root.attribute("Count") != Some("1")
+            || root.attribute("Randomized") != Some("0")
+            || root.attribute("CompType") != Some("2")
+        {
+            return Ok(None);
+        }
+        let w: u32 = root.attribute("Width").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let h: u32 = root.attribute("Height").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let Some(frame) = root.children().find(|n| n.is_element() && n.tag_name().name() == "Frame")
+        else {
+            return Ok(None);
+        };
+        let Some(layers_el) = frame
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "Layers")
+        else {
+            return Ok(None);
+        };
+        if layers_el.attribute("Count") != Some("1") || layers_el.attribute("Bpp") != Some("24") {
+            return Ok(None);
+        }
+        let Some(layer) = layers_el
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "Layer")
+        else {
+            return Ok(None);
+        };
+        if layer.attribute("Visible") != Some("1")
+            || layer.attribute("AlphaOn") == Some("1")
+            || layer.attribute("Alpha") != Some("255")
+            || layer.attribute("TransColor") != Some("-1")
+            || layer.attribute("Left").unwrap_or("0") != "0"
+            || layer.attribute("Top").unwrap_or("0") != "0"
+        {
+            return Ok(None);
+        }
+        let jpeg_blob = input.blob()?;
+        (w, h, jpeg_blob)
+    } else if data.starts_with(b"Gale105") || data.starts_with(b"Gale106") {
+        let mut r = Bytes::new(data);
+        r.take(7)?;
+        let header = r.blob()?;
+        if header.len() < 36 || int(header, 16)? != 1 || header[21] != 0 || header[22] != 2 {
+            return Ok(None);
+        }
+        let w = int(header, 4)?;
+        let h = int(header, 8)?;
+        r.blob()?; // frame name
+        r.take(13)?;
+        let count = r.u32()?;
+        let fw = r.u32()?;
+        let fh = r.u32()?;
+        let bpp = r.u32()?;
+        if count != 1 || fw != w || fh != h || bpp != 24 {
+            return Ok(None);
+        }
+        let x = r.u32()? as i32;
+        let y = r.u32()? as i32;
+        let visible = r.u8()? != 0;
+        let key = r.u32()?;
+        let opacity = r.u32()?;
+        let has_alpha = r.u8()? != 0;
+        if x != 0 || y != 0 || !visible || key != u32::MAX || opacity != 255 || has_alpha {
+            return Ok(None);
+        }
+        r.blob()?; // layer name
+        let jpeg_blob = r.blob()?;
+        (w, h, jpeg_blob)
+    } else {
+        return Ok(None);
+    };
+
+    if width == 0
+        || height == 0
+        || width > 8192
+        || height > 8192
+        || (width as usize) * (height as usize) > MAX_PIXELS
+        || !packed_jpeg.starts_with(&[0xFF, 0xD8])
+    {
+        return Ok(None);
+    }
+
+    let mut dec = zune_jpeg::JpegDecoder::new(Cursor::new(packed_jpeg));
+    let Ok(rgb) = dec.decode() else {
+        return Ok(None);
+    };
+    let Some(info) = dec.info() else {
+        return Ok(None);
+    };
+    if info.width as u32 != width
+        || info.height as u32 != height
+        || rgb.len() != (width as usize) * (height as usize) * 3
+    {
+        return Ok(None);
+    }
+    Ok(Some(nir_import_core::DecodedPixels::Rgb {
+        width,
+        height,
+        data: rgb,
+    }))
+}
+
 /// Single-frame GAL 105/106. Multiple visible layers are composited with their
 /// origin, opacity and color key. Unresolved forward block references fail.
 pub(super) fn gal(data: &[u8]) -> Result<RgbaImage> {

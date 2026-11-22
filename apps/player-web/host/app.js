@@ -127,22 +127,92 @@ class PakSource {
       if (!res.ok) throw new Error(`HTTP ${res.status} range ${start}-${end - 1}`);
       const bytes = new Uint8Array(await res.arrayBuffer());
       const view = bytes.byteLength > size ? bytes.subarray(0, size) : bytes;
-      if (view.byteLength <= this.rangeCacheLimit / 2) {
-        this.rangeCache.set(key, view);
-        this.rangeCacheBytes += view.byteLength;
-        while (this.rangeCacheBytes > this.rangeCacheLimit && this.rangeCache.size > 1) {
-          const oldest = this.rangeCache.keys().next().value;
-          const oldVal = this.rangeCache.get(oldest);
-          this.rangeCache.delete(oldest);
-          this.rangeCacheBytes -= oldVal.byteLength;
-        }
-      }
+      this._putRangeCache(key, view);
       return view;
     })().finally(() => {
       this.inflightRanges.delete(key);
     });
     this.inflightRanges.set(key, promise);
     return promise;
+  }
+
+  _putRangeCache(key, view) {
+    if (view.byteLength <= this.rangeCacheLimit / 2) {
+      const prev = this.rangeCache.get(key);
+      if (prev) {
+        this.rangeCacheBytes -= prev.byteLength;
+        this.rangeCache.delete(key);
+      }
+      this.rangeCache.set(key, view);
+      this.rangeCacheBytes += view.byteLength;
+      while (this.rangeCacheBytes > this.rangeCacheLimit && this.rangeCache.size > 1) {
+        const oldest = this.rangeCache.keys().next().value;
+        const oldVal = this.rangeCache.get(oldest);
+        this.rangeCache.delete(oldest);
+        this.rangeCacheBytes -= oldVal.byteLength;
+      }
+    }
+  }
+
+  /// Coalesces multiple nearby asset byte ranges (e.g. LPM menus, story lookahead bursts,
+  /// gallery thumbs) into single sequential HTTP Range requests!
+  prefetchBatch(items) {
+    if (this.mode !== 'range' || !items || items.length < 2) return;
+    const MAX_GAP = 32 * 1024;
+    const MAX_WINDOW = 512 * 1024;
+
+    const pending = [];
+    const seen = new Set();
+    for (const it of items) {
+      if (!it || !it.size) continue;
+      const start = this.mediaBase + it.offset;
+      const key = `${start}:${it.size}`;
+      if (seen.has(key) || this.rangeCache.has(key) || this.inflightRanges.has(key)) continue;
+      seen.add(key);
+      pending.push({ start, end: start + it.size, size: it.size, key });
+    }
+    if (pending.length < 2) return;
+    pending.sort((a, b) => a.start - b.start);
+
+    // Group adjacent ranges within MAX_GAP and total span <= MAX_WINDOW
+    let i = 0;
+    while (i < pending.length) {
+      let j = i + 1;
+      let winStart = pending[i].start;
+      let winEnd = pending[i].end;
+      while (
+        j < pending.length &&
+        pending[j].start - winEnd <= MAX_GAP &&
+        Math.max(winEnd, pending[j].end) - winStart <= MAX_WINDOW
+      ) {
+        winEnd = Math.max(winEnd, pending[j].end);
+        j += 1;
+      }
+      if (j - i >= 2) {
+        const group = pending.slice(i, j);
+        const batchPromise = (async () => {
+          const res = await fetch(this.url, {
+            headers: { Range: `bytes=${winStart}-${winEnd - 1}` },
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status} batch range ${winStart}-${winEnd - 1}`);
+          return new Uint8Array(await res.arrayBuffer());
+        })();
+        for (const item of group) {
+          const relStart = item.start - winStart;
+          const p = batchPromise
+            .then((buf) => {
+              const slice = buf.subarray(relStart, relStart + item.size);
+              this._putRangeCache(item.key, slice);
+              return slice;
+            })
+            .finally(() => {
+              this.inflightRanges.delete(item.key);
+            });
+          this.inflightRanges.set(item.key, p);
+        }
+      }
+      i = j;
+    }
   }
 }
 
@@ -494,6 +564,68 @@ async function main() {
   const prefetchQueue = [];
   let activePrefetches = 0;
   const MAX_BG_PREFETCH = 3;
+  // Small LRU of decoded straight base ImageBitmaps for instant delta CG/sprite compositing!
+  const baseBitmapCache = new Map(); // baseId -> Promise<ImageBitmap>
+  const MAX_BASE_BITMAPS = 8;
+
+  const getBaseBitmap = (baseId, offset, size, mime) => {
+    const hit = baseBitmapCache.get(baseId);
+    if (hit) {
+      baseBitmapCache.delete(baseId);
+      baseBitmapCache.set(baseId, hit);
+      return hit;
+    }
+    const p = pak.getAssetBytes(offset, size).then((bytes) => {
+      const blob = new Blob([bytes], { type: mime });
+      return createImageBitmap(blob, { premultiplyAlpha: 'none' });
+    });
+    baseBitmapCache.set(baseId, p);
+    if (baseBitmapCache.size > MAX_BASE_BITMAPS) {
+      const oldestKey = baseBitmapCache.keys().next().value;
+      const oldestP = baseBitmapCache.get(oldestKey);
+      baseBitmapCache.delete(oldestKey);
+      oldestP.then((b) => b.close()).catch(() => {});
+    }
+    p.catch(() => baseBitmapCache.delete(baseId));
+    return p;
+  };
+
+  const compositeDeltaBitmap = async (baseBmp, patchBmp, delta) => {
+    const w = baseBmp.width;
+    const h = baseBmp.height;
+    const cvs = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(w, h)
+      : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const ctx = cvs.getContext('2d');
+    ctx.globalCompositeOperation = 'copy';
+    ctx.drawImage(baseBmp, 0, 0);
+
+    const mask = delta.tile_mask;
+    if (!mask || mask.length === 0) {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(patchBmp, delta.x, delta.y);
+    } else {
+      const TILE = 16;
+      const pw = patchBmp.width;
+      const ph = patchBmp.height;
+      const txCount = Math.ceil(pw / TILE);
+      const tyCount = Math.ceil(ph / TILE);
+      ctx.globalCompositeOperation = 'source-over';
+      for (let pty = 0; pty < tyCount; pty++) {
+        for (let ptx = 0; ptx < txCount; ptx++) {
+          const bit = pty * txCount + ptx;
+          if (((mask[bit >> 3] || 0) & (1 << (bit & 7))) === 0) continue;
+          const sx = ptx * TILE;
+          const sy = pty * TILE;
+          const sw = Math.min(TILE, pw - sx);
+          const sh = Math.min(TILE, ph - sy);
+          ctx.clearRect(delta.x + sx, delta.y + sy, sw, sh);
+          ctx.drawImage(patchBmp, sx, sy, sw, sh, delta.x + sx, delta.y + sy, sw, sh);
+        }
+      }
+    }
+    return createImageBitmap(cvs, { premultiplyAlpha: 'premultiply' });
+  };
 
   // Idle-pausing rAF scheduler (0% CPU/GPU when waiting for click!)
   let rafId = 0;
@@ -511,17 +643,47 @@ async function main() {
     inflightImages.add(cmd.id);
     if (isPrefetch) activePrefetches += 1;
 
-    pak.getAssetBytes(cmd.offset, cmd.size)
-      .then((bytes) => {
-        const blob = new Blob([bytes], { type: cmd.mime });
-        return createImageBitmap(blob, { premultiplyAlpha: 'premultiply' });
-      })
-      .then((bmp) => {
+    let task;
+    if (cmd.mime === 'image/ktx2') {
+      task = pak.getAssetBytes(cmd.offset, cmd.size).then((bytes) => {
         inflightImages.delete(cmd.id);
-        engine.upload_image_bitmap(cmd.id, bmp);
-        bmp.close();
+        engine.upload_ktx2_bytes(cmd.id, bytes);
         scheduleFrame();
-      })
+      });
+    } else if (cmd.delta) {
+      const d = cmd.delta;
+      task = Promise.all([
+        getBaseBitmap(d.base_id, d.base_offset, d.base_size, d.base_mime),
+        pak.getAssetBytes(cmd.offset, cmd.size).then((bytes) =>
+          createImageBitmap(new Blob([bytes], { type: cmd.mime }), { premultiplyAlpha: 'none' }),
+        ),
+      ])
+        .then(async ([baseBmp, patchBmp]) => {
+          try {
+            const composited = await compositeDeltaBitmap(baseBmp, patchBmp, d);
+            inflightImages.delete(cmd.id);
+            engine.upload_image_bitmap(cmd.id, composited);
+            composited.close();
+            scheduleFrame();
+          } finally {
+            patchBmp.close();
+          }
+        });
+    } else {
+      task = pak.getAssetBytes(cmd.offset, cmd.size)
+        .then((bytes) => {
+          const blob = new Blob([bytes], { type: cmd.mime });
+          return createImageBitmap(blob, { premultiplyAlpha: 'premultiply' });
+        })
+        .then((bmp) => {
+          inflightImages.delete(cmd.id);
+          engine.upload_image_bitmap(cmd.id, bmp);
+          bmp.close();
+          scheduleFrame();
+        });
+    }
+
+    task
       .catch((err) => {
         inflightImages.delete(cmd.id);
         engine.mark_asset_failed(cmd.id, String(err));
@@ -645,6 +807,10 @@ async function main() {
         engine.hot_reload(freshHeader);
         inflightImages.clear();
         prefetchQueue.length = 0;
+        for (const p of baseBitmapCache.values()) {
+          p.then((b) => b.close()).catch(() => {});
+        }
+        baseBitmapCache.clear();
         audio.clearCache();
         await loadAllFonts();
         scheduleFrame();
@@ -757,7 +923,19 @@ async function main() {
     lastTs = ts;
     const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
     if (cmdsJson) {
-      for (const cmd of JSON.parse(cmdsJson)) {
+      const cmds = JSON.parse(cmdsJson);
+      // Coalesce adjacent HTTP Range requests across the whole command batch!
+      const ranges = [];
+      for (const cmd of cmds) {
+        if (cmd.op === 'decode_image' || cmd.op === 'preload_audio' || cmd.op === 'play_audio') {
+          ranges.push({ offset: cmd.offset, size: cmd.size });
+          if (cmd.delta) {
+            ranges.push({ offset: cmd.delta.base_offset, size: cmd.delta.base_size });
+          }
+        }
+      }
+      if (ranges.length >= 2) pak.prefetchBatch(ranges);
+      for (const cmd of cmds) {
         handleCommand(cmd);
       }
     }

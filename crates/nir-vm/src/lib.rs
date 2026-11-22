@@ -2267,132 +2267,150 @@ impl Vm {
         {
             set.insert(f);
         }
+        // Keep any delta keyframe base pinned alongside its active child patch!
+        let bases: Vec<AssetId> = set
+            .iter()
+            .filter_map(|&id| self.program.asset(id)?.delta.as_ref().map(|d| d.base))
+            .collect();
+        set.extend(bases);
         set
     }
 
-    /// Static lookahead over the next `max_ops` straight-line bytecode instructions
-    /// so `nir-runtime` can asynchronously prefetch upcoming CGs, sprites, and voice clips!
+    /// Bounded multi-branch static lookahead over the next `max_ops` bytecode instructions
+    /// (follows both arms of `JumpIfFalse` up to depth 2, plus `Choice`/`ChoiceMenu` targets
+    /// and pulls delta keyframe bases ahead of their patches!).
     pub fn predict_assets(&self, max_ops: usize) -> Vec<AssetId> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut pc = self.pc as usize;
         let mut visited = BTreeSet::new();
-        for _ in 0..max_ops {
-            if !visited.insert(pc) {
-                break;
+        let mut queue: VecDeque<(usize, u8)> = VecDeque::new();
+        queue.push_back((self.pc as usize, 0));
+
+        let push_asset = |id: AssetId, seen: &mut BTreeSet<AssetId>, out: &mut Vec<AssetId>| {
+            if let Some(base) = self
+                .program
+                .asset(id)
+                .and_then(|m| m.delta.as_ref())
+                .map(|d| d.base)
+            {
+                if seen.insert(base) {
+                    out.push(base);
+                }
             }
-            let Some(op) = self.program.ops.get(pc) else {
-                break;
-            };
-            let mut add = |id: AssetId| {
-                if seen.insert(id) {
-                    out.push(id);
+            if seen.insert(id) {
+                out.push(id);
+            }
+        };
+
+        let mut steps = 0usize;
+        while let Some((mut pc, depth)) = queue.pop_front() {
+            while steps < max_ops {
+                if !visited.insert(pc) {
+                    break;
                 }
-            };
-            match op {
-                Op::LayerSet { asset: Some(a), .. } | Op::LayerAsset { asset: Some(a), .. } => {
-                    add(*a)
-                }
-                Op::StageCommit { transition, .. } => {
-                    if let Some(m) = transition.mask_asset() {
-                        add(m);
+                let Some(op) = self.program.ops.get(pc) else {
+                    break;
+                };
+                steps += 1;
+                match op {
+                    Op::LayerSet { asset: Some(a), .. } | Op::LayerAsset { asset: Some(a), .. } => {
+                        push_asset(*a, &mut seen, &mut out);
                     }
-                }
-                Op::Say { voice: Some(v), .. } => add(*v),
-                Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => add(*asset),
-                Op::SetDialoguePortrait(Some(a)) => add(*a),
-                Op::TimelinePlay { timeline, .. } => {
-                    if let Some(def) = self.program.timelines.get(timeline.0 as usize) {
-                        for clip in &def.clips {
-                            match &clip.kind {
-                                TimelineClipKind::Image { asset, .. }
-                                | TimelineClipKind::Sound { asset, .. } => add(*asset),
-                                TimelineClipKind::Box { .. } => {}
+                    Op::StageCommit { transition, .. } => {
+                        if let Some(m) = transition.mask_asset() {
+                            push_asset(m, &mut seen, &mut out);
+                        }
+                    }
+                    Op::Say { voice: Some(v), .. } => push_asset(*v, &mut seen, &mut out),
+                    Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => {
+                        push_asset(*asset, &mut seen, &mut out);
+                    }
+                    Op::SetDialoguePortrait(Some(a)) => push_asset(*a, &mut seen, &mut out),
+                    Op::TimelinePlay { timeline, .. } => {
+                        if let Some(def) = self.program.timelines.get(timeline.0 as usize) {
+                            for clip in &def.clips {
+                                match &clip.kind {
+                                    TimelineClipKind::Image { asset, .. }
+                                    | TimelineClipKind::Sound { asset, .. } => {
+                                        push_asset(*asset, &mut seen, &mut out);
+                                    }
+                                    TimelineClipKind::Box { .. } => {}
+                                }
                             }
                         }
                     }
-                }
-                Op::ChoiceMenu {
-                    menu,
-                    hover_se,
-                    click_se,
-                    ..
-                } => {
-                    if let Some(se) = hover_se {
-                        add(*se);
-                    }
-                    if let Some(se) = click_se {
-                        add(*se);
-                    }
-                    if let Some(tmpl) = self.program.menus.get(menu.0 as usize) {
-                        if let Some(bg) = tmpl.background {
-                            add(bg);
+                    Op::ChoiceMenu {
+                        menu,
+                        hover_se,
+                        click_se,
+                        ..
+                    } => {
+                        if let Some(se) = hover_se {
+                            push_asset(*se, &mut seen, &mut out);
                         }
-                        for item in &tmpl.items {
-                            if let Some(a) = item.image {
-                                add(a);
+                        if let Some(se) = click_se {
+                            push_asset(*se, &mut seen, &mut out);
+                        }
+                        if let Some(tmpl) = self.program.menus.get(menu.0 as usize) {
+                            if let Some(bg) = tmpl.background {
+                                push_asset(bg, &mut seen, &mut out);
                             }
-                            if let Some(a) = item.hover_image {
-                                add(a);
-                            }
-                            if let Some(a) = item.disabled_image {
-                                add(a);
-                            }
-                            if let Some(a) = item.preview_image {
-                                add(a);
+                            for item in &tmpl.items {
+                                for a in [
+                                    item.image,
+                                    item.hover_image,
+                                    item.disabled_image,
+                                    item.preview_image,
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    push_asset(a, &mut seen, &mut out);
+                                }
                             }
                         }
                     }
-                }
-                Op::Jump(target) => {
-                    pc = *target as usize;
-                    continue;
-                }
-                Op::Call { func, .. } => {
-                    if let Some(f) = self.program.func(*func) {
-                        pc = f.entry_pc as usize;
+                    Op::Jump(target) => {
+                        pc = *target as usize;
                         continue;
                     }
-                    break;
-                }
-                Op::Choice { items, .. } => {
-                    for item in items {
-                        if let Some(a) = item.image {
-                            add(a);
-                        }
-                        if let Some(a) = item.hover_image {
-                            add(a);
-                        }
-                        // Peek first 4 ops of each choice target so selecting a branch is instant!
-                        for bpc in (item.target_pc as usize..).take(4) {
-                            let Some(bop) = self.program.ops.get(bpc) else {
-                                break;
-                            };
-                            match bop {
-                                Op::LayerSet { asset: Some(a), .. }
-                                | Op::LayerAsset { asset: Some(a), .. } => add(*a),
-                                Op::Say { voice: Some(v), .. } => add(*v),
-                                Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => {
-                                    add(*asset)
-                                }
-                                Op::StageCommit { transition, .. } => {
-                                    if let Some(m) = transition.mask_asset() {
-                                        add(m);
-                                    }
-                                }
-                                Op::Jump(_) | Op::Choice { .. } | Op::End { .. } | Op::Ret { .. } => {
-                                    break;
-                                }
-                                _ => {}
-                            }
+                    Op::JumpIfFalse(target) => {
+                        if depth < 2 {
+                            queue.push_back((*target as usize, depth + 1));
                         }
                     }
-                    break;
+                    Op::Call { func, .. } => {
+                        if let Some(f) = self.program.func(*func) {
+                            if depth < 2 {
+                                queue.push_back((pc + 1, depth + 1));
+                            }
+                            pc = f.entry_pc as usize;
+                            continue;
+                        }
+                        break;
+                    }
+                    Op::Choice { items, .. } => {
+                        for item in items {
+                            if let Some(a) = item.image {
+                                push_asset(a, &mut seen, &mut out);
+                            }
+                            if let Some(a) = item.hover_image {
+                                push_asset(a, &mut seen, &mut out);
+                            }
+                            if depth < 2 {
+                                queue.push_back((item.target_pc as usize, depth + 1));
+                            }
+                        }
+                        break;
+                    }
+                    Op::End { .. } | Op::Ret { .. } => break,
+                    _ => {}
                 }
-                Op::End { .. } | Op::Ret { .. } => break,
-                _ => {}
+                pc += 1;
             }
-            pc += 1;
+            if steps >= max_ops {
+                break;
+            }
         }
         out
     }
@@ -3171,5 +3189,100 @@ mod tests {
         vm.notify_modal_closed();
         vm.step(1000).unwrap();
         assert_eq!(vm.outcome.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn predict_assets_follows_branches_and_orders_delta_base_first() {
+        let mk_img = |id: u32, delta: Option<ImageDelta>| AssetMeta {
+            id: AssetId(id),
+            name: StrId(0),
+            kind: AssetKind::Image,
+            codec: MediaCodec::Webp,
+            width: 800,
+            height: 600,
+            trim: None,
+            duration_us: 0,
+            sample_rate: 0,
+            channels: 0,
+            loop_region: None,
+            offset: 0,
+            size: 100,
+            delta,
+        };
+        let prog = Arc::new(NirProgram {
+            features: FEATURE_DELTA_IMAGE,
+            meta: GameMeta {
+                game_id: "org.nir.predict".into(),
+                title: "Predict".into(),
+                version: "1.0".into(),
+                stage_width: 800,
+                stage_height: 600,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![
+                // pc 0: branch to pc 3 (else) or fall through to pc 1 (then)
+                Op::PushBool(true),
+                Op::JumpIfFalse(3),
+                // then arm: uses delta child AssetId(1) whose base is AssetId(0)
+                Op::LayerSet {
+                    layer: LayerId(0),
+                    parent: None,
+                    asset: Some(AssetId(1)),
+                    transform: Box::new(Transform2D::default()),
+                },
+                // else arm: uses AssetId(2)
+                Op::LayerSet {
+                    layer: LayerId(0),
+                    parent: None,
+                    asset: Some(AssetId(2)),
+                    transform: Box::new(Transform2D::default()),
+                },
+                Op::End { outcome: StrId(0) },
+            ],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui: UiTheme::default(),
+            assets: vec![
+                mk_img(0, None),
+                mk_img(
+                    1,
+                    Some(ImageDelta {
+                        base: AssetId(0),
+                        x: 16,
+                        y: 16,
+                        tile_mask: vec![],
+                    }),
+                ),
+                mk_img(2, None),
+            ],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        });
+
+        let vm = Vm::new(prog, None).unwrap();
+        let pred = vm.predict_assets(16);
+        assert!(pred.contains(&AssetId(0)), "delta base must be predicted");
+        assert!(pred.contains(&AssetId(1)), "then-branch delta asset must be predicted");
+        assert!(pred.contains(&AssetId(2)), "else-branch asset must be predicted");
+        let p0 = pred.iter().position(|&a| a == AssetId(0)).unwrap();
+        let p1 = pred.iter().position(|&a| a == AssetId(1)).unwrap();
+        assert!(p0 < p1, "delta base must be prefetched ahead of delta patch");
     }
 }

@@ -941,8 +941,8 @@ impl Runtime {
         for &id in &pinned {
             self.request_asset(id, true);
         }
-        // Predictive background lookahead over next 24 bytecode ops!
-        for id in self.vm.predict_assets(24) {
+        // Predictive multi-branch background lookahead over next 32 bytecode ops!
+        for id in self.vm.predict_assets(32) {
             pinned.insert(id);
             self.request_asset(id, false);
         }

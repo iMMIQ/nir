@@ -63,6 +63,14 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 encoding_rs = "0.8"
 roxmltree = "0.20"
 lewton = "0.10"
+ogg = "0.8"
+postcard = { version = "1.1", features = ["use-std"] }
+libopusenc = "0.2"
+opus-static-sys = "1.5"
+texpresso = "2.0"
+bcdec_rs = "0.2"
+ktx2 = "0.5"
+zune-jpeg = "0.5"
 ttf-parser = "0.25"
 hb-subset = { version = "0.3", features = ["bundled"] }
 webp = "0.3"
