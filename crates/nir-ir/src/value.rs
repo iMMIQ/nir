@@ -161,8 +161,15 @@ pub struct Preferences {
     pub sfx_volume: f32,
     pub reduced_motion: bool,
     pub fullscreen: bool,
+    /// Comfortable docked bottom dialogue layout on narrow portrait screens (phones).
+    #[serde(default = "default_true")]
+    pub portrait_reader: bool,
     /// Per-character voice volume override (0.0 = muted, 1.0 = full).
     pub character_volumes: BTreeMap<String, f32>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Preferences {
@@ -182,6 +189,7 @@ impl Default for Preferences {
             sfx_volume: 0.8,
             reduced_motion: false,
             fullscreen: false,
+            portrait_reader: true,
             character_volumes: BTreeMap::new(),
         }
     }

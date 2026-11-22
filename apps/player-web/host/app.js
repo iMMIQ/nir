@@ -1,9 +1,16 @@
-// NIR v2 Modern Single-Page Web Host
+// NIR v2 Modern Single-Page Web Host (Desktop + Mobile Optimized)
 // HTTP Range streaming OR zero-copy JS-backed .nirpak | Idle-pausing rAF |
-// Priority createImageBitmap GPU decode | Bounded LRU WebAudio + Lookahead | IndexedDB slot index
+// Adaptive Mobile Budgets + DPR Cap | Multi-Touch Gestures + Safe Area Insets |
+// iOS Safari Audio Unlock + Streaming BGM | Wake Lock | WebGL2 Context Loss Recovery |
+// On-Demand Cached Fallback Font + PWA Support
 
 const canvas = document.getElementById('stage');
 const videoEl = document.getElementById('video-layer');
+const videoOverlayEl = document.getElementById('video-overlay');
+const videoPlayBtn = document.getElementById('video-play-btn');
+const videoSkipBtn = document.getElementById('video-skip-btn');
+const fsBtn = document.getElementById('fs-btn');
+const safeProbeEl = document.getElementById('safe-area-probe');
 const loaderEl = document.getElementById('loader');
 const loaderText = document.getElementById('loader-text');
 const loaderFill = document.getElementById('loader-fill');
@@ -13,16 +20,65 @@ const setProgress = (pct, msg) => {
   if (msg && loaderText) loaderText.textContent = msg;
 };
 
+// --- Adaptive Mobile Hardware Profile (prevents mobile Jetsam OOM & 3x overdraw!) ---
+function detectDeviceProfile() {
+  const coarsePointer =
+    typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+  const uaMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS|MicroMessenger/i.test(
+    navigator.userAgent || '',
+  );
+  const hasTouch = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+  const isMobile = coarsePointer || uaMobile;
+  const isIOS =
+    /iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
+    (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+  const memGb = Number(navigator.deviceMemory || 0);
+  const lowMem = (memGb > 0 && memGb <= 3) || (isIOS && Math.min(screen.width, screen.height) <= 390);
+  return {
+    isMobile,
+    isIOS,
+    hasTouch,
+    lowMem,
+    maxDpr: isMobile ? (lowMem ? 1.5 : 2.0) : 3.0,
+    rangeCacheLimit: (isMobile ? (lowMem ? 16 : 32) : 64) * 1024 * 1024,
+    audioDecodedLimit: (isMobile ? (lowMem ? 24 : 40) : 96) * 1024 * 1024,
+    gpuCacheMb: isMobile ? (lowMem ? 64 : 80) : 0, // 0 = use Renderer backend default
+    maxBaseBitmaps: isMobile ? 4 : 8,
+    maxBgPrefetch: isMobile ? 2 : 3,
+  };
+}
+
+const deviceProfile = detectDeviceProfile();
+
+function readViewportMetrics() {
+  const vv = window.visualViewport;
+  const width = Math.max(1, Math.round(vv ? vv.width : window.innerWidth));
+  const height = Math.max(1, Math.round(vv ? vv.height : window.innerHeight));
+  const dpr = Math.min(window.devicePixelRatio || 1, deviceProfile.maxDpr);
+  let top = 0;
+  let right = 0;
+  let bottom = 0;
+  let left = 0;
+  if (safeProbeEl) {
+    const cs = getComputedStyle(safeProbeEl);
+    top = parseFloat(cs.paddingTop) || 0;
+    right = parseFloat(cs.paddingRight) || 0;
+    bottom = parseFloat(cs.paddingBottom) || 0;
+    left = parseFloat(cs.paddingLeft) || 0;
+  }
+  return { width, height, dpr, insets: { top, right, bottom, left } };
+}
+
 // --- Streaming / Zero-Copy `.nirpak` Source (keeps media out of WASM linear memory!) ---
 class PakSource {
-  constructor(url) {
+  constructor(url, rangeCacheLimit) {
     this.url = url;
     this.mode = 'memory'; // 'range' | 'memory'
     this.fullBytes = null;
     this.mediaBase = 0;
     this.rangeCache = new Map(); // key -> Uint8Array
     this.rangeCacheBytes = 0;
-    this.rangeCacheLimit = 64 * 1024 * 1024;
+    this.rangeCacheLimit = rangeCacheLimit || 64 * 1024 * 1024;
     this.inflightRanges = new Map();
   }
 
@@ -52,7 +108,7 @@ class PakSource {
           return buf.byteLength > this.mediaBase ? buf.subarray(0, this.mediaBase) : buf;
         }
       } else {
-        // Server returned full 200 OK; read with progress bar once into JS memory (never copied to WASM!)
+        // Server returned full 200 OK; warn on mobile if payload is huge so users know why it takes longer
         const full = await this._readFullResponse(probe);
         return this._initMemory(full);
       }
@@ -78,6 +134,9 @@ class PakSource {
 
   async _readFullResponse(res) {
     const total = Number(res.headers.get('content-length') || 0);
+    if (deviceProfile.isMobile && total > 96 * 1024 * 1024) {
+      setProgress(15, `服务器未开启断点流式加载，正在下载完整资源 (${Math.round(total / (1024 * 1024))} MB)…`);
+    }
     if (!res.body || !total) {
       const buf = await res.arrayBuffer();
       setProgress(88);
@@ -100,6 +159,15 @@ class PakSource {
       offset += c.byteLength;
     }
     return out;
+  }
+
+  trimCache(targetBytes = 0) {
+    while (this.rangeCacheBytes > targetBytes && this.rangeCache.size > 0) {
+      const oldest = this.rangeCache.keys().next().value;
+      const oldVal = this.rangeCache.get(oldest);
+      this.rangeCache.delete(oldest);
+      this.rangeCacheBytes -= oldVal.byteLength;
+    }
   }
 
   async getAssetBytes(offset, size) {
@@ -174,7 +242,6 @@ class PakSource {
     if (pending.length < 2) return;
     pending.sort((a, b) => a.start - b.start);
 
-    // Group adjacent ranges within MAX_GAP and total span <= MAX_WINDOW
     let i = 0;
     while (i < pending.length) {
       let j = i + 1;
@@ -325,8 +392,6 @@ class SaveStore {
       return localRaw;
     }
   }
-  /// Reads prefs, profile, and slot summaries in a SINGLE IndexedDB readonly transaction,
-  /// optionally reconciling with same-origin cloud saves (`saveApi`)!
   async loadInitialState(slotCount = 24) {
     const remotePromise = this._fetchRemoteBundle();
     let prefsRaw = null;
@@ -355,7 +420,6 @@ class SaveStore {
         this.slotIndex = {};
       }
     } else if (this.db) {
-      // One-time migration from legacy per-slot keys using a single readonly transaction!
       const legacy = await new Promise((resolve) => {
         const tx = this.db.transaction('kv', 'readonly');
         const os = tx.objectStore('kv');
@@ -438,19 +502,23 @@ class SaveStore {
   }
 }
 
-// --- WebAudio API Mixer with Bounded LRU Cache (96 MiB) + Lookahead Pre-decoding ---
+// --- WebAudio API Mixer with Mobile Streaming BGM, iOS Unlock/Interrupted Recovery & Bounded LRU ---
 class WebAudioMixer {
-  constructor() {
+  constructor(decodedLimit, onCodecUnsupported) {
     this.ctx = null;
     this.master = null;
     this.buses = {};
     this.channels = new Map();
     this.decodedCache = new Map(); // assetId -> { buf: AudioBuffer, bytes: number }
     this.decodedBytes = 0;
-    this.decodedLimit = 96 * 1024 * 1024;
+    this.decodedLimit = decodedLimit || 96 * 1024 * 1024;
     this.inflightDecode = new Map();
+    this.hostSuspended = false;
+    this.warnedOgg = false;
+    this.onCodecUnsupported = onCodecUnsupported || null;
     this.prefs = { master_volume: 0.9, bgm_volume: 0.75, voice_volume: 1.0, sfx_volume: 0.85 };
   }
+
   ensureContext() {
     if (!this.ctx) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -465,11 +533,47 @@ class WebAudioMixer {
       }
       this.applyPreferences(this.prefs);
     }
-    if (this.ctx.state === 'suspended') {
+    // Check `!== 'running'` (not just `'suspended'`) so iOS Safari `'interrupted'` state also recovers!
+    if (!this.hostSuspended && this.ctx.state !== 'running') {
       this.ctx.resume().catch(() => {});
+    }
+    // Also kick any streaming HTMLAudioElement that was blocked by autoplay before first gesture
+    if (!this.hostSuspended) {
+      for (const ch of this.channels.values()) {
+        if (ch.mediaEl && ch.pendingPlay && ch.mediaEl.paused) {
+          ch.mediaEl.play().then(() => { ch.pendingPlay = false; }).catch(() => {});
+        }
+      }
     }
     return this.ctx;
   }
+
+  suspendAll() {
+    this.hostSuspended = true;
+    for (const ch of this.channels.values()) {
+      if (ch.mediaEl && !ch.mediaEl.paused) {
+        ch.wasPlayingBeforeSuspend = true;
+        ch.mediaEl.pause();
+      }
+    }
+    if (this.ctx && this.ctx.state === 'running') {
+      this.ctx.suspend().catch(() => {});
+    }
+  }
+
+  resumeAll() {
+    this.hostSuspended = false;
+    if (this.ctx && this.ctx.state !== 'running') {
+      this.ctx.resume().catch(() => {});
+    }
+    for (const ch of this.channels.values()) {
+      if (ch.mediaEl && (ch.wasPlayingBeforeSuspend || ch.pendingPlay)) {
+        ch.wasPlayingBeforeSuspend = false;
+        ch.mediaEl.play().then(() => { ch.pendingPlay = false; }).catch(() => {});
+      }
+    }
+  }
+
   applyPreferences(p) {
     this.prefs = p;
     if (!this.ctx) return;
@@ -479,8 +583,13 @@ class WebAudioMixer {
     this.buses.voice.gain.setTargetAtTime(p.voice_volume ?? 1.0, now, 0.02);
     this.buses.sfx.gain.setTargetAtTime(p.sfx_volume ?? 0.85, now, 0.02);
   }
+
   _putDecoded(assetId, audioBuf) {
     const bytes = audioBuf.length * audioBuf.numberOfChannels * 4;
+    if (bytes > this.decodedLimit * 0.65) {
+      // Avoid evicting the entire voice/SFX cache for a single giant decoded track
+      return;
+    }
     const prev = this.decodedCache.get(assetId);
     if (prev) {
       this.decodedBytes -= prev.bytes;
@@ -490,6 +599,7 @@ class WebAudioMixer {
     this.decodedBytes += bytes;
     this._evictLru(assetId);
   }
+
   _evictLru(keepAsset) {
     if (this.decodedBytes <= this.decodedLimit) return;
     const activeAssets = new Set([keepAsset]);
@@ -503,10 +613,10 @@ class WebAudioMixer {
       this.decodedBytes -= entry.bytes;
     }
   }
-  async _decodeAsset(ctx, assetId, fetchBytes) {
+
+  async _decodeAsset(ctx, assetId, mime, fetchBytes) {
     const hit = this.decodedCache.get(assetId);
     if (hit) {
-      // Touch LRU order
       this.decodedCache.delete(assetId);
       this.decodedCache.set(assetId, hit);
       return hit.buf;
@@ -522,17 +632,99 @@ class WebAudioMixer {
       this._putDecoded(assetId, audioBuf);
       return audioBuf;
     })()
-      .catch(() => null)
+      .catch(() => {
+        if (!this.warnedOgg && mime && mime.startsWith('audio/ogg') && this.onCodecUnsupported) {
+          this.warnedOgg = true;
+          this.onCodecUnsupported(mime);
+        }
+        return null;
+      })
       .finally(() => {
         this.inflightDecode.delete(assetId);
       });
     this.inflightDecode.set(assetId, task);
     return task;
   }
-  preload(assetId, fetchBytes) {
+
+  preload(assetId, mime, size, fetchBytes) {
+    // Skip pre-decoding large BGM tracks into float32 PCM on mobile!
+    if (deviceProfile.isMobile && size > 320 * 1024) return;
     if (!this.ctx || this.decodedCache.has(assetId) || this.inflightDecode.has(assetId)) return;
-    this._decodeAsset(this.ctx, assetId, fetchBytes);
+    this._decodeAsset(this.ctx, assetId, mime, fetchBytes);
   }
+
+  _canStreamMediaElement(cmd) {
+    if (!deviceProfile.isMobile) return false;
+    if (cmd.bus !== 'bgm' || cmd.size < 256 * 1024) return false;
+    // Sample-accurate intro+loop regions still use WebAudio AudioBufferSourceNode
+    if (cmd.looped && cmd.loop_start_s != null && cmd.loop_end_s != null && cmd.loop_end_s > cmd.loop_start_s) {
+      return false;
+    }
+    const probe = document.createElement('audio');
+    return Boolean(probe.canPlayType && probe.canPlayType(cmd.mime || 'audio/mpeg'));
+  }
+
+  async _playStreamingBgm(ctx, cmd, playToken, fetchBytes, onEnded) {
+    const bytes = await fetchBytes();
+    const slot = this.channels.get(cmd.channel);
+    if (!bytes || bytes.byteLength === 0 || !slot || slot.pending !== playToken) return false;
+
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: cmd.mime || 'audio/mpeg' }));
+    const el = new Audio();
+    el.preload = 'auto';
+    el.loop = Boolean(cmd.looped);
+    el.src = blobUrl;
+
+    let mediaNode;
+    try {
+      mediaNode = ctx.createMediaElementSource(el);
+    } catch {
+      URL.revokeObjectURL(blobUrl);
+      return false;
+    }
+
+    const gainNode = ctx.createGain();
+    const targetGain = Math.max(0, cmd.gain ?? 1.0);
+    const now = ctx.currentTime;
+    if (cmd.fade_in_ms > 0) {
+      gainNode.gain.setValueAtTime(0.0001, now);
+      gainNode.gain.linearRampToValueAtTime(targetGain, now + cmd.fade_in_ms / 1000);
+    } else {
+      gainNode.gain.setValueAtTime(targetGain, now);
+    }
+    mediaNode.connect(gainNode);
+    gainNode.connect(this.buses[cmd.bus] ?? this.master);
+
+    const entry = {
+      mediaEl: el,
+      mediaNode,
+      blobUrl,
+      gainNode,
+      bus: cmd.bus,
+      asset: cmd.asset,
+      pendingPlay: false,
+      wasPlayingBeforeSuspend: false,
+    };
+    el.onended = () => {
+      const cur = this.channels.get(cmd.channel);
+      if (cur && cur.mediaEl === el) {
+        this.channels.delete(cmd.channel);
+        URL.revokeObjectURL(blobUrl);
+        try { mediaNode.disconnect(); } catch {}
+        onEnded(cmd.channel);
+      }
+    };
+    this.channels.set(cmd.channel, entry);
+    if (!this.hostSuspended) {
+      el.play().catch(() => {
+        entry.pendingPlay = true;
+      });
+    } else {
+      entry.wasPlayingBeforeSuspend = true;
+    }
+    return true;
+  }
+
   async play(cmd, fetchBytes, onEnded) {
     const ctx = this.ensureContext();
     if (!ctx) return;
@@ -540,8 +732,14 @@ class WebAudioMixer {
     const playToken = Symbol('play');
     this.channels.set(cmd.channel, { pending: playToken, asset: cmd.asset, bus: cmd.bus });
 
-    const audioBuf = await this._decodeAsset(ctx, cmd.asset, fetchBytes);
-    // Abort if channel was stopped or replaced while awaiting async decode!
+    if (this._canStreamMediaElement(cmd)) {
+      const ok = await this._playStreamingBgm(ctx, cmd, playToken, fetchBytes, onEnded);
+      if (ok) return;
+      const slot = this.channels.get(cmd.channel);
+      if (!slot || slot.pending !== playToken) return;
+    }
+
+    const audioBuf = await this._decodeAsset(ctx, cmd.asset, cmd.mime, fetchBytes);
     const slot = this.channels.get(cmd.channel);
     if (!audioBuf || !slot || slot.pending !== playToken) return;
 
@@ -573,10 +771,31 @@ class WebAudioMixer {
     this.channels.set(cmd.channel, { src, gainNode, bus: cmd.bus, asset: cmd.asset });
     src.start(0);
   }
+
   stop(channel, fadeOutMs) {
     const cur = this.channels.get(channel);
     if (!cur || !this.ctx) return;
     this.channels.delete(channel);
+    if (cur.mediaEl) {
+      const cleanupMedia = () => {
+        try {
+          cur.mediaEl.pause();
+          cur.mediaEl.src = '';
+          cur.mediaNode?.disconnect();
+        } catch {}
+        if (cur.blobUrl) URL.revokeObjectURL(cur.blobUrl);
+      };
+      if (fadeOutMs > 0 && cur.gainNode) {
+        const now = this.ctx.currentTime;
+        cur.gainNode.gain.cancelScheduledValues(now);
+        cur.gainNode.gain.setValueAtTime(cur.gainNode.gain.value, now);
+        cur.gainNode.gain.linearRampToValueAtTime(0.0001, now + fadeOutMs / 1000);
+        setTimeout(cleanupMedia, fadeOutMs + 40);
+      } else {
+        cleanupMedia();
+      }
+      return;
+    }
     if (!cur.src) return;
     const now = this.ctx.currentTime;
     try {
@@ -590,16 +809,47 @@ class WebAudioMixer {
       }
     } catch { /* already stopped */ }
   }
+
   setGain(channel, gain) {
     const cur = this.channels.get(channel);
     if (cur && cur.gainNode && this.ctx) {
       cur.gainNode.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.02);
     }
   }
+
   clearCache() {
     this.decodedCache.clear();
     this.decodedBytes = 0;
   }
+}
+
+// --- Optional PWA Service Worker Registration ---
+function registerServiceWorker(cfg) {
+  if (cfg.disableSw || !('serviceWorker' in navigator)) return;
+  const secure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+  if (!secure) return;
+  navigator.serviceWorker.register(new URL('./sw.js', import.meta.url).href).catch(() => {});
+}
+
+async function fetchWithCacheApi(url) {
+  try {
+    if (typeof caches !== 'undefined') {
+      const cache = await caches.open('nir-fonts-v1');
+      const hit = await cache.match(url);
+      if (hit && hit.ok) {
+        return new Uint8Array(await hit.arrayBuffer());
+      }
+      const res = await fetch(url);
+      if (res.ok) {
+        cache.put(url, res.clone()).catch(() => {});
+        return new Uint8Array(await res.arrayBuffer());
+      }
+      return null;
+    }
+  } catch { /* ignore Cache API error */ }
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 async function main() {
@@ -608,6 +858,8 @@ async function main() {
     throw new ReferenceError('WebAssembly is not defined');
   }
   const cfg = globalThis.__NIR_CONFIG__ || {};
+  registerServiceWorker(cfg);
+
   const qs = new URLSearchParams(location.search);
   const pakUrl = cfg.pakUrl || qs.get('pak') || qs.get('file') || './game.nirpak';
   const wasmJsUrl = cfg.wasmJsUrl
@@ -617,7 +869,7 @@ async function main() {
   const gameKey = cfg.gameId || qs.get('game') || null;
   const saveApi = cfg.saveApi || qs.get('save_api') || null;
 
-  let pak = new PakSource(pakUrl);
+  let pak = new PakSource(pakUrl, deviceProfile.rangeCacheLimit);
   const store = new SaveStore(gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2', saveApi);
 
   const [{ default: initWasm, WebEngine }, headerBytes, initialSaves] = await Promise.all([
@@ -634,9 +886,9 @@ async function main() {
   }
 
   setProgress(92, 'Starting GPU renderer…');
-  const dpr = Math.min(window.devicePixelRatio || 1, 3);
-  canvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
-  canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+  const initialView = readViewportMetrics();
+  canvas.width = Math.max(1, Math.round(initialView.width * initialView.dpr));
+  canvas.height = Math.max(1, Math.round(initialView.height * initialView.dpr));
 
   const engine = await WebEngine.create(
     canvas,
@@ -644,9 +896,23 @@ async function main() {
     initialSaves.prefsJson,
     initialSaves.profileJson,
     JSON.stringify(initialSaves.slots),
-    dpr,
+    initialView.dpr,
   );
   document.title = engine.title();
+
+  // Apply adaptive mobile GPU cache cap & initial safe-area insets + touch modality
+  if (deviceProfile.gpuCacheMb > 0) {
+    engine.set_texture_cache_limit_mb(deviceProfile.gpuCacheMb);
+  }
+  engine.set_safe_insets(
+    initialView.insets.top,
+    initialView.insets.right,
+    initialView.insets.bottom,
+    initialView.insets.left,
+  );
+  if (deviceProfile.isMobile) {
+    engine.set_input_mode(true);
+  }
 
   const fallbackFontUrls = (() => {
     const out = [];
@@ -665,22 +931,35 @@ async function main() {
     return out;
   })();
 
-  // Start fetching shared Web CJK fallback font in parallel with WASM + header (browser immutable-cached!)
-  const fallbackFontPromise = (async () => {
+  let fallbackFontStarted = false;
+  let fallbackFontsLoaded = 0;
+  let cachedFallbackBlobs = [];
+  const loadFallbackFontsLazy = async () => {
+    if (fallbackFontStarted) return;
+    fallbackFontStarted = true;
     const loaded = [];
     for (const url of fallbackFontUrls) {
       try {
-        const res = await fetch(url);
-        if (res.ok) {
-          const bytes = new Uint8Array(await res.arrayBuffer());
-          if (bytes.byteLength >= 256) {
-            loaded.push(bytes);
-          }
+        const bytes = await fetchWithCacheApi(url);
+        if (bytes && bytes.byteLength >= 256) {
+          loaded.push(bytes);
         }
       } catch { /* optional fallback font */ }
     }
-    return loaded;
-  })();
+    cachedFallbackBlobs = loaded;
+    for (const bytes of loaded) {
+      try {
+        engine.load_fallback_font(bytes);
+        fallbackFontsLoaded += 1;
+      } catch { /* ignore invalid font */ }
+    }
+    if (globalThis.__nir) {
+      globalThis.__nir.fallbackFonts = fallbackFontsLoaded;
+    }
+    if (loaded.length > 0) {
+      scheduleFrame();
+    }
+  };
 
   const loadAllFonts = async () => {
     const fonts = JSON.parse(engine.font_assets_json() || '[]');
@@ -695,36 +974,91 @@ async function main() {
     return bundledCount;
   };
   const bundledFontCount = await loadAllFonts();
-  let fallbackFontsLoaded = 0;
-  const applyFallbackFonts = (fontBlobs) => {
-    for (const bytes of fontBlobs) {
-      try {
-        engine.load_fallback_font(bytes);
-        fallbackFontsLoaded += 1;
-      } catch { /* ignore invalid font */ }
-    }
-    if (globalThis.__nir) {
-      globalThis.__nir.fallbackFonts = fallbackFontsLoaded;
-    }
-  };
   if (bundledFontCount === 0) {
-    // Wait for shared CJK fallback font when the .nirpak has no bundled font so frame 1 is never blank!
+    // Only fetch the shared Pan-CJK fallback font eagerly when `.nirpak` bundles no font!
+    // When bundled fonts exist, we save 6.1 MiB on mobile and only lazy-load if a missing glyph appears.
     setProgress(96, 'Loading CJK font…');
-    applyFallbackFonts(await fallbackFontPromise);
+    await loadFallbackFontsLazy();
   }
 
-  const audio = new WebAudioMixer();
+  const audio = new WebAudioMixer(deviceProfile.audioDecodedLimit, () => {
+    engine.show_toast('当前浏览器不支持 OGG/Opus 音频，建议使用 MP3 音频构建', 4500);
+    scheduleFrame();
+  });
   try { audio.applyPreferences(JSON.parse(initialSaves.prefsJson)); } catch { /* default */ }
 
-  // Priority image decode scheduler: urgent images dispatch immediately; background prefetches
-  // are concurrency-limited (max 3) so lookahead never starves visible scene assets!
+  // Screen Wake Lock during Auto/Skip reading on mobile
+  let wakeLockSentinel = null;
+  let wakeLockPending = false;
+  const syncWakeLock = () => {
+    if (!navigator.wakeLock || document.visibilityState !== 'visible') {
+      if (wakeLockSentinel) {
+        wakeLockSentinel.release().catch(() => {});
+        wakeLockSentinel = null;
+      }
+      return;
+    }
+    const want = engine.wants_wake_lock();
+    if (want && !wakeLockSentinel && !wakeLockPending) {
+      wakeLockPending = true;
+      navigator.wakeLock
+        .request('screen')
+        .then((s) => {
+          wakeLockSentinel = s;
+          s.addEventListener('release', () => {
+            if (wakeLockSentinel === s) wakeLockSentinel = null;
+          });
+        })
+        .catch(() => {})
+        .finally(() => {
+          wakeLockPending = false;
+        });
+    } else if (!want && wakeLockSentinel) {
+      wakeLockSentinel.release().catch(() => {});
+      wakeLockSentinel = null;
+    }
+  };
+
+  // Subtle mobile fullscreen / landscape button (hidden when fullscreen or unsupported)
+  const syncFullscreenButton = () => {
+    if (!fsBtn) return;
+    const canFs = Boolean(
+      deviceProfile.isMobile &&
+        document.fullscreenEnabled &&
+        document.documentElement.requestFullscreen,
+    );
+    const inFs = Boolean(document.fullscreenElement);
+    fsBtn.hidden = !canFs || inFs;
+  };
+  if (fsBtn) {
+    fsBtn.addEventListener('click', async () => {
+      audio.ensureContext();
+      try {
+        await document.documentElement.requestFullscreen();
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock('landscape').catch(() => {});
+        }
+      } catch { /* ignore */ }
+      syncFullscreenButton();
+    });
+    document.addEventListener('fullscreenchange', syncFullscreenButton);
+    syncFullscreenButton();
+  }
+
+  // Priority image decode scheduler
   const inflightImages = new Set();
   const prefetchQueue = [];
   let activePrefetches = 0;
-  const MAX_BG_PREFETCH = 3;
-  // Small LRU of decoded straight base ImageBitmaps for instant delta CG/sprite compositing!
+  const MAX_BG_PREFETCH = deviceProfile.maxBgPrefetch;
   const baseBitmapCache = new Map(); // baseId -> Promise<ImageBitmap>
-  const MAX_BASE_BITMAPS = 8;
+  const MAX_BASE_BITMAPS = deviceProfile.maxBaseBitmaps;
+
+  const clearBaseBitmapCache = () => {
+    for (const p of baseBitmapCache.values()) {
+      p.then((b) => b.close()).catch(() => {});
+    }
+    baseBitmapCache.clear();
+  };
 
   const getBaseBitmap = (baseId, offset, size, mime) => {
     const hit = baseBitmapCache.get(baseId);
@@ -785,19 +1119,21 @@ async function main() {
     return createImageBitmap(cvs, { premultiplyAlpha: 'premultiply' });
   };
 
-  // Idle-pausing rAF scheduler (0% CPU/GPU when waiting for click!)
+  // Idle-pausing rAF scheduler (0% CPU/GPU when waiting for click/tap!)
   let rafId = 0;
   let lastTs = performance.now();
+  let contextLost = false;
+  let recoveringRenderer = false;
 
   const scheduleFrame = () => {
-    if (rafId === 0) {
+    if (rafId === 0 && !contextLost && document.visibilityState !== 'hidden') {
       lastTs = performance.now();
       rafId = requestAnimationFrame(frame);
     }
   };
 
   const dispatchImageDecode = (cmd, isPrefetch) => {
-    if (inflightImages.has(cmd.id)) return;
+    if (inflightImages.has(cmd.id) || contextLost) return;
     inflightImages.add(cmd.id);
     if (isPrefetch) activePrefetches += 1;
 
@@ -805,7 +1141,7 @@ async function main() {
     if (cmd.mime === 'image/ktx2') {
       task = pak.getAssetBytes(cmd.offset, cmd.size).then((bytes) => {
         inflightImages.delete(cmd.id);
-        engine.upload_ktx2_bytes(cmd.id, bytes);
+        if (!contextLost) engine.upload_ktx2_bytes(cmd.id, bytes);
         scheduleFrame();
       });
     } else if (cmd.delta) {
@@ -820,7 +1156,7 @@ async function main() {
           try {
             const composited = await compositeDeltaBitmap(baseBmp, patchBmp, d);
             inflightImages.delete(cmd.id);
-            engine.upload_image_bitmap(cmd.id, composited);
+            if (!contextLost) engine.upload_image_bitmap(cmd.id, composited);
             composited.close();
             scheduleFrame();
           } finally {
@@ -835,7 +1171,7 @@ async function main() {
         })
         .then((bmp) => {
           inflightImages.delete(cmd.id);
-          engine.upload_image_bitmap(cmd.id, bmp);
+          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
           bmp.close();
           scheduleFrame();
         });
@@ -856,7 +1192,7 @@ async function main() {
   };
 
   const pumpPrefetchQueue = () => {
-    while (activePrefetches < MAX_BG_PREFETCH && prefetchQueue.length > 0) {
+    while (activePrefetches < MAX_BG_PREFETCH && prefetchQueue.length > 0 && !contextLost) {
       const next = prefetchQueue.shift();
       if (!inflightImages.has(next.id)) {
         dispatchImageDecode(next, true);
@@ -867,7 +1203,6 @@ async function main() {
   const enqueueImageDecode = (cmd) => {
     if (inflightImages.has(cmd.id)) return;
     if (cmd.urgent) {
-      // Remove from prefetch queue if already waiting there and run immediately!
       const idx = prefetchQueue.findIndex((q) => q.id === cmd.id);
       if (idx >= 0) prefetchQueue.splice(idx, 1);
       dispatchImageDecode(cmd, false);
@@ -879,36 +1214,136 @@ async function main() {
     }
   };
 
-  const onResize = () => {
-    const r = Math.min(window.devicePixelRatio || 1, 3);
-    const w = Math.max(1, Math.round(window.innerWidth * r));
-    const h = Math.max(1, Math.round(window.innerHeight * r));
-    canvas.width = w;
-    canvas.height = h;
-    engine.resize(w, h, r);
+  // Dynamic viewport + safe area resize handler (handles iOS Safari URL bar & rotation!)
+  let resizeQueued = false;
+  const applyResize = () => {
+    resizeQueued = false;
+    const m = readViewportMetrics();
+    const w = Math.max(1, Math.round(m.width * m.dpr));
+    const h = Math.max(1, Math.round(m.height * m.dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    engine.set_safe_insets(m.insets.top, m.insets.right, m.insets.bottom, m.insets.left);
+    engine.resize(w, h, m.dpr);
     scheduleFrame();
   };
+  const onResize = () => {
+    if (!resizeQueued) {
+      resizeQueued = true;
+      requestAnimationFrame(applyResize);
+    }
+  };
   window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', () => setTimeout(onResize, 80));
+  window.visualViewport?.addEventListener('resize', onResize);
 
-  const unlockAudio = () => audio.ensureContext();
-  canvas.addEventListener('pointermove', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    engine.pointer_move(e.clientX - rect.left, e.clientY - rect.top);
-    if (engine.needs_frame()) scheduleFrame();
+  // WebGL2 / WebGPU Context Loss Recovery (common on mobile backgrounding!)
+  const recoverGpuRenderer = async () => {
+    if (recoveringRenderer) return;
+    recoveringRenderer = true;
+    try {
+      const m = readViewportMetrics();
+      const w = Math.max(1, Math.round(m.width * m.dpr));
+      const h = Math.max(1, Math.round(m.height * m.dpr));
+      canvas.width = w;
+      canvas.height = h;
+      await engine.recreate_renderer(canvas, w, h, m.dpr);
+      if (deviceProfile.gpuCacheMb > 0) {
+        engine.set_texture_cache_limit_mb(deviceProfile.gpuCacheMb);
+      }
+      inflightImages.clear();
+      prefetchQueue.length = 0;
+      await loadAllFonts();
+      for (const blob of cachedFallbackBlobs) {
+        try { engine.load_fallback_font(blob); } catch {}
+      }
+      contextLost = false;
+      scheduleFrame();
+    } catch (e) {
+      console.error('GPU renderer recovery failed:', e);
+    } finally {
+      recoveringRenderer = false;
+    }
+  };
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    contextLost = true;
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
   });
+  canvas.addEventListener('webglcontextrestored', () => {
+    recoverGpuRenderer();
+  });
+
+  // --- Unified Pointer + Multi-Touch Gesture Input ---
+  const unlockAudio = () => audio.ensureContext();
+  window.addEventListener('touchend', unlockAudio, { passive: true });
+  window.addEventListener('click', unlockAudio, { passive: true });
+
+  const localPos = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    return [e.clientX - rect.left, e.clientY - rect.top];
+  };
+
   canvas.addEventListener('pointerdown', (e) => {
     unlockAudio();
+    const [x, y] = localPos(e);
+    if (e.pointerType === 'touch') {
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      engine.touch_start(e.pointerId, x, y);
+      scheduleFrame();
+      return;
+    }
     if (e.button === 2) {
       engine.cancel_or_menu();
       scheduleFrame();
       return;
     }
-    if (e.button === 0) {
-      const rect = canvas.getBoundingClientRect();
-      engine.pointer_click(e.clientX - rect.left, e.clientY - rect.top);
+    if (e.button === 0 && e.isPrimary) {
+      engine.pointer_down(x, y);
       scheduleFrame();
     }
   });
+
+  canvas.addEventListener('pointermove', (e) => {
+    const [x, y] = localPos(e);
+    if (e.pointerType === 'touch') {
+      engine.touch_move(e.pointerId, x, y);
+      if (engine.needs_frame()) scheduleFrame();
+      return;
+    }
+    engine.pointer_move(x, y);
+    if (engine.needs_frame()) scheduleFrame();
+  });
+
+  canvas.addEventListener('pointerup', (e) => {
+    unlockAudio();
+    const [x, y] = localPos(e);
+    if (e.pointerType === 'touch') {
+      try { canvas.releasePointerCapture(e.pointerId); } catch {}
+      engine.touch_end(e.pointerId, x, y);
+      scheduleFrame();
+      return;
+    }
+    if (e.button === 0 && e.isPrimary) {
+      engine.pointer_up(x, y);
+      scheduleFrame();
+    }
+  });
+
+  canvas.addEventListener('pointercancel', (e) => {
+    if (e.pointerType === 'touch') {
+      engine.touch_cancel(e.pointerId);
+    } else {
+      engine.pointer_cancel();
+    }
+    scheduleFrame();
+  });
+
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -940,35 +1375,71 @@ async function main() {
     }
   });
 
-  // Flush debounced profile saves when hiding or closing tab!
-  const flushSaves = () => {
-    const cmdsJson = engine.flush_pending_saves();
-    if (cmdsJson) {
-      for (const cmd of JSON.parse(cmdsJson)) {
-        handleCommand(cmd);
+  // --- Mobile Lifecycle (pause audio/video/clocks & flush saves on background/lockscreen!) ---
+  let videoWasPlayingBeforeHide = false;
+  const dispatchCmdJson = (cmdsJson) => {
+    if (!cmdsJson) return;
+    for (const cmd of JSON.parse(cmdsJson)) {
+      handleCommand(cmd);
+    }
+  };
+
+  const onEnterBackground = () => {
+    dispatchCmdJson(engine.set_host_paused(true));
+    audio.suspendAll();
+    if (videoEl && !videoEl.hidden && !videoEl.paused) {
+      videoWasPlayingBeforeHide = true;
+      videoEl.pause();
+    }
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    syncWakeLock();
+    // Free transient mobile decode caches when backgrounded to minimize Jetsam kills!
+    if (deviceProfile.isMobile) {
+      clearBaseBitmapCache();
+      if (deviceProfile.lowMem) {
+        pak.trimCache(8 * 1024 * 1024);
       }
     }
   };
+
+  const onReturnForeground = () => {
+    dispatchCmdJson(engine.set_host_paused(false));
+    audio.resumeAll();
+    if (videoEl && !videoEl.hidden && videoWasPlayingBeforeHide) {
+      videoWasPlayingBeforeHide = false;
+      videoEl.play().catch(() => {});
+    }
+    syncWakeLock();
+    scheduleFrame();
+  };
+
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushSaves();
+    if (document.visibilityState === 'hidden') {
+      onEnterBackground();
+    } else {
+      onReturnForeground();
+    }
   });
-  window.addEventListener('pagehide', flushSaves);
+  window.addEventListener('pagehide', onEnterBackground);
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) onReturnForeground();
+  });
 
   // Dev server live hot-reload (silently ignored in production static builds)
   try {
     const es = new EventSource('/__nir_events');
     es.addEventListener('reload', async () => {
       try {
-        const nextPak = new PakSource(`./game.nirpak?t=${Date.now()}`);
+        const nextPak = new PakSource(`./game.nirpak?t=${Date.now()}`, deviceProfile.rangeCacheLimit);
         const freshHeader = await nextPak.open();
         pak = nextPak;
         engine.hot_reload(freshHeader);
         inflightImages.clear();
         prefetchQueue.length = 0;
-        for (const p of baseBitmapCache.values()) {
-          p.then((b) => b.close()).catch(() => {});
-        }
-        baseBitmapCache.clear();
+        clearBaseBitmapCache();
         audio.clearCache();
         await loadAllFonts();
         scheduleFrame();
@@ -976,6 +1447,14 @@ async function main() {
     });
     es.onerror = () => es.close();
   } catch { /* static hosting without dev server */ }
+
+  // Active video cleanup hook
+  let activeVideoFinish = null;
+  const clearVideoOverlay = () => {
+    if (videoOverlayEl) videoOverlayEl.hidden = true;
+    if (videoPlayBtn) videoPlayBtn.onclick = null;
+    if (videoSkipBtn) videoSkipBtn.onclick = null;
+  };
 
   const handleCommand = (cmd) => {
     switch (cmd.op) {
@@ -991,7 +1470,7 @@ async function main() {
           .catch(() => {});
         break;
       case 'preload_audio':
-        audio.preload(cmd.asset, () => pak.getAssetBytes(cmd.offset, cmd.size));
+        audio.preload(cmd.asset, cmd.mime, cmd.size, () => pak.getAssetBytes(cmd.offset, cmd.size));
         break;
       case 'play_audio':
         audio.play(
@@ -1024,18 +1503,41 @@ async function main() {
               return;
             }
             const url = URL.createObjectURL(new Blob([bytes], { type: cmd.mime }));
-            videoEl.src = url;
-            videoEl.hidden = false;
+            let done = false;
             const finish = () => {
+              if (done) return;
+              done = true;
+              activeVideoFinish = null;
+              clearVideoOverlay();
               videoEl.hidden = true;
               videoEl.pause();
+              videoEl.src = '';
               URL.revokeObjectURL(url);
               engine.notify_video_finished();
               scheduleFrame();
             };
+            activeVideoFinish = finish;
+            videoEl.src = url;
+            videoEl.hidden = false;
             videoEl.onended = finish;
+            videoEl.onerror = finish;
             videoEl.onclick = cmd.skippable ? finish : null;
-            videoEl.play().catch(finish);
+            videoEl.play().catch(() => {
+              // Mobile autoplay policy blocked playback: present tap-to-play / skip UI instead of silently dropping the movie!
+              if (videoOverlayEl && videoPlayBtn) {
+                videoOverlayEl.hidden = false;
+                if (videoSkipBtn) {
+                  videoSkipBtn.hidden = !cmd.skippable;
+                  videoSkipBtn.onclick = finish;
+                }
+                videoPlayBtn.onclick = () => {
+                  clearVideoOverlay();
+                  videoEl.play().catch(finish);
+                };
+              } else {
+                finish();
+              }
+            });
           })
           .catch(() => {
             engine.notify_video_finished();
@@ -1043,7 +1545,10 @@ async function main() {
           });
         break;
       case 'stop_video':
-        if (videoEl) {
+        if (activeVideoFinish) {
+          activeVideoFinish();
+        } else if (videoEl) {
+          clearVideoOverlay();
           videoEl.pause();
           videoEl.hidden = true;
         }
@@ -1080,28 +1585,23 @@ async function main() {
     gameId: engine.game_id(),
     backend: engine.backend_info(),
     pakMode: pak.mode,
+    mobile: deviceProfile.isMobile,
     fallbackFonts: fallbackFontsLoaded,
     error: null,
   };
 
-  if (bundledFontCount > 0) {
-    // Background-attach CJK fallback font after bundled fonts so missing UI/CJK glyphs render cleanly!
-    fallbackFontPromise.then((blobs) => {
-      if (blobs.length > 0) {
-        applyFallbackFonts(blobs);
-        scheduleFrame();
-      }
-    });
-  }
-
   const frame = (ts) => {
     rafId = 0;
+    if (contextLost || document.visibilityState === 'hidden') return;
+    if (engine.is_device_lost()) {
+      recoverGpuRenderer();
+      return;
+    }
     const dt = ts - lastTs;
     lastTs = ts;
     const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
     if (cmdsJson) {
       const cmds = JSON.parse(cmdsJson);
-      // Coalesce adjacent HTTP Range requests across the whole command batch!
       const ranges = [];
       for (const cmd of cmds) {
         if (cmd.op === 'decode_image' || cmd.op === 'preload_audio' || cmd.op === 'play_audio') {
@@ -1116,6 +1616,11 @@ async function main() {
         handleCommand(cmd);
       }
     }
+    // Lazy-load 6.1 MiB Pan-CJK fallback font ONLY if a bundled font actually encounters a missing glyph!
+    if (!fallbackFontStarted && engine.has_missing_glyphs()) {
+      loadFallbackFontsLazy();
+    }
+    syncWakeLock();
     if (engine.needs_frame()) {
       rafId = requestAnimationFrame(frame);
     }

@@ -100,6 +100,8 @@ strip = "debuginfo"
 [profile.release-wasm]
 inherits = "release"
 opt-level = "s"
+lto = "fat"
+strip = "symbols"
 
 [patch.crates-io]
 wgpu = { path = "vendor/wgpu" }

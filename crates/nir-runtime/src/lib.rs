@@ -5,8 +5,11 @@
 //! Replaces 26,400+ lines across legacy `nir-player` + `nir-engine` + `nir-assets`.
 #![forbid(unsafe_code)]
 
+pub mod gesture;
+
+use gesture::{TouchAction, TouchGestureEngine};
 use nir_ir::*;
-use nir_ui::{DrawPacket, Messages, Screen, SlotSummary, UiContext};
+use nir_ui::{DrawPacket, InputMode, Messages, SafeInsets, Screen, SlotSummary, UiContext};
 use nir_vm::{ProfileData, RollbackCheckpoint, SaveSnapshot, Vm, VmIntent, WaitReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -77,8 +80,14 @@ pub struct Runtime {
     voice_playing: bool,
     checkpoints: VecDeque<RollbackCheckpoint>,
     pub slots: Vec<SlotSummary>,
+    saves_page: usize,
     history_scroll: usize,
     hovered_hit: Option<u32>,
+    pressed_hit: Option<u32>,
+    pressed_started_on_hit: bool,
+    pub safe_insets: SafeInsets,
+    pub input_mode: InputMode,
+    gestures: TouchGestureEngine,
     toast: Option<(String, u64)>,
     loaded_assets: BTreeSet<AssetId>,
     /// Tracks in-flight asset requests and whether they have already been promoted to `urgent`.
@@ -138,8 +147,14 @@ impl Runtime {
             voice_playing: false,
             checkpoints: VecDeque::new(),
             slots: norm_slots,
+            saves_page: 0,
             history_scroll: 0,
             hovered_hit: None,
+            pressed_hit: None,
+            pressed_started_on_hit: false,
+            safe_insets: SafeInsets::default(),
+            input_mode: InputMode::Pointer,
+            gestures: TouchGestureEngine::default(),
             toast: None,
             loaded_assets: BTreeSet::new(),
             requested_assets: BTreeMap::new(),
@@ -257,11 +272,102 @@ impl Runtime {
         self.dirty = true;
     }
 
+    /// Invalidates cached image textures (e.g. after WebGL2 context loss or mobile memory purge)
+    /// and re-requests active + lookahead assets cleanly.
+    pub fn invalidate_all_textures(&mut self) {
+        let program = self.program.clone();
+        self.loaded_assets.retain(|id| {
+            program
+                .asset(*id)
+                .is_some_and(|a| a.kind != AssetKind::Image)
+        });
+        self.requested_assets.retain(|id, _| {
+            program
+                .asset(*id)
+                .is_some_and(|a| a.kind != AssetKind::Image)
+        });
+        self.asset_epoch = self.asset_epoch.wrapping_add(1);
+        if self.screen == Screen::Story {
+            self.request_active_and_lookahead_assets();
+        } else {
+            self.request_title_assets();
+        }
+        self.dirty = true;
+    }
+
+    pub fn set_safe_insets(&mut self, insets: SafeInsets) {
+        if self.safe_insets != insets {
+            self.safe_insets = insets;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_input_mode(&mut self, mode: InputMode) {
+        if self.input_mode != mode {
+            self.input_mode = mode;
+            if mode == InputMode::Touch {
+                self.hovered_hit = None;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Pauses or resumes runtime clocks and all audio buses for mobile background/lockscreen lifecycle.
+    pub fn set_host_paused(&mut self, paused: bool) {
+        if self.paused_by_host == paused {
+            return;
+        }
+        self.paused_by_host = paused;
+        if paused {
+            self.flush_pending_saves();
+            if self.hold_skip {
+                self.hold_skip = false;
+            }
+            if let Some(TouchAction::HoldSkip(false)) = self.gestures.reset() {
+                self.hold_skip = false;
+            }
+            self.pressed_hit = None;
+            self.pressed_started_on_hit = false;
+            for bus in [AudioBus::Bgm, AudioBus::Voice, AudioBus::Sfx] {
+                self.commands
+                    .push(HostCommand::PauseAudioBus { bus, paused: true });
+            }
+        } else {
+            self.commands.push(HostCommand::PauseAudioBus {
+                bus: AudioBus::Bgm,
+                paused: false,
+            });
+            self.commands.push(HostCommand::PauseAudioBus {
+                bus: AudioBus::Sfx,
+                paused: false,
+            });
+            // Keep Voice paused if currently inside the Menu overlay.
+            if self.screen == Screen::Story {
+                self.commands.push(HostCommand::PauseAudioBus {
+                    bus: AudioBus::Voice,
+                    paused: false,
+                });
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Returns whether Auto or Skip reading is currently active (hosts should keep screen awake).
+    pub fn is_auto_or_skip_active(&self) -> bool {
+        !self.paused_by_host
+            && self.screen == Screen::Story
+            && (self.auto || self.skip || self.hold_skip)
+    }
+
+    pub fn messages(&self) -> &Messages {
+        &self.messages
+    }
+
     pub fn needs_clock(&self) -> bool {
         if self.paused_by_host {
             return false;
         }
-        if self.toast.is_some() {
+        if self.toast.is_some() || self.gestures.needs_clock() {
             return true;
         }
         if self.screen != Screen::Story {
@@ -271,44 +377,161 @@ impl Runtime {
     }
 
     pub fn set_hover(&mut self, x: f32, y: f32) {
+        self.set_input_mode(InputMode::Pointer);
         let hit = self.last_packet.hit_test(x, y);
         let next = hit.map(|h| h.id);
         let is_choice_hit = hit.is_some_and(|h| matches!(h.action, UiAction::Choose(_)));
         if next != self.hovered_hit {
             self.hovered_hit = next;
             if is_choice_hit {
-                if let Some(se) = self.vm.choice.as_ref().and_then(|c| c.hover_se) {
-                    self.request_asset(se, true);
-                    self.commands.push(HostCommand::PlayAudio {
-                        channel: ChannelId(6),
-                        bus: AudioBus::Sfx,
-                        asset: se,
-                        gain: 1.0,
-                        looped: false,
-                        fade_in_us: 0,
-                        loop_region: None,
-                        character: None,
-                    });
-                }
+                self.play_choice_hover_se();
             }
             self.dirty = true;
         }
     }
 
-    /// Handles primary click / tap at viewport coordinates `(x, y)`.
-    pub fn pointer_click(&mut self, x: f32, y: f32) {
+    fn play_choice_hover_se(&mut self) {
+        if let Some(se) = self.vm.choice.as_ref().and_then(|c| c.hover_se) {
+            self.request_asset(se, true);
+            self.commands.push(HostCommand::PlayAudio {
+                channel: ChannelId(6),
+                bus: AudioBus::Sfx,
+                asset: se,
+                gain: 1.0,
+                looped: false,
+                fade_in_us: 0,
+                loop_region: None,
+                character: None,
+            });
+        }
+    }
+
+    /// Highlights a pressed control without triggering until release (`pointer_up`),
+    /// preventing accidental taps when dragging away.
+    pub fn pointer_down(&mut self, x: f32, y: f32) {
+        let hit = self.last_packet.hit_test(x, y).map(|h| h.id);
+        self.pressed_hit = hit;
+        self.pressed_started_on_hit = hit.is_some();
+        if hit.is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Clears active press highlight without firing an action.
+    pub fn pointer_cancel(&mut self) {
+        if self.pressed_hit.take().is_some() {
+            self.dirty = true;
+        }
+        self.pressed_started_on_hit = false;
+    }
+
+    /// Releases a primary pointer / tap at viewport coordinates `(x, y)`.
+    pub fn pointer_up(&mut self, x: f32, y: f32) {
+        let started_id = self.pressed_hit.take();
+        let started_on_hit = self.pressed_started_on_hit;
+        self.pressed_started_on_hit = false;
+        if started_id.is_some() {
+            self.dirty = true;
+        }
+
         if self.interface_hidden && self.screen == Screen::Story {
             self.interface_hidden = false;
             self.dirty = true;
             return;
         }
         if let Some(hit) = self.last_packet.hit_test(x, y) {
+            // If press started on a different control, treat release as cancelled.
+            if started_on_hit && started_id != Some(hit.id) {
+                return;
+            }
+            // In Touch mode, image choices with a `preview` image use two-tap confirm:
+            // tap 1 selects & previews, tap 2 confirms selection.
+            if self.input_mode == InputMode::Touch {
+                if let UiAction::Choose(idx) = hit.action {
+                    let has_preview = self
+                        .vm
+                        .choice
+                        .as_ref()
+                        .and_then(|c| c.items.get(idx as usize))
+                        .is_some_and(|it| it.preview.is_some());
+                    if has_preview && self.hovered_hit != Some(hit.id) {
+                        self.hovered_hit = Some(hit.id);
+                        self.play_choice_hover_se();
+                        self.dirty = true;
+                        return;
+                    }
+                }
+            }
             let action = hit.action.clone();
+            self.hovered_hit = None;
             self.dispatch(action);
+            return;
+        }
+        // Dragged off a pressed button -> cancel cleanly without advancing story!
+        if started_on_hit {
             return;
         }
         if self.screen == Screen::Story && self.vm.choice.is_none() {
             self.dispatch(UiAction::Advance);
+        }
+    }
+
+    /// Handles primary click / tap at viewport coordinates `(x, y)` immediately (legacy / desktop helper).
+    pub fn pointer_click(&mut self, x: f32, y: f32) {
+        self.pressed_hit = None;
+        self.pressed_started_on_hit = false;
+        self.pointer_up(x, y);
+    }
+
+    /// Multi-touch input entrypoints shared across Android Native and Mobile Web.
+    pub fn touch_start(&mut self, id: u64, x: f32, y: f32) {
+        self.set_input_mode(InputMode::Touch);
+        if let Some(act) = self.gestures.touch_start(id, x, y) {
+            self.apply_touch_action(act);
+        }
+    }
+
+    pub fn touch_move(&mut self, id: u64, x: f32, y: f32) {
+        if let Some(act) = self.gestures.touch_move(id, x, y, self.screen) {
+            self.apply_touch_action(act);
+        }
+    }
+
+    pub fn touch_end(&mut self, id: u64, x: f32, y: f32) {
+        let allow_story_swipes = self.vm.choice.is_none() && !self.pressed_started_on_hit;
+        if let Some(act) = self
+            .gestures
+            .touch_end(id, x, y, self.screen, allow_story_swipes)
+        {
+            self.apply_touch_action(act);
+        }
+    }
+
+    pub fn touch_cancel(&mut self, id: u64) {
+        if let Some(act) = self.gestures.touch_cancel(id) {
+            self.apply_touch_action(act);
+        }
+    }
+
+    fn apply_touch_action(&mut self, act: TouchAction) {
+        match act {
+            TouchAction::Down(x, y) => self.pointer_down(x, y),
+            TouchAction::Tap(x, y) => self.pointer_up(x, y),
+            TouchAction::CancelPress => self.pointer_cancel(),
+            TouchAction::CancelOrMenu => {
+                self.pointer_cancel();
+                self.cancel_or_menu();
+            }
+            TouchAction::HoldSkip(held) => {
+                if held {
+                    self.pointer_cancel();
+                }
+                self.dispatch(UiAction::HoldSkip(held));
+            }
+            TouchAction::Dispatch(ui_act) => {
+                self.pointer_cancel();
+                self.dispatch(ui_act);
+            }
         }
     }
 
@@ -470,6 +693,7 @@ impl Runtime {
                 if matches!(self.screen, Screen::Title | Screen::Story | Screen::Menu) {
                     self.return_screen = self.screen;
                 }
+                self.saves_page = 0;
                 self.screen = Screen::Saves { save_mode };
             }
             UiAction::OpenSettings => {
@@ -619,6 +843,19 @@ impl Runtime {
                         self.history_scroll.saturating_sub(delta.unsigned_abs() as usize);
                 }
             }
+            UiAction::SavesPage(delta) => {
+                let max_page = self.slots.len().saturating_sub(1);
+                if delta > 0 {
+                    self.saves_page = self.saves_page.saturating_add(delta as usize).min(max_page);
+                } else {
+                    self.saves_page = self.saves_page.saturating_sub(delta.unsigned_abs() as usize);
+                }
+            }
+            UiAction::TogglePortraitReader => {
+                self.prefs.portrait_reader = !self.prefs.portrait_reader;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
             UiAction::Quit => {
                 self.flush_pending_saves();
                 self.commands.push(HostCommand::Quit);
@@ -686,6 +923,15 @@ impl Runtime {
             } else {
                 *rem -= delta_us;
             }
+        }
+
+        // Long-press HoldSkip detection (only on Story blank area without active choices).
+        let can_long_press = self.screen == Screen::Story
+            && !self.interface_hidden
+            && self.vm.choice.is_none()
+            && !self.pressed_started_on_hit;
+        if let Some(act) = self.gestures.tick(delta_us, can_long_press) {
+            self.apply_touch_action(act);
         }
 
         if self.screen != Screen::Story {
@@ -756,12 +1002,18 @@ impl Runtime {
             screen: self.screen,
             prefs: &self.prefs,
             auto: self.auto,
-            skip: self.skip || self.hold_skip,
+            skip: self.skip,
+            hold_skip: self.hold_skip,
             interface_hidden: self.interface_hidden,
             replay_active: self.frozen_vm.is_some(),
             slots: &self.slots,
+            saves_page: self.saves_page,
             history_scroll: self.history_scroll,
             hovered_hit: self.hovered_hit,
+            pressed_hit: self.pressed_hit,
+            safe_insets: self.safe_insets,
+            input_mode: self.input_mode,
+            portrait_reader: self.prefs.portrait_reader,
             toast: self.toast.as_ref().map(|(m, _)| m.as_str()),
         };
         let next = nir_ui::project(&ctx, width, height, &self.messages);
@@ -1235,5 +1487,82 @@ mod tests {
         assert!((rt.prefs.font_scale - 1.2).abs() < 0.001);
         let pcmds = rt.take_commands();
         assert!(pcmds.iter().any(|c| matches!(c, HostCommand::SavePreferences(_))));
+    }
+
+    #[test]
+    fn touch_gestures_and_host_lifecycle_pause_work_end_to_end() {
+        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
+            .unwrap();
+        rt.dispatch(UiAction::NewGame);
+        assert!(rt.prepare_frame(390.0, 844.0).is_some());
+        rt.take_commands();
+
+        // 1. Clean single-finger tap on blank area advances dialogue (reveal -> next line)
+        rt.touch_start(1, 180.0, 200.0);
+        rt.touch_end(1, 182.0, 201.0); // finishes reveal
+        rt.touch_start(2, 180.0, 200.0);
+        rt.touch_end(2, 180.0, 200.0); // advances to line 2
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第二句");
+        assert_eq!(rt.input_mode, InputMode::Touch);
+
+        // 2. Swipe right rolls back to line 1
+        rt.touch_start(3, 80.0, 200.0);
+        rt.touch_move(3, 160.0, 205.0);
+        rt.touch_end(3, 180.0, 205.0);
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第一句");
+
+        // 3. Swipe up opens History, drag scrolls, two-finger tap closes overlay
+        rt.touch_start(4, 180.0, 400.0);
+        rt.touch_move(4, 180.0, 320.0);
+        rt.touch_end(4, 180.0, 300.0);
+        assert_eq!(rt.screen, Screen::History);
+
+        rt.touch_start(5, 100.0, 300.0);
+        rt.touch_start(6, 220.0, 300.0);
+        rt.touch_end(5, 102.0, 302.0);
+        rt.touch_end(6, 221.0, 299.0);
+        assert_eq!(rt.screen, Screen::Story);
+
+        // 4. Swipe down hides UI, tap restores UI without advancing
+        rt.touch_start(7, 180.0, 200.0);
+        rt.touch_end(7, 182.0, 300.0);
+        assert!(rt.interface_hidden);
+        rt.touch_start(8, 180.0, 200.0);
+        rt.touch_end(8, 180.0, 200.0);
+        assert!(!rt.interface_hidden);
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第一句");
+
+        // 5. Long-press (>= 420ms) enables HoldSkip + WakeLock, finger release stops HoldSkip
+        rt.touch_start(9, 180.0, 200.0);
+        assert!(rt.needs_clock());
+        rt.tick(250_000);
+        assert!(!rt.hold_skip);
+        rt.tick(200_000);
+        assert!(rt.hold_skip);
+        assert!(rt.is_auto_or_skip_active());
+        rt.touch_end(9, 180.0, 200.0);
+        assert!(!rt.hold_skip);
+
+        // 6. Host background pause pauses all 3 audio buses & clocks; resume restores cleanly
+        rt.take_commands();
+        rt.set_host_paused(true);
+        assert!(!rt.needs_clock());
+        let paused_cmds = rt.take_commands();
+        assert_eq!(
+            paused_cmds
+                .iter()
+                .filter(|c| matches!(c, HostCommand::PauseAudioBus { paused: true, .. }))
+                .count(),
+            3
+        );
+        rt.set_host_paused(false);
+        let resumed_cmds = rt.take_commands();
+        assert_eq!(
+            resumed_cmds
+                .iter()
+                .filter(|c| matches!(c, HostCommand::PauseAudioBus { paused: false, .. }))
+                .count(),
+            3
+        );
     }
 }

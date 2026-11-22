@@ -24,9 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::LocalStorage;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 #[derive(Debug, Clone, Copy)]
@@ -325,7 +325,14 @@ pub fn run_desktop(pak_path: &Path, watch_hot_reload: bool) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("creating winit event loop")?;
-    run_with_event_loop(pak, None, watch_hot_reload, event_loop)
+    run_with_event_loop(
+        pak,
+        None,
+        watch_hot_reload,
+        event_loop,
+        #[cfg(target_os = "android")]
+        None,
+    )
 }
 
 /// Runs the unified native player on Android (`NativeActivity`), memory-mapping
@@ -355,11 +362,12 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
     };
 
     let data_dir = android_app.internal_data_path();
+    let app_handle = android_app.clone();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_android_app(android_app)
         .build()
         .context("creating Android event loop")?;
-    run_with_event_loop(pak, data_dir, false, event_loop)
+    run_with_event_loop(pak, data_dir, false, event_loop, Some(app_handle))
 }
 
 fn run_with_event_loop(
@@ -367,6 +375,7 @@ fn run_with_event_loop(
     storage_base: Option<PathBuf>,
     watch_hot_reload: bool,
     event_loop: EventLoop<UserEvent>,
+    #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
 ) -> Result<()> {
     let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base)?;
     let prefs = storage.load_preferences();
@@ -374,8 +383,11 @@ fn run_with_event_loop(
     let slots = storage.list_slot_summaries(pak.program.meta.save_slots);
 
     let audio = AudioHost::new(&prefs);
-    let runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
+    let mut runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
         .map_err(|e| anyhow::anyhow!("initializing runtime: {e}"))?;
+    if cfg!(target_os = "android") {
+        runtime.set_input_mode(nir_ui::InputMode::Touch);
+    }
 
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
     let decode_pool = DecodePool::spawn(res_tx, event_loop.create_proxy());
@@ -393,11 +405,16 @@ fn run_with_event_loop(
         pending_decodes: BTreeMap::new(),
         last_frame: Instant::now(),
         last_reload_check: Instant::now(),
+        last_back_press: None,
         watch_hot_reload,
         cursor_logical: [0.0, 0.0],
         scale_factor: 1.0,
         window_size: [1280, 720],
         should_quit: false,
+        #[cfg(target_os = "android")]
+        android_app,
+        #[cfg(target_os = "android")]
+        keep_screen_on: false,
     };
     event_loop.run_app(&mut app).context("winit event loop")?;
     app.runtime.flush_pending_saves();
@@ -420,14 +437,81 @@ struct NativeApp {
     pending_decodes: BTreeMap<AssetId, bool>,
     last_frame: Instant,
     last_reload_check: Instant,
+    last_back_press: Option<Instant>,
     watch_hot_reload: bool,
     cursor_logical: [f32; 2],
     scale_factor: f32,
     window_size: [u32; 2],
     should_quit: bool,
+    #[cfg(target_os = "android")]
+    android_app: Option<android_activity::AndroidApp>,
+    #[cfg(target_os = "android")]
+    keep_screen_on: bool,
 }
 
 impl NativeApp {
+    fn sync_android_insets(&mut self) {
+        #[cfg(target_os = "android")]
+        if let Some(app) = &self.android_app {
+            let rect = app.content_rect();
+            let scale = self.scale_factor.max(0.5);
+            let pw = self.window_size[0] as i32;
+            let ph = self.window_size[1] as i32;
+            if rect.right > rect.left && rect.bottom > rect.top && pw > 0 && ph > 0 {
+                let insets = nir_ui::SafeInsets {
+                    left: (rect.left.max(0) as f32) / scale,
+                    top: (rect.top.max(0) as f32) / scale,
+                    right: ((pw - rect.right).max(0) as f32) / scale,
+                    bottom: ((ph - rect.bottom).max(0) as f32) / scale,
+                };
+                self.runtime.set_safe_insets(insets);
+            }
+        }
+    }
+
+    fn sync_wake_lock(&mut self) {
+        #[cfg(target_os = "android")]
+        if let Some(app) = &self.android_app {
+            let want = self.runtime.is_auto_or_skip_active();
+            if want != self.keep_screen_on {
+                self.keep_screen_on = want;
+                use android_activity::WindowManagerFlags;
+                if want {
+                    app.set_window_flags(
+                        WindowManagerFlags::KEEP_SCREEN_ON,
+                        WindowManagerFlags::empty(),
+                    );
+                } else {
+                    app.set_window_flags(
+                        WindowManagerFlags::empty(),
+                        WindowManagerFlags::KEEP_SCREEN_ON,
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_back_action(&mut self) {
+        if self.runtime.screen == nir_ui::Screen::Title && cfg!(target_os = "android") {
+            let now = Instant::now();
+            if self
+                .last_back_press
+                .is_some_and(|prev| now.duration_since(prev) <= Duration::from_millis(2500))
+            {
+                self.should_quit = true;
+            } else {
+                self.last_back_press = Some(now);
+                let msg = self
+                    .runtime
+                    .messages()
+                    .get(&self.runtime.prefs.ui_locale, "back-again-exit");
+                self.runtime.show_toast(msg, 2200);
+            }
+        } else {
+            self.runtime.cancel_or_menu();
+        }
+    }
+
     fn upload_all_fonts(&mut self) {
         let Some(renderer) = &mut self.renderer else {
             return;
@@ -655,6 +739,19 @@ impl NativeApp {
         self.runtime.set_unix_time(unix);
         self.runtime.tick(delta_us);
         self.process_commands();
+        self.sync_wake_lock();
+
+        if self.renderer.as_ref().is_some_and(Renderer::is_lost) {
+            if let (Some(win), Some(renderer)) = (&self.window, &mut self.renderer) {
+                if let Ok(surface) = self.instance.create_surface(win.clone()) {
+                    renderer.rebind_surface(surface);
+                    renderer.clear_textures();
+                    self.pending_decodes.clear();
+                    self.runtime.invalidate_all_textures();
+                    self.process_commands();
+                }
+            }
+        }
 
         let lw = (self.window_size[0] as f32 / self.scale_factor).max(1.0);
         let lh = (self.window_size[1] as f32 / self.scale_factor).max(1.0);
@@ -680,6 +777,8 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.runtime.set_host_paused(false);
+        self.audio.set_host_paused(false);
         if self.window.is_none() {
             let sw = self.pak.program.meta.stage_width;
             let sh = self.pak.program.meta.stage_height;
@@ -715,17 +814,26 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 }
             }
             self.window = Some(win);
+            self.sync_android_insets();
             self.runtime.dirty = true;
             self.process_commands();
-        } else if let (Some(win), Some(renderer)) = (&self.window, &mut self.renderer) {
-            if let Ok(surface) = self.instance.create_surface(win.clone()) {
-                renderer.rebind_surface(surface);
-                self.runtime.dirty = true;
+        } else if let Some(win) = self.window.clone() {
+            if let Some(renderer) = &mut self.renderer {
+                if let Ok(surface) = self.instance.create_surface(win.clone()) {
+                    renderer.rebind_surface(surface);
+                }
             }
+            self.sync_android_insets();
+            self.runtime.dirty = true;
+            self.process_commands();
+            win.request_redraw();
         }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.runtime.set_host_paused(true);
+        self.audio.set_host_paused(true);
+        self.sync_wake_lock();
         self.runtime.flush_pending_saves();
         self.process_commands();
         self.storage.flush();
@@ -747,16 +855,39 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 self.storage.flush();
                 event_loop.exit();
             }
+            WindowEvent::Focused(focused) => {
+                if cfg!(target_os = "android") {
+                    self.runtime.set_host_paused(!focused);
+                    self.audio.set_host_paused(!focused);
+                    self.sync_wake_lock();
+                    if !focused {
+                        self.runtime.flush_pending_saves();
+                    }
+                    self.process_commands();
+                }
+            }
             WindowEvent::Resized(size) => {
                 self.window_size = [size.width.max(1), size.height.max(1)];
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(self.window_size[0], self.window_size[1]);
                 }
+                self.sync_android_insets();
                 self.runtime.dirty = true;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor as f32;
+                self.sync_android_insets();
                 self.runtime.dirty = true;
+            }
+            WindowEvent::Touch(touch) => {
+                let lx = touch.location.x as f32 / self.scale_factor;
+                let ly = touch.location.y as f32 / self.scale_factor;
+                match touch.phase {
+                    TouchPhase::Started => self.runtime.touch_start(touch.id, lx, ly),
+                    TouchPhase::Moved => self.runtime.touch_move(touch.id, lx, ly),
+                    TouchPhase::Ended => self.runtime.touch_end(touch.id, lx, ly),
+                    TouchPhase::Cancelled => self.runtime.touch_cancel(touch.id),
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_logical = [
@@ -766,16 +897,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 self.runtime
                     .set_hover(self.cursor_logical[0], self.cursor_logical[1]);
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => match button {
-                MouseButton::Left => {
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Left, ElementState::Pressed) => {
                     self.runtime
-                        .pointer_click(self.cursor_logical[0], self.cursor_logical[1]);
+                        .pointer_down(self.cursor_logical[0], self.cursor_logical[1]);
                 }
-                MouseButton::Right => {
+                (MouseButton::Left, ElementState::Released) => {
+                    self.runtime
+                        .pointer_up(self.cursor_logical[0], self.cursor_logical[1]);
+                }
+                (MouseButton::Right, ElementState::Pressed) => {
                     self.runtime.cancel_or_menu();
                 }
                 _ => {}
@@ -800,8 +931,13 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let pressed = event.state == ElementState::Pressed;
+                let pressed = event.state == ElementState::Pressed;
+                if pressed
+                    && !event.repeat
+                    && matches!(event.logical_key, Key::Named(NamedKey::GoBack))
+                {
+                    self.handle_back_action();
+                } else if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
                         KeyCode::ControlLeft | KeyCode::ControlRight => {
                             self.runtime.dispatch(UiAction::HoldSkip(pressed));
@@ -809,8 +945,8 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                         KeyCode::Space | KeyCode::Enter if pressed && !event.repeat => {
                             self.runtime.dispatch(UiAction::Advance);
                         }
-                        KeyCode::Escape if pressed && !event.repeat => {
-                            self.runtime.cancel_or_menu();
+                        KeyCode::Escape | KeyCode::BrowserBack if pressed && !event.repeat => {
+                            self.handle_back_action();
                         }
                         KeyCode::KeyA if pressed && !event.repeat => {
                             self.runtime.dispatch(UiAction::ToggleAuto);

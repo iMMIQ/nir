@@ -214,6 +214,7 @@ fn main() -> Result<()> {
                 ktx2_textures: ktx2,
                 ..Default::default()
             };
+            warn_mobile_build_flags(target, &opt);
             cmd_build(&project, target, out.as_deref(), &opt, sdk.as_deref())
         }
         Cmd::Convert {
@@ -243,6 +244,9 @@ fn main() -> Result<()> {
                 ktx2_textures: ktx2,
                 ..Default::default()
             };
+            if let Some(t) = build {
+                warn_mobile_build_flags(t, &opt);
+            }
             cmd_convert(
                 &source,
                 &out,
@@ -424,6 +428,19 @@ fn package_built(
         }
     }
     Ok(())
+}
+
+fn warn_mobile_build_flags(target: BuildTarget, opt: &OptimizeConfig) {
+    if opt.ktx2_textures && matches!(target, BuildTarget::Android | BuildTarget::Web) {
+        eprintln!(
+            "warning: --ktx2 encodes desktop BC1/BC3 blocks, which fall back to CPU decode on mobile GPUs (ASTC/ETC2); prefer default WebP for mobile builds."
+        );
+    }
+    if opt.audio_codec == AudioCodecMode::Opus && matches!(target, BuildTarget::Web) {
+        eprintln!(
+            "warning: --audio-codec opus outputs Ogg Opus, which iOS Safari WebAudio does not decode natively; prefer default `--audio-codec mp3` for universal mobile Web compatibility."
+        );
+    }
 }
 
 fn cmd_build(

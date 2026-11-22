@@ -13,6 +13,7 @@
 //!     min_sdk: 26,
 //!     target_sdk: 29,
 //!     lib_name: "player".to_owned(),
+//!     screen_orientation: None,
 //! };
 //! let entries = vec![(
 //!     "lib/arm64-v8a/libplayer.so".to_owned(),
@@ -38,6 +39,30 @@ use std::path::{Path, PathBuf};
 /// Native library alignment for STORED `lib/**` entries (page size).
 const LIB_ALIGNMENT: u16 = 4096;
 
+/// Optional Android `android:screenOrientation` enum values (matches `ActivityInfo.SCREEN_ORIENTATION_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ScreenOrientation {
+    Landscape = 0,
+    Portrait = 1,
+    SensorLandscape = 6,
+    SensorPortrait = 7,
+    FullSensor = 10,
+}
+
+impl ScreenOrientation {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "landscape" => Some(Self::Landscape),
+            "portrait" => Some(Self::Portrait),
+            "sensorlandscape" | "sensor_landscape" | "sensor-landscape" => Some(Self::SensorLandscape),
+            "sensorportrait" | "sensor_portrait" | "sensor-portrait" => Some(Self::SensorPortrait),
+            "fullsensor" | "full_sensor" | "full-sensor" | "auto" => Some(Self::FullSensor),
+            _ => None,
+        }
+    }
+}
+
 /// Manifest fields for the generated `AndroidManifest.xml`.
 pub struct ManifestSpec {
     /// Java package name, e.g. `one.nir.g0123abcd`; each dot-separated
@@ -56,6 +81,8 @@ pub struct ManifestSpec {
     /// Native library stem (`player` becomes the `android.app.lib_name`
     /// meta-data value; the entry itself is passed in `entries`).
     pub lib_name: String,
+    /// Optional `android:screenOrientation` lock/hint (omitted when `None`).
+    pub screen_orientation: Option<ScreenOrientation>,
 }
 
 /// Content source for one APK entry; `File` streams from disk so large games
@@ -334,6 +361,12 @@ fn manifest_element(manifest: &ManifestSpec) -> Element {
         "launchMode",
         AttrValue::IntDec(LAUNCH_MODE_SINGLE_TASK),
     ));
+    if let Some(orient) = manifest.screen_orientation {
+        activity.attrs.push(Attr::android(
+            "screenOrientation",
+            AttrValue::IntDec(orient as u32),
+        ));
+    }
     activity.attrs.push(Attr::android(
         "configChanges",
         AttrValue::IntHex(CONFIG_CHANGES),
@@ -406,6 +439,7 @@ mod tests {
                 min_sdk: 26,
                 target_sdk: 29,
                 lib_name: "player".to_owned(),
+                screen_orientation: None,
             };
             assert!(validate_manifest(&manifest).is_err(), "{package}");
         }
@@ -443,6 +477,7 @@ mod tests {
             min_sdk: 26,
             target_sdk: 29,
             lib_name: "player".to_owned(),
+            screen_orientation: None,
         };
         let encoded = axml::encode(&manifest_element(&manifest)).unwrap();
         let decoded = axml::decode(&encoded).unwrap();
@@ -457,5 +492,29 @@ mod tests {
         assert_eq!(activity.children.len(), 2);
         assert_eq!(activity.children[0].name, "meta-data");
         assert_eq!(activity.children[1].children.len(), 2);
+    }
+
+    #[test]
+    fn screen_orientation_encodes_with_verified_resource_id() {
+        let manifest = ManifestSpec {
+            package: "one.nir.g0123abcd".to_owned(),
+            version_code: 1,
+            version_name: "1.0.0".to_owned(),
+            label: "Orientation".to_owned(),
+            min_sdk: 26,
+            target_sdk: 34,
+            lib_name: "player".to_owned(),
+            screen_orientation: ScreenOrientation::parse("sensorLandscape"),
+        };
+        let encoded = axml::encode(&manifest_element(&manifest)).unwrap();
+        let decoded = axml::decode(&encoded).unwrap();
+        let activity = &decoded.root.children[1].children[0];
+        let orient = activity
+            .attrs
+            .iter()
+            .find(|a| a.name == "screenOrientation")
+            .expect("screenOrientation attr emitted");
+        assert_eq!(orient.resource_id, Some(0x0101_001e));
+        assert_eq!(orient.value, axml::DecodedValue::IntDec(6));
     }
 }

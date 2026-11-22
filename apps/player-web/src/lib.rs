@@ -253,7 +253,7 @@ mod wasm_host {
     use nir_ir::{decode_nirpak_header_only, ChannelId, UiAction};
     use nir_render::{wgpu, Renderer, RendererBackend};
     use nir_runtime::Runtime;
-    use nir_ui::SlotSummary;
+    use nir_ui::{InputMode, SafeInsets, SlotSummary};
     use nir_vm::{ProfileData, SaveSnapshot};
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -441,13 +441,134 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
+        pub fn set_safe_insets(&mut self, top: f32, right: f32, bottom: f32, left: f32) {
+            self.runtime.set_safe_insets(SafeInsets {
+                top,
+                right,
+                bottom,
+                left,
+            });
+        }
+
+        #[wasm_bindgen]
+        pub fn set_input_mode(&mut self, is_touch: bool) {
+            self.runtime.set_input_mode(if is_touch {
+                InputMode::Touch
+            } else {
+                InputMode::Pointer
+            });
+        }
+
+        #[wasm_bindgen]
+        pub fn set_texture_cache_limit_mb(&mut self, mb: u32) {
+            self.renderer
+                .set_texture_cache_limit((mb.max(24) as u64) * 1024 * 1024);
+            let evicted = self.renderer.take_evicted_assets();
+            if !evicted.is_empty() {
+                self.runtime.mark_assets_evicted(&evicted);
+            }
+        }
+
+        #[wasm_bindgen]
+        pub fn clear_gpu_cache(&mut self) {
+            let removed = self.renderer.clear_textures();
+            if !removed.is_empty() {
+                self.runtime.mark_assets_evicted(&removed);
+            }
+        }
+
+        #[wasm_bindgen]
+        pub fn set_host_paused(&mut self, paused: bool) -> String {
+            self.runtime.set_host_paused(paused);
+            self.drain_js_commands()
+        }
+
+        #[wasm_bindgen]
+        pub fn wants_wake_lock(&self) -> bool {
+            self.runtime.is_auto_or_skip_active()
+        }
+
+        #[wasm_bindgen]
+        pub fn has_missing_glyphs(&self) -> bool {
+            self.renderer.has_missing_glyphs()
+        }
+
+        #[wasm_bindgen]
+        pub fn is_device_lost(&self) -> bool {
+            self.renderer.is_lost()
+        }
+
+        #[wasm_bindgen]
+        pub async fn recreate_renderer(
+            &mut self,
+            canvas: HtmlCanvasElement,
+            phys_width: u32,
+            phys_height: u32,
+            dpr: f32,
+        ) -> Result<(), JsValue> {
+            let w = phys_width.max(1);
+            let h = phys_height.max(1);
+            self.dpr = dpr.clamp(0.5, 4.0);
+            self.logical_width = (w as f32 / self.dpr).max(1.0);
+            self.logical_height = (h as f32 / self.dpr).max(1.0);
+            self.renderer = create_web_renderer(canvas, w, h)
+                .await
+                .map_err(|e| JsValue::from_str(&e))?;
+            self.runtime.invalidate_all_textures();
+            Ok(())
+        }
+
+        #[wasm_bindgen]
+        pub fn show_toast(&mut self, message: &str, duration_ms: u32) {
+            self.runtime.show_toast(message, duration_ms as u64);
+        }
+
+        #[wasm_bindgen]
         pub fn pointer_move(&mut self, logical_x: f32, logical_y: f32) {
             self.runtime.set_hover(logical_x, logical_y);
         }
 
         #[wasm_bindgen]
+        pub fn pointer_down(&mut self, logical_x: f32, logical_y: f32) {
+            self.runtime.pointer_down(logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn pointer_up(&mut self, logical_x: f32, logical_y: f32) {
+            self.runtime.pointer_up(logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn pointer_cancel(&mut self) {
+            self.runtime.pointer_cancel();
+        }
+
+        #[wasm_bindgen]
         pub fn pointer_click(&mut self, logical_x: f32, logical_y: f32) {
             self.runtime.pointer_click(logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn touch_start(&mut self, id: f64, logical_x: f32, logical_y: f32) {
+            self.runtime
+                .touch_start(id.max(0.0) as u64, logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn touch_move(&mut self, id: f64, logical_x: f32, logical_y: f32) {
+            self.runtime
+                .touch_move(id.max(0.0) as u64, logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn touch_end(&mut self, id: f64, logical_x: f32, logical_y: f32) {
+            self.runtime
+                .touch_end(id.max(0.0) as u64, logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn touch_cancel(&mut self, id: f64) {
+            self.runtime.touch_cancel(id.max(0.0) as u64);
         }
 
         #[wasm_bindgen]

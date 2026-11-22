@@ -104,3 +104,10 @@ history-voice-stop-compact = Stop
 unavailable-slot = Unreadable slot
 
 cancel-navigation = Cancel page change
+portrait-reader = Portrait reader
+on = ON
+off = OFF
+delete = Del
+back-again-exit = Press Back again to exit
+auto-active = Auto
+skip-active = Skipping

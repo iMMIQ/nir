@@ -33,6 +33,34 @@ pub struct SlotSummary {
     pub saved_at_unix: u64,
 }
 
+/// Safe-area insets in logical pixels (notch, Dynamic Island, status bar, Home Indicator).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SafeInsets {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl SafeInsets {
+    /// Clamps insets to reasonable bounds and returns the usable inner rect `[x, y, w, h]`.
+    pub fn rect(self, width: f32, height: f32) -> [f32; 4] {
+        let l = self.left.clamp(0.0, width * 0.25);
+        let r = self.right.clamp(0.0, width * 0.25);
+        let t = self.top.clamp(0.0, height * 0.25);
+        let b = self.bottom.clamp(0.0, height * 0.25);
+        [l, t, (width - l - r).max(120.0), (height - t - b).max(120.0)]
+    }
+}
+
+/// Active pointer modality for responsive touch ergonomics vs desktop pointer ergonomics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    Pointer,
+    Touch,
+}
+
 /// Read-only projection input supplied by `nir-runtime`.
 pub struct UiContext<'a> {
     pub vm: &'a Vm,
@@ -40,11 +68,17 @@ pub struct UiContext<'a> {
     pub prefs: &'a Preferences,
     pub auto: bool,
     pub skip: bool,
+    pub hold_skip: bool,
     pub interface_hidden: bool,
     pub replay_active: bool,
     pub slots: &'a [SlotSummary],
+    pub saves_page: usize,
     pub history_scroll: usize,
     pub hovered_hit: Option<u32>,
+    pub pressed_hit: Option<u32>,
+    pub safe_insets: SafeInsets,
+    pub input_mode: InputMode,
+    pub portrait_reader: bool,
     pub toast: Option<&'a str>,
 }
 
@@ -56,6 +90,33 @@ pub fn fit_stage(stage_w: f32, stage_h: f32, view_w: f32, view_h: f32) -> ([f32;
     let x = (view_w - w) * 0.5;
     let y = (view_h - h) * 0.5;
     ([x, y, w, h], scale)
+}
+
+/// Computes top-docked stage viewport inside `[area_x, area_y, area_w, area_h]` (used by Portrait Docked Reader).
+fn fit_stage_top_in(stage_w: f32, stage_h: f32, area: [f32; 4]) -> ([f32; 4], f32) {
+    let scale = (area[2] / stage_w.max(1.0)).min(area[3] / stage_h.max(1.0));
+    let w = stage_w * scale;
+    let h = stage_h * scale;
+    let x = area[0] + (area[2] - w) * 0.5;
+    let y = area[1];
+    ([x, y, w, h], scale)
+}
+
+fn is_portrait_docked(ctx: &UiContext<'_>, width: f32, height: f32) -> bool {
+    if !ctx.portrait_reader || ctx.screen != Screen::Story {
+        return false;
+    }
+    if height <= width * 1.12 {
+        return false;
+    }
+    // Keep exact stage mapping when an image/positioned choice menu (e.g. LiveMaker .lpm) is active.
+    let choice_hides_dialogue = ctx.vm.choice.as_ref().is_some_and(|c| {
+        c.background.is_some()
+            || c.items
+                .iter()
+                .any(|it| it.image.is_some() || it.rect.is_some())
+    });
+    !choice_hides_dialogue
 }
 
 /// Projects persistent scene graph layers into renderer quads, applying:
@@ -500,10 +561,17 @@ struct Builder<'a> {
     ui_fonts: Vec<AssetId>,
     text_fonts: Vec<AssetId>,
     hovered: Option<u32>,
+    pressed: Option<u32>,
+    input_mode: InputMode,
+    safe: [f32; 4],
     next_hit_id: u32,
 }
 
 impl<'a> Builder<'a> {
+    fn is_touch(&self) -> bool {
+        self.input_mode == InputMode::Touch
+    }
+
     fn push_text(&mut self, mut run: TextRun) {
         run.compute_key();
         self.pkt.texts.push(run);
@@ -519,9 +587,17 @@ impl<'a> Builder<'a> {
     ) {
         let id = self.next_hit_id;
         self.next_hit_id += 1;
-        let is_hover = enabled && self.hovered == Some(id);
+        let is_pressed = enabled && self.pressed == Some(id);
+        let is_hover = enabled && !self.is_touch() && self.hovered == Some(id);
         let bg = if !enabled {
             [0.14, 0.16, 0.20, 0.55]
+        } else if is_pressed {
+            [
+                (self.theme.accent[0] * 1.05).min(1.0),
+                (self.theme.accent[1] * 1.05).min(1.0),
+                (self.theme.accent[2] * 1.05).min(1.0),
+                0.96,
+            ]
         } else if is_hover {
             [
                 self.theme.accent[0] * 0.85,
@@ -540,8 +616,8 @@ impl<'a> Builder<'a> {
             self.theme.panel
         };
         self.pkt.quads.push(Quad::solid(rect, bg));
-        // Subtle 1px top/bottom border
-        let border = if is_hover {
+        // Subtle border (brighter when hovered or pressed)
+        let border = if is_pressed || is_hover {
             self.theme.accent
         } else {
             self.theme.panel_border
@@ -554,11 +630,11 @@ impl<'a> Builder<'a> {
             border,
         ));
 
-        let size = (rect[3] * 0.46).clamp(10.0, 22.0);
-        let pad_x = (rect[2] * 0.10).clamp(3.0, 14.0);
+        let size = (rect[3] * 0.44).clamp(11.0, 22.0);
+        let pad_x = (rect[2] * 0.09).clamp(3.0, 14.0);
         let text_color = if !enabled {
             self.theme.muted
-        } else if is_hover {
+        } else if is_pressed || is_hover {
             [0.05, 0.07, 0.10, 1.0]
         } else {
             self.theme.text
@@ -567,7 +643,7 @@ impl<'a> Builder<'a> {
             text: label.clone(),
             visible_bytes: None,
             x: rect[0] + pad_x,
-            y: rect[1] + 1.0,
+            y: rect[1] + if is_pressed { 2.0 } else { 1.0 },
             width: (rect[2] - pad_x * 2.0).max(8.0),
             height: (rect[3] - 2.0).max(8.0),
             size,
@@ -599,7 +675,14 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
     let prog = ctx.vm.program();
     let sw = prog.meta.stage_width as f32;
     let sh = prog.meta.stage_height as f32;
-    let (stage_rect, scale) = fit_stage(sw, sh, width, height);
+    let safe = ctx.safe_insets.rect(width, height);
+    let portrait_docked = is_portrait_docked(ctx, width, height);
+    let (stage_rect, scale) = if portrait_docked {
+        let max_stage_h = (safe[3] * 0.56).max(160.0);
+        fit_stage_top_in(sw, sh, [safe[0], safe[1], safe[2], max_stage_h])
+    } else {
+        fit_stage(sw, sh, width, height)
+    };
     let loc = &ctx.prefs.ui_locale;
 
     let mut b = Builder {
@@ -614,6 +697,9 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         ui_fonts: prog.meta.ui_fonts.clone(),
         text_fonts: prog.meta.text_fonts.clone(),
         hovered: ctx.hovered_hit,
+        pressed: ctx.pressed_hit,
+        input_mode: ctx.input_mode,
+        safe,
         next_hit_id: 1,
     };
 
@@ -665,7 +751,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
 
         // Story HUD (unless hidden)
         if !ctx.interface_hidden && ctx.screen == Screen::Story {
-            project_story_hud(&mut b, ctx, messages, loc, stage_rect, scale);
+            project_story_hud(&mut b, ctx, messages, loc, stage_rect, scale, portrait_docked);
         }
 
         // Modal overlays
@@ -680,12 +766,12 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         }
     }
 
-    // Lightweight Toast notification (replaces 1,500 lines of recovery UI state machines!)
+    // Lightweight Toast notification (strictly inside safe area!)
     if let Some(msg) = ctx.toast {
-        let tw = (width * 0.5).clamp(200.0, 520.0).min((width - 24.0).max(160.0));
-        let th = 38.0;
-        let rect = [(width - tw) * 0.5, 14.0, tw, th];
-        b.pkt.quads.push(Quad::solid(rect, [0.08, 0.11, 0.16, 0.92]));
+        let tw = (safe[2] * 0.65).clamp(200.0, 520.0).min((safe[2] - 20.0).max(160.0));
+        let th = 40.0;
+        let rect = [safe[0] + (safe[2] - tw) * 0.5, safe[1] + 12.0, tw, th];
+        b.pkt.quads.push(Quad::solid(rect, [0.08, 0.11, 0.16, 0.94]));
         b.pkt.quads.push(Quad::solid(
             [rect[0], rect[1] + th - 2.0, tw, 2.0],
             b.theme.accent,
@@ -732,22 +818,25 @@ fn project_title(
         return;
     }
 
-    // Sleek built-in title screen (responsive from narrow mobile to 4K desktop)
+    // Sleek built-in title screen (safe-area aware, responsive from narrow mobile to 4K desktop)
     let w = b.pkt.width;
     let h = b.pkt.height;
+    let [sx, sy, sw, sh] = b.safe;
     b.pkt
         .quads
         .push(Quad::solid([0.0, 0.0, w, h], [0.04, 0.06, 0.10, 0.45]));
 
-    let title_size = (h * 0.075).clamp(22.0, 60.0);
-    let title_y = (h * 0.14).clamp(20.0, h * 0.22);
-    let title_h = (title_size * 2.1).min(h * 0.28);
+    let title_size = (sh * 0.075).clamp(22.0, 60.0);
+    let title_y = sy + (sh * 0.14).clamp(16.0, sh * 0.22);
+    let title_h = (title_size * 2.1).min(sh * 0.28);
+    let title_x = sx + sw * 0.08;
+    let title_w = sw * 0.84;
     b.push_text(TextRun {
         text: prog.meta.title.clone(),
         visible_bytes: None,
-        x: w * 0.08,
+        x: title_x,
         y: title_y,
-        width: w * 0.84,
+        width: title_w,
         height: title_h,
         size: title_size,
         line_height: title_size * 1.25,
@@ -755,7 +844,7 @@ fn project_title(
         emphasis: Vec::new(),
         shadow: b.theme.text_shadow,
         scroll: 0.0,
-        clip: Some([w * 0.08, title_y, w * 0.84, title_h]),
+        clip: Some([title_x, title_y, title_w, title_h]),
         font_assets: b.ui_fonts.clone(),
         align: TextAlign::Left,
         valign_center: false,
@@ -768,13 +857,18 @@ fn project_title(
     let has_gallery = !prog.ui.gallery.is_empty();
     let btn_count = if has_gallery { 4usize } else { 3usize };
 
-    let bw = (w * 0.28).clamp(180.0, 320.0).min((w * 0.84).max(160.0));
-    let bx = w * 0.08;
-    let start_y = (title_y + title_h + 14.0).max(h * 0.40);
-    let avail_h = (h - start_y - 16.0).max(110.0);
-    let gap = (avail_h * 0.05).clamp(6.0, 12.0);
-    let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(30.0, 48.0);
-    let mut by = start_y.min((h - (bh * btn_count as f32 + gap * (btn_count - 1) as f32) - 12.0).max(12.0));
+    let bw = (sw * if b.is_touch() { 0.56 } else { 0.28 })
+        .clamp(196.0, 340.0)
+        .min((sw * 0.84).max(160.0));
+    let bx = sx + sw * 0.08;
+    let start_y = (title_y + title_h + 16.0).max(sy + sh * 0.40);
+    let avail_h = (sy + sh - start_y - 16.0).max(120.0);
+    let gap = (avail_h * 0.05).clamp(8.0, 14.0);
+    let min_bh = if b.is_touch() { 42.0 } else { 32.0 };
+    let max_bh = if b.is_touch() { 54.0 } else { 48.0 };
+    let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(min_bh, max_bh);
+    let total_h = bh * btn_count as f32 + gap * (btn_count - 1) as f32;
+    let mut by = start_y.min((sy + sh - total_h - 12.0).max(sy + 12.0));
 
     b.button(
         [bx, by, bw, bh],
@@ -931,9 +1025,12 @@ fn project_story_hud(
     loc: &str,
     stage_rect: [f32; 4],
     scale: f32,
+    portrait_docked: bool,
 ) {
-    let w = b.pkt.width;
-    let h = b.pkt.height;
+    let [sx, sy, sw, sh] = b.safe;
+    let sright = sx + sw;
+    let sbottom = sy + sh;
+    let touch = b.is_touch();
     let alpha = ctx.vm.dialogue_alpha();
 
     // Suppress dialogue chrome when an image/positioned ChoiceMenu (e.g. LiveMaker .lpm menu) is active
@@ -944,6 +1041,52 @@ fn project_story_hud(
                 .iter()
                 .any(|it| it.image.is_some() || it.rect.is_some())
     });
+
+    // Subtle top-right reading-mode indicator pill (Auto / Skip / Long-press HoldSkip) inside safe area.
+    if ctx.auto || ctx.skip || ctx.hold_skip {
+        let mode_label = if ctx.skip || ctx.hold_skip {
+            messages.get(loc, "skip-active")
+        } else {
+            messages.get(loc, "auto-active")
+        };
+        let pill_h = if touch { 28.0 } else { 24.0 };
+        let pill_w = (estimate_display_units(&mode_label) * 13.0 + 24.0).clamp(72.0, 160.0);
+        let pill_rect = [sright - pill_w - 8.0, sy + 8.0, pill_w, pill_h];
+        b.pkt.quads.push(Quad::solid(
+            pill_rect,
+            [
+                b.theme.accent[0] * 0.28,
+                b.theme.accent[1] * 0.28,
+                b.theme.accent[2] * 0.28,
+                0.86,
+            ],
+        ));
+        b.pkt.quads.push(Quad::solid(
+            [pill_rect[0], pill_rect[1] + pill_h - 2.0, pill_w, 2.0],
+            b.theme.accent,
+        ));
+        b.push_text(TextRun {
+            text: mode_label,
+            visible_bytes: None,
+            x: pill_rect[0] + 6.0,
+            y: pill_rect[1] + 1.0,
+            width: pill_w - 12.0,
+            height: pill_h - 3.0,
+            size: 13.0,
+            line_height: 16.0,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some(pill_rect),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
 
     let prog = ctx.vm.program();
     let style = prog
@@ -965,44 +1108,75 @@ fn project_story_hud(
 
             let ui_s = scale.clamp(0.55, 1.35);
             let scaled_shadow = b.theme.text_shadow.map(|mut s| {
-                let ss = scale.clamp(0.5, 2.0);
+                let ss = if portrait_docked { 1.0 } else { scale.clamp(0.5, 2.0) };
                 s.offset = [s.offset[0] * ss, s.offset[1] * ss];
                 s
             });
 
-            // 1. Dialogue box rect (clamped safely inside viewport)
-            let box_rect = if let Some(r) = dlg_rect_cfg {
+            // Toolbar sizing (touch targets >= 40px on mobile!)
+            let bar_h = if touch {
+                (42.0 * ui_s.max(0.92)).clamp(40.0, 46.0)
+            } else {
+                (26.0 * ui_s).clamp(22.0, 32.0)
+            };
+            let gap = if touch { 5.0 } else { (4.0 * ui_s).clamp(2.0, 6.0) };
+            let margin = if touch { 8.0 } else { (4.0 * ui_s).clamp(2.0, 8.0) };
+
+            // 1. Dialogue box rect: Portrait Docked Reader places a spacious panel below the top-docked stage;
+            //    Landscape / Classic mode places the box faithfully on the stage clamped within safe area.
+            let box_rect = if portrait_docked {
+                let pad_x = 10.0;
+                let dock_top = stage_rect[1] + stage_rect[3] + 10.0;
+                let bar_reserve = bar_h + margin + 8.0;
+                let dock_bottom = (sbottom - bar_reserve).max(dock_top + 104.0);
+                let bh = (dock_bottom - dock_top).max(104.0);
+                let bw = (sw - pad_x * 2.0).max(180.0);
+                [sx + pad_x, dock_top, bw, bh]
+            } else if let Some(r) = dlg_rect_cfg {
                 let raw = [
                     stage_rect[0] + r[0] * scale,
                     stage_rect[1] + r[1] * scale,
                     (r[2] * scale).max(64.0),
                     (r[3] * scale).max(40.0),
                 ];
-                let bx = raw[0].clamp(0.0, (w - 64.0).max(0.0));
-                let by = raw[1].clamp(0.0, (h - 40.0).max(0.0));
-                let bw = raw[2].min((w - bx).max(64.0));
-                let bh = raw[3].min((h - by).max(40.0));
+                let bx = raw[0].clamp(sx, (sright - 64.0).max(sx));
+                let by = raw[1].clamp(sy, (sbottom - 40.0).max(sy));
+                let bw = raw[2].min((sright - bx).max(64.0));
+                let bh = raw[3].min((sbottom - by).max(40.0));
                 [bx, by, bw, bh]
             } else {
-                let bh = (stage_rect[3] * 0.28).clamp(88.0, 220.0).min((h * 0.36).max(80.0));
-                let bw = (stage_rect[2] * 0.92).min((w - 16.0).max(180.0));
-                let bx = (stage_rect[0] + (stage_rect[2] - bw) * 0.5).clamp(8.0, (w - bw - 8.0).max(0.0));
+                let bh = (stage_rect[3] * 0.28).clamp(88.0, 220.0).min((sh * 0.36).max(80.0));
+                let bw = (stage_rect[2] * 0.92).min((sw - 16.0).max(180.0));
+                let bx = (stage_rect[0] + (stage_rect[2] - bw) * 0.5)
+                    .clamp(sx + 8.0, (sright - bw - 8.0).max(sx));
                 let margin_b = (12.0 * scale).clamp(6.0, 18.0);
                 let by = (stage_rect[1] + stage_rect[3] - bh - margin_b)
-                    .clamp(8.0, (h - bh - 6.0).max(8.0));
+                    .clamp(sy + 8.0, (sbottom - bh - 6.0).max(sy + 8.0));
                 [bx, by, bw, bh]
             };
 
-            if let Some(bg) = dlg_bg_cfg {
-                let mut q = Quad::image(box_rect, bg);
-                q.color[3] = alpha;
-                b.pkt.quads.push(q);
+            if !portrait_docked {
+                if let Some(bg) = dlg_bg_cfg {
+                    let mut q = Quad::image(box_rect, bg);
+                    q.color[3] = alpha;
+                    b.pkt.quads.push(q);
+                } else {
+                    let mut panel = b.theme.panel;
+                    panel[3] *= alpha;
+                    b.pkt.quads.push(Quad::solid(box_rect, panel));
+                    let mut border = b.theme.panel_border;
+                    border[3] *= alpha;
+                    b.pkt.quads.push(Quad::solid(
+                        [box_rect[0], box_rect[1], box_rect[2], 2.0],
+                        border,
+                    ));
+                }
             } else {
                 let mut panel = b.theme.panel;
-                panel[3] *= alpha;
+                panel[3] = (panel[3].max(0.92)) * alpha;
                 b.pkt.quads.push(Quad::solid(box_rect, panel));
-                let mut border = b.theme.panel_border;
-                border[3] *= alpha;
+                let mut border = b.theme.accent;
+                border[3] *= 0.72 * alpha;
                 b.pkt.quads.push(Quad::solid(
                     [box_rect[0], box_rect[1], box_rect[2], 2.0],
                     border,
@@ -1025,7 +1199,7 @@ fn project_story_hud(
                         (0.0, 0.0, orig_w, orig_h)
                     };
                     let (fx_out, fy_out, fw_out, fh_out, draw_rect) =
-                        if let Some([px, py]) = style.and_then(|s| s.face_pos) {
+                        if let Some([px, py]) = style.and_then(|s| s.face_pos).filter(|_| !portrait_docked) {
                             let fx0 = stage_rect[0] + px * scale;
                             let fy0 = stage_rect[1] + py * scale;
                             (
@@ -1041,16 +1215,17 @@ fn project_story_hud(
                                 ],
                             )
                         } else {
-                            let margin = (10.0 * scale).clamp(4.0, 14.0);
-                            let max_h = (box_rect[3] - margin * 2.0).max(24.0);
+                            let fmargin = if portrait_docked { 12.0 } else { (10.0 * scale).clamp(4.0, 14.0) };
+                            let max_h = (box_rect[3] - fmargin * 2.0).max(24.0).min(if portrait_docked { 128.0 } else { box_rect[3] });
                             let max_w = (box_rect[2] * 0.28).max(24.0);
-                            let fit = (max_h / (orig_h * scale).max(1.0))
-                                .min(max_w / (orig_w * scale).max(1.0))
+                            let base_s = if portrait_docked { 1.0 } else { scale };
+                            let fit = (max_h / (orig_h * base_s).max(1.0))
+                                .min(max_w / (orig_w * base_s).max(1.0))
                                 .min(1.0);
-                            let s = scale * fit;
+                            let s = base_s * fit;
                             let fw = orig_w * s;
                             let fh = orig_h * s;
-                            let fx0 = box_rect[0] + margin;
+                            let fx0 = box_rect[0] + fmargin;
                             let fy0 = box_rect[1] + (box_rect[3] - fh) * 0.5;
                             (
                                 fx0,
@@ -1069,14 +1244,23 @@ fn project_story_hud(
 
             // 3. Dialogue text rect (scaled + safely clamped + indented around any overlapping face icon!)
             let shake = ctx.vm.dialogue_shake;
-            let mut text_rect = if let Some(tr) = text_rect_cfg {
+            let mut text_rect = if portrait_docked {
+                let pad_x = 16.0;
+                let pad_y = 14.0;
+                [
+                    box_rect[0] + pad_x + shake[0] * scale,
+                    box_rect[1] + pad_y + shake[1] * scale,
+                    (box_rect[2] - pad_x * 2.0).max(60.0),
+                    (box_rect[3] - pad_y * 2.0).max(40.0),
+                ]
+            } else if let Some(tr) = text_rect_cfg {
                 let raw_x = stage_rect[0] + (tr[0] + shake[0]) * scale;
                 let raw_y = stage_rect[1] + (tr[1] + shake[1]) * scale;
                 let raw_w = (tr[2] * scale).max(40.0);
                 let raw_h = (tr[3] * scale).max(24.0);
-                let x = raw_x.clamp(2.0, (w - 42.0).max(2.0));
-                let y = raw_y.clamp(2.0, (h - 26.0).max(2.0));
-                [x, y, raw_w.min((w - x - 2.0).max(40.0)), raw_h.min((h - y - 2.0).max(24.0))]
+                let x = raw_x.clamp(sx + 2.0, (sright - 42.0).max(sx + 2.0));
+                let y = raw_y.clamp(sy + 2.0, (sbottom - 26.0).max(sy + 2.0));
+                [x, y, raw_w.min((sright - x - 2.0).max(40.0)), raw_h.min((sbottom - y - 2.0).max(24.0))]
             } else {
                 let pad_x = (22.0 * scale).clamp(10.0, 28.0);
                 let pad_y = (14.0 * scale).clamp(8.0, 20.0);
@@ -1094,32 +1278,67 @@ fn project_story_hud(
                 let h_ov = (fr[0] + fr[2]).min(text_rect[0] + text_rect[2])
                     - fr[0].max(text_rect[0]);
                 if v_ov > text_rect[3] * 0.15 && h_ov > 2.0 {
-                    let gap = (12.0 * scale).clamp(6.0, 16.0);
+                    let fgap = if portrait_docked { 12.0 } else { (12.0 * scale).clamp(6.0, 16.0) };
                     let face_cx = fr[0] + fr[2] * 0.5;
                     let box_cx = box_rect[0] + box_rect[2] * 0.5;
                     let min_text_w = (box_rect[2] * 0.35).max(60.0);
                     if face_cx <= box_cx {
                         let right = text_rect[0] + text_rect[2];
-                        let desired_x = text_rect[0].max(fr[0] + fr[2] + gap);
+                        let desired_x = text_rect[0].max(fr[0] + fr[2] + fgap);
                         let clamped_x = desired_x.min((right - min_text_w).max(text_rect[0]));
                         text_rect[2] = (right - clamped_x).max(32.0);
                         text_rect[0] = clamped_x;
                     } else {
-                        let desired_right = (text_rect[0] + text_rect[2]).min(fr[0] - gap);
+                        let desired_right = (text_rect[0] + text_rect[2]).min(fr[0] - fgap);
                         let next_w = (desired_right - text_rect[0]).max(min_text_w.min(text_rect[2]));
                         text_rect[2] = next_w.max(32.0);
                     }
                 }
             }
 
-            // 4. Speaker nameplate (explicit `name_rect` OR floating pill above `box_rect` OR reserved
-            //    header row above `text_rect` — NEVER overlaps line 1 of subtitles or face portrait!)
+            // 4. Speaker nameplate (never overlaps subtitles, stage art in portrait mode, or face portrait!)
             let mut speaker_top_pill_rect: Option<[f32; 4]> = None;
             if !dlg.speaker.is_empty() {
                 let mut sc = dlg.speaker_color.unwrap_or(b.theme.accent);
                 sc[3] *= alpha;
-                let sp_size = (style_font_size * scale * ctx.prefs.font_scale * 0.88).clamp(11.0, 34.0);
-                if let Some(nr) = style.and_then(|s| s.name_rect) {
+                let sp_size = if portrait_docked {
+                    (16.0 * ctx.prefs.font_scale).clamp(13.0, 26.0)
+                } else {
+                    (style_font_size * scale * ctx.prefs.font_scale * 0.88).clamp(11.0, 34.0)
+                };
+                if portrait_docked {
+                    // Integrated header band at the top of the docked portrait panel — keeps artwork unobstructed!
+                    let header_h = (sp_size * 1.45).clamp(24.0, 38.0).min(text_rect[3] * 0.32);
+                    let name_box = [text_rect[0], text_rect[1], text_rect[2], header_h];
+                    let push_down = header_h + 6.0;
+                    text_rect[1] += push_down;
+                    text_rect[3] = (text_rect[3] - push_down).max(28.0);
+                    b.pkt.quads.push(Quad::solid(
+                        [name_box[0], name_box[1] + header_h + 1.0, (name_box[2] * 0.38).min(120.0), 1.5],
+                        [sc[0], sc[1], sc[2], sc[3] * 0.7],
+                    ));
+                    b.push_text(TextRun {
+                        text: dlg.speaker.clone(),
+                        visible_bytes: None,
+                        x: name_box[0],
+                        y: name_box[1],
+                        width: name_box[2],
+                        height: name_box[3],
+                        size: sp_size,
+                        line_height: sp_size * 1.22,
+                        color: sc,
+                        emphasis: Vec::new(),
+                        shadow: scaled_shadow,
+                        scroll: 0.0,
+                        clip: Some(name_box),
+                        font_assets: b.text_fonts.clone(),
+                        align: TextAlign::Left,
+                        valign_center: true,
+                        auto_fit: true,
+                        inline_images: Vec::new(),
+                        cache_key: 0,
+                    });
+                } else if let Some(nr) = style.and_then(|s| s.name_rect) {
                     let name_box = [
                         stage_rect[0] + nr[0] * scale,
                         stage_rect[1] + nr[1] * scale,
@@ -1151,13 +1370,13 @@ fn project_story_hud(
                     let tab_h = (sp_size * 1.48).clamp(22.0, 44.0);
                     let tab_gap = (4.0 * ui_s).clamp(2.0, 6.0);
                     let tab_y = box_rect[1] - tab_h - tab_gap;
-                    if tab_y >= 4.0 {
+                    if tab_y >= sy + 4.0 {
                         let pad_x = (14.0 * ui_s).clamp(8.0, 20.0);
                         let units = estimate_display_units(&dlg.speaker);
                         let min_w = (72.0 * ui_s).clamp(52.0, 110.0);
-                        let max_w = (box_rect[2] * 0.55).max(min_w).min((w - 16.0).max(80.0));
+                        let max_w = (box_rect[2] * 0.55).max(min_w).min((sw - 16.0).max(80.0));
                         let tab_w = (units * sp_size + pad_x * 2.0).clamp(min_w, max_w);
-                        let tab_x = box_rect[0].clamp(4.0, (w - tab_w - 4.0).max(4.0));
+                        let tab_x = box_rect[0].clamp(sx + 4.0, (sright - tab_w - 4.0).max(sx + 4.0));
                         let tab_rect = [tab_x, tab_y, tab_w, tab_h];
                         b.pkt.quads.push(Quad::solid(
                             tab_rect,
@@ -1223,12 +1442,18 @@ fn project_story_hud(
                 }
             }
 
-            // 5. Dialogue text — properly scaled by viewport `scale`, with automatic overflow fit
-            //    and inline image support so subtitles are ALWAYS crisp and never clipped!
-            let fsize = (style_font_size * scale * ctx.prefs.font_scale).clamp(10.0, 72.0);
-            let lh = (style_line_height * scale * ctx.prefs.font_scale)
-                .max(fsize * 1.15)
-                .min(fsize * 1.85);
+            // 5. Dialogue text — comfortable mobile size in Portrait Docked Reader,
+            //    or faithful stage-scaled typography in Landscape / Classic mode.
+            let (fsize, lh) = if portrait_docked {
+                let sz = (17.5 * ctx.prefs.font_scale).clamp(14.0, 30.0);
+                (sz, (sz * 1.45).clamp(20.0, 46.0))
+            } else {
+                let sz = (style_font_size * scale * ctx.prefs.font_scale).clamp(10.0, 72.0);
+                let l = (style_line_height * scale * ctx.prefs.font_scale)
+                    .max(sz * 1.15)
+                    .min(sz * 1.85);
+                (sz, l)
+            };
             let emphasis: Vec<(usize, usize)> = dlg
                 .spans
                 .iter()
@@ -1268,14 +1493,10 @@ fn project_story_hud(
                 cache_key: 0,
             });
 
-            // 6. Responsive non-overlapping quick-action toolbar docked OUTSIDE `text_rect` & box art!
-            //    Prefers top-right edge above `box_rect` -> bottom letterbox margin -> top-right viewport.
-            let bar_h = (26.0 * ui_s).clamp(22.0, 32.0);
-            let gap = (4.0 * ui_s).clamp(2.0, 6.0);
-            let margin = (4.0 * ui_s).clamp(2.0, 8.0);
+            // 6. Responsive non-overlapping quick-action toolbar strictly within safe area!
             let buttons: [(&str, UiAction, bool); 7] = [
                 ("auto", UiAction::ToggleAuto, ctx.auto),
-                ("skip-compact", UiAction::ToggleSkip, ctx.skip),
+                ("skip-compact", UiAction::ToggleSkip, ctx.skip || ctx.hold_skip),
                 ("history-compact", UiAction::OpenHistory, false),
                 ("rollback", UiAction::Rollback, false),
                 ("save", UiAction::OpenSaves { save_mode: true }, !ctx.replay_active),
@@ -1283,27 +1504,30 @@ fn project_story_hud(
                 ("menu", UiAction::OpenMenu, false),
             ];
             let n = buttons.len() as f32;
-            let min_comfortable_w = n * 34.0 + (n - 1.0) * gap;
+            let min_btn_w = if touch { 44.0 } else { 34.0 };
+            let min_comfortable_w = n * min_btn_w + (n - 1.0) * gap;
 
             let top_y = box_rect[1] - bar_h - margin;
-            let top_min_l = speaker_top_pill_rect.map_or(box_rect[0].max(4.0), |sr| {
+            let top_min_l = speaker_top_pill_rect.map_or(box_rect[0].max(sx + 4.0), |sr| {
                 sr[0] + sr[2] + (8.0 * ui_s).clamp(4.0, 12.0)
             });
-            let top_max_r = (box_rect[0] + box_rect[2]).min(w - 4.0);
+            let top_max_r = (box_rect[0] + box_rect[2]).min(sright - 4.0);
             let below_y = (box_rect[1] + box_rect[3]).max(stage_rect[1] + stage_rect[3]) + margin;
 
-            let (bar_min_l, bar_max_r, bar_y, bar_centered) =
-                if top_y >= 4.0 && (top_max_r - top_min_l) >= min_comfortable_w {
-                    (top_min_l, top_max_r, top_y, false)
-                } else if below_y + bar_h + 4.0 <= h {
-                    (6.0, (w - 6.0).max(126.0), below_y, true)
-                } else {
-                    (6.0, (w - 6.0).max(126.0), 6.0, false)
-                };
+            let (bar_min_l, bar_max_r, bar_y, bar_centered) = if portrait_docked {
+                (sx + 6.0, (sright - 6.0).max(sx + 126.0), sbottom - bar_h - 6.0, true)
+            } else if top_y >= sy + 4.0 && (top_max_r - top_min_l) >= min_comfortable_w {
+                (top_min_l, top_max_r, top_y, false)
+            } else if below_y + bar_h + 4.0 <= sbottom {
+                (sx + 6.0, (sright - 6.0).max(sx + 126.0), below_y, true)
+            } else {
+                (sx + 6.0, (sright - 6.0).max(sx + 126.0), sy + 6.0, false)
+            };
 
             let avail_w = (bar_max_r - bar_min_l).max(120.0);
             let max_btn_w = ((avail_w - gap * (n - 1.0)) / n).max(16.0);
-            let btn_w = max_btn_w.min((64.0 * ui_s).clamp(40.0, 74.0));
+            let cap_btn_w = if touch { 76.0 } else { (64.0 * ui_s).clamp(40.0, 74.0) };
+            let btn_w = max_btn_w.min(cap_btn_w);
             let total_w = btn_w * n + gap * (n - 1.0);
             let mut bx = if bar_centered {
                 bar_min_l + ((avail_w - total_w) * 0.5).max(0.0)
@@ -1327,7 +1551,7 @@ fn project_story_hud(
             if let Some(sr) = speaker_top_pill_rect {
                 top_bound = top_bound.min(sr[1]);
             }
-            if bar_y < box_rect[1] && bar_y > 12.0 {
+            if bar_y < box_rect[1] && bar_y > sy + 12.0 {
                 top_bound = top_bound.min(bar_y);
             }
             dialogue_top_y = Some(top_bound);
@@ -1347,15 +1571,19 @@ fn project_story_hud(
             _ => (scale, scale),
         };
         let plain_count = choice.items.iter().filter(|it| it.rect.is_none()).count().max(1);
-        let cw = (w * 0.54).clamp(220.0, 620.0).min((w - 28.0).max(180.0));
-        let avail_top = 18.0f32;
+        let cw = (sw * if touch { 0.84 } else { 0.54 })
+            .clamp(220.0, 620.0)
+            .min((sw - 24.0).max(180.0));
+        let avail_top = sy + 16.0;
         let avail_bottom = dialogue_top_y
-            .map_or(h - 24.0, |dy| (dy - 14.0).max(h * 0.35))
+            .map_or(sbottom - 20.0, |dy| (dy - 12.0).max(sy + sh * 0.35))
             .max(avail_top + 64.0);
         let avail_h = (avail_bottom - avail_top).max(64.0);
-        let gap = (avail_h * 0.04).clamp(6.0, 14.0);
-        let ch = ((avail_h - gap * (plain_count - 1) as f32) / plain_count as f32).clamp(32.0, 52.0);
-        let total_h = plain_count as f32 * ch + plain_count.saturating_sub(1) as f32 * gap;
+        let cgap = (avail_h * 0.04).clamp(6.0, 14.0);
+        let min_ch = if touch { 42.0 } else { 32.0 };
+        let max_ch = if touch { 56.0 } else { 52.0 };
+        let ch = ((avail_h - cgap * (plain_count - 1) as f32) / plain_count as f32).clamp(min_ch, max_ch);
+        let total_h = plain_count as f32 * ch + plain_count.saturating_sub(1) as f32 * cgap;
         let mut cy = (avail_top + (avail_h - total_h) * 0.5).max(avail_top);
         let mut hovered_preview: Option<(AssetId, [f32; 2])> = None;
         for (i, item) in choice.items.iter().enumerate() {
@@ -1367,14 +1595,14 @@ fn project_story_hud(
                     r[3] * my,
                 ]
             } else {
-                let r = [(w - cw) * 0.5, cy, cw, ch];
-                cy += ch + gap;
+                let r = [sx + (sw - cw) * 0.5, cy, cw, ch];
+                cy += ch + cgap;
                 r
             };
             if let Some(img) = item.image {
                 let id = b.next_hit_id;
                 b.next_hit_id += 1;
-                let is_hover = !item.disabled && b.hovered == Some(id);
+                let is_hover = !item.disabled && (b.hovered == Some(id) || b.pressed == Some(id));
                 let asset = if item.disabled {
                     item.disabled_image.unwrap_or(img)
                 } else if is_hover {
@@ -1448,22 +1676,36 @@ fn project_story_hud(
 fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &str) -> [f32; 4] {
     let w = b.pkt.width;
     let h = b.pkt.height;
+    let [sx, sy, sw, sh] = b.safe;
+    let touch = b.is_touch();
     b.pkt
         .quads
-        .push(Quad::solid([0.0, 0.0, w, h], [0.03, 0.05, 0.09, 0.78]));
-    let pw = (w * 0.86).clamp(280.0, 960.0).min((w - 16.0).max(200.0));
-    let ph = (h * 0.86).clamp(260.0, 660.0).min((h - 16.0).max(200.0));
-    let px = (w - pw) * 0.5;
-    let py = (h - ph) * 0.5;
+        .push(Quad::solid([0.0, 0.0, w, h], [0.03, 0.05, 0.09, 0.80]));
+    let pw = (sw * if touch { 0.94 } else { 0.86 })
+        .clamp(280.0, 960.0)
+        .min((sw - 12.0).max(200.0));
+    let ph = (sh * if touch { 0.92 } else { 0.86 })
+        .clamp(260.0, 680.0)
+        .min((sh - 12.0).max(200.0));
+    let px = sx + (sw - pw) * 0.5;
+    let py = sy + (sh - ph) * 0.5;
     let pad = (pw * 0.035).clamp(12.0, 24.0);
-    let hdr_h = (ph * 0.11).clamp(36.0, 56.0);
-    let back_w = (pw * 0.18).clamp(68.0, 104.0);
-    let back_h = (hdr_h * 0.72).clamp(28.0, 38.0);
+    let hdr_h = if touch {
+        (ph * 0.11).clamp(46.0, 58.0)
+    } else {
+        (ph * 0.11).clamp(36.0, 56.0)
+    };
+    let back_w = (pw * 0.20).clamp(if touch { 76.0 } else { 68.0 }, 108.0);
+    let back_h = if touch {
+        (hdr_h * 0.82).clamp(38.0, 44.0)
+    } else {
+        (hdr_h * 0.72).clamp(28.0, 38.0)
+    };
     b.pkt.quads.push(Quad::solid([px, py, pw, ph], b.theme.surface));
     b.pkt
         .quads
         .push(Quad::solid([px, py, pw, 2.0], b.theme.accent));
-    let title_size = (hdr_h * 0.48).clamp(16.0, 26.0);
+    let title_size = (hdr_h * 0.46).clamp(16.0, 26.0);
     b.push_text(TextRun {
         text: title,
         visible_bytes: None,
@@ -1497,6 +1739,7 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
 
 fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "menu"), messages, loc);
+    let touch = b.is_touch();
     let items: [(&str, UiAction, bool, bool); 6] = [
         ("close", UiAction::CloseOverlay, true, true),
         ("save", UiAction::OpenSaves { save_mode: true }, !ctx.replay_active, false),
@@ -1514,11 +1757,13 @@ fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Mes
             false,
         ),
     ];
-    let bw = area[2].min(360.0);
+    let bw = area[2].min(380.0);
     let bx = area[0] + (area[2] - bw) * 0.5;
     let n = items.len() as f32;
-    let gap = (area[3] * 0.025).clamp(5.0, 12.0);
-    let bh = ((area[3] - gap * (n - 1.0)) / n).clamp(28.0, 46.0);
+    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
+    let min_bh = if touch { 38.0 } else { 28.0 };
+    let max_bh = if touch { 52.0 } else { 46.0 };
+    let bh = ((area[3] - gap * (n - 1.0)) / n).clamp(min_bh, max_bh);
     let total_h = bh * n + gap * (n - 1.0);
     let mut by = area[1] + ((area[3] - total_h) * 0.5).max(0.0);
     for (key, action, enabled, primary) in items {
@@ -1536,19 +1781,40 @@ fn project_saves_overlay(
 ) {
     let title = messages.get(loc, if save_mode { "save" } else { "load" });
     let area = overlay_shell(b, title, messages, loc);
+    let touch = b.is_touch();
     let cols = if area[2] >= 560.0 { 2 } else { 1 };
-    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
+    let gap = (area[3] * 0.022).clamp(6.0, 12.0);
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = (area[3] * 0.14).clamp(40.0, 64.0);
+    let cell_h = if touch {
+        (area[3] * 0.135).clamp(44.0, 62.0)
+    } else {
+        (area[3] * 0.14).clamp(40.0, 64.0)
+    };
+    let nav_h = if touch { 42.0 } else { 34.0 };
+    let total_slots = ctx.slots.len();
 
-    for (idx, slot) in ctx.slots.iter().take(12).enumerate() {
-        let col = idx % cols;
-        let row = idx / cols;
+    let rows_full = (((area[3] + gap) / (cell_h + gap)).floor() as usize).max(1);
+    let need_pages = total_slots > rows_full * cols;
+    let list_h = if need_pages {
+        (area[3] - nav_h - gap).max(cell_h)
+    } else {
+        area[3]
+    };
+    let rows_per_page = (((list_h + gap) / (cell_h + gap)).floor() as usize).max(1);
+    let per_page = (rows_per_page * cols).max(1);
+    let total_pages = total_slots.div_ceil(per_page).max(1);
+    let page = ctx.saves_page.min(total_pages - 1);
+    let start = page * per_page;
+    let end = (start + per_page).min(total_slots);
+
+    let del_w = if touch { 48.0 } else { 40.0 };
+    let del_gap = 6.0;
+
+    for (local_idx, slot) in ctx.slots[start..end].iter().enumerate() {
+        let col = local_idx % cols;
+        let row = local_idx / cols;
         let x = area[0] + col as f32 * (cell_w + gap);
         let y = area[1] + row as f32 * (cell_h + gap);
-        if y + cell_h > area[1] + area[3] + 1.0 {
-            break;
-        }
         let label = if slot.exists {
             format!("#{:02}  {}", slot.slot + 1, slot.summary)
         } else {
@@ -1560,17 +1826,77 @@ fn project_saves_overlay(
             UiAction::LoadSlot(slot.slot)
         };
         let enabled = save_mode || slot.exists;
-        b.button([x, y, cell_w, cell_h], label, action, enabled, false);
+        let show_delete = save_mode && slot.exists && cell_w > del_w + del_gap + 120.0;
+        let main_w = if show_delete {
+            cell_w - del_w - del_gap
+        } else {
+            cell_w
+        };
+        b.button([x, y, main_w, cell_h], label, action, enabled, false);
+        if show_delete {
+            b.button(
+                [x + main_w + del_gap, y, del_w, cell_h],
+                "×".into(),
+                UiAction::DeleteSlot(slot.slot),
+                true,
+                false,
+            );
+        }
+    }
+
+    if total_pages > 1 {
+        let by = area[1] + area[3] - nav_h;
+        let nav_w = ((area[2] - 80.0) * 0.5).clamp(76.0, 128.0);
+        b.button(
+            [area[0], by, nav_w, nav_h],
+            messages.get(loc, "scroll-back"),
+            UiAction::SavesPage(-1),
+            page > 0,
+            false,
+        );
+        b.button(
+            [area[0] + area[2] - nav_w, by, nav_w, nav_h],
+            messages.get(loc, "scroll-forward"),
+            UiAction::SavesPage(1),
+            page + 1 < total_pages,
+            false,
+        );
+        let mid_x = area[0] + nav_w + 6.0;
+        let mid_w = (area[2] - nav_w * 2.0 - 12.0).max(40.0);
+        b.push_text(TextRun {
+            text: format!("{} / {}", page + 1, total_pages),
+            visible_bytes: None,
+            x: mid_x,
+            y: by,
+            width: mid_w,
+            height: nav_h,
+            size: 14.0,
+            line_height: 18.0,
+            color: b.theme.muted,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([mid_x, by, mid_w, nav_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
     }
 }
 
 fn project_settings_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "settings"), messages, loc);
+    let touch = b.is_touch();
     let has_locales = !ctx.vm.program().meta.locales.is_empty();
-    let total_rows = 5 + usize::from(has_locales);
-    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
-    let row_h = ((area[3] - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(30.0, 46.0);
-    let btn_w = (area[2] * 0.14).clamp(40.0, 56.0);
+    let total_rows = 6 + usize::from(has_locales);
+    let gap = (area[3] * 0.02).clamp(5.0, 10.0);
+    let min_rh = if touch { 36.0 } else { 28.0 };
+    let max_rh = if touch { 48.0 } else { 44.0 };
+    let row_h = ((area[3] - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(min_rh, max_rh);
+    let btn_w = (area[2] * 0.16).clamp(if touch { 48.0 } else { 40.0 }, 64.0);
     let btn_gap = 8.0;
     let right_x = area[0] + area[2];
     let plus_x = right_x - btn_w;
@@ -1642,6 +1968,42 @@ fn project_settings_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: 
         UiAction::SetFontScale((ctx.prefs.font_scale + 0.1).clamp(0.75, 1.50)),
     );
 
+    // Portrait docked reader toggle (`竖屏舒适阅读`)
+    if y + row_h <= area[1] + area[3] + 2.0 {
+        let toggle_w = (btn_w * 2.0 + btn_gap).min(136.0);
+        let toggle_x = right_x - toggle_w;
+        let tlabel_w = (toggle_x - area[0] - 8.0).max(64.0);
+        b.push_text(TextRun {
+            text: messages.get(loc, "portrait-reader"),
+            visible_bytes: None,
+            x: area[0],
+            y,
+            width: tlabel_w,
+            height: row_h,
+            size: label_size,
+            line_height: label_size * 1.25,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([area[0], y, tlabel_w, row_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Left,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+        b.button(
+            [toggle_x, y, toggle_w, row_h],
+            messages.get(loc, if ctx.portrait_reader { "on" } else { "off" }),
+            UiAction::TogglePortraitReader,
+            true,
+            ctx.portrait_reader,
+        );
+        y += row_h + gap;
+    }
+
     // Language switchers (fit cleanly inside area width)
     let locales = &ctx.vm.program().meta.locales;
     if !locales.is_empty() && y + row_h <= area[1] + area[3] + 2.0 {
@@ -1669,7 +2031,8 @@ fn project_settings_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: 
 
 fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "history"), messages, loc);
-    let nav_h = 36.0;
+    let touch = b.is_touch();
+    let nav_h = if touch { 44.0 } else { 36.0 };
     let row_h = (area[3] * 0.16).clamp(48.0, 68.0);
     let visible_rows = ((area[3] - nav_h - 10.0) / row_h).max(1.0) as usize;
     let total = ctx.vm.history.len();
@@ -1677,7 +2040,7 @@ fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
     let start = end.saturating_sub(visible_rows);
 
     let mut y = area[1];
-    let fsize = (row_h * 0.28).clamp(13.0, 18.0);
+    let fsize = (row_h * 0.28).clamp(14.0, 18.0);
     for entry in ctx.vm.history.range(start..end) {
         let text = if entry.speaker.is_empty() {
             entry.text.clone()
@@ -1709,7 +2072,7 @@ fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
     }
 
     let by = area[1] + area[3] - nav_h;
-    let nav_w = ((area[2] - 12.0) * 0.5).clamp(80.0, 124.0);
+    let nav_w = ((area[2] - 72.0) * 0.5).clamp(80.0, 128.0);
     b.button(
         [area[0], by, nav_w, nav_h],
         messages.get(loc, "scroll-back"),
@@ -1718,12 +2081,37 @@ fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
         false,
     );
     b.button(
-        [area[0] + nav_w + 10.0, by, nav_w, nav_h],
+        [area[0] + area[2] - nav_w, by, nav_w, nav_h],
         messages.get(loc, "scroll-forward"),
         UiAction::ScrollHistory(-3),
         ctx.history_scroll > 0,
         false,
     );
+    if total > 0 {
+        let mid_x = area[0] + nav_w + 4.0;
+        let mid_w = (area[2] - nav_w * 2.0 - 8.0).max(36.0);
+        b.push_text(TextRun {
+            text: format!("{}–{}/{}", start + 1, end.max(start + 1), total),
+            visible_bytes: None,
+            x: mid_x,
+            y: by,
+            width: mid_w,
+            height: nav_h,
+            size: 13.0,
+            line_height: 17.0,
+            color: b.theme.muted,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([mid_x, by, mid_w, nav_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
 }
 
 fn project_gallery_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
@@ -1803,11 +2191,13 @@ mod tests {
     }
 
     fn livemaker_like_program() -> Arc<NirProgram> {
-        let mut ui = UiTheme::default();
-        ui.dialogue_rect = Some([0.0, 440.0, 800.0, 160.0]);
-        ui.text_rect = Some([32.0, 456.0, 736.0, 128.0]);
-        ui.font_size = 24.0;
-        ui.line_height = 34.0;
+        let mut ui = UiTheme {
+            dialogue_rect: Some([0.0, 440.0, 800.0, 160.0]),
+            text_rect: Some([32.0, 456.0, 736.0, 128.0]),
+            font_size: 24.0,
+            line_height: 34.0,
+            ..Default::default()
+        };
         ui.dialogue_styles.push(DialogueStyleDef {
             name: StrId(1),
             dialogue_bg: None,
@@ -1923,11 +2313,17 @@ mod tests {
                 prefs: &prefs,
                 auto: false,
                 skip: false,
+                hold_skip: false,
                 interface_hidden: false,
                 replay_active: false,
                 slots: &[],
+                saves_page: 0,
                 history_scroll: 0,
                 hovered_hit: None,
+                pressed_hit: None,
+                safe_insets: SafeInsets::default(),
+                input_mode: InputMode::Pointer,
+                portrait_reader: false,
                 toast: None,
             };
             let pkt = project(&ctx, vw, vh, &msgs);
@@ -2049,11 +2445,17 @@ mod tests {
             prefs: &prefs,
             auto: false,
             skip: false,
+            hold_skip: false,
             interface_hidden: false,
             replay_active: false,
             slots: &[],
+            saves_page: 0,
             history_scroll: 0,
             hovered_hit: None,
+            pressed_hit: None,
+            safe_insets: SafeInsets::default(),
+            input_mode: InputMode::Pointer,
+            portrait_reader: true,
             toast: None,
         };
         let pkt = project(&ctx, 800.0, 600.0, &msgs);
@@ -2063,5 +2465,105 @@ mod tests {
         // 960/1280 * 800 = 600, 540/720 * 600 = 450, 200/1280*800 = 125, 80/720*600 = 66.67 -> fits inside 800x600!
         assert!((r[0] - 600.0).abs() < 0.5 && (r[1] - 450.0).abs() < 0.5);
         assert!(r[0] + r[2] <= 800.5 && r[1] + r[3] <= 600.5);
+    }
+
+    #[test]
+    fn mobile_portrait_docked_reader_and_safe_insets_deliver_comfortable_targets() {
+        let prog = livemaker_like_program();
+        let mut vm = Vm::new(prog, Some("zh-Hans".into())).unwrap();
+        vm.step(1000).unwrap();
+        let prefs = Preferences::default();
+        let msgs = Messages::default();
+
+        // Realistic iPhone 15 portrait (390x844) with Dynamic Island (59px) & Home Indicator (34px)
+        let insets = SafeInsets {
+            top: 59.0,
+            right: 0.0,
+            bottom: 34.0,
+            left: 0.0,
+        };
+        let ctx = UiContext {
+            vm: &vm,
+            screen: Screen::Story,
+            prefs: &prefs,
+            auto: false,
+            skip: false,
+            hold_skip: false,
+            interface_hidden: false,
+            replay_active: false,
+            slots: &[],
+            saves_page: 0,
+            history_scroll: 0,
+            hovered_hit: None,
+            pressed_hit: None,
+            safe_insets: insets,
+            input_mode: InputMode::Touch,
+            portrait_reader: true,
+            toast: None,
+        };
+        let pkt = project(&ctx, 390.0, 844.0, &msgs);
+        // Stage docked at safe top (59px)
+        assert!((pkt.stage_rect[1] - 59.0).abs() < 0.5);
+        let stage_bottom = pkt.stage_rect[1] + pkt.stage_rect[3];
+
+        // Dialogue text sits below stage at comfortable >= 15px mobile reading size
+        let dlg_run = pkt
+            .texts
+            .iter()
+            .find(|t| t.text.contains("测试台词"))
+            .expect("dialogue text run missing");
+        assert!(dlg_run.size >= 16.0, "portrait reader font should be readable, got {}", dlg_run.size);
+        assert!(dlg_run.y >= stage_bottom, "dialogue should sit below stage in portrait reader");
+
+        // All 7 touch toolbar buttons >= 40px tall and strictly inside safe insets!
+        assert_eq!(pkt.hits.len(), 7);
+        for h in &pkt.hits {
+            assert!(h.rect[3] >= 40.0, "touch button {} too short: {}", h.label, h.rect[3]);
+            assert!(h.rect[1] >= insets.top - 0.5);
+            assert!(h.rect[1] + h.rect[3] <= 844.0 - insets.bottom + 0.5);
+        }
+
+        // Landscape phone (844x390) with horizontal notches (47px left/right, 21px bottom)
+        let land_insets = SafeInsets {
+            top: 0.0,
+            right: 47.0,
+            bottom: 21.0,
+            left: 47.0,
+        };
+        let slots: Vec<SlotSummary> = (0..24)
+            .map(|i| SlotSummary {
+                slot: i,
+                exists: i < 4,
+                summary: format!("Line {i}"),
+                saved_at_unix: 1000 + i as u64,
+            })
+            .collect();
+        let saves_ctx = UiContext {
+            vm: &vm,
+            screen: Screen::Saves { save_mode: true },
+            prefs: &prefs,
+            auto: false,
+            skip: false,
+            hold_skip: false,
+            interface_hidden: false,
+            replay_active: false,
+            slots: &slots,
+            saves_page: 1,
+            history_scroll: 0,
+            hovered_hit: None,
+            pressed_hit: None,
+            safe_insets: land_insets,
+            input_mode: InputMode::Touch,
+            portrait_reader: true,
+            toast: None,
+        };
+        let saves_pkt = project(&saves_ctx, 844.0, 390.0, &msgs);
+        // Must have pagination buttons and stay inside safe horizontal/bottom insets!
+        assert!(saves_pkt.hits.iter().any(|h| h.action == UiAction::SavesPage(-1)));
+        for h in &saves_pkt.hits {
+            assert!(h.rect[0] >= land_insets.left - 0.5, "button {} enters left notch: {:?}", h.label, h.rect);
+            assert!(h.rect[0] + h.rect[2] <= 844.0 - land_insets.right + 0.5, "button {} enters right notch: {:?}", h.label, h.rect);
+            assert!(h.rect[1] + h.rect[3] <= 390.0 - land_insets.bottom + 0.5, "button {} enters home indicator: {:?}", h.label, h.rect);
+        }
     }
 }

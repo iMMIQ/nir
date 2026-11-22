@@ -23,12 +23,18 @@ use symphonia::core::probe::Hint;
 /// Compressed size threshold below which non-looped audio (SFX/Voice) is eligible for LRU caching.
 const SHORT_AUDIO_MAX_COMPRESSED: usize = 256 * 1024;
 /// Maximum RAM dedicated to decoded short audio (Voice / SFX) PCM16 cache (~2x capacity vs f32!).
+#[cfg(target_os = "android")]
+const AUDIO_CACHE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
 const AUDIO_CACHE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 /// Samples per streaming chunk sent from feeder thread to rodio mixer thread (~16 KiB per chunk).
 const STREAM_CHUNK_SAMPLES: usize = 4096;
 /// Bounded streaming queue depth (8 * 16 KiB ≈ 128 KiB peak per active streaming track).
 const STREAM_QUEUE_DEPTH: usize = 8;
-/// Persistent streaming decoder worker threads (eliminates per-click OS thread spawns during Skip!).
+/// Persistent streaming decoder worker threads (fewer threads on mobile to save stack RAM & wakeups).
+#[cfg(target_os = "android")]
+const STREAM_POOL_WORKERS: usize = 3;
+#[cfg(not(target_os = "android"))]
 const STREAM_POOL_WORKERS: usize = 6;
 
 const INV_I16_SCALE: f32 = 1.0 / 32768.0;
@@ -273,6 +279,7 @@ pub struct AudioHost {
     channels: HashMap<ChannelId, ActiveChannel>,
     bus_gains: [f32; 4], // [master, bgm, voice, sfx]
     bus_paused: [bool; 3],
+    host_paused: bool,
     cache: Arc<Mutex<AudioCache>>,
     prefetch_tx: mpsc::Sender<PrefetchJob>,
     stream_tx: mpsc::Sender<StreamJob>,
@@ -322,6 +329,7 @@ impl AudioHost {
             channels: HashMap::new(),
             bus_gains: [1.0; 4],
             bus_paused: [false; 3],
+            host_paused: false,
             cache,
             prefetch_tx,
             stream_tx,
@@ -401,7 +409,7 @@ impl AudioHost {
         let sink = Sink::connect_new(stream.mixer());
         let vol = self.effective_gain(bus, gain);
         sink.set_volume(vol);
-        if self.bus_paused[bus_index(bus)] {
+        if self.host_paused || self.bus_paused[bus_index(bus)] {
             sink.pause();
         }
 
@@ -481,13 +489,29 @@ impl AudioHost {
 
     pub fn set_bus_paused(&mut self, bus: AudioBus, paused: bool) {
         self.bus_paused[bus_index(bus)] = paused;
+        let eff_paused = self.host_paused || paused;
         for ch in self.channels.values() {
             if ch.bus == bus {
-                if paused {
+                if eff_paused {
                     ch.sink.pause();
                 } else {
                     ch.sink.play();
                 }
+            }
+        }
+    }
+
+    /// Global lifecycle pause/resume (e.g. Android `suspended` / focus lost) preserving per-bus pauses.
+    pub fn set_host_paused(&mut self, paused: bool) {
+        if self.host_paused == paused {
+            return;
+        }
+        self.host_paused = paused;
+        for ch in self.channels.values() {
+            if paused || self.bus_paused[bus_index(ch.bus)] {
+                ch.sink.pause();
+            } else {
+                ch.sink.play();
             }
         }
     }

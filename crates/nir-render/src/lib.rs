@@ -25,7 +25,7 @@ const WEBGL2_GPU_CACHE_LIMIT: u64 = 96 * 1024 * 1024;
 const ATLAS_TRIM_INTERVAL: u64 = 64;
 
 fn default_cache_limit_for(backend: RendererBackend) -> u64 {
-    if backend == RendererBackend::WebGl2 {
+    if matches!(backend, RendererBackend::WebGl2 | RendererBackend::Gles) {
         WEBGL2_GPU_CACHE_LIMIT
     } else if cfg!(target_os = "android") {
         ANDROID_GPU_CACHE_LIMIT
@@ -39,6 +39,7 @@ pub enum RendererBackend {
     Dx12,
     Metal,
     Vulkan,
+    Gles,
     WebGpu,
     WebGl2,
 }
@@ -49,9 +50,14 @@ impl RendererBackend {
             Self::Dx12 => "dx12",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Gles => "gles",
             Self::WebGpu => "webgpu",
             Self::WebGl2 => "webgl2",
         }
+    }
+
+    pub const fn is_gl(self) -> bool {
+        matches!(self, Self::WebGl2 | Self::Gles)
     }
 }
 
@@ -446,7 +452,7 @@ pub fn decode_ktx2_to_rgba_premultiplied(ktx: &DecodedKtx2) -> Result<Vec<u8>> {
 /// (saving 25% VRAM and 4 offscreen GPU render passes per uploaded texture!), while textures
 /// genuinely downscaled relative to the active viewport get up to 3 mip levels.
 fn mip_level_count_for(w: u32, h: u32, vp_w: u32, vp_h: u32, backend: RendererBackend) -> u32 {
-    if backend == RendererBackend::WebGl2 || w.max(h) < 256 {
+    if backend.is_gl() || w.max(h) < 256 {
         return 1;
     }
     if w <= vp_w.saturating_mul(5) / 4 && h <= vp_h.saturating_mul(5) / 4 {
@@ -520,27 +526,24 @@ fn select_surface_format(
     formats: &[wgpu::TextureFormat],
     backend: RendererBackend,
 ) -> Result<(wgpu::TextureFormat, wgpu::TextureFormat, Vec<wgpu::TextureFormat>)> {
-    match backend {
-        RendererBackend::WebGl2 => {
-            let fmt = formats
-                .iter()
-                .copied()
-                .find(wgpu::TextureFormat::is_srgb)
-                .or_else(|| formats.first().copied())
-                .ok_or_else(|| rerr("no surface format"))?;
-            Ok((fmt, fmt, Vec::new()))
-        }
-        _ => {
-            let surface_fmt = formats
-                .iter()
-                .copied()
-                .find(|f| f.is_srgb() || f.add_srgb_suffix().is_srgb())
-                .or_else(|| formats.first().copied())
-                .ok_or_else(|| rerr("no surface format"))?;
-            let fmt = surface_fmt.add_srgb_suffix();
-            let views = if fmt == surface_fmt { vec![] } else { vec![fmt] };
-            Ok((surface_fmt, fmt, views))
-        }
+    if backend.is_gl() {
+        let fmt = formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| formats.first().copied())
+            .ok_or_else(|| rerr("no surface format"))?;
+        Ok((fmt, fmt, Vec::new()))
+    } else {
+        let surface_fmt = formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb() || f.add_srgb_suffix().is_srgb())
+            .or_else(|| formats.first().copied())
+            .ok_or_else(|| rerr("no surface format"))?;
+        let fmt = surface_fmt.add_srgb_suffix();
+        let views = if fmt == surface_fmt { vec![] } else { vec![fmt] };
+        Ok((surface_fmt, fmt, views))
     }
 }
 
@@ -601,6 +604,20 @@ impl Renderer {
                 .map_err(|e| rerr(e.to_string()))?,
         };
         let info = adapter.get_info();
+        let backend = match info.backend {
+            wgpu::Backend::Gl => {
+                if cfg!(target_arch = "wasm32") {
+                    RendererBackend::WebGl2
+                } else {
+                    RendererBackend::Gles
+                }
+            }
+            wgpu::Backend::Vulkan => RendererBackend::Vulkan,
+            wgpu::Backend::Metal => RendererBackend::Metal,
+            wgpu::Backend::Dx12 => RendererBackend::Dx12,
+            wgpu::Backend::BrowserWebGpu => RendererBackend::WebGpu,
+            _ => backend,
+        };
         let adapter_info = format!("{:?} / {} / {}", info.backend, info.name, info.driver);
         let desired_compression = wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
@@ -610,9 +627,10 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("NIR v2 Renderer"),
                 required_features: optional_features,
-                required_limits: match backend {
-                    RendererBackend::WebGl2 => wgpu::Limits::downlevel_webgl2_defaults(),
-                    _ => wgpu::Limits::downlevel_defaults(),
+                required_limits: if backend.is_gl() {
+                    wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    wgpu::Limits::downlevel_defaults()
                 }
                 .using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -918,8 +936,26 @@ impl Renderer {
         self.text.has_any_font()
     }
 
+    pub fn has_missing_glyphs(&self) -> bool {
+        self.text.missing_glyphs
+    }
+
     pub fn set_texture_cache_limit(&mut self, bytes: u64) {
-        self.texture_limit = bytes.max(32 * 1024 * 1024);
+        self.texture_limit = bytes.max(24 * 1024 * 1024);
+        self.evict_lru_keeping(None);
+    }
+
+    /// Drops all cached GPU textures and transition scratch targets (e.g. under mobile memory pressure).
+    pub fn clear_textures(&mut self) -> Vec<AssetId> {
+        let mut removed: Vec<AssetId> = self.textures.keys().copied().collect();
+        removed.extend(std::mem::take(&mut self.evicted_ids));
+        self.textures.clear();
+        self.texture_bytes = 0;
+        self.scratch = None;
+        self.scratch_from_sig = None;
+        self.scratch_to_sig = None;
+        self.texture_epoch = self.texture_epoch.wrapping_add(1);
+        removed
     }
 
     pub fn texture_memory_bytes(&self) -> u64 {

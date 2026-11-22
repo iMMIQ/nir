@@ -104,3 +104,10 @@ history-voice-stop-compact = 停止
 unavailable-slot = 存储操作失败
 
 cancel-navigation = 取消切换
+portrait-reader = 竖屏舒适阅读
+on = 开
+off = 关
+delete = 删除
+back-again-exit = 再按一次返回键退出
+auto-active = 自动阅读中
+skip-active = 快进中

@@ -184,6 +184,8 @@ pub enum UiAction {
     ToggleReducedMotion,
     SetLocale(String),
     ScrollHistory(i32),
+    SavesPage(i32),
+    TogglePortraitReader,
     Quit,
     SetFontScale(f32),
 }

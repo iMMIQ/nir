@@ -343,6 +343,7 @@ fn mime_for_path(path: &Path) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "wasm" => "application/wasm",
         "json" => "application/json; charset=utf-8",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
         "png" => "image/png",
         "webp" => "image/webp",
         "jpg" | "jpeg" => "image/jpeg",

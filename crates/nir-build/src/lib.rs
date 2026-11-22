@@ -85,6 +85,8 @@ pub struct AndroidSection {
     pub version_code: u32,
     pub min_sdk: u32,
     pub target_sdk: u32,
+    /// Optional Android screen orientation (`sensorLandscape`, `fullSensor`, `landscape`, `portrait`).
+    pub orientation: Option<String>,
 }
 
 impl Default for AndroidSection {
@@ -93,6 +95,7 @@ impl Default for AndroidSection {
             version_code: 1,
             min_sdk: 26,
             target_sdk: 34,
+            orientation: None,
         }
     }
 }
@@ -679,6 +682,8 @@ pub fn package_web(built: &BuiltBundle, sdk_web_dir: &Path, out_dir: &Path) -> R
         "index.html",
         "style.css",
         "app.js",
+        "manifest.webmanifest",
+        "sw.js",
         "player_web.js",
         "player_web_bg.wasm",
         "fallback-cjk.otf",
@@ -766,6 +771,11 @@ pub fn package_android(
         min_sdk: manifest.android.min_sdk,
         target_sdk: manifest.android.target_sdk,
         lib_name: "player".into(),
+        screen_orientation: manifest
+            .android
+            .orientation
+            .as_deref()
+            .and_then(nir_apk::ScreenOrientation::parse),
     };
     if let Some(parent) = out_apk.parent() {
         fs::create_dir_all(parent)?;

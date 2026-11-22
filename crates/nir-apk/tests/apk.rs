@@ -28,6 +28,7 @@ fn manifest_spec() -> ManifestSpec {
         min_sdk: 26,
         target_sdk: 29,
         lib_name: "player".to_owned(),
+        screen_orientation: None,
     }
 }
 

@@ -1,0 +1,10 @@
+{
+  "name": "NIR Player",
+  "short_name": "NIR",
+  "start_url": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "any",
+  "background_color": "#0d1118",
+  "theme_color": "#0d1118"
+}

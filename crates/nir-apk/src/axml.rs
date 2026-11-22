@@ -45,6 +45,7 @@ const FRAMEWORK_ATTRIBUTES: &[(&str, u32)] = &[
     ("hasCode", 0x0101_000c),
     ("exported", 0x0101_0010),
     ("launchMode", 0x0101_001d),
+    ("screenOrientation", 0x0101_001e),
     ("configChanges", 0x0101_001f),
     ("value", 0x0101_0024),
     ("minSdkVersion", 0x0101_020c),

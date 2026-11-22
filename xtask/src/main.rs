@@ -94,11 +94,11 @@ fn main() -> Result<()> {
             } else {
                 println!("SDK: wasm-opt not found on PATH; skipping WASM size pass");
             }
-            for name in ["index.html", "style.css", "app.js"] {
-                fs::copy(
-                    format!("apps/player-web/host/{name}"),
-                    format!("dist/sdk/{name}"),
-                )?;
+            for name in ["index.html", "style.css", "app.js", "manifest.webmanifest", "sw.js"] {
+                let src = format!("apps/player-web/host/{name}");
+                if Path::new(&src).is_file() {
+                    fs::copy(src, format!("dist/sdk/{name}"))?;
+                }
             }
 
             // 2. Build unified native player

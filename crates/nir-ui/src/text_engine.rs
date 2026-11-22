@@ -23,6 +23,7 @@ pub struct TextEngine {
     fallback_dirty: bool,
     #[cfg(not(target_arch = "wasm32"))]
     system_fonts_loaded: bool,
+    pub missing_glyphs: bool,
     pub shapes: u64,
 }
 
@@ -69,6 +70,7 @@ impl Default for TextEngine {
             fallback_dirty: false,
             #[cfg(not(target_arch = "wasm32"))]
             system_fonts_loaded: false,
+            missing_glyphs: false,
             shapes: 0,
         }
     }
@@ -98,6 +100,7 @@ impl TextEngine {
         }
         self.buffers.clear();
         self.recency.clear();
+        self.missing_glyphs = false;
         self.fallback_dirty = true;
         Ok(())
     }
@@ -148,6 +151,7 @@ impl TextEngine {
         }
         self.buffers.clear();
         self.recency.clear();
+        self.missing_glyphs = false;
         self.fallback_dirty = true;
         Ok(())
     }
@@ -337,6 +341,26 @@ impl TextEngine {
                 cur_lh = (cur_lh * ratio).max(cur_size * 1.12);
                 b = Self::build_buffer(&mut self.fonts, r, &attrs, rich, align, cur_size, cur_lh);
                 (run_count, content_h) = Self::measure_buffer(&b);
+            }
+        }
+
+        if !self.missing_glyphs {
+            'scan: for run in b.layout_runs() {
+                for g in run.glyphs {
+                    if g.glyph_id == 0 {
+                        if let Some(slice) = run.text.get(g.start..g.end) {
+                            if slice.chars().any(|c| {
+                                !c.is_whitespace()
+                                    && !c.is_control()
+                                    && c != '\u{3000}'
+                                    && c != '\u{FFFC}'
+                            }) {
+                                self.missing_glyphs = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
             }
         }
 
