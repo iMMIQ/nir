@@ -94,6 +94,23 @@ pub fn encode<T: Serialize>(value: &T) -> Result<(Vec<u8>, bool)> {
     }
 }
 
+struct CountingWriter(u64);
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn scalar_json_len(value: &Value, at: &str) -> Result<u64> {
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|e| failure(at, e.to_string()))?;
+    Ok(counter.0)
+}
+
 fn check(package: &Package, at: &str) -> Result<()> {
     if package.package_encoding != ENCODING
         || package.pool.is_empty()
@@ -123,9 +140,7 @@ fn check(package: &Package, at: &str) -> Result<()> {
         };
         match entry {
             Entry::V(value) if !value.is_array() && !value.is_object() => {
-                length = serde_json::to_vec(value)
-                    .map_err(|e| failure(at, e.to_string()))?
-                    .len() as u64;
+                length = scalar_json_len(value, at)?;
                 depth = 0;
             }
             Entry::V(_) => return Err(failure(at, "scalar entry contains a container")),

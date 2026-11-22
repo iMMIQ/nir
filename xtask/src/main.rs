@@ -142,16 +142,25 @@ fn main() -> Result<()> {
                 "web",
                 "--out-dir",
                 "dist/sdk",
-                "--no-typescript",
                 "target/wasm32-unknown-unknown/release/player_web.wasm",
             ]))?;
-            for name in ["index.html", "bootstrap.js"] {
+            for name in ["index.html", "bootstrap.js", "style.css"] {
                 fs::copy(
                     format!("apps/player-web/host/{name}"),
                     format!("dist/sdk/{name}"),
                 )?;
             }
-            fs::copy("crates/nir-platform-web/host.js", "dist/sdk/host.js")?;
+            let bun = std::env::var_os("BUN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "bun.exe" } else { "bun" }));
+            run(Command::new(bun).args([
+                "build",
+                "--target=browser",
+                "--format=esm",
+                "--outfile",
+                "dist/sdk/host.js",
+                "crates/nir-platform-web/host.js",
+            ]))?;
             for name in ["runtime-worker.js", "asset-worker.js"] {
                 fs::copy(
                     format!("crates/nir-platform-web/{name}"),
@@ -303,19 +312,28 @@ fn main() -> Result<()> {
             let mut command = Command::new("cargo");
             command.args(["test", "--locked"]);
             for package in [
+                "nir-format",
                 "nir-core",
                 "nir-content",
                 "nir-assets",
                 "nir-player",
                 "nir-presentation",
                 "nir-render-wgpu",
+                "nir-engine",
                 "nir-apk",
                 "player-desktop",
             ] {
                 command.args(["-p", package]);
             }
             if !quick {
-                command.args(["-p", "nir-compiler", "-p", "novelc"]);
+                command.args([
+                    "-p",
+                    "nir-compiler",
+                    "-p",
+                    "nir-import-livemaker",
+                    "-p",
+                    "novelc",
+                ]);
             }
             run(command.args(args))?;
             if !quick {

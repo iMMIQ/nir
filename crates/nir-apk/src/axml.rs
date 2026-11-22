@@ -453,9 +453,18 @@ pub fn decode(data: &[u8]) -> Result<DecodedXml> {
             }
             CHUNK_END_ELEMENT => {
                 ensure!(size >= 24, "E_AXML_DECODE: bad end element chunk");
+                let name_idx = u32_at(data, pos + 20)? as usize;
+                let end_name = strings
+                    .as_deref()
+                    .and_then(|s| s.get(name_idx))
+                    .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: bad end element name"))?;
                 let element = stack
                     .pop()
                     .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: unbalanced end element"))?;
+                ensure!(
+                    element.name == *end_name,
+                    "E_AXML_DECODE: mismatched end element"
+                );
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(element);
                 } else {
@@ -491,14 +500,31 @@ fn decode_string_pool(
         28 + 4 * count <= size,
         "E_AXML_DECODE: string offsets exceed chunk"
     );
+    let pool_end = pos
+        .checked_add(size)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: string pool out of bounds"))?;
     let mut strings = Vec::with_capacity(count);
     for index in 0..count {
         let offset = u32_at(data, pos + 28 + 4 * index)? as usize;
-        let start = pos + strings_start + offset;
-        let length = pool_length(data, start)?;
-        let raw = data
-            .get(start + length.1..start + length.1 + length.0 * 2)
+        let start = pos
+            .checked_add(strings_start)
+            .and_then(|v| v.checked_add(offset))
+            .filter(|&s| s < pool_end)
+            .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: string offset exceeds pool"))?;
+        let length = pool_length(&data[..pool_end], start)?;
+        let raw_start = start
+            .checked_add(length.1)
+            .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: string length overflow"))?;
+        let raw_len = length
+            .0
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: string length overflow"))?;
+        let raw_end = raw_start
+            .checked_add(raw_len)
+            .filter(|&e| e <= pool_end)
             .ok_or_else(|| anyhow::anyhow!("E_AXML_DECODE: string exceeds pool"))?;
+        let raw = &data[raw_start..raw_end];
         let units: Vec<u16> = raw
             .as_chunks::<2>()
             .0
@@ -709,5 +735,26 @@ mod tests {
             decoded.root.attrs[0].value,
             DecodedValue::String("星之梦 ～开辟之诗～".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_mismatched_end_element_name() {
+        let mut encoded = encode(&sample()).unwrap();
+        // Locate the last CHUNK_END_ELEMENT (0x0103) and corrupt its name index (offset +20).
+        let mut pos = 8;
+        let mut last_end = None;
+        while pos + 8 <= encoded.len() {
+            let ty = u16::from_le_bytes([encoded[pos], encoded[pos + 1]]);
+            let size = u32::from_le_bytes(encoded[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if ty == CHUNK_END_ELEMENT {
+                last_end = Some(pos);
+            }
+            pos += size;
+        }
+        let end_pos = last_end.expect("end element present");
+        let orig = u32::from_le_bytes(encoded[end_pos + 20..end_pos + 24].try_into().unwrap());
+        let wrong: u32 = if orig == 0 { 1 } else { 0 };
+        encoded[end_pos + 20..end_pos + 24].copy_from_slice(&wrong.to_le_bytes());
+        assert!(decode(&encoded).is_err());
     }
 }

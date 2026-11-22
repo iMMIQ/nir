@@ -302,6 +302,13 @@ fn validation_and_restore_gate_the_reveal() {
         mask_err.contains("invalid window reveal mask"),
         "{mask_err}"
     );
+    reveal_err(&|s: &mut Snapshot| {
+        s.window_reveal.as_mut().unwrap().duration_us = Micros(60_000_001);
+    });
+    reveal_err(&|s: &mut Snapshot| {
+        let reveal = s.window_reveal.as_mut().unwrap();
+        reveal.started_us = Micros(s.tick_us.0 + 1);
+    });
     // The capability must still be declared by the restoring program even
     // when its own ops never used a transition.
     let mut bare = program(json!({"type":"dialogue_visibility","visible":false}), false);
@@ -315,4 +322,220 @@ fn validation_and_restore_gate_the_reveal() {
         Ok(_) => panic!("capability-less program must not adopt a reveal"),
     };
     assert!(err.contains("invalid window reveal"), "{err}");
+}
+
+#[test]
+fn v2_runtime_code_admission_validates_window_reveal() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    let build_runtime = |ops: serde_json::Value, capability: bool| {
+        let mut p = program(ops, capability);
+        for (id, asset) in &mut p.assets {
+            asset.object = format!("{:064x}", id.bytes().map(u64::from).sum::<u64>() + 1000);
+            asset.decoded_bytes = if asset.kind == AssetKind::Image {
+                asset.width as u64 * asset.height as u64 * 4
+            } else {
+                1
+            };
+        }
+        let media: BTreeMap<_, _> = p
+            .assets
+            .iter()
+            .map(|(id, a)| (id.clone(), a.object.clone()))
+            .collect();
+        for plan in p
+            .locale_config
+            .ui
+            .values_mut()
+            .chain(p.locale_config.text.values_mut())
+        {
+            plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &media);
+        }
+        let owner = "story".to_owned();
+        let owners = |ids: Vec<String>| ids.into_iter().map(|id| (id, owner.clone())).collect();
+        let code_pkg = ModuleCode {
+            format: 2,
+            module: owner.clone(),
+            functions: p.functions.clone(),
+        };
+        let code_bytes = serde_json::to_vec(&code_pkg).unwrap();
+        let code_hash = format!("{:x}", Sha256::digest(&code_bytes));
+        let static_pkg = ModuleStatic {
+            format: 2,
+            module: owner.clone(),
+            scenes: p.scenes.clone(),
+            cues: p.cues.clone(),
+            choices: p.choices.clone(),
+            text_contracts: p.texts.clone(),
+            activation_recipes: p
+                .cues
+                .keys()
+                .map(|cue| (cue.clone(), p.cue_media_assets(cue)))
+                .collect(),
+            sprite_timelines: BTreeMap::new(),
+        };
+        let static_bytes = serde_json::to_vec(&static_pkg).unwrap();
+        let static_hash = format!("{:x}", Sha256::digest(&static_bytes));
+        let assets = p
+            .assets
+            .iter()
+            .map(|(id, a)| {
+                (
+                    id.clone(),
+                    AssetIndexEntry {
+                        kind: a.kind,
+                        object: a.object.clone(),
+                        catalog: "main".into(),
+                    },
+                )
+            })
+            .collect();
+        let root = RuntimeProgram {
+            timeline_owners: BTreeMap::new(),
+            format: 2,
+            game_id: p.game_id,
+            revision: p.revision,
+            entry: p.entry,
+            requires: p.requires,
+            stage: p.stage,
+            variables: p.variables,
+            function_index: p
+                .functions
+                .iter()
+                .map(|(id, f)| {
+                    (
+                        id.clone(),
+                        RuntimeFunctionIndex {
+                            execution_module: None,
+                            module: owner.clone(),
+                            signature: FunctionSignature::from(f),
+                        },
+                    )
+                })
+                .collect(),
+            modules: BTreeMap::from([(
+                owner.clone(),
+                ModuleIndex {
+                    functions: p
+                        .functions
+                        .iter()
+                        .map(|(id, f)| (id.clone(), FunctionSignature::from(f)))
+                        .collect(),
+                    texts: p.texts.keys().cloned().collect(),
+                    code: code_hash,
+                    static_content: static_hash,
+                    locales: p
+                        .locales
+                        .keys()
+                        .enumerate()
+                        .map(|(i, locale)| (locale.clone(), format!("{:064x}", i + 10)))
+                        .collect(),
+                },
+            )]),
+            scene_owners: owners(p.scenes.keys().cloned().collect()),
+            cue_owners: owners(p.cues.keys().cloned().collect()),
+            choice_owners: owners(p.choices.keys().cloned().collect()),
+            text_owners: owners(p.texts.keys().cloned().collect()),
+            task_owners: owners(
+                p.cues
+                    .values()
+                    .flat_map(|c| c.effects.iter().map(|e| e.id.clone()))
+                    .collect(),
+            ),
+            text_contracts: p
+                .texts
+                .iter()
+                .map(|(id, t)| {
+                    (
+                        id.clone(),
+                        RuntimeTextIdentity {
+                            images: vec![],
+                            module: owner.clone(),
+                            source_revision: t.source_revision,
+                            contract_revision: t.contract_revision,
+                            meaning_revision: t.meaning_revision,
+                            contract_digest: t.contract_digest.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            locales: p.locales.keys().cloned().collect(),
+            locale_config: p.locale_config,
+            assets,
+            catalogs: BTreeMap::from([("main".into(), format!("{:064x}", 2))]),
+            default_locale: p.default_locale,
+            title_scene: p
+                .title_scene
+                .clone()
+                .or_else(|| p.scenes.keys().next().cloned()),
+            title_nodes: p
+                .title_scene
+                .as_ref()
+                .and_then(|id| p.scenes.get(id))
+                .or_else(|| p.scenes.values().next())
+                .cloned()
+                .unwrap_or_default(),
+            theme: p.theme,
+            player: p.player,
+        };
+        let vp = ValidatedProgram::from_runtime(root).unwrap();
+        vp.install_batch(vec![
+            (
+                ContentKey::Static {
+                    module: owner.clone(),
+                },
+                RuntimeObject::Static(static_pkg),
+                static_bytes.len() as u64,
+            ),
+            (
+                ContentKey::Code { module: owner },
+                RuntimeObject::Code(code_pkg),
+                code_bytes.len() as u64,
+            ),
+        ])
+    };
+
+    assert_eq!(
+        build_runtime(hide_op(), false).unwrap_err().code,
+        "E_CAPABILITY"
+    );
+    assert_eq!(
+        build_runtime(
+            json!({
+                "type":"dialogue_visibility","visible":false,
+                "transition":{"type":"dissolve"},"duration_us":"0"
+            }),
+            true
+        )
+        .unwrap_err()
+        .code,
+        "E_TIME"
+    );
+    assert_eq!(
+        build_runtime(
+            json!({
+                "type":"dialogue_visibility","visible":false,
+                "transition":{"type":"dissolve"},"duration_us":"60000001"
+            }),
+            true
+        )
+        .unwrap_err()
+        .code,
+        "E_TIME"
+    );
+    assert_eq!(
+        build_runtime(
+            json!({
+                "type":"dialogue_visibility","visible":false,
+                "transition":{"type":"mask","asset":"audio.bgm","channel":"alpha"},
+                "duration_us":"1000000"
+            }),
+            true
+        )
+        .unwrap_err()
+        .code,
+        "E_ASSET"
+    );
+    assert!(build_runtime(hide_op(), true).is_ok());
 }

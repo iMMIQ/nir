@@ -81,7 +81,12 @@ impl BufferSource {
     /// Keep one converter for the voice lifetime. Sink queues and mixers can
     /// divide Sources into spans; resampling inside those spans would restart
     /// fractional phase at every span or authored loop boundary.
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    ))]
     pub fn at_device_rate(self, rate: u32) -> DeviceSource {
         use rodio::Source;
         let channels = self.channels;
@@ -135,14 +140,24 @@ impl BufferSource {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub struct DeviceSource {
     input: rodio::conversions::SampleRateConverter<BufferSource>,
     channels: u16,
     rate: u32,
     duration: Option<Duration>,
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl Iterator for DeviceSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
@@ -152,7 +167,12 @@ impl Iterator for DeviceSource {
         self.input.size_hint()
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl rodio::Source for DeviceSource {
     // Output format stays fixed across every intro and loop boundary. Any
     // outer queue span conversion is now at an identical rate (a passthrough).
@@ -173,36 +193,96 @@ impl rodio::Source for DeviceSource {
 /// The sink's queue survives an output-device replacement. The old stream is
 /// dropped by the output worker before a new mixer can pull this same queue;
 /// its cursor, resampler, envelope and Sink position never restart.
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
-#[derive(Clone)]
+///
+/// The active audio callback borrows the inner queue once into `local` and
+/// returns it in `Drop`, avoiding per-sample mutex locks on the real-time thread.
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub struct SharedVoiceQueue {
-    input: Arc<std::sync::Mutex<FixedVoiceQueue>>,
+    shared: Arc<std::sync::Mutex<Option<FixedVoiceQueue>>>,
+    local: Option<FixedVoiceQueue>,
     channels: u16,
     rate: u32,
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
+impl Clone for SharedVoiceQueue {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            local: None,
+            channels: self.channels,
+            rate: self.rate,
+        }
+    }
+}
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
+impl Drop for SharedVoiceQueue {
+    fn drop(&mut self) {
+        if let Some(queue) = self.local.take() {
+            *self
+                .shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(queue);
+        }
+    }
+}
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl SharedVoiceQueue {
     pub fn new(input: rodio::queue::SourcesQueueOutput, channels: u16, rate: u32) -> Self {
         Self {
-            input: Arc::new(std::sync::Mutex::new(FixedVoiceQueue::new(
+            shared: Arc::new(std::sync::Mutex::new(Some(FixedVoiceQueue::new(
                 input, channels, rate,
-            ))),
+            )))),
+            local: None,
             channels,
             rate,
         }
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl Iterator for SharedVoiceQueue {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        self.input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .next()
+        if self.local.is_none() {
+            self.local = self
+                .shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        }
+        self.local.as_mut()?.next()
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl rodio::Source for SharedVoiceQueue {
     fn current_span_len(&self) -> Option<usize> {
         None
@@ -222,13 +302,23 @@ impl rodio::Source for SharedVoiceQueue {
 /// format before the queue's initially empty source has yielded any audio;
 /// otherwise the mixer bootstraps with rodio's empty-source 48 kHz mono
 /// metadata and can prefetch silence or convert the first span incorrectly.
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub struct FixedVoiceQueue {
     input: rodio::queue::SourcesQueueOutput,
     channels: u16,
     rate: u32,
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl FixedVoiceQueue {
     pub fn new(input: rodio::queue::SourcesQueueOutput, channels: u16, rate: u32) -> Self {
         Self {
@@ -238,14 +328,24 @@ impl FixedVoiceQueue {
         }
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl Iterator for FixedVoiceQueue {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         self.input.next()
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl rodio::Source for FixedVoiceQueue {
     fn current_span_len(&self) -> Option<usize> {
         None
@@ -284,7 +384,12 @@ impl Iterator for BufferSource {
         }
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl rodio::Source for BufferSource {
     fn current_span_len(&self) -> Option<usize> {
         // Direct consumers can inspect the contiguous run up to the loop
@@ -365,7 +470,12 @@ mod tests {
             .is_err());
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    ))]
     #[test]
     fn region_spans_end_at_the_loop_boundary_and_then_exclude_intro() {
         use rodio::Source as _;
@@ -387,7 +497,12 @@ mod tests {
         (0..len).map(|i| i as f32 * 0.5 - 3.).collect()
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    ))]
     fn rodio_reference(
         samples: &[f32],
         channels: u16,
@@ -418,7 +533,12 @@ mod tests {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    ))]
     #[test]
     fn finite_sources_match_skip_duration_at_all_offsets() {
         for (channels, rate, frames) in [(1u16, 44_100u32, 5_000), (2, 48_000, 3_731)] {
@@ -512,7 +632,12 @@ mod tests {
         assert!(buffer.source(u64::MAX / 1_000, false).next().is_none());
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    ))]
     #[test]
     fn source_reports_shape_and_remaining_duration() {
         use rodio::Source as _;
@@ -535,7 +660,15 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(windows, target_os = "linux", target_os = "android")))]
+#[cfg(all(
+    test,
+    any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )
+))]
 mod recovery_tests {
     use super::*;
     use rodio::{mixer::mixer, source::UniformSourceIterator, Sink};

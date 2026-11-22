@@ -1,0 +1,31 @@
+:root{--nir-safe-top:env(safe-area-inset-top,0px);--nir-safe-right:env(safe-area-inset-right,0px);--nir-safe-bottom:env(safe-area-inset-bottom,0px);--nir-safe-left:env(safe-area-inset-left,0px)}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#10252b;color:#e9eddf;font:16px system-ui,sans-serif}
+canvas{position:fixed;left:var(--nir-safe-left);top:var(--nir-safe-top);display:block;width:calc(100% - var(--nir-safe-left) - var(--nir-safe-right));height:calc(100% - var(--nir-safe-top) - var(--nir-safe-bottom));touch-action:none;outline:none}
+#shell{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#10252b;z-index:5}
+#shell[hidden]{display:none}
+.shell-card{max-width:560px;padding:40px;border-left:2px solid #d4ba7a}
+h1{font-size:24px;font-weight:500}
+p{line-height:1.7;white-space:pre-wrap}
+button{background:#d4ba7a;color:#10252b;border:0;padding:12px 24px;cursor:pointer}
+.accessible{position:fixed;left:0;top:0;width:1px;height:1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+#focus-ring{position:fixed;border:2px solid #eedca6;pointer-events:none;display:none;z-index:3}
+#nir-history-button,#nir-dev-banner{position:fixed;z-index:4;font:14px system-ui,sans-serif}
+#nir-history-button{top:12px;right:12px;max-width:45vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:4px;cursor:pointer}
+#nir-dev-banner{top:12px;left:12px;padding:7px 10px;background:#9d6823;color:#fff;border-radius:4px;pointer-events:none}
+#nir-history-panel{position:fixed;z-index:6;inset:0;background:#071b20ed;color:#f2f2e9;overflow:auto;padding:clamp(18px,4vw,48px);font:15px system-ui,sans-serif}
+#nir-history-panel[hidden]{display:none}
+#nir-history-panel .nir-history-inner{max-width:900px;margin:auto}
+#nir-history-panel h2{font-size:24px;font-weight:500}
+#nir-history-panel button{margin:3px;padding:8px 12px;background:#d4ba7a;color:#10252b;border:0;border-radius:3px;cursor:pointer}
+#nir-history-panel button:disabled{opacity:.45;cursor:default}
+#nir-history-panel table{width:100%;border-collapse:collapse}
+#nir-history-panel th,#nir-history-panel td{text-align:left;border-bottom:1px solid #5d7474;padding:10px 6px;vertical-align:top}
+#nir-history-panel code{overflow-wrap:anywhere}
+#nir-history-panel .nir-history-status{min-width:115px}
+#nir-storage-recovery{position:fixed;bottom:12px;right:12px;z-index:999;padding:10px;border-radius:8px;background:#182535;color:#fff;font:14px sans-serif;max-width:min(420px,calc(100vw - 24px));box-sizing:border-box}
+#nir-storage-retry{margin-left:8px;padding:8px 12px;min-height:44px;border-radius:6px;font:14px sans-serif}
+#nir-audio-recovery{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:1000;padding:12px;border-radius:8px;background:#182535;color:#fff;border:1px solid #b6c8dd;font:16px sans-serif;width:min(480px,calc(100vw - 32px));box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain}
+#nir-audio-resume,#nir-audio-recovery-saves{padding:12px 18px;min-height:44px;border-radius:8px;background:#182535;color:#fff;border:1px solid #b6c8dd;font:16px sans-serif}
+#nir-audio-recovery-status{margin:8px 0}
+#nir-dev-status{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:10px 16px;background:#291d11;color:#fff;font:14px/1.5 system-ui;white-space:pre-wrap;max-height:30vh;overflow:auto}

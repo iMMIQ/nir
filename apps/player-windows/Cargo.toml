@@ -2,10 +2,11 @@
 name = "player-windows"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-player-desktop = { path = "../player-desktop" }
+player-desktop.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -453,10 +453,15 @@ impl Cache<'_> {
         )
     }
     fn load(&self, key: &str, ext: &str) -> Option<Vec<u8>> {
-        let meta: CacheMeta =
-            serde_json::from_str(&fs::read_to_string(self.root.join(format!("{key}.json"))).ok()?)
-                .ok()?;
-        let bytes = fs::read(self.root.join(format!("{key}.{ext}"))).ok()?;
+        let meta_path = self.root.join(format!("{key}.json"));
+        let data_path = self.root.join(format!("{key}.{ext}"));
+        if fs::symlink_metadata(&meta_path).is_ok_and(|m| m.file_type().is_symlink())
+            || fs::symlink_metadata(&data_path).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return None;
+        }
+        let meta: CacheMeta = serde_json::from_str(&fs::read_to_string(&meta_path).ok()?).ok()?;
+        let bytes = fs::read(&data_path).ok()?;
         if nir_content::digest(&bytes) != meta.output {
             return None;
         }
@@ -470,22 +475,48 @@ impl Cache<'_> {
         source: &str,
         params: &str,
     ) -> Result<PathBuf> {
+        use std::io::Write;
+        if let Ok(meta) = fs::symlink_metadata(self.root) {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink() && meta.is_dir(),
+                "E_PATH_ESCAPE: optimize cache root must be a real directory"
+            );
+        }
         fs::create_dir_all(self.root)?;
         let path = self.root.join(format!("{key}.{ext}"));
-        let temporary = self.root.join(format!("{key}.{ext}.next"));
-        fs::write(&temporary, bytes)?;
-        fs::rename(&temporary, &path)?;
+        anyhow::ensure!(
+            !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()),
+            "E_PATH_ESCAPE: optimize cache entry is a symlink"
+        );
+        let mut tmp = tempfile::NamedTempFile::new_in(self.root)?;
+        tmp.write_all(bytes)?;
+        tmp.persist(&path).map_err(|e| e.error)?;
         let meta = CacheMeta {
             source: source.into(),
             params: params.into(),
             output: nir_content::digest(bytes),
         };
         let meta_path = self.root.join(format!("{key}.json"));
-        let temporary = self.root.join(format!("{key}.json.next"));
-        fs::write(&temporary, serde_json::to_vec(&meta)?)?;
-        fs::rename(&temporary, &meta_path)?;
+        anyhow::ensure!(
+            !fs::symlink_metadata(&meta_path).is_ok_and(|m| m.file_type().is_symlink()),
+            "E_PATH_ESCAPE: optimize cache metadata is a symlink"
+        );
+        let mut tmp = tempfile::NamedTempFile::new_in(self.root)?;
+        tmp.write_all(&serde_json::to_vec(&meta)?)?;
+        tmp.persist(&meta_path).map_err(|e| e.error)?;
         Ok(path)
     }
+}
+
+fn validate_cached_mp3_header(mp3: &[u8], wav: &WavPcm) -> Result<()> {
+    let tag = nir_format::lame::parse(mp3).context("encoded MP3 is missing a LAME gapless tag")?;
+    anyhow::ensure!(
+        tag.rate == wav.rate,
+        "MP3 sample rate {} != source {} Hz",
+        tag.rate,
+        wav.rate
+    );
+    Ok(())
 }
 
 fn is_webp(b: &[u8]) -> bool {
@@ -504,27 +535,56 @@ pub(crate) fn optimize_media(
     cache_root: &Path,
 ) -> Result<(OptimizeReport, BTreeMap<String, StoredMedia>)> {
     let cache = Cache { root: cache_root };
-    let mut report = OptimizeReport {
-        tool: OPTIMIZE_TOOL.into(),
-        ..Default::default()
-    };
-    let mut stored = BTreeMap::new();
+    struct WorkItem<'a> {
+        id: &'a str,
+        kind: AssetKind,
+        width: u32,
+        height: u32,
+        policy: AssetPolicy,
+        bytes: &'a [u8],
+    }
+    struct WorkResult {
+        id: String,
+        kind: AssetKind,
+        outcome: AssetOutcome,
+        stored: StoredMedia,
+        replacement: Option<(Vec<u8>, String)>,
+    }
+
+    let mut items = Vec::new();
     for id in roots {
         let Some(bytes) = p.media.get(id) else {
             bail!("E_OPTIMIZE: packaged asset {id} has no media bytes");
         };
         let asset = &p.program.assets[id];
+        if asset.kind == AssetKind::Font {
+            continue;
+        }
         let policy = p
             .asset_optimize
             .get(id)
             .copied()
             .unwrap_or(AssetPolicy::Auto);
+        items.push(WorkItem {
+            id: id.as_str(),
+            kind: asset.kind,
+            width: asset.width,
+            height: asset.height,
+            policy,
+            bytes: bytes.as_slice(),
+        });
+    }
+
+    let process = |item: &WorkItem<'_>| -> Result<WorkResult> {
+        let id = item.id;
+        let bytes = item.bytes;
+        let policy = item.policy;
         let mut outcome = AssetOutcome {
-            id: id.clone(),
-            kind: match asset.kind {
+            id: id.to_owned(),
+            kind: match item.kind {
                 AssetKind::Image => "image",
                 AssetKind::Audio => "audio",
-                AssetKind::Font => continue, // fonts have their own pipeline
+                AssetKind::Font => unreachable!("fonts filtered above"),
             },
             action: "kept",
             from: "",
@@ -534,7 +594,7 @@ pub(crate) fn optimize_media(
             reason: None,
             cache_hit: false,
         };
-        match asset.kind {
+        match item.kind {
             AssetKind::Image => {
                 let source_is_webp = is_webp(bytes);
                 let lossless = options.image_format == ImageFormat::WebpLossless
@@ -557,12 +617,13 @@ pub(crate) fn optimize_media(
                     } else {
                         "image conversion disabled".into()
                     });
-                    stored.insert(id.clone(), media);
-                    report.images.kept += 1;
-                    report.images.bytes_before += bytes.len() as u64;
-                    report.images.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
+                    return Ok(WorkResult {
+                        id: id.to_owned(),
+                        kind: AssetKind::Image,
+                        outcome,
+                        stored: media,
+                        replacement: None,
+                    });
                 }
                 let params = format!(
                     "image:{}:lossless={lossless}:quality={}",
@@ -579,12 +640,10 @@ pub(crate) fn optimize_media(
                     } else {
                         encode_webp_lossy(bytes, options.image_quality)?
                     };
-                    // The descriptor's dimensions are cross-checked by every
-                    // player against the decoded object; re-verify on encode.
                     let decoded = image::load_from_memory(&fresh)
                         .context("E_OPTIMIZE_IMAGE: webp verification decode")?;
                     anyhow::ensure!(
-                        decoded.width() == asset.width && decoded.height() == asset.height,
+                        decoded.width() == item.width && decoded.height() == item.height,
                         "E_OPTIMIZE_IMAGE: webp dimensions changed for {id}"
                     );
                     cache.store(&key, "webp", &fresh, &nir_content::digest(bytes), &params)?;
@@ -595,29 +654,29 @@ pub(crate) fn optimize_media(
                     outcome.to = "png";
                     outcome.reason = Some("conversion did not shrink the object".into());
                     outcome.cache_hit = cache_hit;
-                    stored.insert(id.clone(), StoredMedia::Png);
-                    report.images.kept += 1;
-                    report.images.bytes_before += bytes.len() as u64;
-                    report.images.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
+                    return Ok(WorkResult {
+                        id: id.to_owned(),
+                        kind: AssetKind::Image,
+                        outcome,
+                        stored: StoredMedia::Png,
+                        replacement: None,
+                    });
                 }
                 outcome.action = "converted";
                 outcome.from = "png";
                 outcome.to = "webp";
                 outcome.bytes_after = converted.len() as u64;
                 outcome.cache_hit = cache_hit;
-                report.images.converted += 1;
-                report.images.bytes_before += bytes.len() as u64;
-                report.images.bytes_after += converted.len() as u64;
-                let asset = p.program.assets.get_mut(id).unwrap();
-                asset.object = nir_content::digest(&converted);
-                asset.bytes = converted.len() as u64;
-                p.media.insert(id.clone(), converted);
-                stored.insert(id.clone(), StoredMedia::Webp);
+                let digest = nir_content::digest(&converted);
+                Ok(WorkResult {
+                    id: id.to_owned(),
+                    kind: AssetKind::Image,
+                    outcome,
+                    stored: StoredMedia::Webp,
+                    replacement: Some((converted, digest)),
+                })
             }
             AssetKind::Audio => {
-                let reason_kept = |why: &str| -> String { why.to_owned() };
                 let convert =
                     options.audio_format == AudioFormat::Mp3 && policy != AssetPolicy::None;
                 let guarded = if !convert {
@@ -634,13 +693,14 @@ pub(crate) fn optimize_media(
                 if let Some(reason) = guarded {
                     outcome.from = "wav";
                     outcome.to = "wav";
-                    outcome.reason = Some(reason_kept(reason));
-                    stored.insert(id.clone(), StoredMedia::Wav);
-                    report.audio.kept += 1;
-                    report.audio.bytes_before += bytes.len() as u64;
-                    report.audio.bytes_after += bytes.len() as u64;
-                    report.assets.push(outcome);
-                    continue;
+                    outcome.reason = Some(reason.to_owned());
+                    return Ok(WorkResult {
+                        id: id.to_owned(),
+                        kind: AssetKind::Audio,
+                        outcome,
+                        stored: StoredMedia::Wav,
+                        replacement: None,
+                    });
                 }
                 let wav = parse_wav_pcm16(bytes)
                     .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
@@ -665,15 +725,12 @@ pub(crate) fn optimize_media(
                 let params = format!("audio:mp3:cbr:{}:{}", options.audio_bitrate_kbps, wav.rate);
                 let key = cache.key(bytes, &params);
                 let (converted, cache_hit) = if let Some(hit) = cache.load(&key, "mp3") {
-                    validate_mp3(&hit, &wav)
+                    validate_cached_mp3_header(&hit, &wav)
                         .with_context(|| format!("E_OPTIMIZE_AUDIO: cached asset {id}"))?;
                     (hit, true)
                 } else {
                     let fresh = encode_mp3(&wav, bitrate)
                         .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
-                    // Validate before publishing a cache entry. A tagged file
-                    // alone is insufficient: decoding must also return every
-                    // authored sample at the original rate and channel count.
                     validate_mp3(&fresh, &wav)
                         .with_context(|| format!("E_OPTIMIZE_AUDIO: asset {id}"))?;
                     cache.store(&key, "mp3", &fresh, &nir_content::digest(bytes), &params)?;
@@ -684,20 +741,79 @@ pub(crate) fn optimize_media(
                 outcome.to = "mp3";
                 outcome.bytes_after = converted.len() as u64;
                 outcome.cache_hit = cache_hit;
-                report.audio.converted += 1;
-                report.audio.bytes_before += bytes.len() as u64;
-                report.audio.bytes_after += converted.len() as u64;
-                // duration_us and decoded_bytes stay authored. Native trims
-                // to source frames; Web separately budgets context-rate PCM.
-                let asset = p.program.assets.get_mut(id).unwrap();
-                asset.object = nir_content::digest(&converted);
-                asset.bytes = converted.len() as u64;
-                p.media.insert(id.clone(), converted);
-                stored.insert(id.clone(), StoredMedia::Mp3);
+                let digest = nir_content::digest(&converted);
+                Ok(WorkResult {
+                    id: id.to_owned(),
+                    kind: AssetKind::Audio,
+                    outcome,
+                    stored: StoredMedia::Mp3,
+                    replacement: Some((converted, digest)),
+                })
             }
-            AssetKind::Font => unreachable!("fonts continue above"),
+            AssetKind::Font => unreachable!("fonts filtered above"),
         }
-        report.assets.push(outcome);
+    };
+
+    let worker_count = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8)
+        .min(items.len().max(1));
+    let results: Vec<Result<WorkResult>> = if worker_count <= 1 || items.len() <= 1 {
+        items.iter().map(process).collect()
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<Result<WorkResult>>>> = (0..items.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= items.len() {
+                        break;
+                    }
+                    let res = process(&items[idx]);
+                    *slots[idx].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("worker processed slot")
+            })
+            .collect()
+    };
+
+    let mut report = OptimizeReport {
+        tool: OPTIMIZE_TOOL.into(),
+        ..Default::default()
+    };
+    let mut stored = BTreeMap::new();
+    for res in results {
+        let res = res?;
+        let class = match res.kind {
+            AssetKind::Image => &mut report.images,
+            AssetKind::Audio => &mut report.audio,
+            AssetKind::Font => unreachable!(),
+        };
+        if res.outcome.action == "converted" {
+            class.converted += 1;
+        } else {
+            class.kept += 1;
+        }
+        class.bytes_before += res.outcome.bytes_before;
+        class.bytes_after += res.outcome.bytes_after;
+        if let Some((converted, digest)) = res.replacement {
+            let asset = p.program.assets.get_mut(&res.id).unwrap();
+            asset.object = digest;
+            asset.bytes = converted.len() as u64;
+            p.media.insert(res.id.clone(), converted);
+        }
+        stored.insert(res.id, res.stored);
+        report.assets.push(res.outcome);
     }
     Ok((report, stored))
 }

@@ -126,3 +126,93 @@ pub(crate) fn materialize(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nir_format::BitmapText;
+
+    fn base_node(id: &str) -> Node {
+        Node {
+            id: id.into(),
+            parent: None,
+            asset: Some("atlas.digits".into()),
+            x: 100.,
+            y: 200.,
+            width: 0.,
+            height: 0.,
+            offset: [0.; 2],
+            sprite_transform: None,
+            timeline_binding: None,
+            inherit_existence: false,
+            scale: 1.,
+            opacity: 1.,
+            color: [1., 1., 1., 1.],
+            order: 0,
+            clip: None,
+            bitmap_text: None,
+            preserve_pose: vec![],
+        }
+    }
+
+    #[test]
+    fn tree_ids_and_remove_tree_prune_entire_subtree() {
+        let mut root = base_node("root");
+        root.asset = None;
+        let mut child = base_node("child");
+        child.parent = Some("root".into());
+        let mut grand = base_node("grand");
+        grand.parent = Some("child".into());
+        let sibling = base_node("sibling");
+        let mut nodes = vec![root, child, grand, sibling];
+        assert_eq!(
+            tree_ids(&nodes, "root"),
+            BTreeSet::from(["root".into(), "child".into(), "grand".into()])
+        );
+        remove_tree(&mut nodes, "root");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "sibling");
+    }
+
+    #[test]
+    fn materialize_expands_multiline_aligned_glyphs_and_rejects_errors() {
+        let mut tpl = base_node("score");
+        tpl.bitmap_text = Some(BitmapText {
+            slot: "label".into(),
+            alphabet: "0123456789AB".into(),
+            cell: [10, 20],
+            line_spacing: 4,
+            align: BitmapAnchor::Center,
+            x_anchor: BitmapAnchor::End,
+            y_anchor: BitmapAnchor::Start,
+        });
+        let vars = BTreeMap::from([("label".into(), Value::String("12\r\n3".into()))]);
+        let out = materialize(&[tpl.clone()], &vars).unwrap();
+        // 1 container group + 3 glyphs ('1', '2', '3')
+        assert_eq!(out.len(), 4);
+        assert!(out[0].bitmap_text.is_none());
+        assert!(out[0].asset.is_none());
+        // width = 20, height = 20*2 + 4 = 44, x_anchor=End => 100 - 20 = 80
+        assert_eq!(out[0].x, 80.);
+        assert_eq!(out[0].y, 200.);
+        assert_eq!(out[0].width, 20.);
+        assert_eq!(out[0].height, 44.);
+        // First glyph '1' at alphabet index 1 => clip x=10
+        assert_eq!(out[1].clip, Some([10., 0., 10., 20.]));
+        // Second line '3' centered inside width 20 => aligned_x = (20-10)/2 = 5, offset = 30 => x = -25
+        assert_eq!(out[3].x, -25.);
+        assert_eq!(out[3].y, 24.);
+
+        // Missing glyph in alphabet
+        let bad_char = BTreeMap::from([("label".into(), Value::String("Z".into()))]);
+        assert!(materialize(&[tpl.clone()], &bad_char).is_err());
+
+        // Overlong > 128 chars
+        let too_long = BTreeMap::from([("label".into(), Value::String("0".repeat(129)))]);
+        assert!(materialize(&[tpl.clone()], &too_long).is_err());
+
+        // Wrong variable type (Bool)
+        let bad_ty = BTreeMap::from([("label".into(), Value::Bool(true))]);
+        assert!(materialize(&[tpl], &bad_ty).is_err());
+    }
+}

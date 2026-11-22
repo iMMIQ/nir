@@ -18,6 +18,27 @@ pub struct GameManifest {
     pub engine: Engine,
     pub stage: Stage,
     pub inputs: Inputs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<AndroidConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidConfig {
+    #[serde(default = "default_android_version_code")]
+    pub version_code: u32,
+    #[serde(default = "default_android_min_sdk")]
+    pub min_sdk: u32,
+    #[serde(default = "default_android_target_sdk")]
+    pub target_sdk: u32,
+}
+fn default_android_version_code() -> u32 {
+    1
+}
+fn default_android_min_sdk() -> u32 {
+    26
+}
+fn default_android_target_sdk() -> u32 {
+    29
 }
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -72,22 +93,22 @@ pub(crate) struct Module {
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Fragment {
-    fragment_format: u32,
+pub struct Fragment {
+    pub fragment_format: u32,
     #[serde(default)]
-    variables: BTreeMap<String, Value>,
+    pub variables: BTreeMap<String, Value>,
     #[serde(default)]
-    functions: BTreeMap<String, Function>,
+    pub functions: BTreeMap<String, Function>,
     #[serde(default)]
-    scenes: BTreeMap<String, Vec<Node>>,
+    pub scenes: BTreeMap<String, Vec<Node>>,
     #[serde(default)]
-    sprite_timelines: BTreeMap<String, SpriteTimeline>,
+    pub sprite_timelines: BTreeMap<String, SpriteTimeline>,
     #[serde(default)]
-    cues: BTreeMap<String, Cue>,
+    pub cues: BTreeMap<String, Cue>,
     #[serde(default)]
-    choices: BTreeMap<String, Choice>,
+    pub choices: BTreeMap<String, Choice>,
 }
-pub(crate) fn validate_generated_fragment(fragment: &serde_json::Value) -> Result<()> {
+pub fn validate_generated_fragment(fragment: &serde_json::Value) -> Result<()> {
     let fragment: Fragment =
         serde_json::from_value(fragment.clone()).context("E_SCHEMA: generated story fragment")?;
     let mut operations = BTreeMap::new();
@@ -455,7 +476,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     let entry_module_id = entry_module.id.clone();
     let entry_local = entry_local.clone();
     let (theme, player, resolved_config) = crate::config::resolve_config(&root, &manifest)?;
-    let texts = crate::texts::compiled_texts(&root, namespaced)?;
+    let mut texts = crate::texts::compiled_texts(&root, namespaced)?;
     let entry = module_key(&entry_module_id, &entry_local, namespaced);
     let mut program = Program {
         format: FORMAT_VERSION,
@@ -521,13 +542,42 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                     path.display()
                 );
             }
-            let f: Fragment = json(&path)?;
-            sources.fragment_in_module(
-                &root,
-                &path,
-                &read(&path)?,
-                namespaced.then_some(module.id.as_str()),
-            );
+            let f: Fragment = if path.extension().and_then(|s| s.to_str()) == Some("nirs") {
+                let raw = fs::read_to_string(&path)
+                    .with_context(|| format!("E_IO: unable to read {}", path.display()))?;
+                let lowered = crate::script::lower_nirs(&path, &raw, &manifest.stage)?;
+                for (text_id, contract) in lowered.text_contracts {
+                    let key = module_key(&module.id, &text_id, namespaced);
+                    if program.texts.insert(key.clone(), contract).is_some() {
+                        bail!("E_DUPLICATE: text {key} from {}", path.display());
+                    }
+                    texts
+                        .module_texts
+                        .entry(module.id.clone())
+                        .or_default()
+                        .insert(key);
+                }
+                for (text_id, doc) in lowered.text_docs {
+                    let key = module_key(&module.id, &text_id, namespaced);
+                    for locale in locale_config.text.keys() {
+                        program
+                            .locales
+                            .entry(locale.clone())
+                            .or_default()
+                            .insert(key.clone(), doc.clone());
+                    }
+                }
+                lowered.fragment
+            } else {
+                let f: Fragment = json(&path)?;
+                sources.fragment_in_module(
+                    &root,
+                    &path,
+                    &read(&path)?,
+                    namespaced.then_some(module.id.as_str()),
+                );
+                f
+            };
             if f.fragment_format != 1 {
                 bail!("E_FRAGMENT: {}", path.display());
             }
@@ -690,17 +740,19 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
     let mut provenance = BTreeMap::new();
     let mut asset_optimize = BTreeMap::new();
     let mut normalized = BTreeMap::new();
+    let mut catalog_sources = Vec::new();
     for catalog in &manifest.inputs.asset_catalogs {
         let path = relative(&root, &root, catalog)?;
         let catalog: Catalog = toml_file(&path)?;
         if catalog.format != 1 {
             bail!("E_CATALOG_VERSION: {}", path.display());
         }
+        let catalog_dir = path.parent().unwrap().to_path_buf();
         for source in catalog.assets {
             if source.rights.trim().is_empty() {
                 bail!("E_RIGHTS: {} lacks source/permission record", source.id);
             }
-            let source_path = relative(&root, path.parent().unwrap(), &source.source)?;
+            let source_path = relative(&root, &catalog_dir, &source.source)?;
             let local = forward_slashes(source_path.strip_prefix(&root)?);
             let normalized_path = local.nfc().collect::<String>().to_lowercase();
             if let Some(old) = normalized.insert(normalized_path, local.clone()) {
@@ -708,83 +760,156 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
                     bail!("E_PATH_COLLISION: {old} / {local}");
                 }
             }
-            // Imported PCM is an offline intermediate. Allow the bounded
-            // 128 MiB payload plus WAV headers without increasing script,
-            // image, font or runtime admission limits.
-            let mut bytes = if source.kind == AssetKind::Audio {
-                read_limited(&source_path, 128 * 1024 * 1024 + 64 * 1024)?
-            } else {
-                read(&source_path)?
-            };
-            if let Some(recipe) = &source.font {
+            let license_info = if let Some(recipe) = &source.font {
                 if source.kind != AssetKind::Font {
                     bail!("E_FONT_RECIPE: font recipe requires kind = font");
                 }
-                let license_path = relative(&root, path.parent().unwrap(), &recipe.license)?;
+                let license_path = relative(&root, &catalog_dir, &recipe.license)?;
                 let license = String::from_utf8(read(&license_path)?)
                     .context("E_FONT_LICENSE: expected UTF-8 license")?;
                 if license.trim().is_empty() {
                     bail!("E_FONT_LICENSE: empty license for {}", source.id);
                 }
-                let chars = font_characters.get(&source.id).ok_or_else(|| {
-                    anyhow!(
+                if !font_characters.contains_key(&source.id) {
+                    bail!(
                         "E_FONT_PLAN_UNUSED: font {} is not referenced by a UI or text locale",
                         source.id
-                    )
-                })?;
-                let (prepared, mut report) = crate::fonts::prepare(&root, &bytes, recipe, chars)
-                    .with_context(|| format!("font {} ({local})", source.id))?;
-                report.source = local.clone();
-                report.license = forward_slashes(license_path.strip_prefix(&root)?);
-                report.license_digest = nir_content::digest(license.as_bytes());
-                font_notices.insert(source.id.clone(), license);
-                fonts.insert(source.id.clone(), report);
-                bytes = prepared;
-            }
-            let mut asset = Asset {
-                kind: source.kind,
-                object: nir_content::digest(&bytes),
-                bytes: bytes.len() as u64,
-                width: 0,
-                height: 0,
-                duration_us: Micros(0),
-                decoded_bytes: 0,
+                    );
+                }
+                let license_rel = forward_slashes(license_path.strip_prefix(&root)?);
+                Some((license, license_rel))
+            } else {
+                None
             };
-            match asset.kind {
-                AssetKind::Image => {
-                    let img = image::ImageReader::new(std::io::Cursor::new(&bytes))
-                        .with_guessed_format()?
-                        .into_dimensions()
-                        .context("E_IMAGE: dimensions")?;
-                    if img.0 > 8192 || img.1 > 8192 || img.0 == 0 || img.1 == 0 {
-                        bail!("E_LIMIT: image {} dimensions", source.id);
-                    }
-                    asset.width = img.0;
-                    asset.height = img.1;
-                    asset.decoded_bytes = img.0 as u64 * img.1 as u64 * 4;
-                    if source.expected_size.is_some_and(|s| s != [img.0, img.1]) {
-                        bail!("E_ASSET_SIZE: {} is {}x{}", source.id, img.0, img.1);
-                    }
-                    image::load_from_memory(&bytes).context("E_IMAGE: corrupt image")?;
-                }
-                AssetKind::Audio => {
-                    let (duration, decoded) = wav_info(&bytes)?;
-                    asset.duration_us = Micros(duration);
-                    asset.decoded_bytes = decoded;
-                }
-                AssetKind::Font => {
-                    ttf_parser::Face::parse(&bytes, 0)
-                        .map_err(|_| anyhow!("E_FONT: invalid font {}", source.id))?;
-                    asset.decoded_bytes = asset.bytes * 4;
-                }
-            }
-            if program.assets.insert(source.id.clone(), asset).is_some() {
-                bail!("E_DUPLICATE: asset {}", source.id);
-            }
-            provenance.insert(source.id.clone(), source.rights);
-            asset_optimize.insert(source.id.clone(), source.optimize.unwrap_or_default());
-            media.insert(source.id, bytes);
+            catalog_sources.push((source, source_path, local, license_info));
         }
+    }
+    struct PreparedAsset {
+        id: String,
+        rights: String,
+        optimize: crate::AssetPolicy,
+        asset: Asset,
+        bytes: Vec<u8>,
+        font: Option<(String, crate::FontReport)>,
+    }
+    let prepare_asset = |(source, source_path, local, license_info): &(
+        AssetSource,
+        PathBuf,
+        String,
+        Option<(String, String)>,
+    )|
+     -> Result<PreparedAsset> {
+        // Imported PCM is an offline intermediate. Allow the bounded
+        // 128 MiB payload plus WAV headers without increasing script,
+        // image, font or runtime admission limits.
+        let mut bytes = if source.kind == AssetKind::Audio {
+            read_limited(source_path, 128 * 1024 * 1024 + 64 * 1024)?
+        } else {
+            read(source_path)?
+        };
+        let mut font_out = None;
+        if let Some(recipe) = &source.font {
+            let (license, license_rel) = license_info.as_ref().unwrap();
+            let chars = &font_characters[&source.id];
+            let (prepared, mut report) = crate::fonts::prepare(&root, &bytes, recipe, chars)
+                .with_context(|| format!("font {} ({local})", source.id))?;
+            report.source = local.clone();
+            report.license = license_rel.clone();
+            report.license_digest = nir_content::digest(license.as_bytes());
+            font_out = Some((license.clone(), report));
+            bytes = prepared;
+        }
+        let mut asset = Asset {
+            kind: source.kind,
+            object: nir_content::digest(&bytes),
+            bytes: bytes.len() as u64,
+            width: 0,
+            height: 0,
+            duration_us: Micros(0),
+            decoded_bytes: 0,
+        };
+        match asset.kind {
+            AssetKind::Image => {
+                let img = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()?
+                    .into_dimensions()
+                    .context("E_IMAGE: dimensions")?;
+                if img.0 > 8192 || img.1 > 8192 || img.0 == 0 || img.1 == 0 {
+                    bail!("E_LIMIT: image {} dimensions", source.id);
+                }
+                asset.width = img.0;
+                asset.height = img.1;
+                asset.decoded_bytes = img.0 as u64 * img.1 as u64 * 4;
+                if source.expected_size.is_some_and(|s| s != [img.0, img.1]) {
+                    bail!("E_ASSET_SIZE: {} is {}x{}", source.id, img.0, img.1);
+                }
+                image::load_from_memory(&bytes).context("E_IMAGE: corrupt image")?;
+            }
+            AssetKind::Audio => {
+                let (duration, decoded) = wav_info(&bytes)?;
+                asset.duration_us = Micros(duration);
+                asset.decoded_bytes = decoded;
+            }
+            AssetKind::Font => {
+                ttf_parser::Face::parse(&bytes, 0)
+                    .map_err(|_| anyhow!("E_FONT: invalid font {}", source.id))?;
+                asset.decoded_bytes = asset.bytes * 4;
+            }
+        }
+        Ok(PreparedAsset {
+            id: source.id.clone(),
+            rights: source.rights.clone(),
+            optimize: source.optimize.unwrap_or_default(),
+            asset,
+            bytes,
+            font: font_out,
+        })
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8)
+        .min(catalog_sources.len().max(1));
+    let prepared: Vec<Result<PreparedAsset>> = if workers <= 1 || catalog_sources.len() <= 1 {
+        catalog_sources.iter().map(prepare_asset).collect()
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Option<Result<PreparedAsset>>>> = (0..catalog_sources
+            .len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= catalog_sources.len() {
+                        break;
+                    }
+                    let res = prepare_asset(&catalog_sources[idx]);
+                    *slots[idx].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("worker processed asset slot")
+            })
+            .collect()
+    };
+    for res in prepared {
+        let item = res?;
+        if let Some((license, report)) = item.font {
+            font_notices.insert(item.id.clone(), license);
+            fonts.insert(item.id.clone(), report);
+        }
+        if program.assets.insert(item.id.clone(), item.asset).is_some() {
+            bail!("E_DUPLICATE: asset {}", item.id);
+        }
+        provenance.insert(item.id.clone(), item.rights);
+        asset_optimize.insert(item.id.clone(), item.optimize);
+        media.insert(item.id, item.bytes);
     }
     if let Some(title) = &program.title_scene {
         if !program.scenes.contains_key(title) {
@@ -805,693 +930,7 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         plan.digest = LocaleFontPlan::digest_for(&plan.fonts, &asset_objects);
     }
     crate::fonts::coverage_by_plan(&program, &media, &character_sets)?;
-    // New optional semantics are advertised only when used; legacy capability
-    // inference remains unchanged until the full dependency analysis is introduced.
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(|m| !m.builtin_navigation)
-    {
-        program.requires.retain(|c| c != "ui.menu-chrome.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect.effect_tree_any(&|e| {
-                matches!(
-                    e,
-                    Effect::Audio {
-                        loop_region: Some(_),
-                        ..
-                    }
-                )
-            })
-        })
-        && !program.theme.image_menus.values().any(|menu| {
-            menu.effects
-                .as_ref()
-                .and_then(|e| e.music.as_ref())
-                .is_some_and(|music| music.loop_region.is_some())
-        })
-    {
-        program.requires.retain(|cap| cap != "audio.loop-region.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|e| matches!(e, Effect::Audio { gain, .. } if *gain != 1.0))
-        })
-    {
-        program.requires.retain(|cap| cap != "audio.gain.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|e| matches!(e, Effect::AudioStop { .. }))
-        })
-    {
-        program.requires.retain(|cap| cap != "audio.stop.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|e| matches!(e, Effect::Tween { .. }))
-        })
-    {
-        program.requires.retain(|cap| cap != "tween.target.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect.effect_tree_any(&|e| {
-                matches!(
-                    e,
-                    Effect::Tween {
-                        target: TweenTarget::AudioInstance { .. },
-                        ..
-                    }
-                )
-            })
-        })
-    {
-        program.requires.retain(|cap| cap != "audio.gain-tween.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| def.effect.uses_compose())
-    {
-        program.requires.retain(|cap| cap != "task.compose.v1");
-    }
-    if !program
-        .scenes
-        .values()
-        .flatten()
-        .any(|node| node.sprite_transform.is_some())
-        && !program
-            .sprite_timelines
-            .values()
-            .flat_map(|t| &t.tracks)
-            .flat_map(|t| &t.frames)
-            .any(|f| f.transform.is_some())
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.sprite-transform.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .any(|b| {
-            matches!(
-                b.terminator,
-                Terminator::Await {
-                    on_advance: Some(_),
-                    ..
-                }
-            )
-        })
-    {
-        program.requires.retain(|c| c != "control.advance-wait.v1");
-    }
-    if program.sprite_timelines.is_empty()
-        && !program
-            .scenes
-            .values()
-            .flatten()
-            .any(|n| n.timeline_binding.is_some())
-        && !program.cues.values().flat_map(|c| &c.effects).any(|d| {
-            d.effect
-                .effect_tree_any(&|e| matches!(e, Effect::SpriteTimeline { .. }))
-        })
-    {
-        program.requires.retain(|c| c != "stage.sprite-timeline.v1");
-    }
-    if !program
-        .scenes
-        .values()
-        .flatten()
-        .any(|node| node.inherit_existence)
-        && !program
-            .cues
-            .values()
-            .flat_map(|cue| &cue.effects)
-            .any(|def| {
-                def.effect.effect_tree_any(&|effect| {
-                    matches!(
-                        effect,
-                        Effect::SpriteTimeline {
-                            delete_on_finish: true,
-                            ..
-                        }
-                    )
-                })
-            })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.sprite-lifecycle.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .any(|b| {
-            matches!(
-                &b.terminator,
-                Terminator::Interact {
-                    result: Some(_),
-                    ..
-                } | Terminator::Interact {
-                    on_cancel: Some(_),
-                    ..
-                }
-            )
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "story.typed-result.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| matches!(op.operation, Operation::DialogueVoice { .. }))
-    {
-        program
-            .requires
-            .retain(|cap| cap != "text.voice-binding.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| {
-            matches!(
-                op.operation,
-                Operation::DialogueVoice {
-                    wait: nir_format::VoiceWaitPolicy::SampledRemaining,
-                    ..
-                }
-            )
-        })
-    {
-        program.requires.retain(|cap| cap != "text.voice-timer.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| {
-            matches!(
-                op.operation,
-                Operation::DialogueVisibility {
-                    transition: Some(_),
-                    ..
-                }
-            )
-        })
-        && !program
-            .cues
-            .values()
-            .flat_map(|cue| &cue.effects)
-            .any(|def| {
-                def.effect.effect_tree_any(&|effect| {
-                    matches!(effect, Effect::StagePresent {
-                dialogue_visible: Some(_), duration_us, .. } if duration_us.0 > 0)
-                })
-            })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "text.window-transition.v1");
-    }
-    if program.player.auto_delay_policy == nir_format::AutoDelayPolicy::LengthScaled {
-        program
-            .requires
-            .retain(|cap| cap != "player.auto-delay-policy.v1");
-    }
-    if program.player.hide_policy == HidePolicy::ContinueStory {
-        program
-            .requires
-            .retain(|cap| cap != "player.hide-policy.v1");
-    }
-    if program.theme.dialogue.shadow.is_none()
-        && program
-            .theme
-            .dialogue_styles
-            .values()
-            .all(|style| style.dialogue.shadow.is_none())
-    {
-        program.requires.retain(|cap| cap != "text.shadow.v1");
-    }
-    if !program
-        .locales
-        .values()
-        .flat_map(|texts| texts.values())
-        .flat_map(|text| &text.spans)
-        .any(|s| matches!(s, nir_format::Span::Pause { .. }))
-    {
-        program.requires.retain(|c| c != "text.pause.v1");
-    }
-    if !program
-        .locales
-        .values()
-        .flat_map(|texts| texts.values())
-        .flat_map(|text| &text.spans)
-        .any(|s| matches!(s, nir_format::Span::Ruby { .. }))
-    {
-        program.requires.retain(|c| c != "text.ruby.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| matches!(op.operation, Operation::ProfileRead { .. }))
-    {
-        program.requires.retain(|c| c != "story.profile-read.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| {
-            matches!(
-                op.operation,
-                Operation::ProfileValueRead { .. } | Operation::ProfileValueAssign { .. }
-            )
-        })
-    {
-        program.requires.retain(|c| c != "story.profile-value.v1");
-    }
-    if !program
-        .scenes
-        .values()
-        .flatten()
-        .any(|n| n.bitmap_text.is_some())
-    {
-        program.requires.retain(|c| c != "stage.bitmap-text.v1");
-    }
-    if !program
-        .scenes
-        .values()
-        .flatten()
-        .any(|n| !n.preserve_pose.is_empty())
-    {
-        program
-            .requires
-            .retain(|c| c != "stage.sprite-continuity.v1");
-    }
-    if !program.uses_float80() {
-        program.requires.retain(|c| c != "story.float80.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::DialogueShake { .. }))
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.dialogue-shake.v1");
-    }
-    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def|
-        def.effect.effect_tree_any(&|effect| matches!(effect, Effect::StagePresent { inherit_images, .. } if !inherit_images.is_empty()))) {
-        program.requires.retain(|cap| cap != "stage.inherit-image.v1");
-    }
-    if !program.cues.values().flat_map(|cue| &cue.effects).any(|def|
-        def.effect.effect_tree_any(&|effect| matches!(effect, Effect::StagePresent { inherit_image_geometry, .. } if !inherit_image_geometry.is_empty()))) {
-        program.requires.retain(|cap| cap != "stage.inherit-image-geometry.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::SpriteShake { .. }))
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.sprite-shake.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect.effect_tree_any(&|effect| {
-                matches!(
-                    effect,
-                    Effect::SpriteShake {
-                        mode: nir_format::SpriteShakeMode::Quake,
-                        ..
-                    }
-                )
-            })
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.sprite-quake.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::SourceMotion { .. }))
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.source-motion.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect.effect_tree_any(&|effect| {
-                matches!(
-                    effect,
-                    Effect::SourceMotion {
-                        property: nir_format::Property::Opacity,
-                        ..
-                    }
-                )
-            })
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "stage.source-opacity.v1");
-    }
-    if program.theme.dialogue_styles.is_empty() {
-        program.requires.retain(|cap| cap != "dialogue.style.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::DialogueDecoration { .. }))
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "dialogue.decoration.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::StoryModal { .. }))
-        })
-    {
-        program.requires.retain(|cap| cap != "ui.story-modal.v1");
-    }
-    if !program.texts.values().any(|t| !t.images.is_empty()) {
-        program.requires.retain(|c| c != "text.inline-image.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect.effect_tree_any(&|effect| {
-                matches!(
-                    effect,
-                    Effect::StagePresent {
-                        dialogue_visible: Some(_),
-                        ..
-                    }
-                )
-            })
-        })
-    {
-        program.requires.retain(|cap| cap != "stage.window-flip.v1");
-    }
-    if !program
-        .cues
-        .values()
-        .flat_map(|cue| &cue.effects)
-        .any(|def| {
-            def.effect
-                .effect_tree_any(&|effect| matches!(effect, Effect::SpriteWave { .. }))
-        })
-        && !program
-            .scenes
-            .values()
-            .flatten()
-            .any(|node| node.offset != [0.; 2])
-    {
-        program.requires.retain(|cap| cap != "stage.sprite-wave.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| matches!(op.operation, Operation::MenuAccess { .. }))
-    {
-        program.requires.retain(|c| c != "player.menu-access.v1");
-    }
-    if program.theme.image_menus.len() <= 64 {
-        program.requires.retain(|c| c != "ui.menu-pages.v1");
-    }
-    if !program
-        .choices
-        .values()
-        .flat_map(|c| &c.options)
-        .any(|o| o.image.is_some())
-    {
-        program.requires.retain(|c| c != "choice.image.v1");
-    }
-    if !program
-        .choices
-        .values()
-        .flat_map(|choice| &choice.options)
-        .any(|option| {
-            option
-                .image
-                .as_ref()
-                .is_some_and(|image| image.disabled_asset.is_some())
-        })
-    {
-        program
-            .requires
-            .retain(|cap| cap != "choice.disabled-image.v1");
-    }
-    if program.theme.dialogue.text_rect.is_none()
-        && program
-            .theme
-            .dialogue_styles
-            .values()
-            .all(|style| style.dialogue.text_rect.is_none())
-    {
-        program.requires.retain(|cap| cap != "text.rect.v1");
-    }
-    if !program
-        .functions
-        .values()
-        .flat_map(|f| f.blocks.values())
-        .flat_map(|b| &b.ops)
-        .any(|op| matches!(op.operation, Operation::AudioPause { .. }))
-    {
-        program.requires.retain(|cap| cap != "audio.pause.v1");
-    }
-    if !program.cues.values().flat_map(|c| &c.effects).any(
-        |d| matches!(&d.effect,Effect::StagePresent {transition,..} if transition.capability()==Some("stage.wipe.v1")),
-    ) {
-        program.requires.retain(|cap| cap != "stage.wipe.v1");
-    }
-    if !program.cues.values().flat_map(|c|&c.effects).any(|d|matches!(&d.effect,Effect::StagePresent {transition,..} if transition.asset().is_some())) {program.requires.retain(|cap|cap!="stage.mask.v1");}
-    if program
-        .theme
-        .image_menus
-        .values()
-        .all(|m| m.elements.is_empty())
-    {
-        program.requires.retain(|c| c != "ui.menu-elements.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_state)
-    {
-        program.requires.retain(|c| c != "ui.menu-state.v1");
-    }
-    if program.theme.menu_overlay.is_none()
-        && !program
-            .theme
-            .image_menus
-            .values()
-            .any(nir_format::ImageMenu::uses_services)
-    {
-        program.requires.retain(|c| c != "ui.menu-services.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_text_buttons)
-    {
-        program.requires.retain(|c| c != "ui.menu-text-button.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_stack)
-    {
-        program.requires.retain(|c| c != "ui.menu-stack.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_story)
-    {
-        program.requires.retain(|c| c != "ui.menu-story.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_reading)
-    {
-        program.requires.retain(|c| c != "ui.menu-reading.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_storage)
-    {
-        program.requires.retain(|c| c != "ui.menu-storage.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_history)
-    {
-        program.requires.retain(|c| c != "ui.menu-history.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_values)
-    {
-        program.requires.retain(|c| c != "ui.menu-values.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_navigation)
-    {
-        program.requires.retain(|c| c != "ui.menu-navigation.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_history_availability)
-    {
-        program
-            .requires
-            .retain(|c| c != "ui.menu-history-availability.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_history_voice)
-    {
-        program.requires.retain(|c| c != "ui.menu-history-voice.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_history_flow)
-    {
-        program.requires.retain(|c| c != "ui.menu-history-flow.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_effects)
-    {
-        program.requires.retain(|c| c != "ui.menu-effects.v1");
-    }
-    if !program.theme.image_menus.values().any(|m| {
-        m.effects
-            .iter()
-            .any(nir_format::MenuEffects::uses_transition)
-    }) {
-        program.requires.retain(|c| c != "ui.menu-transition.v1");
-    }
-    if !program.theme.image_menus.values().any(|m| {
-        m.effects
-            .iter()
-            .any(nir_format::MenuEffects::uses_element_tween)
-    }) {
-        program.requires.retain(|c| c != "ui.menu-element-tween.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_replay)
-    {
-        program.requires.retain(|c| c != "ui.replay.v1");
-    }
-    if !program
-        .theme
-        .image_menus
-        .values()
-        .any(nir_format::ImageMenu::uses_history_scrollbar)
-    {
-        program
-            .requires
-            .retain(|c| c != "ui.menu-history-scrollbar.v1");
-    }
+    program.requires = infer_program_capabilities(&program);
     // Revision depends on canonical source content, never local paths or iteration order.
     program.revision = nir_content::digest(&serde_json::to_vec(&program)?);
     ValidatedProgram::new(program.clone()).map_err(|d| sources.annotate(d))?;
@@ -1509,6 +948,311 @@ pub fn load_project(root: &Path) -> Result<LoadedProject> {
         font_notices,
         asset_optimize,
     })
+}
+
+/// Single-pass capability inference over the assembled `Program`, returning
+/// required capability names in canonical [`CAPABILITIES`] order.
+fn infer_program_capabilities(program: &Program) -> Vec<String> {
+    use nir_format::{Capability as Cap, CapabilitySet};
+
+    fn scan_effect(effect: &Effect, caps: &mut CapabilitySet, top_level: bool) {
+        match effect {
+            Effect::Audio {
+                gain, loop_region, ..
+            } => {
+                if *gain != 1.0 {
+                    caps.insert(Cap::AudioGain);
+                }
+                if loop_region.is_some() {
+                    caps.insert(Cap::AudioLoopRegion);
+                }
+            }
+            Effect::AudioStop { .. } => caps.insert(Cap::AudioStop),
+            Effect::Tween { target, .. } => {
+                caps.insert(Cap::TweenTarget);
+                if matches!(target, TweenTarget::AudioInstance { .. }) {
+                    caps.insert(Cap::AudioGainTween);
+                }
+            }
+            Effect::SpriteTimeline {
+                delete_on_finish, ..
+            } => {
+                caps.insert(Cap::StageSpriteTimeline);
+                if *delete_on_finish {
+                    caps.insert(Cap::StageSpriteLifecycle);
+                }
+            }
+            Effect::StagePresent {
+                dialogue_visible,
+                duration_us,
+                inherit_images,
+                inherit_image_geometry,
+                transition,
+                ..
+            } => {
+                if dialogue_visible.is_some() {
+                    caps.insert(Cap::StageWindowFlip);
+                    if duration_us.0 > 0 {
+                        caps.insert(Cap::TextWindowTransition);
+                    }
+                }
+                if !inherit_images.is_empty() {
+                    caps.insert(Cap::StageInheritImage);
+                }
+                if !inherit_image_geometry.is_empty() {
+                    caps.insert(Cap::StageInheritImageGeometry);
+                }
+                if top_level {
+                    if transition.capability() == Some("stage.wipe.v1") {
+                        caps.insert(Cap::StageWipe);
+                    }
+                    if transition.asset().is_some() {
+                        caps.insert(Cap::StageMask);
+                    }
+                }
+            }
+            Effect::DialogueShake { .. } => caps.insert(Cap::StageDialogueShake),
+            Effect::SpriteWave { .. } => caps.insert(Cap::StageSpriteWave),
+            Effect::SpriteShake { mode, .. } => {
+                caps.insert(Cap::StageSpriteShake);
+                if *mode == nir_format::SpriteShakeMode::Quake {
+                    caps.insert(Cap::StageSpriteQuake);
+                }
+            }
+            Effect::SourceMotion { property, .. } => {
+                caps.insert(Cap::StageSourceMotion);
+                if *property == nir_format::Property::Opacity {
+                    caps.insert(Cap::StageSourceOpacity);
+                }
+            }
+            Effect::DialogueDecoration { .. } => caps.insert(Cap::DialogueDecoration),
+            Effect::StoryModal { .. } => caps.insert(Cap::UiStoryModal),
+            Effect::Sequence { children } | Effect::ParallelAll { children } => {
+                caps.insert(Cap::TaskCompose);
+                for child in children {
+                    scan_effect(&child.effect, caps, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut caps = CapabilitySet::baseline();
+
+    for cue in program.cues.values() {
+        for def in &cue.effects {
+            scan_effect(&def.effect, &mut caps, true);
+        }
+    }
+
+    if !program.sprite_timelines.is_empty() {
+        caps.insert(Cap::StageSpriteTimeline);
+        if program
+            .sprite_timelines
+            .values()
+            .flat_map(|t| &t.tracks)
+            .flat_map(|t| &t.frames)
+            .any(|f| f.transform.is_some())
+        {
+            caps.insert(Cap::StageSpriteTransform);
+        }
+    }
+
+    for node in program.scenes.values().flatten() {
+        if node.sprite_transform.is_some() {
+            caps.insert(Cap::StageSpriteTransform);
+        }
+        if node.timeline_binding.is_some() {
+            caps.insert(Cap::StageSpriteTimeline);
+        }
+        if node.inherit_existence {
+            caps.insert(Cap::StageSpriteLifecycle);
+        }
+        if node.bitmap_text.is_some() {
+            caps.insert(Cap::StageBitmapText);
+        }
+        if !node.preserve_pose.is_empty() {
+            caps.insert(Cap::StageSpriteContinuity);
+        }
+        if node.offset != [0.; 2] {
+            caps.insert(Cap::StageSpriteWave);
+        }
+    }
+
+    for func in program.functions.values() {
+        for block in func.blocks.values() {
+            match &block.terminator {
+                Terminator::Await {
+                    on_advance: Some(_),
+                    ..
+                } => caps.insert(Cap::ControlAdvanceWait),
+                Terminator::Interact {
+                    result: Some(_), ..
+                }
+                | Terminator::Interact {
+                    on_cancel: Some(_), ..
+                } => caps.insert(Cap::StoryTypedResult),
+                _ => {}
+            }
+            for op in &block.ops {
+                match &op.operation {
+                    Operation::DialogueVoice { wait, .. } => {
+                        caps.insert(Cap::TextVoiceBinding);
+                        if *wait == nir_format::VoiceWaitPolicy::SampledRemaining {
+                            caps.insert(Cap::TextVoiceTimer);
+                        }
+                    }
+                    Operation::DialogueVisibility {
+                        transition: Some(_),
+                        ..
+                    } => caps.insert(Cap::TextWindowTransition),
+                    Operation::ProfileRead { .. } => caps.insert(Cap::StoryProfileRead),
+                    Operation::ProfileValueRead { .. } | Operation::ProfileValueAssign { .. } => {
+                        caps.insert(Cap::StoryProfileValue);
+                    }
+                    Operation::MenuAccess { .. } => caps.insert(Cap::PlayerMenuAccess),
+                    Operation::AudioPause { .. } => caps.insert(Cap::AudioPause),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for option in program.choices.values().flat_map(|c| &c.options) {
+        if let Some(image) = &option.image {
+            caps.insert(Cap::ChoiceImage);
+            if image.disabled_asset.is_some() {
+                caps.insert(Cap::ChoiceDisabledImage);
+            }
+        }
+    }
+
+    for span in program
+        .locales
+        .values()
+        .flat_map(|texts| texts.values())
+        .flat_map(|text| &text.spans)
+    {
+        match span {
+            nir_format::Span::Pause { .. } => caps.insert(Cap::TextPause),
+            nir_format::Span::Ruby { .. } => caps.insert(Cap::TextRuby),
+            _ => {}
+        }
+    }
+
+    if program.texts.values().any(|t| !t.images.is_empty()) {
+        caps.insert(Cap::TextInlineImage);
+    }
+    if program.uses_float80() {
+        caps.insert(Cap::StoryFloat80);
+    }
+    if program.player.auto_delay_policy != nir_format::AutoDelayPolicy::LengthScaled {
+        caps.insert(Cap::PlayerAutoDelayPolicy);
+    }
+    if program.player.hide_policy != HidePolicy::ContinueStory {
+        caps.insert(Cap::PlayerHidePolicy);
+    }
+    if program.theme.dialogue.shadow.is_some()
+        || program
+            .theme
+            .dialogue_styles
+            .values()
+            .any(|s| s.dialogue.shadow.is_some())
+    {
+        caps.insert(Cap::TextShadow);
+    }
+    if program.theme.dialogue.text_rect.is_some()
+        || program
+            .theme
+            .dialogue_styles
+            .values()
+            .any(|s| s.dialogue.text_rect.is_some())
+    {
+        caps.insert(Cap::TextRect);
+    }
+    if !program.theme.dialogue_styles.is_empty() {
+        caps.insert(Cap::DialogueStyle);
+    }
+    if program.theme.image_menus.len() > 64 {
+        caps.insert(Cap::UiMenuPages);
+    }
+    if program.theme.menu_overlay.is_some() {
+        caps.insert(Cap::UiMenuServices);
+    }
+
+    for menu in program.theme.image_menus.values() {
+        if !menu.builtin_navigation {
+            caps.insert(Cap::UiMenuChrome);
+        }
+        if !menu.elements.is_empty() {
+            caps.insert(Cap::UiMenuElements);
+        }
+        if menu.uses_state() {
+            caps.insert(Cap::UiMenuState);
+        }
+        if menu.uses_services() {
+            caps.insert(Cap::UiMenuServices);
+        }
+        if menu.uses_text_buttons() {
+            caps.insert(Cap::UiMenuTextButton);
+        }
+        if menu.uses_stack() {
+            caps.insert(Cap::UiMenuStack);
+        }
+        if menu.uses_story() {
+            caps.insert(Cap::UiMenuStory);
+        }
+        if menu.uses_reading() {
+            caps.insert(Cap::UiMenuReading);
+        }
+        if menu.uses_storage() {
+            caps.insert(Cap::UiMenuStorage);
+        }
+        if menu.uses_history() {
+            caps.insert(Cap::UiMenuHistory);
+        }
+        if menu.uses_values() {
+            caps.insert(Cap::UiMenuValues);
+        }
+        if menu.uses_navigation() {
+            caps.insert(Cap::UiMenuNavigation);
+        }
+        if menu.uses_history_availability() {
+            caps.insert(Cap::UiMenuHistoryAvailability);
+        }
+        if menu.uses_history_voice() {
+            caps.insert(Cap::UiMenuHistoryVoice);
+        }
+        if menu.uses_history_flow() {
+            caps.insert(Cap::UiMenuHistoryFlow);
+        }
+        if menu.uses_effects() {
+            caps.insert(Cap::UiMenuEffects);
+        }
+        if let Some(effects) = &menu.effects {
+            if effects
+                .music
+                .as_ref()
+                .is_some_and(|music| music.loop_region.is_some())
+            {
+                caps.insert(Cap::AudioLoopRegion);
+            }
+            if effects.uses_transition() {
+                caps.insert(Cap::UiMenuTransition);
+            }
+            if effects.uses_element_tween() {
+                caps.insert(Cap::UiMenuElementTween);
+            }
+        }
+        if menu.uses_replay() {
+            caps.insert(Cap::UiReplay);
+        }
+        if menu.uses_history_scrollbar() {
+            caps.insert(Cap::UiMenuHistoryScrollbar);
+        }
+    }
+
+    caps.to_vec()
 }
 fn wav_info(b: &[u8]) -> Result<(u64, u64)> {
     if b.len() < 44 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {

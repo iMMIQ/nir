@@ -224,7 +224,10 @@ impl ImageMenu {
             .chain(self.elements.iter().filter_map(MenuElement::control))
     }
     pub fn validate_elements(&self) -> Result<()> {
-        self.validate_state()?;
+        self.validate_elements_with_slots(DEFAULT_SAVE_SLOTS)
+    }
+    pub fn validate_elements_with_slots(&self, save_slots: u32) -> Result<()> {
+        self.validate_state(save_slots)?;
         if let Some(effects) = &self.effects {
             effects.validate()?;
             for tween in &effects.elements {
@@ -515,6 +518,456 @@ impl ImageMenu {
         }
         Ok(())
     }
+    pub fn uses_history_voice(&self) -> bool {
+        self.elements.iter().any(|e| {
+            matches!(
+                e.content,
+                MenuContent::HistoryFlow {
+                    voice_controls: true,
+                    ..
+                } | MenuContent::HistoryWindow {
+                    voice_controls: true,
+                    ..
+                }
+            )
+        })
+    }
+    pub fn uses_effects(&self) -> bool {
+        self.effects.is_some()
+    }
+    /// Menu media closure including effect sounds and page music.
+    pub fn effect_assets(&self) -> BTreeSet<String> {
+        self.effects
+            .iter()
+            .flat_map(|e| e.assets().into_iter().map(str::to_owned))
+            .collect()
+    }
+    pub fn uses_state(&self) -> bool {
+        !self.locals.is_empty()
+            || self.elements.iter().any(|e| {
+                !e.visible_when.is_empty() || !e.enabled_when.is_empty() || e.text_local.is_some()
+            })
+            || self
+                .controls()
+                .any(|(_, a, _)| matches!(a, ImageMenuAction::SetLocal { .. }))
+    }
+    pub fn initial_locals(&self) -> BTreeMap<String, MenuValue> {
+        self.locals
+            .iter()
+            .map(|(k, v)| (k.clone(), v.initial()))
+            .collect()
+    }
+    pub fn element_state(
+        &self,
+        id: &str,
+        locals: &BTreeMap<String, MenuValue>,
+        profile: &BTreeSet<String>,
+        reading: &BTreeSet<MenuReadingMode>,
+        story: &BTreeMap<String, MenuValue>,
+        history: bool,
+    ) -> (bool, bool) {
+        let mut visible = true;
+        let mut enabled = true;
+        let mut current = Some(id);
+        for _ in 0..8 {
+            let Some(id) = current else {
+                return (visible, enabled);
+            };
+            let Some(e) = self.elements.iter().find(|e| e.id == id) else {
+                return (false, false);
+            };
+            visible &= e
+                .visible_when
+                .iter()
+                .all(|c| c.matches(locals, profile, reading, story, history));
+            enabled &= e
+                .enabled_when
+                .iter()
+                .all(|c| c.matches(locals, profile, reading, story, history))
+                && e.control()
+                    .is_none_or(|(_, _, guard)| guard.is_none_or(|k| profile.contains(k)));
+            current = e.parent.as_deref();
+        }
+        if current.is_some() {
+            (false, false)
+        } else {
+            (visible, enabled)
+        }
+    }
+    pub fn uses_stack(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.content, MenuContent::Stack { .. }))
+    }
+    pub fn uses_text_buttons(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.content, MenuContent::TextButton { .. }))
+    }
+    /// Pure layout in parent coordinates. Declaration order and IDs remain
+    /// stable; only the position of visible stack rows changes.
+    pub fn element_positions(
+        &self,
+        locals: &BTreeMap<String, MenuValue>,
+        profile: &BTreeSet<String>,
+        reading: &BTreeSet<MenuReadingMode>,
+        story: &BTreeMap<String, MenuValue>,
+        history: bool,
+    ) -> BTreeMap<String, [f32; 2]> {
+        let mut positions: BTreeMap<_, _> = self
+            .elements
+            .iter()
+            .map(|e| (e.id.clone(), [e.rect[0], e.rect[1]]))
+            .collect();
+        for parent in &self.elements {
+            let MenuContent::Stack { gap } = parent.content else {
+                continue;
+            };
+            let mut y = 0.;
+            for child in self
+                .elements
+                .iter()
+                .filter(|e| e.parent.as_deref() == Some(&parent.id))
+            {
+                if self
+                    .element_state(&child.id, locals, profile, reading, story, history)
+                    .0
+                {
+                    positions.insert(child.id.clone(), [child.rect[0], y]);
+                    y += child.rect[3] * child.scale + gap;
+                }
+            }
+        }
+        positions
+    }
+    fn validate_state(&self, save_slots: u32) -> Result<()> {
+        let fail = || {
+            Diagnostic::new(
+                "E_VIEW_STATE",
+                "theme.image_menus",
+                "invalid local declaration, binding, or assignment",
+            )
+        };
+        let key = |s: &str| !s.is_empty() && s.len() <= 128;
+        if self.locals.len() > 32
+            || self.story_exports.len() > 32
+            || self
+                .story_exports
+                .iter()
+                .any(|(alias, variable)| !key(alias) || !key(variable))
+        {
+            return Err(fail());
+        }
+        for (name, local) in &self.locals {
+            if !key(name) || !local.accepts(&local.initial()) {
+                return Err(fail());
+            }
+            if let MenuLocal::Enum { values, .. } = local {
+                if values.is_empty()
+                    || values.len() > 32
+                    || values.iter().any(|v| v.is_empty() || v.len() > 256)
+                    || values.iter().collect::<BTreeSet<_>>().len() != values.len()
+                {
+                    return Err(fail());
+                }
+            }
+        }
+        for e in &self.elements {
+            if let Some(slot) = &e.text_slot {
+                if !slot.valid_in(&self.locals, save_slots)
+                    || e.text_preference.is_some()
+                    || e.text_local.is_some()
+                    || !matches!(e.content, MenuContent::Text { .. })
+                {
+                    return Err(fail());
+                }
+            }
+            if e.text_preference.is_some()
+                && (e.text_local.is_some() || !matches!(e.content, MenuContent::Text { .. }))
+            {
+                return Err(fail());
+            }
+            if e.visible_when.len() > 16 || e.enabled_when.len() > 16 {
+                return Err(fail());
+            }
+            for c in e.visible_when.iter().chain(&e.enabled_when) {
+                match c {
+                    MenuCondition::Story { name, equals }
+                        if !self.story_exports.contains_key(name)
+                            || matches!(equals, MenuValue::Text(_)) =>
+                    {
+                        return Err(fail())
+                    }
+                    MenuCondition::Local { name, equals }
+                        if self.locals.get(name).is_none_or(|l| !l.accepts(equals)) =>
+                    {
+                        return Err(fail())
+                    }
+                    MenuCondition::Profile { key: k, .. } if !key(k) => return Err(fail()),
+                    _ => {}
+                }
+            }
+            if let Some(local) = &e.text_local {
+                if !matches!(e.content, MenuContent::Text { .. })
+                    || !self.locals.contains_key(local)
+                {
+                    return Err(fail());
+                }
+            }
+        }
+        for (_, action, _) in self.controls() {
+            if let ImageMenuAction::PushMenu { menu } = action {
+                if menu.is_empty() || menu.len() > 128 {
+                    return Err(fail());
+                }
+            }
+            if let ImageMenuAction::HistoryPage { window, delta } = action {
+                if *delta == 0
+                    || delta.unsigned_abs() > 16
+                    || !self.elements.iter().any(|e| {
+                        e.id == *window && matches!(e.content, MenuContent::HistoryWindow { .. })
+                    })
+                {
+                    return Err(fail());
+                }
+            }
+            if let ImageMenuAction::SaveSlot { slot } | ImageMenuAction::LoadSlot { slot } = action
+            {
+                if !slot.valid_in(&self.locals, save_slots) {
+                    return Err(fail());
+                }
+            }
+            if let ImageMenuAction::AdjustPreference { delta, .. } = action {
+                if !delta.is_finite() || delta.abs() > 4. {
+                    return Err(fail());
+                }
+            }
+            if let ImageMenuAction::SetLocal { local, value } = action {
+                if self.locals.get(local).is_none_or(|l| !l.accepts(value)) {
+                    return Err(fail());
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn uses_services(&self) -> bool {
+        self.uses_navigation()
+            || self.uses_reading()
+            || self.uses_storage()
+            || self.uses_history()
+            || self.uses_history_flow()
+            || self.uses_history_availability()
+            || self.uses_values()
+            || self.elements.iter().any(|e| e.text_preference.is_some())
+            || self.controls().any(|(_, a, _)| {
+                matches!(
+                    a,
+                    ImageMenuAction::Close
+                        | ImageMenuAction::Reading { .. }
+                        | ImageMenuAction::AdjustPreference { .. }
+                        | ImageMenuAction::ToggleReducedMotion
+                )
+            })
+    }
+    pub fn uses_reading(&self) -> bool {
+        self.controls()
+            .any(|(_, a, _)| matches!(a, ImageMenuAction::Reading { .. }))
+            || self.elements.iter().any(|e| {
+                e.visible_when
+                    .iter()
+                    .chain(&e.enabled_when)
+                    .any(|c| matches!(c, MenuCondition::ReadingAvailable { .. }))
+            })
+    }
+    pub fn image_assets(&self) -> BTreeSet<String> {
+        std::iter::once(self.background.clone())
+            .chain(self.buttons.iter().flat_map(|b| {
+                std::iter::once(b.asset.clone())
+                    .chain(b.hover_asset.clone())
+                    .chain(b.locked_asset.clone())
+            }))
+            .chain(
+                self.elements
+                    .iter()
+                    .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
+            )
+            .chain(
+                self.effects
+                    .iter()
+                    .flat_map(|e| e.mask_assets().into_iter().map(str::to_owned)),
+            )
+            .collect()
+    }
+    /// Assets a page needs resident before it may present and play its page
+    /// effects: every image plus the effect sounds and looping music, so a
+    /// prepared page never addresses an undecoded buffer.
+    pub fn prepared_assets(&self) -> BTreeSet<String> {
+        let mut assets = self.image_assets();
+        assets.extend(self.effect_assets());
+        assets
+    }
+    pub fn uses_storage(&self) -> bool {
+        self.elements.iter().any(|e| e.text_slot.is_some())
+            || self.controls().any(|(_, a, _)| {
+                matches!(
+                    a,
+                    ImageMenuAction::SaveSlot { .. } | ImageMenuAction::LoadSlot { .. }
+                )
+            })
+    }
+    pub fn uses_history_scrollbar(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.content, MenuContent::HistoryScrollbar { .. }))
+    }
+    pub fn uses_history_availability(&self) -> bool {
+        self.elements.iter().any(|e| {
+            e.visible_when
+                .iter()
+                .chain(&e.enabled_when)
+                .any(|c| matches!(c, MenuCondition::HistoryAvailable { .. }))
+        })
+    }
+    pub fn uses_history_flow(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.content, MenuContent::HistoryFlow { .. }))
+    }
+    pub fn uses_history(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.content, MenuContent::HistoryWindow { .. }))
+            || self
+                .controls()
+                .any(|(_, a, _)| matches!(a, ImageMenuAction::HistoryPage { .. }))
+    }
+    pub fn history_page(
+        &self,
+        window: &str,
+        delta: i32,
+        locals: &BTreeMap<String, MenuValue>,
+        total: usize,
+    ) -> Option<(String, i32)> {
+        self.history_page_with_capacity(window, delta, locals, total, None)
+    }
+    pub fn history_page_with_capacity(
+        &self,
+        window: &str,
+        delta: i32,
+        locals: &BTreeMap<String, MenuValue>,
+        total: usize,
+        capacity: Option<usize>,
+    ) -> Option<(String, i32)> {
+        let element = self.elements.iter().find(|e| e.id == window)?;
+        let MenuContent::HistoryWindow {
+            offset_local,
+            limit,
+            voice_controls,
+            ..
+        } = &element.content
+        else {
+            return None;
+        };
+        let MenuLocal::Int { max, .. } = self.locals.get(offset_local)? else {
+            return None;
+        };
+        if *limit == 0 {
+            return None;
+        }
+        let MenuValue::Int(value) = locals.get(offset_local)? else {
+            return None;
+        };
+        let effective = if *voice_controls {
+            capacity
+                .unwrap_or(*limit as usize)
+                .clamp(1, *limit as usize)
+        } else {
+            *limit as usize
+        };
+        // Whole-page commands use the visible capacity; explicit single
+        // record steps retain the author's delta.
+        let delta = if *voice_controls && delta % *limit as i32 == 0 {
+            delta as i64 / *limit as i64 * effective as i64
+        } else {
+            delta as i64
+        };
+        let end = total.saturating_sub(effective).min(*max as usize) as i64;
+        let current = (*value as i64).clamp(0, end);
+        let next = (current + delta).clamp(0, end);
+        (next != current).then(|| (offset_local.clone(), next as i32))
+    }
+    pub fn uses_values(&self) -> bool {
+        self.elements.iter().any(|e| {
+            matches!(
+                e.content,
+                MenuContent::Range { .. } | MenuContent::Toggle { .. }
+            )
+        })
+    }
+    pub fn uses_story(&self) -> bool {
+        !self.story_exports.is_empty()
+            || self.elements.iter().any(|e| {
+                e.visible_when
+                    .iter()
+                    .chain(&e.enabled_when)
+                    .any(|c| matches!(c, MenuCondition::Story { .. }))
+            })
+    }
+    /// Project only explicitly exported bool/i32 values. Missing values fail closed.
+    pub fn story_values(&self, variables: &BTreeMap<String, Value>) -> BTreeMap<String, MenuValue> {
+        self.story_exports
+            .iter()
+            .filter_map(|(alias, variable)| {
+                let value = match variables.get(variable)? {
+                    Value::Bool(v) => MenuValue::Bool(*v),
+                    Value::I32(v) => MenuValue::Int(*v),
+                    Value::String(_) | Value::F80(_) => return None,
+                };
+                Some((alias.clone(), value))
+            })
+            .collect()
+    }
+    pub fn validate_story_exports(&self, variables: &BTreeMap<String, Value>) -> Result<()> {
+        let fail = || {
+            Diagnostic::new(
+                "E_VIEW_STORY",
+                "theme.image_menus.story_exports",
+                "expected declared bool/i32 variables and same-typed comparisons",
+            )
+        };
+        let values = self.story_values(variables);
+        if values.len() != self.story_exports.len() {
+            return Err(fail());
+        }
+        for condition in self
+            .elements
+            .iter()
+            .flat_map(|e| e.visible_when.iter().chain(&e.enabled_when))
+        {
+            if let MenuCondition::Story { name, equals } = condition {
+                if !matches!(
+                    (values.get(name), equals),
+                    (Some(MenuValue::Bool(_)), MenuValue::Bool(_))
+                        | (Some(MenuValue::Int(_)), MenuValue::Int(_))
+                ) {
+                    return Err(fail());
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn uses_navigation(&self) -> bool {
+        self.controls()
+            .any(|(_, a, _)| matches!(a, ImageMenuAction::PushMenu { .. } | ImageMenuAction::Back))
+    }
+    pub fn uses_replay(&self) -> bool {
+        self.controls().any(|(_, a, _)| {
+            matches!(
+                a,
+                ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay
+            )
+        })
+    }
 }
 
 /// Finite page presentation effects. Sounds and music run in the foreground
@@ -669,8 +1122,6 @@ impl MenuEffects {
         }
         Ok(())
     }
-}
-impl MenuEffects {
     /// Transition mask assets. They are page images, not effect audio, so
     /// they join the image closure and its Image-kind validation.
     pub fn mask_assets(&self) -> Vec<&str> {
@@ -692,32 +1143,6 @@ impl MenuEffects {
     /// machinery. The effects capability alone does not admit one.
     pub fn uses_element_tween(&self) -> bool {
         !self.elements.is_empty()
-    }
-}
-impl ImageMenu {
-    pub fn uses_history_voice(&self) -> bool {
-        self.elements.iter().any(|e| {
-            matches!(
-                e.content,
-                MenuContent::HistoryFlow {
-                    voice_controls: true,
-                    ..
-                } | MenuContent::HistoryWindow {
-                    voice_controls: true,
-                    ..
-                }
-            )
-        })
-    }
-    pub fn uses_effects(&self) -> bool {
-        self.effects.is_some()
-    }
-    /// Menu media closure including effect sounds and page music.
-    pub fn effect_assets(&self) -> BTreeSet<String> {
-        self.effects
-            .iter()
-            .flat_map(|e| e.assets().into_iter().map(str::to_owned))
-            .collect()
     }
 }
 /// UI-local data never aliases VM variables or snapshot slots.
@@ -814,216 +1239,6 @@ impl MenuCondition {
         }
     }
 }
-impl ImageMenu {
-    pub fn uses_state(&self) -> bool {
-        !self.locals.is_empty()
-            || self.elements.iter().any(|e| {
-                !e.visible_when.is_empty() || !e.enabled_when.is_empty() || e.text_local.is_some()
-            })
-            || self
-                .controls()
-                .any(|(_, a, _)| matches!(a, ImageMenuAction::SetLocal { .. }))
-    }
-    pub fn initial_locals(&self) -> BTreeMap<String, MenuValue> {
-        self.locals
-            .iter()
-            .map(|(k, v)| (k.clone(), v.initial()))
-            .collect()
-    }
-    pub fn element_state(
-        &self,
-        id: &str,
-        locals: &BTreeMap<String, MenuValue>,
-        profile: &BTreeSet<String>,
-        reading: &BTreeSet<MenuReadingMode>,
-        story: &BTreeMap<String, MenuValue>,
-        history: bool,
-    ) -> (bool, bool) {
-        let mut visible = true;
-        let mut enabled = true;
-        let mut current = Some(id);
-        for _ in 0..8 {
-            let Some(id) = current else {
-                return (visible, enabled);
-            };
-            let Some(e) = self.elements.iter().find(|e| e.id == id) else {
-                return (false, false);
-            };
-            visible &= e
-                .visible_when
-                .iter()
-                .all(|c| c.matches(locals, profile, reading, story, history));
-            enabled &= e
-                .enabled_when
-                .iter()
-                .all(|c| c.matches(locals, profile, reading, story, history))
-                && e.control()
-                    .is_none_or(|(_, _, guard)| guard.is_none_or(|k| profile.contains(k)));
-            current = e.parent.as_deref();
-        }
-        if current.is_some() {
-            (false, false)
-        } else {
-            (visible, enabled)
-        }
-    }
-    pub fn uses_stack(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.content, MenuContent::Stack { .. }))
-    }
-    pub fn uses_text_buttons(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.content, MenuContent::TextButton { .. }))
-    }
-    /// Pure layout in parent coordinates. Declaration order and IDs remain
-    /// stable; only the position of visible stack rows changes.
-    pub fn element_positions(
-        &self,
-        locals: &BTreeMap<String, MenuValue>,
-        profile: &BTreeSet<String>,
-        reading: &BTreeSet<MenuReadingMode>,
-        story: &BTreeMap<String, MenuValue>,
-        history: bool,
-    ) -> BTreeMap<String, [f32; 2]> {
-        let mut positions: BTreeMap<_, _> = self
-            .elements
-            .iter()
-            .map(|e| (e.id.clone(), [e.rect[0], e.rect[1]]))
-            .collect();
-        for parent in &self.elements {
-            let MenuContent::Stack { gap } = parent.content else {
-                continue;
-            };
-            let mut y = 0.;
-            for child in self
-                .elements
-                .iter()
-                .filter(|e| e.parent.as_deref() == Some(&parent.id))
-            {
-                if self
-                    .element_state(&child.id, locals, profile, reading, story, history)
-                    .0
-                {
-                    positions.insert(child.id.clone(), [child.rect[0], y]);
-                    y += child.rect[3] * child.scale + gap;
-                }
-            }
-        }
-        positions
-    }
-    fn validate_state(&self) -> Result<()> {
-        let fail = || {
-            Diagnostic::new(
-                "E_VIEW_STATE",
-                "theme.image_menus",
-                "invalid local declaration, binding, or assignment",
-            )
-        };
-        let key = |s: &str| !s.is_empty() && s.len() <= 128;
-        if self.locals.len() > 32
-            || self.story_exports.len() > 32
-            || self
-                .story_exports
-                .iter()
-                .any(|(alias, variable)| !key(alias) || !key(variable))
-        {
-            return Err(fail());
-        }
-        for (name, local) in &self.locals {
-            if !key(name) || !local.accepts(&local.initial()) {
-                return Err(fail());
-            }
-            if let MenuLocal::Enum { values, .. } = local {
-                if values.is_empty()
-                    || values.len() > 32
-                    || values.iter().any(|v| v.is_empty() || v.len() > 256)
-                    || values.iter().collect::<BTreeSet<_>>().len() != values.len()
-                {
-                    return Err(fail());
-                }
-            }
-        }
-        for e in &self.elements {
-            if let Some(slot) = &e.text_slot {
-                if !slot.valid(&self.locals)
-                    || e.text_preference.is_some()
-                    || e.text_local.is_some()
-                    || !matches!(e.content, MenuContent::Text { .. })
-                {
-                    return Err(fail());
-                }
-            }
-            if e.text_preference.is_some()
-                && (e.text_local.is_some() || !matches!(e.content, MenuContent::Text { .. }))
-            {
-                return Err(fail());
-            }
-            if e.visible_when.len() > 16 || e.enabled_when.len() > 16 {
-                return Err(fail());
-            }
-            for c in e.visible_when.iter().chain(&e.enabled_when) {
-                match c {
-                    MenuCondition::Story { name, equals }
-                        if !self.story_exports.contains_key(name)
-                            || matches!(equals, MenuValue::Text(_)) =>
-                    {
-                        return Err(fail())
-                    }
-                    MenuCondition::Local { name, equals }
-                        if self.locals.get(name).is_none_or(|l| !l.accepts(equals)) =>
-                    {
-                        return Err(fail())
-                    }
-                    MenuCondition::Profile { key: k, .. } if !key(k) => return Err(fail()),
-                    _ => {}
-                }
-            }
-            if let Some(local) = &e.text_local {
-                if !matches!(e.content, MenuContent::Text { .. })
-                    || !self.locals.contains_key(local)
-                {
-                    return Err(fail());
-                }
-            }
-        }
-        for (_, action, _) in self.controls() {
-            if let ImageMenuAction::PushMenu { menu } = action {
-                if menu.is_empty() || menu.len() > 128 {
-                    return Err(fail());
-                }
-            }
-            if let ImageMenuAction::HistoryPage { window, delta } = action {
-                if *delta == 0
-                    || delta.unsigned_abs() > 16
-                    || !self.elements.iter().any(|e| {
-                        e.id == *window && matches!(e.content, MenuContent::HistoryWindow { .. })
-                    })
-                {
-                    return Err(fail());
-                }
-            }
-            if let ImageMenuAction::SaveSlot { slot } | ImageMenuAction::LoadSlot { slot } = action
-            {
-                if !slot.valid(&self.locals) {
-                    return Err(fail());
-                }
-            }
-            if let ImageMenuAction::AdjustPreference { delta, .. } = action {
-                if !delta.is_finite() || delta.abs() > 4. {
-                    return Err(fail());
-                }
-            }
-            if let ImageMenuAction::SetLocal { local, value } = action {
-                if self.locals.get(local).is_none_or(|l| !l.accepts(value)) {
-                    return Err(fail());
-                }
-            }
-        }
-        Ok(())
-    }
-}
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1066,66 +1281,12 @@ impl MenuPreference {
             Self::AutoWaitScale => UiAction::AutoWait { delta },
         }
     }
-}
-impl ImageMenu {
-    pub fn uses_services(&self) -> bool {
-        self.uses_navigation()
-            || self.uses_reading()
-            || self.uses_storage()
-            || self.uses_history()
-            || self.uses_history_flow()
-            || self.uses_history_availability()
-            || self.uses_values()
-            || self.elements.iter().any(|e| e.text_preference.is_some())
-            || self.controls().any(|(_, a, _)| {
-                matches!(
-                    a,
-                    ImageMenuAction::Close
-                        | ImageMenuAction::Reading { .. }
-                        | ImageMenuAction::AdjustPreference { .. }
-                        | ImageMenuAction::ToggleReducedMotion
-                )
-            })
-    }
-}
-
-impl ImageMenu {
-    pub fn uses_reading(&self) -> bool {
-        self.controls()
-            .any(|(_, a, _)| matches!(a, ImageMenuAction::Reading { .. }))
-            || self.elements.iter().any(|e| {
-                e.visible_when
-                    .iter()
-                    .chain(&e.enabled_when)
-                    .any(|c| matches!(c, MenuCondition::ReadingAvailable { .. }))
-            })
-    }
-    pub fn image_assets(&self) -> BTreeSet<String> {
-        std::iter::once(self.background.clone())
-            .chain(self.buttons.iter().flat_map(|b| {
-                std::iter::once(b.asset.clone())
-                    .chain(b.hover_asset.clone())
-                    .chain(b.locked_asset.clone())
-            }))
-            .chain(
-                self.elements
-                    .iter()
-                    .flat_map(|e| e.assets().into_iter().map(str::to_owned)),
-            )
-            .chain(
-                self.effects
-                    .iter()
-                    .flat_map(|e| e.mask_assets().into_iter().map(str::to_owned)),
-            )
-            .collect()
-    }
-    /// Assets a page needs resident before it may present and play its page
-    /// effects: every image plus the effect sounds and looping music, so a
-    /// prepared page never addresses an undecoded buffer.
-    pub fn prepared_assets(&self) -> BTreeSet<String> {
-        let mut assets = self.image_assets();
-        assets.extend(self.effect_assets());
-        assets
+    pub fn limits(self) -> (f32, f32) {
+        match self {
+            Self::BgmVolume | Self::VoiceVolume | Self::SfxVolume => (0., 1.),
+            Self::FontScale => (0.8, 1.5),
+            Self::TextSpeed | Self::AutoWaitScale => (0.25, 4.),
+        }
     }
 }
 
@@ -1139,119 +1300,28 @@ pub enum MenuSlot {
 }
 impl MenuSlot {
     pub fn resolve(&self, locals: &BTreeMap<String, MenuValue>) -> Option<u32> {
+        self.resolve_in(locals, DEFAULT_SAVE_SLOTS)
+    }
+    pub fn resolve_in(&self, locals: &BTreeMap<String, MenuValue>, save_slots: u32) -> Option<u32> {
+        let limit = save_slots.clamp(1, MAX_SAVE_SLOTS);
         match self {
-            Self::Fixed { slot } => (*slot < 3).then_some(*slot),
+            Self::Fixed { slot } => (*slot < limit).then_some(*slot),
             Self::Local { name } => match locals.get(name) {
-                Some(MenuValue::Int(value)) if (0..3).contains(value) => Some(*value as u32),
+                Some(MenuValue::Int(value)) if *value >= 0 && (*value as u32) < limit => {
+                    Some(*value as u32)
+                }
                 _ => None,
             },
         }
     }
-    fn valid(&self, locals: &BTreeMap<String, MenuLocal>) -> bool {
+    fn valid_in(&self, locals: &BTreeMap<String, MenuLocal>, save_slots: u32) -> bool {
+        let limit = save_slots.clamp(1, MAX_SAVE_SLOTS) as i32;
         match self {
-            Self::Fixed { slot } => *slot < 3,
+            Self::Fixed { slot } => *slot < limit as u32,
             Self::Local { name } => {
-                matches!(locals.get(name), Some(MenuLocal::Int {min,max,..}) if *min >= 0 && *max < 3)
+                matches!(locals.get(name), Some(MenuLocal::Int {min,max,..}) if *min >= 0 && *max < limit)
             }
         }
-    }
-}
-impl ImageMenu {
-    pub fn uses_storage(&self) -> bool {
-        self.elements.iter().any(|e| e.text_slot.is_some())
-            || self.controls().any(|(_, a, _)| {
-                matches!(
-                    a,
-                    ImageMenuAction::SaveSlot { .. } | ImageMenuAction::LoadSlot { .. }
-                )
-            })
-    }
-}
-
-impl ImageMenu {
-    pub fn uses_history_scrollbar(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.content, MenuContent::HistoryScrollbar { .. }))
-    }
-    pub fn uses_history_availability(&self) -> bool {
-        self.elements.iter().any(|e| {
-            e.visible_when
-                .iter()
-                .chain(&e.enabled_when)
-                .any(|c| matches!(c, MenuCondition::HistoryAvailable { .. }))
-        })
-    }
-    pub fn uses_history_flow(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.content, MenuContent::HistoryFlow { .. }))
-    }
-    pub fn uses_history(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.content, MenuContent::HistoryWindow { .. }))
-            || self
-                .controls()
-                .any(|(_, a, _)| matches!(a, ImageMenuAction::HistoryPage { .. }))
-    }
-}
-
-impl ImageMenu {
-    pub fn history_page(
-        &self,
-        window: &str,
-        delta: i32,
-        locals: &BTreeMap<String, MenuValue>,
-        total: usize,
-    ) -> Option<(String, i32)> {
-        self.history_page_with_capacity(window, delta, locals, total, None)
-    }
-    pub fn history_page_with_capacity(
-        &self,
-        window: &str,
-        delta: i32,
-        locals: &BTreeMap<String, MenuValue>,
-        total: usize,
-        capacity: Option<usize>,
-    ) -> Option<(String, i32)> {
-        let element = self.elements.iter().find(|e| e.id == window)?;
-        let MenuContent::HistoryWindow {
-            offset_local,
-            limit,
-            voice_controls,
-            ..
-        } = &element.content
-        else {
-            return None;
-        };
-        let MenuLocal::Int { max, .. } = self.locals.get(offset_local)? else {
-            return None;
-        };
-        if *limit == 0 {
-            return None;
-        }
-        let MenuValue::Int(value) = locals.get(offset_local)? else {
-            return None;
-        };
-        let effective = if *voice_controls {
-            capacity
-                .unwrap_or(*limit as usize)
-                .clamp(1, *limit as usize)
-        } else {
-            *limit as usize
-        };
-        // Whole-page commands use the visible capacity; explicit single
-        // record steps retain the author's delta.
-        let delta = if *voice_controls && delta % *limit as i32 == 0 {
-            delta as i64 / *limit as i64 * effective as i64
-        } else {
-            delta as i64
-        };
-        let end = total.saturating_sub(effective).min(*max as usize) as i64;
-        let current = (*value as i64).clamp(0, end);
-        let next = (current + delta).clamp(0, end);
-        (next != current).then(|| (offset_local.clone(), next as i32))
     }
 }
 
@@ -1321,95 +1391,6 @@ impl MenuRangeBinding {
                 _ => None,
             },
         }
-    }
-}
-impl MenuPreference {
-    pub fn limits(self) -> (f32, f32) {
-        match self {
-            Self::BgmVolume | Self::VoiceVolume | Self::SfxVolume => (0., 1.),
-            Self::FontScale => (0.8, 1.5),
-            Self::TextSpeed | Self::AutoWaitScale => (0.25, 4.),
-        }
-    }
-}
-impl ImageMenu {
-    pub fn uses_values(&self) -> bool {
-        self.elements.iter().any(|e| {
-            matches!(
-                e.content,
-                MenuContent::Range { .. } | MenuContent::Toggle { .. }
-            )
-        })
-    }
-}
-
-impl ImageMenu {
-    pub fn uses_story(&self) -> bool {
-        !self.story_exports.is_empty()
-            || self.elements.iter().any(|e| {
-                e.visible_when
-                    .iter()
-                    .chain(&e.enabled_when)
-                    .any(|c| matches!(c, MenuCondition::Story { .. }))
-            })
-    }
-    /// Project only explicitly exported bool/i32 values. Missing values fail closed.
-    pub fn story_values(&self, variables: &BTreeMap<String, Value>) -> BTreeMap<String, MenuValue> {
-        self.story_exports
-            .iter()
-            .filter_map(|(alias, variable)| {
-                let value = match variables.get(variable)? {
-                    Value::Bool(v) => MenuValue::Bool(*v),
-                    Value::I32(v) => MenuValue::Int(*v),
-                    Value::String(_) | Value::F80(_) => return None,
-                };
-                Some((alias.clone(), value))
-            })
-            .collect()
-    }
-    pub fn validate_story_exports(&self, variables: &BTreeMap<String, Value>) -> Result<()> {
-        let fail = || {
-            Diagnostic::new(
-                "E_VIEW_STORY",
-                "theme.image_menus.story_exports",
-                "expected declared bool/i32 variables and same-typed comparisons",
-            )
-        };
-        let values = self.story_values(variables);
-        if values.len() != self.story_exports.len() {
-            return Err(fail());
-        }
-        for condition in self
-            .elements
-            .iter()
-            .flat_map(|e| e.visible_when.iter().chain(&e.enabled_when))
-        {
-            if let MenuCondition::Story { name, equals } = condition {
-                if !matches!(
-                    (values.get(name), equals),
-                    (Some(MenuValue::Bool(_)), MenuValue::Bool(_))
-                        | (Some(MenuValue::Int(_)), MenuValue::Int(_))
-                ) {
-                    return Err(fail());
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ImageMenu {
-    pub fn uses_navigation(&self) -> bool {
-        self.controls()
-            .any(|(_, a, _)| matches!(a, ImageMenuAction::PushMenu { .. } | ImageMenuAction::Back))
-    }
-    pub fn uses_replay(&self) -> bool {
-        self.controls().any(|(_, a, _)| {
-            matches!(
-                a,
-                ImageMenuAction::Replay { .. } | ImageMenuAction::ExitReplay
-            )
-        })
     }
 }
 

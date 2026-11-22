@@ -19,6 +19,7 @@ pub use wgpu;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendererBackend {
     Dx12,
+    Metal,
     Vulkan,
     WebGpu,
     WebGl2,
@@ -28,6 +29,7 @@ impl RendererBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Dx12 => "dx12",
+            Self::Metal => "metal",
             Self::Vulkan => "vulkan",
             Self::WebGpu => "webgpu",
             Self::WebGl2 => "webgl2",
@@ -121,6 +123,7 @@ struct Vertex {
     color: [f32; 4],
 }
 struct Texture {
+    view: wgpu::TextureView,
     bind: wgpu::BindGroup,
     _texture: wgpu::Texture,
 }
@@ -148,6 +151,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     mix_pipeline: wgpu::RenderPipeline,
     scratch: Option<(Texture, Texture, u32, u32)>,
+    scratch_sig: Option<u64>,
+    texture_gen: u64,
     /// Offscreen surface-sized root for the diverted message window; text
     /// alignment pins it to the swapchain extent, not the stage size.
     window_root: Option<(Texture, u32, u32)>,
@@ -156,17 +161,21 @@ pub struct Renderer {
     menu_roots: Option<(Texture, Texture, u32, u32)>,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    textures: BTreeMap<String, Texture>,
+    textures: std::collections::HashMap<String, Texture>,
     uploads: BTreeMap<String, ImageUpload>,
     pub upload_steps: u64,
     vertices: wgpu::Buffer,
+    scratch_verts: Vec<Vertex>,
     capacity: usize,
     pub text: TextEngine,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     menu_text_renderers: Vec<(usize, TextRenderer)>,
-    window_text_renderers: Vec<(usize, TextRenderer)>,
-    page_text_renderers: Vec<(usize, TextRenderer)>,
+    menu_text_active: usize,
+    window_text_renderer: TextRenderer,
+    window_text_active: bool,
+    page_text_renderer: TextRenderer,
+    page_text_active: bool,
     viewport: Viewport,
     swash: SwashCache,
     pub submitted: u64,
@@ -176,6 +185,35 @@ pub struct Renderer {
     errors: Arc<Mutex<Vec<String>>>,
     profile: ProfileCollector,
 }
+fn transition_layers_signature(
+    a: &[nir_presentation::Quad],
+    b: &[nir_presentation::Quad],
+    stage_size: [u32; 2],
+    texture_gen: u64,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    stage_size.hash(&mut h);
+    texture_gen.hash(&mut h);
+    for slice in [a, b] {
+        slice.len().hash(&mut h);
+        for q in slice {
+            q.asset.hash(&mut h);
+            for v in q.rect {
+                v.to_bits().hash(&mut h);
+            }
+            for v in q.color {
+                v.to_bits().hash(&mut h);
+            }
+            q.corners
+                .map(|c| c.map(|pt| [pt[0].to_bits(), pt[1].to_bits()]))
+                .hash(&mut h);
+            q.clip.map(|c| c.map(f32::to_bits)).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::new("E_RENDER", "wgpu", message).classified(
         ErrorDomain::Render,
@@ -193,8 +231,16 @@ fn select_surface_format(
     Vec<wgpu::TextureFormat>,
 )> {
     match backend {
-        RendererBackend::WebGpu | RendererBackend::Dx12 | RendererBackend::Vulkan => {
-            let surface_format = *formats.first().ok_or_else(|| error("no surface format"))?;
+        RendererBackend::WebGpu
+        | RendererBackend::Dx12
+        | RendererBackend::Metal
+        | RendererBackend::Vulkan => {
+            let surface_format = formats
+                .iter()
+                .copied()
+                .find(|f| f.is_srgb() || f.add_srgb_suffix().is_srgb())
+                .or_else(|| formats.first().copied())
+                .ok_or_else(|| error("no surface format"))?;
             let format = surface_format.add_srgb_suffix();
             let views = if format == surface_format {
                 Vec::new()
@@ -306,7 +352,14 @@ pub fn decode_image(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         .with_guessed_format()
         .map_err(|e| error(e.to_string()))?;
     let (width, height) = reader.into_dimensions().map_err(|e| error(e.to_string()))?;
-    let mut pixels = image::load_from_memory(bytes)
+    if !image_dimensions_allowed(width, height, 8192) {
+        return Err(error("image dimensions exceed limit"));
+    }
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| error(e.to_string()))?;
+    let mut pixels = reader
+        .decode()
         .map_err(|e| error(e.to_string()))?
         .to_rgba8()
         .into_raw();
@@ -339,9 +392,10 @@ impl Renderer {
                 label: Some("NIR renderer"),
                 required_features: wgpu::Features::empty(),
                 required_limits: match backend {
-                    RendererBackend::WebGpu | RendererBackend::Dx12 | RendererBackend::Vulkan => {
-                        wgpu::Limits::downlevel_defaults()
-                    }
+                    RendererBackend::WebGpu
+                    | RendererBackend::Dx12
+                    | RendererBackend::Metal
+                    | RendererBackend::Vulkan => wgpu::Limits::downlevel_defaults(),
                     RendererBackend::WebGl2 => wgpu::Limits::downlevel_webgl2_defaults(),
                 }
                 .using_resolution(adapter.limits()),
@@ -357,10 +411,22 @@ impl Renderer {
         });
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
-        device.on_uncaptured_error(Box::new(move |e| sink.lock().unwrap().push(e.to_string())));
+        device.on_uncaptured_error(Box::new(move |e| {
+            sink.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(e.to_string());
+        }));
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let caps = surface.get_capabilities(&adapter);
         let (surface_format, format, view_formats) = select_surface_format(&caps.formats, backend)?;
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        };
         let max_dimension = device.limits().max_texture_dimension_2d;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -368,7 +434,7 @@ impl Renderer {
             width: width.clamp(1, max_dimension),
             height: height.clamp(1, max_dimension),
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats,
             desired_maximum_frame_latency: 2,
         };
@@ -484,6 +550,10 @@ impl Renderer {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let window_text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let page_text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let mut r = Self {
             _instance: instance.clone(),
             device,
@@ -494,21 +564,27 @@ impl Renderer {
             pipeline,
             mix_pipeline,
             scratch: None,
+            scratch_sig: None,
+            texture_gen: 0,
             window_root: None,
             menu_roots: None,
             layout,
             sampler,
-            textures: BTreeMap::new(),
+            textures: std::collections::HashMap::new(),
             uploads: BTreeMap::new(),
             upload_steps: 0,
             vertices,
+            scratch_verts: Vec::with_capacity(256),
             capacity,
             text: TextEngine::default(),
             atlas,
             text_renderer,
             menu_text_renderers: vec![],
-            window_text_renderers: vec![],
-            page_text_renderers: vec![],
+            menu_text_active: 0,
+            window_text_renderer,
+            window_text_active: false,
+            page_text_renderer,
+            page_text_active: false,
             viewport,
             swash: SwashCache::new(),
             submitted: 0,
@@ -528,7 +604,11 @@ impl Renderer {
         Ok(r)
     }
     pub fn validation_error(&self) -> Option<String> {
-        self.errors.lock().unwrap().first().cloned()
+        self.errors
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .first()
+            .cloned()
     }
     /// Enables CPU stage timing with a caller supplied monotonic microsecond clock.
     /// Passing `None` disables timing and clears any pending samples.
@@ -551,6 +631,13 @@ impl Renderer {
     pub fn destroy(&self) {
         self.device.destroy();
     }
+}
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.device.destroy();
+    }
+}
+impl Renderer {
     pub fn surface_extent(&self) -> [u32; 2] {
         [self.config.width, self.config.height]
     }
@@ -673,6 +760,7 @@ impl Renderer {
         if complete {
             self.textures
                 .insert(id.into(), self.uploads.remove(id).unwrap().texture);
+            self.texture_gen = self.texture_gen.wrapping_add(1);
         }
         Ok((complete, end - start))
     }
@@ -777,6 +865,7 @@ impl Renderer {
             ],
         });
         Texture {
+            view,
             bind,
             _texture: texture,
         }
@@ -803,11 +892,16 @@ impl Renderer {
             },
         );
         self.textures.insert(id.into(), texture);
+        self.texture_gen = self.texture_gen.wrapping_add(1);
     }
     pub fn retain(&mut self, ids: &BTreeSet<String>) {
         self.uploads.retain(|id, _| ids.contains(id));
+        let before = self.textures.len();
         self.textures
             .retain(|id, _| id.is_empty() || id == "@transparent" || ids.contains(id));
+        if self.textures.len() != before {
+            self.texture_gen = self.texture_gen.wrapping_add(1);
+        }
     }
     pub fn prepare(&mut self, p: &DrawPacket, dpr: f32, full: bool) -> Result<()> {
         // Reprepare every text layer together. The previous preparation may
@@ -845,7 +939,7 @@ impl Renderer {
                 _ => None,
             })
             .collect();
-        self.menu_text_renderers.truncate(menu_indices.len());
+        self.menu_text_active = menu_indices.len();
         for (batch, index) in menu_indices.iter().enumerate() {
             if batch == self.menu_text_renderers.len() {
                 self.menu_text_renderers.push((
@@ -871,38 +965,8 @@ impl Renderer {
             .iter()
             .flat_map(|layers| layers.texts.iter().copied())
             .collect();
-        self.page_text_renderers.truncate(page_indices.len());
-        for (batch, index) in page_indices.iter().enumerate() {
-            if batch == self.page_text_renderers.len() {
-                self.page_text_renderers.push((
-                    *index,
-                    TextRenderer::new(
-                        &mut self.atlas,
-                        &self.device,
-                        wgpu::MultisampleState::default(),
-                        None,
-                    ),
-                ));
-            } else {
-                self.page_text_renderers[batch].0 = *index;
-            }
-        }
-        self.window_text_renderers.truncate(window_indices.len());
-        for (batch, index) in window_indices.iter().enumerate() {
-            if batch == self.window_text_renderers.len() {
-                self.window_text_renderers.push((
-                    *index,
-                    TextRenderer::new(
-                        &mut self.atlas,
-                        &self.device,
-                        wgpu::MultisampleState::default(),
-                        None,
-                    ),
-                ));
-            } else {
-                self.window_text_renderers[batch].0 = *index;
-            }
-        }
+        self.window_text_active = !window_indices.is_empty();
+        self.page_text_active = !page_indices.is_empty();
         self.text.layout_texts(&paint_runs);
         self.profile_end("prepare.layout", layout_start);
         if let Some(error) = self.text.missing_font.take() {
@@ -925,17 +989,13 @@ impl Renderer {
         );
         let mut areas = vec![];
         let mut menu_areas: Vec<Vec<TextArea<'_>>> = menu_indices.iter().map(|_| vec![]).collect();
-        let mut window_areas: Vec<Vec<TextArea<'_>>> =
-            window_indices.iter().map(|_| vec![]).collect();
-        let mut page_areas: Vec<Vec<TextArea<'_>>> = page_indices.iter().map(|_| vec![]).collect();
+        let mut window_areas: Vec<TextArea<'_>> = vec![];
+        let mut page_areas: Vec<TextArea<'_>> = vec![];
         for (run_index, r) in paint_runs.iter().enumerate() {
-            let areas = if let Some(batch) =
-                page_indices.iter().position(|i| *i == owners[run_index])
-            {
-                &mut page_areas[batch]
-            } else if let Some(batch) = window_indices.iter().position(|i| *i == owners[run_index])
-            {
-                &mut window_areas[batch]
+            let areas = if page_indices.contains(&owners[run_index]) {
+                &mut page_areas
+            } else if window_indices.contains(&owners[run_index]) {
+                &mut window_areas
             } else if let Some(batch) = menu_indices.iter().position(|i| *i == owners[run_index]) {
                 &mut menu_areas[batch]
             } else {
@@ -1023,7 +1083,10 @@ impl Renderer {
             &mut self.swash,
         );
         glyphs_result.map_err(|e| error(e.to_string()))?;
-        for ((_, renderer), areas) in self.menu_text_renderers.iter_mut().zip(menu_areas) {
+        for ((_, renderer), areas) in self.menu_text_renderers[..self.menu_text_active]
+            .iter_mut()
+            .zip(menu_areas)
+        {
             renderer
                 .prepare(
                     &self.device,
@@ -1036,28 +1099,28 @@ impl Renderer {
                 )
                 .map_err(|e| error(e.to_string()))?;
         }
-        for ((_, renderer), areas) in self.window_text_renderers.iter_mut().zip(window_areas) {
-            renderer
+        if self.window_text_active {
+            self.window_text_renderer
                 .prepare(
                     &self.device,
                     &self.queue,
                     &mut self.text.fonts,
                     &mut self.atlas,
                     &self.viewport,
-                    areas,
+                    window_areas,
                     &mut self.swash,
                 )
                 .map_err(|e| error(e.to_string()))?;
         }
-        for ((_, renderer), areas) in self.page_text_renderers.iter_mut().zip(page_areas) {
-            renderer
+        if self.page_text_active {
+            self.page_text_renderer
                 .prepare(
                     &self.device,
                     &self.queue,
                     &mut self.text.fonts,
                     &mut self.atlas,
                     &self.viewport,
-                    areas,
+                    page_areas,
                     &mut self.swash,
                 )
                 .map_err(|e| error(e.to_string()))?;
@@ -1096,6 +1159,7 @@ impl Renderer {
             ],
         });
         Texture {
+            view,
             bind,
             _texture: texture,
         }
@@ -1109,113 +1173,141 @@ impl Renderer {
         physical: [u32; 2],
     ) -> Result<()> {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
+        let sx = physical[0] as f32 / p.width;
+        let sy = physical[1] as f32 / p.height;
+        // Batch consecutive standard-pipeline quads that share the same texture
+        // and scissor rect into a single draw call.
+        let mut active_batch: Option<(&str, [u32; 4], u32, u32)> = None;
+        let mut standard_pipeline_bound = false;
+        let flush_batch =
+            |pass: &mut wgpu::RenderPass<'_>, batch: &mut Option<(&str, [u32; 4], u32, u32)>| {
+                if let Some((_, _, v_start, v_end)) = batch.take() {
+                    pass.draw(v_start..v_end, 0..1);
+                }
+            };
         for (i, q) in quads.iter().enumerate() {
             let id = q.asset.as_deref().unwrap_or("");
             let clip = q.clip.unwrap_or([0., 0., p.width, p.height]);
-            let sx = physical[0] as f32 / p.width;
-            let sy = physical[1] as f32 / p.height;
             let x = (clip[0] * sx).max(0.) as u32;
             let y = (clip[1] * sy).max(0.) as u32;
             let right = ((clip[0] + clip[2]) * sx).clamp(0., physical[0] as f32) as u32;
             let bottom = ((clip[1] + clip[3]) * sy).clamp(0., physical[1] as f32) as u32;
             if right <= x || bottom <= y {
+                flush_batch(pass, &mut active_batch);
                 continue;
             }
-            pass.set_scissor_rect(x, y, right - x, bottom - y);
-            if id == "@transition" {
-                let (a, b, _, _) = self
-                    .scratch
-                    .as_ref()
-                    .ok_or_else(|| error("transition targets missing"))?;
-                pass.set_pipeline(&self.mix_pipeline);
-                pass.set_bind_group(0, &a.bind, &[]);
-                pass.set_bind_group(1, &b.bind, &[]);
-                let mask = self
-                    .textures
-                    .get(p.transition_style.asset().unwrap_or(""))
-                    .ok_or_else(|| error("transition mask missing"))?;
-                pass.set_bind_group(2, &mask.bind, &[]);
-            } else if id == "@window" {
-                let layers = p
-                    .window_layers
-                    .as_ref()
-                    .ok_or_else(|| error("window layers missing"))?;
-                let root = self
-                    .window_root
-                    .as_ref()
-                    .map(|(texture, _, _)| texture)
-                    .ok_or_else(|| error("window root missing"))?;
-                let transparent = self
-                    .textures
-                    .get("@transparent")
-                    .ok_or_else(|| error("transparent placeholder missing"))?;
-                pass.set_pipeline(&self.mix_pipeline);
-                // mix(source, target, coverage): a hiding reveal keeps the
-                // rendered window as the source so coverage erases it; a
-                // showing reveal puts it on the target side.
-                if layers.to_visible {
-                    pass.set_bind_group(0, &transparent.bind, &[]);
-                    pass.set_bind_group(1, &root.bind, &[]);
+            let scissor = [x, y, right - x, bottom - y];
+            let v_start = (start + i * 6) as u32;
+            let v_end = v_start + 6;
+            if id == "@transition" || id == "@window" || id == "@menu" {
+                flush_batch(pass, &mut active_batch);
+                standard_pipeline_bound = false;
+                pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                if id == "@transition" {
+                    let (a, b, _, _) = self
+                        .scratch
+                        .as_ref()
+                        .ok_or_else(|| error("transition targets missing"))?;
+                    pass.set_pipeline(&self.mix_pipeline);
+                    pass.set_bind_group(0, &a.bind, &[]);
+                    pass.set_bind_group(1, &b.bind, &[]);
+                    let mask = self
+                        .textures
+                        .get(p.transition_style.asset().unwrap_or(""))
+                        .ok_or_else(|| error("transition mask missing"))?;
+                    pass.set_bind_group(2, &mask.bind, &[]);
+                } else if id == "@window" {
+                    let layers = p
+                        .window_layers
+                        .as_ref()
+                        .ok_or_else(|| error("window layers missing"))?;
+                    let root = self
+                        .window_root
+                        .as_ref()
+                        .map(|(texture, _, _)| texture)
+                        .ok_or_else(|| error("window root missing"))?;
+                    let transparent = self
+                        .textures
+                        .get("@transparent")
+                        .ok_or_else(|| error("transparent placeholder missing"))?;
+                    pass.set_pipeline(&self.mix_pipeline);
+                    if layers.to_visible {
+                        pass.set_bind_group(0, &transparent.bind, &[]);
+                        pass.set_bind_group(1, &root.bind, &[]);
+                    } else {
+                        pass.set_bind_group(0, &root.bind, &[]);
+                        pass.set_bind_group(1, &transparent.bind, &[]);
+                    }
+                    let mask = self
+                        .textures
+                        .get(layers.style.asset().unwrap_or(""))
+                        .ok_or_else(|| error("window mask missing"))?;
+                    pass.set_bind_group(2, &mask.bind, &[]);
                 } else {
-                    pass.set_bind_group(0, &root.bind, &[]);
-                    pass.set_bind_group(1, &transparent.bind, &[]);
+                    let layers = p
+                        .menu_layers
+                        .as_ref()
+                        .ok_or_else(|| error("menu layers missing"))?;
+                    let (underlying, page, _, _) = self
+                        .menu_roots
+                        .as_ref()
+                        .ok_or_else(|| error("menu roots missing"))?;
+                    pass.set_pipeline(&self.mix_pipeline);
+                    if layers.to_visible {
+                        pass.set_bind_group(0, &underlying.bind, &[]);
+                        pass.set_bind_group(1, &page.bind, &[]);
+                    } else {
+                        pass.set_bind_group(0, &page.bind, &[]);
+                        pass.set_bind_group(1, &underlying.bind, &[]);
+                    }
+                    let mask = self
+                        .textures
+                        .get(layers.style.asset().unwrap_or(""))
+                        .ok_or_else(|| error("menu mask missing"))?;
+                    pass.set_bind_group(2, &mask.bind, &[]);
                 }
-                let mask = self
-                    .textures
-                    .get(layers.style.asset().unwrap_or(""))
-                    .ok_or_else(|| error("window mask missing"))?;
-                pass.set_bind_group(2, &mask.bind, &[]);
-            } else if id == "@menu" {
-                let layers = p
-                    .menu_layers
-                    .as_ref()
-                    .ok_or_else(|| error("menu layers missing"))?;
-                let (underlying, page, _, _) = self
-                    .menu_roots
-                    .as_ref()
-                    .ok_or_else(|| error("menu roots missing"))?;
-                pass.set_pipeline(&self.mix_pipeline);
-                // mix(source, target, coverage): an entering page is revealed
-                // over the frozen underlying frame; a closing page is erased
-                // back to it.
-                if layers.to_visible {
-                    pass.set_bind_group(0, &underlying.bind, &[]);
-                    pass.set_bind_group(1, &page.bind, &[]);
-                } else {
-                    pass.set_bind_group(0, &page.bind, &[]);
-                    pass.set_bind_group(1, &underlying.bind, &[]);
-                }
-                let mask = self
-                    .textures
-                    .get(layers.style.asset().unwrap_or(""))
-                    .ok_or_else(|| error("menu mask missing"))?;
-                pass.set_bind_group(2, &mask.bind, &[]);
-            } else {
-                pass.set_pipeline(&self.pipeline);
-                let texture = self
-                    .textures
-                    .get(id)
-                    .ok_or_else(|| error(format!("required image not resident: {id}")))?;
-                pass.set_bind_group(0, &texture.bind, &[]);
+                pass.draw(v_start..v_end, 0..1);
+                continue;
             }
-            pass.draw((start + i * 6) as u32..(start + i * 6 + 6) as u32, 0..1);
+            if let Some((batch_id, batch_scissor, _, batch_end)) = active_batch.as_mut() {
+                if *batch_id == id && *batch_scissor == scissor && *batch_end == v_start {
+                    *batch_end = v_end;
+                    continue;
+                }
+            }
+            flush_batch(pass, &mut active_batch);
+            if !standard_pipeline_bound {
+                pass.set_pipeline(&self.pipeline);
+                standard_pipeline_bound = true;
+            }
+            pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+            let texture = self
+                .textures
+                .get(id)
+                .ok_or_else(|| error(format!("required image not resident: {id}")))?;
+            pass.set_bind_group(0, &texture.bind, &[]);
+            active_batch = Some((id, scissor, v_start, v_end));
         }
+        flush_batch(pass, &mut active_batch);
         Ok(())
     }
     /// Acquires the next frame, reconfiguring once on a stale surface. The
     /// `render` entry point guards the no-surface case, so reaching here
     /// without one means the surface was released mid-turn.
-    fn acquire_frame(&mut self) -> Result<wgpu::SurfaceTexture> {
+    fn acquire_frame(&mut self) -> Result<Option<wgpu::SurfaceTexture>> {
         let Some(surface) = self.surface.as_mut() else {
             return Err(error("surface released during render"));
         };
         match surface.get_current_texture() {
-            Ok(frame) => Ok(frame),
+            Ok(frame) => Ok(Some(frame)),
+            Err(wgpu::SurfaceError::Timeout) => Ok(None),
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 surface.configure(&self.device, &self.config);
-                surface
-                    .get_current_texture()
-                    .map_err(|e| error(e.to_string()))
+                match surface.get_current_texture() {
+                    Ok(frame) => Ok(Some(frame)),
+                    Err(wgpu::SurfaceError::Timeout) => Ok(None),
+                    Err(e) => Err(error(e.to_string())),
+                }
             }
             Err(e) => Err(error(e.to_string())),
         }
@@ -1227,6 +1319,7 @@ impl Renderer {
         // until GPU settlement; dropping our handles does not cancel a frame.
         if p.transition_layers.is_none() {
             self.scratch = None;
+            self.scratch_sig = None;
         }
         if p.window_layers.is_none() {
             self.window_root = None;
@@ -1241,8 +1334,10 @@ impl Renderer {
         }
         self.prepare(p, dpr, false)?;
         let vertex_start = self.profile_start();
-        let vertex_result = (|| -> Result<(usize, usize, usize, usize, usize, usize)> {
-            let mut verts = vec![];
+        let mut redraw_transition = false;
+        let vertex_result = (|| -> Result<(usize, usize, usize, usize)> {
+            let mut verts = std::mem::take(&mut self.scratch_verts);
+            verts.clear();
             let append = |verts: &mut Vec<Vertex>, quads: &[nir_presentation::Quad]| {
                 for q in quads {
                     let [x, y, w, h] = q.rect;
@@ -1295,23 +1390,30 @@ impl Renderer {
             let source_start = verts.len();
             let mut target_start = source_start;
             if let Some((a, b, _)) = &p.transition_layers {
-                append(&mut verts, a);
-                target_start = verts.len();
-                append(&mut verts, b);
                 let [w, h] = p.stage_size;
                 if w == 0
                     || h == 0
                     || w > self.device.limits().max_texture_dimension_2d
                     || h > self.device.limits().max_texture_dimension_2d
                 {
+                    self.scratch_verts = verts;
                     return Err(error("stage dimensions exceed GPU texture limit"));
                 }
-                if !self
+                let reallocated = !self
                     .scratch
                     .as_ref()
-                    .is_some_and(|(_, _, x, y)| *x == w && *y == h)
-                {
+                    .is_some_and(|(_, _, x, y)| *x == w && *y == h);
+                if reallocated {
                     self.scratch = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
+                    self.scratch_sig = None;
+                }
+                let sig = transition_layers_signature(a, b, p.stage_size, self.texture_gen);
+                if reallocated || self.scratch_sig != Some(sig) {
+                    append(&mut verts, a);
+                    target_start = verts.len();
+                    append(&mut verts, b);
+                    redraw_transition = true;
+                    self.scratch_sig = Some(sig);
                 }
             }
             let window_start = verts.len();
@@ -1326,16 +1428,11 @@ impl Renderer {
                     self.window_root = Some((self.offscreen(w, h), w, h));
                 }
             }
-            // Root A holds the frame without the page (the quads around the
-            // sentinel, contiguously); root B holds the diverted page.
-            let menu_under_start = verts.len();
-            let mut menu_after_start = menu_under_start;
-            let mut menu_page_start = menu_under_start;
+            // Root A reuses p.quads[..layers.position] directly at vertex offset 0;
+            // root B holds the diverted page quads. Overlays after the sentinel stay
+            // solely in the final swapchain pass so they never double-blend.
+            let menu_page_start = verts.len();
             if let Some(layers) = &p.menu_layers {
-                append(&mut verts, &p.quads[..layers.position]);
-                menu_after_start = verts.len();
-                append(&mut verts, &p.quads[layers.position + 1..]);
-                menu_page_start = verts.len();
                 append(&mut verts, &layers.quads);
                 let (w, h) = (self.config.width, self.config.height);
                 if !self
@@ -1346,34 +1443,35 @@ impl Renderer {
                     self.menu_roots = Some((self.offscreen(w, h), self.offscreen(w, h), w, h));
                 }
             }
-            if verts.len() > self.capacity {
+            const MAX_VERTICES: usize = 262_144;
+            if verts.len() > MAX_VERTICES {
+                self.scratch_verts = verts;
                 return Err(error("quad capacity exceeded"));
+            }
+            if verts.len() > self.capacity {
+                let next_cap = verts.len().next_power_of_two().min(MAX_VERTICES);
+                self.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ordered quads"),
+                    size: (next_cap * 32) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.capacity = next_cap;
             }
             self.queue
                 .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
-            Ok((
-                source_start,
-                target_start,
-                window_start,
-                menu_under_start,
-                menu_after_start,
-                menu_page_start,
-            ))
+            self.scratch_verts = verts;
+            Ok((source_start, target_start, window_start, menu_page_start))
         })();
         self.profile_end("vertex.build_write", vertex_start);
-        let (
-            source_start,
-            target_start,
-            window_start,
-            menu_under_start,
-            menu_after_start,
-            menu_page_start,
-        ) = vertex_result?;
+        let (source_start, target_start, window_start, menu_page_start) = vertex_result?;
 
         let acquire_start = self.profile_start();
         let frame_result = self.acquire_frame();
         self.profile_end("surface.acquire", acquire_start);
-        let frame = frame_result?;
+        let Some(frame) = frame_result? else {
+            return Ok(());
+        };
 
         let encode_start = self.profile_start();
         let encode_result = (|| -> Result<wgpu::CommandBuffer> {
@@ -1386,38 +1484,38 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("NIR frame"),
                 });
-            if let Some((a, b, _)) = &p.transition_layers {
-                let (source, target, w, h) = self.scratch.as_ref().unwrap();
-                for (texture, quads, start) in
-                    [(source, a, source_start), (target, b, target_start)]
-                {
-                    let view = texture._texture.create_view(&Default::default());
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("freeze side"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    self.paint(&mut pass, quads, start, p, [*w, *h])?;
+            if redraw_transition {
+                if let Some((a, b, _)) = &p.transition_layers {
+                    let (source, target, w, h) = self.scratch.as_ref().unwrap();
+                    for (texture, quads, start) in
+                        [(source, a, source_start), (target, b, target_start)]
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("freeze side"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &texture.view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        self.paint(&mut pass, quads, start, p, [*w, *h])?;
+                    }
                 }
             }
             if let Some(layers) = &p.window_layers {
                 // The window root re-renders every frame: text reveal and
                 // appearance stay live underneath the spatial coverage.
                 let (root, w, h) = self.window_root.as_ref().unwrap();
-                let view = root._texture.create_view(&Default::default());
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("window root"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view: &root.view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1430,8 +1528,8 @@ impl Renderer {
                 });
                 self.paint(&mut pass, &layers.quads, window_start, p, [*w, *h])?;
                 pass.set_scissor_rect(0, 0, *w, *h);
-                for (_, renderer) in &self.window_text_renderers {
-                    renderer
+                if self.window_text_active {
+                    self.window_text_renderer
                         .render(&self.atlas, &self.viewport, &mut pass)
                         .map_err(|e| error(e.to_string()))?;
                 }
@@ -1439,13 +1537,12 @@ impl Renderer {
             if let Some(layers) = &p.menu_layers {
                 let (underlying, page, w, h) = self.menu_roots.as_ref().unwrap();
                 {
-                    // Root A: the underlying frame — every quad except the
-                    // diverted page and its sentinel — plus the shared texts.
-                    let view = underlying._texture.create_view(&Default::default());
+                    // Root A: the underlying frame before the diverted page
+                    // sentinel plus the shared texts behind the page.
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("menu underlying root"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: &underlying.view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1456,20 +1553,9 @@ impl Renderer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    self.paint(
-                        &mut pass,
-                        &p.quads[..layers.position],
-                        menu_under_start,
-                        p,
-                        [*w, *h],
-                    )?;
-                    self.paint(
-                        &mut pass,
-                        &p.quads[layers.position + 1..],
-                        menu_after_start,
-                        p,
-                        [*w, *h],
-                    )?;
+                    if layers.position <= p.quads.len() {
+                        self.paint(&mut pass, &p.quads[..layers.position], 0, p, [*w, *h])?;
+                    }
                     pass.set_scissor_rect(0, 0, *w, *h);
                     self.text_renderer
                         .render(&self.atlas, &self.viewport, &mut pass)
@@ -1478,11 +1564,10 @@ impl Renderer {
                 {
                     // Root B: the page quads and its own texts, re-rendered
                     // every frame so live state stays visible under coverage.
-                    let view = page._texture.create_view(&Default::default());
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("menu page root"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: &page.view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1495,8 +1580,8 @@ impl Renderer {
                     });
                     self.paint(&mut pass, &layers.quads, menu_page_start, p, [*w, *h])?;
                     pass.set_scissor_rect(0, 0, *w, *h);
-                    for (_, renderer) in &self.page_text_renderers {
-                        renderer
+                    if self.page_text_active {
+                        self.page_text_renderer
                             .render(&self.atlas, &self.viewport, &mut pass)
                             .map_err(|e| error(e.to_string()))?;
                     }
@@ -1518,7 +1603,20 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
                 let physical = [self.config.width, self.config.height];
-                if let Some((start, end)) = p.menu_quad_range {
+                if let Some(layers) = &p.menu_layers {
+                    if layers.position < p.quads.len() {
+                        // Paint the @menu composite sentinel plus any post-menu
+                        // overlays (focus rings, notices) without re-drawing
+                        // underlying quads or shared texts a second time.
+                        self.paint(
+                            &mut pass,
+                            &p.quads[layers.position..],
+                            layers.position * 6,
+                            p,
+                            physical,
+                        )?;
+                    }
+                } else if let Some((start, end)) = p.menu_quad_range {
                     self.paint(&mut pass, &p.quads[..start], 0, p, physical)?;
                     for paint in &p.menu_paint {
                         match *paint {
@@ -1527,8 +1625,8 @@ impl Renderer {
                             }
                             nir_presentation::MenuPaint::Text(i) => {
                                 pass.set_scissor_rect(0, 0, physical[0], physical[1]);
-                                if let Some((_, renderer)) = self
-                                    .menu_text_renderers
+                                if let Some((_, renderer)) = self.menu_text_renderers
+                                    [..self.menu_text_active]
                                     .iter()
                                     .find(|(index, _)| *index == i)
                                 {
@@ -1540,13 +1638,17 @@ impl Renderer {
                         }
                     }
                     self.paint(&mut pass, &p.quads[end..], end * 6, p, physical)?;
+                    pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    self.text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|e| error(e.to_string()))?;
                 } else {
                     self.paint(&mut pass, &p.quads, 0, p, physical)?;
+                    pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    self.text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|e| error(e.to_string()))?;
                 }
-                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-                self.text_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .map_err(|e| error(e.to_string()))?;
             }
             Ok(encoder.finish())
         })();

@@ -1,19 +1,21 @@
 format = 1
 engine_api = "nir-player/0.1"
 capability_profile = "web-v1"
-sdk_digest = "b7c9484095d0630e758f41b769256da8a661b9567a6510c84a40204c19cbba2a"
+sdk_digest = "601f3bed82e7912b9c87d7aebb3eedba4c52ca16140f6b3d51919637979f78d6"
 
 [sdk]
 format = 1
 compiler_version = "0.1.1"
 
 [sdk.files]
-"THIRD-PARTY.txt" = "f08a6f3fb0a3467ea451c4fd7918d164052a909afc84c68256d0a611983c0d98"
-"android/lib/arm64-v8a/libplayer.so" = "50d1daddbea4e7eb50140a228919c2167a84d09738eeb4a6eec0d5c4ef945b5a"
-"bootstrap.js" = "0389a4eb7010cd66511ce3bbfa35ae34fccff1e4e0bfc21ff8d3c9739909beac"
-"compiler.sha256" = "ddfd424e7ea7451de896c68641bbc46ef0da9cc61de9fe80ec706989b3029fa1"
-"host.js" = "fe25cfd03d63505f921757156e2ab5d2fa44c0868a7ab8c1320bc82c7a33bb92"
-"index.html" = "61d4c8349194f8a3c47ce1480f8d4d84c5fc089a0aac95102910479ec1b50c7b"
-"linux/player-linux" = "4bc37ef01a03fd289b053ffba31a15ea82a5697995faa3b383c2e1a0ce4defa4"
-"player_web.js" = "068b00f3edd35c6ddeddcd8f910701632435ded7c64cf71474d83e792ffabd12"
-"player_web_bg.wasm" = "6ed16221e7e91684bb8d009245b1cd16fe88f2c9654184ff6800bbec415974cc"
+"THIRD-PARTY.txt" = "094fd4675f2f84439dc3e2fb6b98a4455ff634a5a5ab490ef2c45699e1de3bec"
+"asset-worker.js" = "0eb0c4dac5647e530338cd43721037bacf2aac39ff7be594bc039b96c5a1b7c2"
+"bootstrap.js" = "271294dd7e60a31c9ca49f40e56a12877ce1787bd38e4c54874851aa9ebe16b3"
+"compiler.sha256" = "f920de20188dad99c7adb49960f593068daacc9f7acbe85d7776a3f981847365"
+"host.js" = "a85f81145338c8bf4888d8765c0e50ecda2f3233435c638cae8c9bf6e3a130f0"
+"index.html" = "127db7ed2767de05de6789c99e9a838ca888acfb3df2231486716345f16aa2ee"
+"linux/player-linux" = "62d524f2c401a7cb8f7cfd4b89e30add1655ceb7ca878ad60f3b227c5a78f75f"
+"player_web.js" = "aa6db83b753d79e1fbe8322be05be6aba4ae36296ecebf5c806025d6e3cff9a7"
+"player_web_bg.wasm" = "3606a7bb1064e3bc7f000a19bdd798788ab908f2a1c6f661dd25ccd3dbeed287"
+"runtime-worker.js" = "831ba539389d4cdd969a2a84014d8341c3fc1698e71e3d8c197164a51e1d6972"
+"style.css" = "78478c88403021025ed8e56e7746c94025f120d318f489bd57cd32dd8c1fe7d0"

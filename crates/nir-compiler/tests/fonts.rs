@@ -27,6 +27,7 @@ fn sdk() -> tempfile::TempDir {
         "asset-worker.js",
         "index.html",
         "bootstrap.js",
+        "style.css",
         "THIRD-PARTY.txt",
         "compiler.sha256",
     ] {

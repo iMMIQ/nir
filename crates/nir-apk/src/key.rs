@@ -134,9 +134,27 @@ impl SigningIdentity {
         out
     }
 
-    /// Writes the identity to `path` (plain UTF-8 PEM document).
+    /// Writes the identity to `path` (plain UTF-8 PEM document) with owner-only
+    /// permissions (`0o600` on Unix).
     pub fn save(&self, path: &Path) -> Result<()> {
-        fs::write(path, self.to_pem()).context("E_SIGNING_WRITE")
+        write_private_pem(path, &self.to_pem(), false)
+    }
+
+    /// Atomically creates a brand-new identity file at `path` with owner-only
+    /// permissions (`0o600` on Unix). Returns `Ok(true)` if created, or
+    /// `Ok(false)` if another writer already created `path` first.
+    pub fn save_new(&self, path: &Path) -> Result<bool> {
+        match write_private_pem(path, &self.to_pem(), true) {
+            Ok(()) => Ok(true),
+            Err(err)
+                if err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Loads an identity previously written by [`SigningIdentity::save`].
@@ -207,8 +225,35 @@ pub(crate) fn certificate_spki(certificate: &[u8]) -> Result<Vec<u8>> {
     tbs.next().context("E_CERTIFICATE: subject")?; // subject
     let (tag, spki) = tbs.next().context("E_CERTIFICATE: SubjectPublicKeyInfo")?;
     ensure!(tag == der::TAG_SEQUENCE, "E_CERTIFICATE: bad SPKI");
-    ensure!(tbs.is_empty(), "E_CERTIFICATE: unexpected TBS fields");
+    // X.509 v3 certificates may carry optional issuerUniqueID [1],
+    // subjectUniqueID [2], or extensions [3] after SubjectPublicKeyInfo.
+    while let Some((extra_tag, _)) = tbs.next() {
+        ensure!(
+            matches!(extra_tag, 0x81 | 0x82 | 0xa3),
+            "E_CERTIFICATE: unexpected TBS field {extra_tag:#04x}"
+        );
+    }
     Ok(der::tlv(der::TAG_SEQUENCE, spki))
+}
+
+fn write_private_pem(path: &Path, pem: &str, create_new: bool) -> Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).context("E_SIGNING_WRITE")?;
+    file.write_all(pem.as_bytes()).context("E_SIGNING_WRITE")?;
+    file.sync_all().context("E_SIGNING_WRITE")?;
+    Ok(())
 }
 
 fn pem_block(label: &str, data: &[u8]) -> String {
@@ -236,8 +281,15 @@ fn extract_spki_point(spki: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut inner = der::Reader::new(body);
-    inner.expect(der::TAG_SEQUENCE)?; // algorithm identifier
-    let (_, bit_string) = inner.next()?;
+    let alg = inner.expect(der::TAG_SEQUENCE)?;
+    let expected_alg = der::sequence(&[&der::oid(OID_EC_PUBLIC_KEY), &der::oid(OID_PRIME256V1)]);
+    if der::tlv(der::TAG_SEQUENCE, alg) != expected_alg {
+        return None;
+    }
+    let bit_string = inner.expect(der::TAG_BIT_STRING)?;
+    if !inner.is_empty() {
+        return None;
+    }
     let valid = bit_string.first() == Some(&0) // zero unused bits
         && bit_string.get(1) == Some(&0x04) // uncompressed point
         && bit_string.len() == 66;
@@ -306,9 +358,14 @@ mod tests {
         assert!(pem.contains("-----BEGIN CERTIFICATE-----"));
         let loaded = SigningIdentity::from_pem(&pem).unwrap();
         assert_eq!(loaded.certificate_der(), identity.certificate_der());
-        let path = std::env::temp_dir().join("nir-apk-key-test.pem");
+        let path = std::env::temp_dir().join(format!(
+            "nir-apk-key-test-{}-{:?}.pem",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         SigningIdentity::save(&loaded, &path).unwrap();
         let reloaded = SigningIdentity::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
         assert_eq!(reloaded.to_pem(), pem);
     }
 

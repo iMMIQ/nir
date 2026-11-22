@@ -2,10 +2,12 @@
 name = "novelc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 nir-compiler.workspace = true
+nir-import-livemaker.workspace = true
 nir-content.workspace = true
 nir-format.workspace = true
 clap.workspace = true

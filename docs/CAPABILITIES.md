@@ -37,11 +37,11 @@ Web Worker 的执行边界、协议、回退及验证见 [Web 执行域](WEB-EXE
 
 M4 的发行操作、存档隔离、后端选择和验收入口见 [发行与桌面渲染](M4-RELEASE.md)。
 
-体验保真相关的输入／阅读、演出任务和界面扩展见 [能力与语义设计提案](EXPERIENCE-SEMANTICS.md)。该提案不能视为全部已实现，逐批交付状态见 [实施进度](NIR-NEXT-PROGRESS.md)。
+体验保真相关的输入／阅读、演出任务和界面扩展见 [能力与语义设计提案](EXPERIENCE-SEMANTICS.md)。该提案不能视为全部已实现，逐批交付状态见 [实施进度](archive/NIR-NEXT-PROGRESS.md)。
 
 下一阶段的依赖顺序、代码差距与验收门禁见 [NIR-NEXT 实施计划](NIR-NEXT-IMPLEMENTATION-PLAN.md)。该计划基于新的迁移语义提案；已交付与待实施项见实施进展，不能将整个计划视为当前能力。
 
-NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](NIR-NEXT-PROGRESS.md)；其余计划项尚未完成。
+NIR-NEXT 首批实现状态与存档版本变更见 [实施进展](archive/NIR-NEXT-PROGRESS.md)；其余计划项尚未完成。
 
 音频事件增益、有限淡出停止、终态与恢复规则见 [音频语义](AUDIO-SEMANTICS.md)。`audio.gain-tween.v1` 在共享补间轨道上提供 `audio_instance` 增益目标：把已建立音频实例的 0–1 包络线性补间到声明值，声音保持播放，所有权与 `audio_stop` 互斥，取消提交设备时钟当前值，恢复续播剩余段，见 [音频语义](AUDIO-SEMANTICS.md) 的实例增益补间一节。作者总线动画和声明式菜单媒体仍属后续计划。
 
@@ -195,25 +195,25 @@ Interact 可声明 `result` 目标变量与 `on_cancel` 取消路径，选项以
 
 | story.code-packages.v1 | crates/nir-compiler/src/release.rs、crates/nir-core/tests/streaming.rs | crates/nir-player/tests/runtime_content.rs | tests/livenovel-features/playback.spec.js | 待验证 | 代码按需加载，共享原声明域；任务和音频实例保持身份 |
 | content.interned-json.v1 | crates/nir-content/src/interned.rs、crates/nir-compiler/src/release.rs（有界池、包校验及内容驻留） | crates/nir-core/tests/streaming.rs（编码/原JSON恢复等价，保留BGM实例） | tests/livenovel-features/interned-content.spec.js（Worker/主线程，换页音乐不重启，冷恢复） | 待验证 | 不可变 JSON 子树复用；身份、任务和执行顺序不变；编码内容仍受16MiB输入与驻留预算限制，逻辑展开另受64MiB及128层上限约束 |
-| stage.bitmap-text.v1 | crates/nir-core/src/bitmap.rs、crates/nir-compiler/src/import/livenovel_bitmap.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 atlas 实绘及恢复） | 待验证 | 显式捕获 I32/String；固定横向图集；提交后为普通冻结图片节点 |
-| stage.sprite-continuity.v1 | crates/nir-core/tests/tween_contract.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/tween_contract.rs | tests/livenovel-features/playback.spec.js（Worker/主线程冷加载恢复、位置实绘） | 待验证 | 按节点属性保留局部姿态，session/frame 动画保留实例与时钟；过渡两层同步 |
+| stage.bitmap-text.v1 | crates/nir-core/src/bitmap.rs、crates/nir-import-livemaker/src/livenovel_bitmap.rs | crates/nir-core/tests/semantics.rs | tests/livenovel-features/playback.spec.js（Worker/主线程 atlas 实绘及恢复） | 待验证 | 显式捕获 I32/String；固定横向图集；提交后为普通冻结图片节点 |
+| stage.sprite-continuity.v1 | crates/nir-core/tests/tween_contract.rs、crates/nir-import-livemaker/src/livenovel_motion.rs | crates/nir-core/tests/tween_contract.rs | tests/livenovel-features/playback.spec.js（Worker/主线程冷加载恢复、位置实绘） | 待验证 | 按节点属性保留局部姿态，session/frame 动画保留实例与时钟；过渡两层同步 |
 
 | choice.disabled-image.v1 | crates/nir-core/src/validate.rs、crates/nir-presentation/src/lib.rs | crates/nir-core/tests/typed_result_contract.rs | tests/livenovel-features/preview-filters.spec.js | 待验证 | 不可选图片选项使用原专用图片，拒绝悬停替换；媒体闭包包含全部状态 |
 
 | stage.inherit-image.v1 | crates/nir-core/src/vm.rs、crates/nir-core/src/validate.rs | crates/nir-core/tests/timeline_contract.rs | tests/livenovel-features/image-inheritance.spec.js | 待验证 | 画面提交时捕获指定普通图层的已绑定图片；媒体准备不请求旧模板图片，渐变与冷恢复保留各路线的真实图片 |
-| stage.inherit-image-geometry.v1 | crates/nir-core/tests/timeline_contract.rs、crates/nir-compiler/src/import/livenovel.rs | crates/nir-core/tests/timeline_contract.rs | tests/livenovel-features/image-inheritance.spec.js（Worker/主线程，两个不同矩形路线、渐变冷恢复实绘） | 待验证 | 未改动的普通图层沿用已提交的局部矩形；源布局读取保留分支区别，显式换图重新计算尺寸与锚点 |
+| stage.inherit-image-geometry.v1 | crates/nir-core/tests/timeline_contract.rs、crates/nir-import-livemaker/src/livenovel.rs | crates/nir-core/tests/timeline_contract.rs | tests/livenovel-features/image-inheritance.spec.js（Worker/主线程，两个不同矩形路线、渐变冷恢复实绘） | 待验证 | 未改动的普通图层沿用已提交的局部矩形；源布局读取保留分支区别，显式换图重新计算尺寸与锚点 |
 
-| stage.sprite-shake.v1 | crates/nir-core/src/shake.rs、crates/nir-compiler/src/import/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（独立轨迹、冷恢复、时间分割一致性及篡改拒绝） | tests/livenovel-features/sprite-shake.spec.js（Worker/主线程独立像素、暂停、冷恢复、结束归零与音乐实例） | 待验证 | 有限 WAVE/BOUND，最多 32 个目标；随机强度按目标和坐标轴独立冻结 |
+| stage.sprite-shake.v1 | crates/nir-core/src/shake.rs、crates/nir-import-livemaker/src/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（独立轨迹、冷恢复、时间分割一致性及篡改拒绝） | tests/livenovel-features/sprite-shake.spec.js（Worker/主线程独立像素、暂停、冷恢复、结束归零与音乐实例） | 待验证 | 有限 WAVE/BOUND，最多 32 个目标；随机强度按目标和坐标轴独立冻结 |
 
-| stage.sprite-quake.v1 | crates/nir-core/src/shake.rs、crates/nir-compiler/src/import/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（共用方向、独立强度、冷恢复、时间分割一致性、篡改拒绝和能力门） | tests/livenovel-features/sprite-shake.spec.js（NIR_TEST_SPRITE_QUAKE；Worker/主线程实绘、暂停、冷恢复和音乐实例） | 待验证 | 有限 QUAKE，最多 32 个目标；每个阶段共用随机方向，按源目标顺序独立捕获各轴强度；结束归零 |
+| stage.sprite-quake.v1 | crates/nir-core/src/shake.rs、crates/nir-import-livemaker/src/livenovel_quake.rs | crates/nir-core/tests/timeline_contract.rs（共用方向、独立强度、冷恢复、时间分割一致性、篡改拒绝和能力门） | tests/livenovel-features/sprite-shake.spec.js（NIR_TEST_SPRITE_QUAKE；Worker/主线程实绘、暂停、冷恢复和音乐实例） | 待验证 | 有限 QUAKE，最多 32 个目标；每个阶段共用随机方向，按源目标顺序独立捕获各轴强度；结束归零 |
 
-| stage.source-motion.v1 | crates/nir-format/src/tween.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（整数毫秒、原点/终点、跨场景与冷恢复） | tests/livenovel-features/stock-motion.spec.js（Worker/主线程 INC/DEC 位置实绘、暂停、冷恢复、音乐身份） | 待验证 | 有界整数 X/Y 移动，共用既有标量写入所有权；原加减速正弦与截断坐标 |
+| stage.source-motion.v1 | crates/nir-format/src/tween.rs、crates/nir-import-livemaker/src/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（整数毫秒、原点/终点、跨场景与冷恢复） | tests/livenovel-features/stock-motion.spec.js（Worker/主线程 INC/DEC 位置实绘、暂停、冷恢复、音乐身份） | 待验证 | 有界整数 X/Y 移动，共用既有标量写入所有权；原加减速正弦与截断坐标 |
 
-| stage.source-opacity.v1 | crates/nir-format/src/tween.rs、crates/nir-compiler/src/import/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（逐毫秒字节采样、能力门、渐变与冷恢复） | tests/livenovel-features/source-opacity.spec.js（Worker/主线程实际透明度、暂停与冷恢复） | 待验证 | source_motion 的线性 0–255 透明度；保留整数截断和精确终点，0 表示完全透明 |
+| stage.source-opacity.v1 | crates/nir-format/src/tween.rs、crates/nir-import-livemaker/src/livenovel_motion.rs | crates/nir-core/tests/timeline_contract.rs（逐毫秒字节采样、能力门、渐变与冷恢复） | tests/livenovel-features/source-opacity.spec.js（Worker/主线程实际透明度、暂停与冷恢复） | 待验证 | source_motion 的线性 0–255 透明度；保留整数截断和精确终点，0 表示完全透明 |
 
 | dialogue.style.v1 | crates/nir-format/src/lib.rs、crates/nir-core/src/vm.rs、crates/nir-player/src/lib.rs | crates/nir-core/tests/dialogue_style_contract.rs | tests/livenovel-features/dialogue-style.spec.js | 待验证 | 准备新背景后原子切换对白窗口、文字区域、字号和颜色；音乐不重启，冷恢复保留样式 |
 | dialogue.decoration.v1 | crates/nir-format/src/lib.rs、crates/nir-core/src/vm.rs、crates/nir-player/src/lib.rs、crates/nir-presentation/src/reading.rs | crates/nir-core/tests/dialogue_decoration_contract.rs（准备/尺寸校验、阅读与音乐时钟、冷恢复） | tests/livenovel-features/dialogue-decoration.spec.js（Worker/主线程实绘、隐藏、清除及恢复，音乐实例不变） | 待验证 | 两个静态对白装饰槽：头像与姓名图片；提交时捕获固定舞台坐标或当前文字区域原点，保留字号独立的几何位置；不支持动画头像与自动重排 |
 
 | ui.story-modal.v1 | crates/nir-core/tests/story_modal_contract.rs、crates/nir-player/src/menu.rs | crates/nir-player/tests/coordination.rs | tests/livenovel-features/story-modal.spec.js | 待验证 | 剧情内读档、存档或图片菜单作为有限暂停任务；关闭后继续，冷恢复刷新输入身份；读取页面禁用保存 |
 
-| stage.sprite-lifecycle.v1 | crates/nir-core/src/vm.rs、crates/nir-compiler/src/import/livenovel.rs | crates/nir-core/tests/timeline_contract.rs（自然结束删除整棵图层树、渐变目标同步、冷恢复、不复活、取消保留与显式重建） | tests/livenovel-features/sprite-lifecycle.spec.js（Worker/主线程实绘、读档与后续页面） | 待验证 | 有限动画自然结束后删除绑定图层；后续模板可保留缺席，显式创建重新显示；SCRAP 导入目前限 Motion111 |
+| stage.sprite-lifecycle.v1 | crates/nir-core/src/vm.rs、crates/nir-import-livemaker/src/livenovel.rs | crates/nir-core/tests/timeline_contract.rs（自然结束删除整棵图层树、渐变目标同步、冷恢复、不复活、取消保留与显式重建） | tests/livenovel-features/sprite-lifecycle.spec.js（Worker/主线程实绘、读档与后续页面） | 待验证 | 有限动画自然结束后删除绑定图层；后续模板可保留缺席，显式创建重新显示；SCRAP 导入目前限 Motion111 |

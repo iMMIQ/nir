@@ -39,11 +39,13 @@ impl BudgetLedger {
         let mut ledger = self.0.borrow_mut();
         let mut extra = 0u64;
         for (id, cost) in assets {
-            if !ledger.items.contains_key(id) {
-                extra = extra
-                    .checked_add(*cost)
-                    .ok_or_else(|| Diagnostic::new("E_BUDGET", "reserve", "cost overflow"))?;
-            }
+            let delta = match ledger.items.get(id) {
+                None => *cost,
+                Some(existing) => cost.saturating_sub(existing.bytes),
+            };
+            extra = extra
+                .checked_add(delta)
+                .ok_or_else(|| Diagnostic::new("E_BUDGET", "reserve", "cost overflow"))?;
         }
         if extra > ledger.limit.saturating_sub(ledger.used) {
             return Err(Diagnostic::new(
@@ -57,11 +59,20 @@ impl BudgetLedger {
             ));
         }
         for (id, cost) in assets {
-            let e = ledger.items.entry(id.clone()).or_insert(Entry {
-                bytes: *cost,
-                pins: 0,
-            });
-            e.pins += 1;
+            if let Some(e) = ledger.items.get_mut(id) {
+                if *cost > e.bytes {
+                    e.bytes = *cost;
+                }
+                e.pins += 1;
+            } else {
+                ledger.items.insert(
+                    id.clone(),
+                    Entry {
+                        bytes: *cost,
+                        pins: 1,
+                    },
+                );
+            }
         }
         ledger.used += extra;
         Ok(Reservation {
@@ -133,7 +144,9 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut l = self.ledger.0.borrow_mut();
+        let Ok(mut l) = self.ledger.0.try_borrow_mut() else {
+            return;
+        };
         for id in &self.ids {
             if let Some(e) = l.items.get_mut(id) {
                 e.pins -= 1;

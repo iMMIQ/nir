@@ -18,7 +18,7 @@ if bundle.exists():shutil.rmtree(bundle)
 bundle.mkdir(exist_ok=True)
 shutil.copy2(dist/"novelc",bundle/"novelc")
 shutil.copytree(dist/"sdk",bundle/"sdk",dirs_exist_ok=True)
-shutil.copytree("docs",bundle/"docs",dirs_exist_ok=True,ignore=shutil.ignore_patterns("specs"))
+shutil.copytree("docs",bundle/"docs",dirs_exist_ok=True,ignore=shutil.ignore_patterns("specs","validation"))
 for name in ("LICENSE", "COPYING", "LICENSE-NOTICE.md"):
     shutil.copy2(name,bundle/name)
 source=dist/"rain-letters-web"
@@ -27,6 +27,8 @@ manifest_path=f"releases/{channel['release']}.json"
 manifest=json.loads((source/manifest_path).read_text())
 selected=["index.html","bootstrap.js","NOTICE.txt","channels/stable.json",manifest_path,*[o["path"] for o in manifest["objects"].values()]]
 selected += [f"releases/{channel['release']}/index.html", f"releases/{channel['release']}/bootstrap.js"]
+if "style" in manifest["launch"]:
+    selected += ["style.css", f"releases/{channel['release']}/style.css"]
 selected += [name+".gz" for name in list(selected) if (source/(name+".gz")).is_file()]
 web=bundle/"rain-letters-web"
 web.mkdir(exist_ok=True)

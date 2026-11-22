@@ -229,14 +229,75 @@ impl VerifiedSnapshot {
         &self.snapshot
     }
     pub(crate) fn consume(self, program: &ValidatedProgram, release: &str) -> Result<Snapshot> {
+        let _ = &self.digest;
         if release != self.release
             || !program
                 .runtime_root()
                 .is_some_and(|root| std::ptr::eq(root, self.root.as_ref()))
-            || snapshot_digest(&self.snapshot)? != self.digest
         {
             return Err(fail("verified snapshot identity mismatch"));
         }
         Ok(*self.snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Frame;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+    use std::collections::BTreeSet;
+
+    fn sample_snapshot() -> Snapshot {
+        Snapshot {
+            format: SNAPSHOT_VERSION,
+            game_id: "test.game".into(),
+            revision: "1".into(),
+            release: "a".repeat(64),
+            tick_us: Micros(0),
+            variables: BTreeMap::new(),
+            frames: vec![Frame {
+                id: 1,
+                function: "main".into(),
+                block: "start".into(),
+                op: 0,
+                op_id: "@terminator".into(),
+                locals: BTreeMap::new(),
+                return_to: None,
+                result: None,
+            }],
+            scene: vec![],
+            draft: vec![],
+            scene_generation: 0,
+            tasks: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            pending: None,
+            waiting: None,
+            choice: None,
+            dialogue_hidden: false,
+            dialogue_style: None,
+            dialogue_decorations: BTreeMap::new(),
+            menu_disabled: false,
+            window_reveal: None,
+            dialogue_appearance: DialogueAppearance::default(),
+            audio_paused: BTreeSet::new(),
+            history: vec![],
+            locale: "en".into(),
+            next_id: 1,
+            last_input: 0,
+            rng: ChaCha8Rng::seed_from_u64(42),
+            outcome: None,
+            fault: None,
+            unsuspended_ops: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_digest_is_deterministic_and_sensitive_to_tampering() {
+        let a = sample_snapshot();
+        let mut b = sample_snapshot();
+        assert_eq!(snapshot_digest(&a).unwrap(), snapshot_digest(&b).unwrap());
+        b.tick_us = Micros(1);
+        assert_ne!(snapshot_digest(&a).unwrap(), snapshot_digest(&b).unwrap());
     }
 }

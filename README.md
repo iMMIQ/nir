@@ -116,9 +116,10 @@ cargo xtask sdk
 ```sh
 cargo fmt --all --check
 cargo xtask test
-cargo clippy --workspace --all-targets --exclude player-web --exclude nir-render-wgpu --exclude nir-platform-web -- -D warnings
-cargo clippy -p player-web --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --locked --workspace --all-targets --exclude player-web --exclude nir-platform-web -- -D warnings
+cargo clippy --locked -p player-web -p nir-platform-web -p nir-render-wgpu -p nir-engine --target wasm32-unknown-unknown -- -D warnings
 bun install --frozen-lockfile
+bun run check:js
 bun run test:host
 TMPDIR="$PWD/target/tmp" bun run test:browser
 python3 scripts/verify_release.py examples/rain-letters/dist/full/web

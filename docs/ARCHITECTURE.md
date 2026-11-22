@@ -4,18 +4,20 @@
 
 | 库 | 职责 |
 |---|---|
-| nir-format | 版本化 DTO、显式类型标签、能力声明与稳定诊断 |
-| nir-core | 纯同步确定性状态机、表达式、任务、快照 |
+| nir-format | 版本化 DTO、显式类型标签、类型化能力位图（`CapabilitySet`）、共享 UI Fluent 消息与稳定诊断 |
+| nir-core | 纯同步确定性状态机（`vm/*`）、统一源/运行时校验（`validate/*`）、表达式、任务、快照 |
 | nir-content | 有界严格 JSON、内容身份、发行与执行索引校验 |
 | nir-assets | 联合预算、去重占用、准备集合、不可复制 ReadyLease |
 | nir-presentation | Fluent、只读界面投影、场景层次、cosmic-text 排版 |
 | nir-player | 事件队列、准备提交、暂停所有权、存储作业和恢复候选 |
-| nir-render-wgpu | WebGPU/WebGL2 表面、线性预乘合成、转场与 glyphon |
-| nir-platform-web | 浏览器画布接口及输入、Web Audio、IndexedDB 宿主 |
-| nir-compiler | 工程解析、验证、执行模块、场景测试、构建与锁 |
-| nir-engine | Web 与桌面共用的 Player 与渲染器组装、阅读导航、资源交付和设备恢复 |
+| nir-render-wgpu | WebGPU/WebGL2/DX12/Vulkan/Metal 表面、线性预乘合批合成、转场与 glyphon |
+| nir-platform-web | 浏览器画布接口及模块化宿主（`src_js/*` + `host.js`）、Web Audio、IndexedDB、Worker 调度 |
+| nir-apk | 纯 Rust Android 二进制清单（AXML）、ZIP 打包与 APK v2 签名 |
+| nir-compiler | 工程解析、声明式脚本降级、验证、执行模块、场景测试、构建与锁 |
+| nir-import-livemaker | 独立外部引擎导入器（LiveMaker LSB / LiveNovel 迁移），隔离解析器依赖不污染主编译器 |
+| nir-engine | Web 与原生共用的 Player 与渲染器组装、阅读导航、资源交付和设备恢复 |
 
-入口分别为 `apps/player-web`（浏览器绑定）、`apps/player-desktop`（Windows/Linux 共用的原生窗口、音频与本地存储外壳）、`apps/player-windows` 与 `apps/player-linux`（平台二进制入口）、`tools/novelc`（作者工具）、`xtask`（SDK 构建）。依赖检查基于 Cargo 实际解析图，同时检查传递依赖：核心无浏览器/GPU，播放器不链接编译器。
+入口分别为 `apps/player-web`（浏览器绑定）、`apps/player-desktop`（Windows/Linux/macOS/Android 共用的原生窗口、音频与本地存储外壳）、`apps/player-windows`、`apps/player-linux` 与 `apps/player-android`（平台入口）、`tools/novelc`（作者工具）、`xtask`（SDK 构建）。依赖检查基于 Cargo 实际解析图（含目标条件依赖），同时检查传递依赖：核心无浏览器/GPU，播放器不链接编译器与导入器。
 
 ## ADR-001：一个同步剧情流
 

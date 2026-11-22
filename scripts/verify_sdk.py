@@ -149,7 +149,7 @@ with tempfile.TemporaryDirectory(dir="target/tmp", prefix="standalone-") as temp
             return super().do_GET()
         def guess_type(self, path):
             ext = Path(path).suffix
-            mime = {".html":"text/html", ".js":"text/javascript", ".json":"application/json", ".wasm":"application/wasm", ".png":"image/png", ".webp":"image/webp", ".wav":"audio/wav", ".mp3":"audio/mpeg", ".otf":"font/otf", ".ttf":"font/ttf", ".txt":"text/plain"}.get(ext, "application/octet-stream")
+            mime = {".html":"text/html", ".css":"text/css", ".js":"text/javascript", ".json":"application/json", ".wasm":"application/wasm", ".png":"image/png", ".webp":"image/webp", ".wav":"audio/wav", ".mp3":"audio/mpeg", ".otf":"font/otf", ".ttf":"font/ttf", ".txt":"text/plain"}.get(ext, "application/octet-stream")
             if self.fault == "mime" and path.endswith(f"{first}.json"):
                 return "text/plain"
             return mime

@@ -64,6 +64,7 @@ fn model() -> UiModel {
         save_confirmation: Default::default(),
         busy_slots: Default::default(),
         can_save: Default::default(),
+        can_import: true,
         replay_active: Default::default(),
         menu_story: Default::default(),
         menu_reading_modes: Default::default(),
@@ -148,8 +149,9 @@ fn adaptive_reader_preserves_long_text_overflow_and_fixed_author_geometry() {
         .scrolls
         .iter()
         .any(|s| s.region == ScrollRegion::Dialogue && s.max > 0.));
-    m.theme.dialogue.rect = Some([160., 450., 960., 200.]);
-    m.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    let theme = std::sync::Arc::make_mut(&mut m.theme);
+    theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
     let fixed = reading.project(&m, (1, 1), 390., 844., &messages, &mut text);
     assert!(fixed.builtin_dialogue.is_none());
     assert!(fixed.stage_viewport.is_none());
@@ -183,8 +185,9 @@ fn input_hints_switch_without_changing_dialogue_geometry() {
 fn dialogue_images_keep_stage_geometry_and_share_visibility_without_background_alpha() {
     use nir_format::{DialogueDecoration, DialogueDecorationSlot};
     let mut m = model();
-    m.theme.dialogue.rect = Some([160., 450., 960., 200.]);
-    m.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    let theme = std::sync::Arc::make_mut(&mut m.theme);
+    theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
     m.dialogue_appearance.background_opacity = 0.2;
     m.dialogue_decorations.insert(
         DialogueDecorationSlot::Portrait,
@@ -371,7 +374,7 @@ fn compact_story_keeps_speaker_body_and_scroll_controls_separate() {
             for slot in [DialogueComponent::Bottom, DialogueComponent::Top] {
                 let mut m = model();
                 m.prefs.font_scale = font_scale;
-                m.theme.slots.dialogue = slot;
+                std::sync::Arc::make_mut(&mut m.theme).slots.dialogue = slot;
                 let mut text = TextEngine::default();
                 text.add_font_asset(
                     "font.reader",

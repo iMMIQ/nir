@@ -313,7 +313,9 @@ async function patchCapacityObjects(web, manifest, executable, program, chapterI
   await fs.mkdir(path.join(web, 'releases'), { recursive: true });
   await fs.writeFile(path.join(web, `releases/${releaseHash}.json`), releaseBytes);
   await fs.mkdir(path.join(web, `releases/${releaseHash}`), { recursive: true });
-  for(const [name,identity] of [['index.html',manifest.launch.html],['bootstrap.js',manifest.launch.bootstrap]]){
+  const launchList = [['index.html',manifest.launch.html],['bootstrap.js',manifest.launch.bootstrap]];
+  if (manifest.launch.style) launchList.push(['style.css', manifest.launch.style]);
+  for(const [name,identity] of launchList){
     await fs.copyFile(path.join(web,manifest.objects[identity].path),path.join(web,`releases/${releaseHash}/${name}`));
   }
   await fs.writeFile(

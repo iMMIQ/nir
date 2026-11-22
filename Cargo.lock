@@ -2336,11 +2336,9 @@ name = "nir-compiler"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "encoding_rs",
  "flate2",
  "hb-subset",
  "image",
- "lewton",
  "mp3lame-encoder",
  "nir-apk",
  "nir-content",
@@ -2348,7 +2346,6 @@ dependencies = [
  "nir-format",
  "nir-player",
  "nir-presentation",
- "roxmltree",
  "rustybuzz",
  "schemars",
  "serde",
@@ -2410,6 +2407,28 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "nir-import-livemaker"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "flate2",
+ "image",
+ "lewton",
+ "nir-compiler",
+ "nir-content",
+ "nir-core",
+ "nir-format",
+ "nir-player",
+ "nir-presentation",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -2477,6 +2496,7 @@ dependencies = [
  "nir-compiler",
  "nir-content",
  "nir-format",
+ "nir-import-livemaker",
  "reqwest",
  "serde_json",
  "tiny_http",

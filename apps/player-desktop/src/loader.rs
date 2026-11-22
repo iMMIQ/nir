@@ -62,11 +62,37 @@ pub(crate) enum Loaded {
         tokens: u64,
         data: std::result::Result<AssetData, String>,
     },
+    /// Every loader worker exited unexpectedly; pending jobs will never arrive.
+    WorkerLost,
 }
 struct Budget {
     total: u64,
     remaining: Mutex<u64>,
     available: Condvar,
+}
+struct BudgetGuard<'a> {
+    budget: &'a Budget,
+    tokens: u64,
+}
+impl<'a> BudgetGuard<'a> {
+    fn acquire(budget: &'a Budget, tokens: u64) -> Self {
+        if tokens > 0 {
+            budget.acquire(tokens);
+        }
+        Self { budget, tokens }
+    }
+    fn disarm(mut self) -> u64 {
+        let tokens = self.tokens;
+        self.tokens = 0;
+        tokens
+    }
+}
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        if self.tokens > 0 {
+            self.budget.release(self.tokens);
+        }
+    }
 }
 impl Budget {
     fn new(total: u64) -> Self {
@@ -83,14 +109,23 @@ impl Budget {
     /// whole budget takes the entire budget instead of waiting forever.
     fn acquire(&self, want: u64) {
         let want = self.clamp(want);
-        let mut remaining = self.remaining.lock().unwrap();
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         while *remaining < want {
-            remaining = self.available.wait(remaining).unwrap();
+            remaining = self
+                .available
+                .wait(remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
         }
         *remaining -= want;
     }
     fn release(&self, want: u64) {
-        let mut remaining = self.remaining.lock().unwrap();
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         *remaining = (*remaining + self.clamp(want)).min(self.total);
         drop(remaining);
         self.available.notify_all();
@@ -154,12 +189,24 @@ impl Loader {
     /// Takes at most one finished result and releases its decode budget.
     /// One delivery per owner turn keeps ADR-007 admission pacing.
     pub(crate) fn drain(&mut self) -> Option<Loaded> {
-        let loaded = self.results.try_recv().ok()?;
-        self.outstanding -= 1;
-        if let Loaded::Asset { tokens, .. } = &loaded {
-            self.budget.release(*tokens);
+        match self.results.try_recv() {
+            Ok(loaded) => {
+                self.outstanding = self.outstanding.saturating_sub(1);
+                if let Loaded::Asset { tokens, .. } = &loaded {
+                    self.budget.release(*tokens);
+                }
+                Some(loaded)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if self.outstanding > 0 {
+                    self.outstanding = 0;
+                    Some(Loaded::WorkerLost)
+                } else {
+                    None
+                }
+            }
         }
-        Some(loaded)
     }
 }
 fn run_worker(
@@ -170,7 +217,10 @@ fn run_worker(
 ) {
     loop {
         // The lock guards only the recv; decoding runs without it.
-        let job = jobs.lock().unwrap().recv();
+        let job = jobs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .recv();
         let Ok(job) = job else {
             return;
         };
@@ -179,16 +229,22 @@ fn run_worker(
                 request,
                 hashes,
                 limit,
-            } => Loaded::Content {
-                request,
-                data: load_content(&bundle, &hashes, limit).map_err(|e| e.to_string()),
-            },
+            } => {
+                let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    load_content(&bundle, &hashes, limit).map_err(|e| e.to_string())
+                }))
+                .unwrap_or_else(|_| Err("E_LOADER_PANIC".into()));
+                Loaded::Content { request, data }
+            }
             Job::Asset {
                 request,
                 id,
                 descriptor,
             } => {
-                let data = load_asset(&bundle, &budget, &descriptor);
+                let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    load_asset(&bundle, &budget, &descriptor)
+                }))
+                .unwrap_or_else(|_| Err(anyhow!("E_LOADER_PANIC")));
                 match data {
                     Ok((data, tokens)) => Loaded::Asset {
                         request,
@@ -233,18 +289,11 @@ fn load_asset(bundle: &Bundle, budget: &Budget, descriptor: &Asset) -> Result<(A
         AssetKind::Image | AssetKind::Audio => descriptor.decoded_bytes,
         AssetKind::Font => 0,
     };
-    if tokens > 0 {
-        budget.acquire(tokens);
-    }
-    // Any failure after acquiring must give the tokens back immediately;
-    // success transfers them to the result for the owner to release.
-    match decode_asset(bundle, descriptor) {
-        Ok(data) => Ok((data, tokens)),
-        Err(e) => {
-            budget.release(tokens);
-            Err(e)
-        }
-    }
+    let guard = BudgetGuard::acquire(budget, tokens);
+    // Any failure or panic after acquiring gives the tokens back via Drop;
+    // success disarms the guard and transfers ownership to the owner thread.
+    let data = decode_asset(bundle, descriptor)?;
+    Ok((data, guard.disarm()))
 }
 /// Aligns a tag-unaware (whole-frames) MP3 decode back to the authored
 /// window. The LAME tag's delay is relative to the fixed 528+1 MP3 decoder
@@ -295,7 +344,7 @@ fn decode_asset(bundle: &Bundle, descriptor: &Asset) -> Result<AssetData> {
                 }
                 None => authored,
             };
-            let mut samples: Vec<f32> = Vec::new();
+            let mut samples: Vec<f32> = Vec::with_capacity((cap.min(32 * 1024 * 1024)) as usize);
             for sample in decoder {
                 ensure!((samples.len() as u64) < cap, "E_AUDIO_SIZE");
                 samples.push(sample);

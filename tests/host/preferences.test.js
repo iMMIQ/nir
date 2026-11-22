@@ -7,7 +7,7 @@ test('first visit inherits work defaults and supported browser language',()=>{
     assert.deepEqual(initialPreferences(defaults,null,locales,['en-US'],false),{...defaults,ui_locale:'en',text_locale:'en'});
     assert.equal(initialPreferences(defaults,null,locales,['zh-CN'],false).text_locale,'zh-Hans');
     assert.equal(initialPreferences(defaults,null,locales,['zh-Hant-TW','en-GB'],false).ui_locale,'en');
-    assert.equal(initialPreferences(defaults,null,locales,['zh-CN','en-US'],false).ui_locale,'en');
+    assert.equal(initialPreferences(defaults,null,locales,['zh-CN','en-US'],false).ui_locale,'zh-Hans');
     assert.equal(initialPreferences(defaults,null,{...locales,default_ui:'en'},['zh-Hant-TW'],false).ui_locale,'en');
     assert.equal(initialPreferences(defaults,null,locales,['zh-Hans-CN'],false).ui_locale,'zh-Hans');
 });

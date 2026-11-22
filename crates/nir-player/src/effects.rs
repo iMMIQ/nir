@@ -121,9 +121,10 @@ impl MenuEffectsState {
             closing: None,
         }
     }
-    pub fn alloc_task(&mut self) -> u32 {
-        self.next_task = self.next_task.saturating_add(1);
-        self.next_task
+    pub fn alloc_task(&mut self) -> Option<u32> {
+        let next = self.next_task.checked_add(1)?;
+        self.next_task = next;
+        Some(next)
     }
     pub fn opacity(&self, now_us: u64, reduced_motion: bool) -> f32 {
         match &self.fade {

@@ -310,14 +310,24 @@ pub(crate) fn central_directory(entries: &[EntryRecord]) -> Result<Vec<u8>> {
 /// Builds the 22-byte EOCD record for a central directory at `cd_offset`.
 pub(crate) fn eocd(entry_count: u32, cd_size: u64, cd_offset: u64) -> Result<Vec<u8>> {
     ensure!(entry_count <= MAX_ENTRIES, "E_ZIP_ENTRY_COUNT");
+    let cd_size_u32 = u32::try_from(cd_size).context("E_ZIP_LIMIT: central dir exceeds ZIP32")?;
+    let cd_offset_u32 =
+        u32::try_from(cd_offset).context("E_ZIP_LIMIT: central dir offset exceeds ZIP32")?;
+    ensure!(
+        cd_offset
+            .checked_add(cd_size)
+            .and_then(|v| v.checked_add(22))
+            .is_some_and(|total| total <= u32::MAX as u64),
+        "E_ZIP_LIMIT: archive exceeds ZIP32 limit"
+    );
     let mut out = Vec::with_capacity(22);
     out.extend_from_slice(&EOCD_SIG.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // disk number
     out.extend_from_slice(&0u16.to_le_bytes()); // central directory disk
     out.extend_from_slice(&(entry_count as u16).to_le_bytes());
     out.extend_from_slice(&(entry_count as u16).to_le_bytes());
-    out.extend_from_slice(&(cd_size as u32).to_le_bytes());
-    out.extend_from_slice(&(cd_offset as u32).to_le_bytes());
+    out.extend_from_slice(&cd_size_u32.to_le_bytes());
+    out.extend_from_slice(&cd_offset_u32.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // comment length
     Ok(out)
 }
@@ -327,17 +337,20 @@ pub(crate) fn eocd(entry_count: u32, cd_size: u64, cd_offset: u64) -> Result<Vec
 pub(crate) fn find_eocd(tail: &[u8]) -> Result<usize> {
     ensure!(tail.len() >= 22, "E_ZIP_EOCD: archive too short");
     let scan = tail.len().min(22 + u16::MAX as usize);
+    let mut saw_sig = false;
     for offset in (tail.len() - scan..=tail.len() - 22).rev() {
         let signature = u32::from_le_bytes(tail[offset..offset + 4].try_into().unwrap());
         if signature != EOCD_SIG {
             continue;
         }
+        saw_sig = true;
         let comment = u16::from_le_bytes(tail[offset + 20..offset + 22].try_into().unwrap());
-        ensure!(
-            offset + 22 + comment as usize == tail.len(),
-            "E_ZIP_EOCD: trailing data after EOCD"
-        );
-        return Ok(offset);
+        if offset + 22 + comment as usize == tail.len() {
+            return Ok(offset);
+        }
+    }
+    if saw_sig {
+        bail!("E_ZIP_EOCD: trailing data after EOCD");
     }
     bail!("E_ZIP_EOCD: record not found")
 }
@@ -374,7 +387,12 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
         let name_len = u16::from_le_bytes(record[28..30].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(record[30..32].try_into().unwrap()) as usize;
         let comment_len = u16::from_le_bytes(record[32..34].try_into().unwrap()) as usize;
-        let total = 46 + name_len + extra_len + comment_len;
+        let total = 46usize
+            .checked_add(name_len)
+            .and_then(|v| v.checked_add(extra_len))
+            .and_then(|v| v.checked_add(comment_len))
+            .filter(|&t| offset.checked_add(t).is_some_and(|end| end <= eocd))
+            .context("E_ZIP_CENTRAL: record exceeds central directory")?;
         let name = String::from_utf8(
             record
                 .get(46..46 + name_len)
@@ -397,6 +415,12 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
 
 /// Extracts and decompresses one entry from an in-memory archive.
 pub fn extract_entry(data: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
+    const MAX_EXTRACT_BYTES: u64 = 128 * 1024 * 1024;
+    ensure!(
+        entry.uncompressed_size as u64 <= MAX_EXTRACT_BYTES,
+        "E_ZIP_SIZE: {} exceeds extract limit",
+        entry.name
+    );
     let local = data
         .get(entry.local_offset as usize..)
         .context("E_ZIP_LOCAL: offset out of bounds")?;
@@ -405,15 +429,23 @@ pub fn extract_entry(data: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
     ensure!(signature == LOCAL_HEADER_SIG, "E_ZIP_LOCAL: bad signature");
     let name_len = u16::from_le_bytes(local[26..28].try_into().unwrap()) as usize;
     let extra_len = u16::from_le_bytes(local[28..30].try_into().unwrap()) as usize;
-    let start = 30 + name_len + extra_len;
+    let start = 30usize
+        .checked_add(name_len)
+        .and_then(|v| v.checked_add(extra_len))
+        .context("E_ZIP_LOCAL: header overflow")?;
+    let end = start
+        .checked_add(entry.compressed_size as usize)
+        .context("E_ZIP_LOCAL: payload overflow")?;
     let payload = local
-        .get(start..start + entry.compressed_size as usize)
+        .get(start..end)
         .context("E_ZIP_LOCAL: truncated data")?;
     let output = match entry.method {
         METHOD_STORE => payload.to_vec(),
         METHOD_DEFLATE => {
-            let mut out = Vec::with_capacity(entry.uncompressed_size as usize);
+            let limit = entry.uncompressed_size as u64;
+            let mut out = Vec::with_capacity((entry.uncompressed_size as usize).min(64 * 1024));
             DeflateDecoder::new(payload)
+                .take(limit + 1)
                 .read_to_end(&mut out)
                 .context("E_ZIP_DEFLATE")?;
             out
@@ -580,5 +612,34 @@ mod tests {
         let extra = &archive[lib.local_offset as usize + 30 + lib.name.len()..data_start];
         assert_eq!(&extra[..2], &0xd935u16.to_le_bytes());
         assert_eq!(extract_entry(&archive, lib).unwrap(), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn eocd_skips_false_positive_sig_and_checks_zip32_limits() {
+        // ZIP32 boundary check rejects offsets exceeding u32::MAX.
+        assert!(eocd(1, 100, u32::MAX as u64).is_err());
+
+        // A valid EOCD followed by a comment containing a false-positive EOCD signature
+        // must still resolve to the real EOCD at offset 0.
+        let mut tail = eocd(0, 0, 0).unwrap();
+        let mut comment = vec![0u8; 26];
+        comment[0..4].copy_from_slice(&EOCD_SIG.to_le_bytes());
+        comment[20..22].copy_from_slice(&99u16.to_le_bytes());
+        tail[20..22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        tail.extend_from_slice(&comment);
+        assert_eq!(find_eocd(&tail).unwrap(), 0);
+    }
+
+    #[test]
+    fn extract_entry_rejects_oversized_uncompressed_limit() {
+        let entry = ZipEntry {
+            name: "huge.bin".into(),
+            method: METHOD_DEFLATE,
+            crc32: 0,
+            compressed_size: 4,
+            uncompressed_size: 200 * 1024 * 1024,
+            local_offset: 0,
+        };
+        assert!(extract_entry(&[0u8; 64], &entry).is_err());
     }
 }

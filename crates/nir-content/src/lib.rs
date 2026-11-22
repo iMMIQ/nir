@@ -331,9 +331,10 @@ impl<'de> Deserialize<'de> for Strict {
             ) -> std::result::Result<Strict, A::Error> {
                 let mut v = serde_json::Map::new();
                 while let Some((k, Strict(x))) = a.next_entry::<String, Strict>()? {
-                    if v.insert(k.clone(), x).is_some() {
+                    if v.contains_key(&k) {
                         return Err(serde::de::Error::custom(format!("E_DUPLICATE: {k}")));
                     }
+                    v.insert(k, x);
                     if v.len() > 100_000 {
                         return Err(serde::de::Error::custom("E_LIMIT: map length"));
                     }
@@ -363,9 +364,7 @@ fn parse_package<T: DeserializeOwned>(root: &RuntimeProgram, bytes: &[u8], at: &
         }
         interned::decode_bytes(bytes, at)
     } else {
-        let value: serde_json::Value = parse(bytes, at)?;
-        serde_json::from_value(value)
-            .map_err(|e| Diagnostic::new("E_JSON_SCHEMA", at, e.to_string()))
+        parse(bytes, at)
     }
 }
 
@@ -431,6 +430,7 @@ pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
         &r.launch.bootstrap,
     ]
     .into_iter()
+    .chain(r.launch.style.iter())
     .chain(r.engine.runtime_worker.iter())
     .chain(r.engine.asset_worker.iter())
     .chain(r.notices.iter())
@@ -442,7 +442,14 @@ pub fn validate_release(r: &ReleaseManifest) -> Result<()> {
     for (id, mime, ext) in [
         (&r.launch.html, "text/html; charset=utf-8", ".html"),
         (&r.launch.bootstrap, "text/javascript", ".js"),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        r.launch
+            .style
+            .iter()
+            .map(|id| (id, "text/css; charset=utf-8", ".css")),
+    ) {
         let object = &r.objects[id];
         if object.media_type != mime || !object.path.ends_with(ext) {
             return Err(Diagnostic::new("E_LAUNCH", id, "invalid launch object"));
@@ -470,5 +477,70 @@ mod tests {
     #[test]
     fn corrupted_bytes() {
         assert!(verify(b"changed", &digest(b"original")).is_err());
+    }
+    #[test]
+    fn oversized_input_rejected_before_parsing() {
+        let huge = vec![b' '; MAX_INPUT_BYTES + 1];
+        assert_eq!(
+            parse::<serde_json::Value>(&huge, "huge").unwrap_err().code,
+            "E_LIMIT"
+        );
+    }
+    #[test]
+    fn validate_release_checks_optional_style_and_rejects_path_traversal() {
+        let h = |ch: char| ch.to_string().repeat(64);
+        let mut objects = BTreeMap::new();
+        for (id, ext, mime) in [
+            (h('a'), ".json", "application/json"),
+            (h('b'), ".js", "text/javascript"),
+            (h('c'), ".wasm", "application/wasm"),
+            (h('d'), ".js", "text/javascript"),
+            (h('e'), ".html", "text/html; charset=utf-8"),
+            (h('f'), ".js", "text/javascript"),
+            (h('0'), ".css", "text/css; charset=utf-8"),
+        ] {
+            objects.insert(
+                id.clone(),
+                Object {
+                    path: format!("objects/{id}{ext}"),
+                    bytes: 16,
+                    media_type: mime.into(),
+                },
+            );
+        }
+        let mut manifest = ReleaseManifest {
+            format: 1,
+            profile: "release".into(),
+            game_id: "g".into(),
+            title: "T".into(),
+            version: "1".into(),
+            engine_build: "1".into(),
+            program: h('a'),
+            objects,
+            engine: EngineFiles {
+                js: h('b'),
+                wasm: h('c'),
+                host: h('d'),
+                runtime_worker: None,
+                asset_worker: None,
+            },
+            launch: LaunchFiles {
+                html: h('e'),
+                bootstrap: h('f'),
+                style: Some(h('0')),
+            },
+            notices: vec![],
+        };
+        assert!(validate_release(&manifest).is_ok());
+        // Legacy release without style also passes.
+        manifest.launch.style = None;
+        assert!(validate_release(&manifest).is_ok());
+        // Bad MIME on style fails closed.
+        manifest.launch.style = Some(h('0'));
+        manifest.objects.get_mut(&h('0')).unwrap().media_type = "text/plain".into();
+        assert_eq!(validate_release(&manifest).unwrap_err().code, "E_LAUNCH");
+        // Path traversal fails closed.
+        manifest.objects.get_mut(&h('0')).unwrap().path = format!("objects/../{}.css", h('0'));
+        assert_eq!(validate_release(&manifest).unwrap_err().code, "E_OBJECT");
     }
 }

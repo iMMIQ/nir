@@ -50,3 +50,44 @@ test('dispose cancels pending open and prevents work; a custom late resolver is 
 test('dispose before the open microtask makes no factory request',async()=>{
   let opens=0;const connection=new SaveDatabaseConnection(()=>{opens++;return database();});const p=connection.connect();connection.close();await assert.rejects(p,/E_STORAGE_CLOSED/);assert.equal(opens,0);
 });
+test('waitOnBlocked keeps open pending until browser resolves onsuccess, and runRead reconnects once on InvalidStateError',async()=>{
+  const {request,factory}=openFixture(),db=database();
+  const p=openSaveDatabase(factory,{timeoutMs:100,waitOnBlocked:true});
+  request.onblocked();
+  request.result=db;request.onsuccess();
+  assert.equal(await p,db);
+
+  const dbs=[database(),database()];let opens=0,reads=0;
+  const conn=new SaveDatabaseConnection(()=>dbs[opens++]);
+  const res=await conn.runRead(()=>{
+    reads++;
+    if(reads===1)throw new DOMException('stale handle','InvalidStateError');
+    return 'ok';
+  });
+  assert.equal(res,'ok');assert.equal(opens,2);assert.equal(reads,2);assert.equal(dbs[0].closed,1);
+  conn.close();
+});
+test('listSaveRecords uses one readonly transaction and respects configurable slotCount',async()=>{
+  const {listSaveRecords,validHistoryKey}=await import('../../crates/nir-platform-web/host.js');
+  let txCount=0;
+  const gameId='g',profile='release',digest='a'.repeat(64);
+  const store={
+    get(key){
+      const req={};
+      queueMicrotask(()=>{
+        req.result=key[3]===4?{gameId,profile,releaseDigest:digest,slot:4,label:'Slot 5',envelope:{ok:true}}:undefined;
+        req.onsuccess?.();
+        if(++seen===6)tx.oncomplete?.();
+      });
+      return req;
+    },
+  };
+  let seen=0;
+  const tx={objectStore:()=>store};
+  const db={transaction:()=>{txCount++;return tx;}};
+  const rows=await listSaveRecords(db,gameId,profile,digest,async()=>7,{slotCount:6});
+  assert.equal(txCount,1);
+  assert.deepEqual(rows,[{slot:4,revision:7,label:'Slot 5'}]);
+  assert.equal(validHistoryKey([gameId,profile,digest,4],6),true);
+  assert.equal(validHistoryKey([gameId,profile,digest,6],6),false);
+});

@@ -2,11 +2,11 @@
 name = "nir-platform-web"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 wasm-bindgen.workspace = true
-web-sys.workspace = true
-[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.77"
-features = ["Window", "Document", "HtmlCanvasElement", "Element"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = ["Window", "Document", "HtmlCanvasElement", "Element"] }

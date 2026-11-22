@@ -72,7 +72,9 @@ async fn renderer(
         backends: match backend {
             RendererBackend::WebGpu => wgpu::Backends::BROWSER_WEBGPU,
             RendererBackend::WebGl2 => wgpu::Backends::GL,
-            RendererBackend::Dx12 | RendererBackend::Vulkan => unreachable!(),
+            RendererBackend::Dx12 | RendererBackend::Metal | RendererBackend::Vulkan => {
+                unreachable!()
+            }
         },
         ..Default::default()
     });
@@ -171,7 +173,10 @@ impl Engine {
             return self.content_failed(request, "E_CONTENT_LIMIT".into());
         }
         for object in objects.iter() {
-            let array = js_sys::Uint8Array::new(&object);
+            let array = match object.dyn_into::<js_sys::Uint8Array>() {
+                Ok(array) => array,
+                Err(val) => js_sys::Uint8Array::new(&val),
+            };
             total = total.saturating_add(array.length() as usize);
             if total > nir_format::MAX_INPUT_BYTES {
                 return self.content_failed(request, "E_CONTENT_LIMIT".into());
@@ -298,17 +303,16 @@ impl Engine {
     pub fn tick_domains(&mut self, story_us: u32, foreground_us: u32) -> Result<(), JsValue> {
         self.inner.tick_domains(story_us, foreground_us).map_err(js)
     }
+    pub fn set_tracing(&mut self, enabled: bool) {
+        self.inner.set_tracing(enabled);
+    }
     pub fn audio_positions_in(
         &mut self,
         domain: String,
         session: u32,
         positions: String,
     ) -> std::result::Result<(), JsValue> {
-        let domain = nir_content::parse(
-            serde_json::to_string(&domain).unwrap().as_bytes(),
-            "audio-domain",
-        )
-        .map_err(js)?;
+        let domain = parse_time_domain(&domain).map_err(js)?;
         let positions = nir_content::parse(positions.as_bytes(), "audio-positions").map_err(js)?;
         self.inner
             .audio_positions_in(domain, session, positions)
@@ -337,8 +341,7 @@ impl Engine {
         task: u32,
         session: u32,
     ) -> std::result::Result<(), JsValue> {
-        let domain =
-            serde_json::from_value(serde_json::Value::String(domain.into())).map_err(js)?;
+        let domain = parse_time_domain(domain).map_err(js)?;
         self.inner.audio_ended_in(domain, task, session).map_err(js)
     }
     pub fn audio_failed_in(
@@ -348,8 +351,7 @@ impl Engine {
         session: u32,
         message: String,
     ) -> std::result::Result<(), JsValue> {
-        let domain =
-            serde_json::from_value(serde_json::Value::String(domain.into())).map_err(js)?;
+        let domain = parse_time_domain(domain).map_err(js)?;
         self.inner
             .audio_failed_in(domain, task, session, message)
             .map_err(js)
@@ -369,14 +371,26 @@ impl Engine {
         self.inner.needs_clock()
     }
     pub fn state(&self) -> String {
-        let mut state: serde_json::Value = serde_json::from_str(&self.inner.state()).unwrap();
-        state["wasm_memory_bytes"] = serde_json::json!(js_sys::Reflect::get(
-            &wasm_bindgen::memory(),
-            &JsValue::from_str("buffer")
-        )
-        .ok()
-        .map(|b| js_sys::ArrayBuffer::from(b).byte_length()));
-        state.to_string()
+        let mut json = self.inner.state();
+        let bytes = js_sys::Reflect::get(&wasm_bindgen::memory(), &JsValue::from_str("buffer"))
+            .ok()
+            .map(|b| js_sys::ArrayBuffer::from(b).byte_length());
+        if json.ends_with('}') {
+            json.pop();
+            if json.len() > 1 {
+                json.push(',');
+            }
+            match bytes {
+                Some(n) => {
+                    use std::fmt::Write;
+                    let _ = write!(json, r#""wasm_memory_bytes":{n}}}"#);
+                }
+                None => json.push_str(r#""wasm_memory_bytes":null}"#),
+            }
+            json
+        } else {
+            json
+        }
     }
     pub fn host_state(&mut self) -> String {
         self.inner.host_state()
@@ -398,6 +412,14 @@ impl Engine {
     }
     pub fn replace_gpu(&mut self, replacement: GpuReplacement) -> std::result::Result<(), JsValue> {
         self.inner.replace_gpu(replacement.renderer).map_err(js)
+    }
+}
+
+fn parse_time_domain(domain: &str) -> Result<nir_format::TimeDomain, String> {
+    match domain {
+        "story" => Ok(nir_format::TimeDomain::Story),
+        "foreground_ui" => Ok(nir_format::TimeDomain::ForegroundUi),
+        _ => Err(format!("E_AUDIO_DOMAIN: unknown time domain {domain}")),
     }
 }
 

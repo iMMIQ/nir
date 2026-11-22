@@ -1,26 +1,71 @@
 //! Native package and persistence contracts, independent of window/GPU setup.
 #![forbid(unsafe_code)]
 pub mod audio_envelope;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod audio_output;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod audio_output_state;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod audio_output_worker;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod audio_recovery_input;
 pub mod audio_source;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod close;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub mod desktop;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub mod dialog;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub mod io_worker;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod lifecycle;
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 pub mod loader;
 use anyhow::{bail, ensure, Context, Result};
 use nir_format::{NativeRelease, Preferences, RuntimeExecutable};
@@ -116,37 +161,99 @@ impl Bundle {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().context("E_STORAGE_PATH")?;
-    fs::create_dir_all(parent)?;
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = fs::File::create(&temp)?;
-    file.write_all(bytes)?;
-    #[cfg(test)]
-    let sync_timing = std::env::var_os("NIR_STORAGE_TIMINGS").map(|_| {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-        let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        eprintln!("NIR_STORAGE_SYNC_BEGIN id={id} bytes={}", bytes.len());
-        (id, std::time::Instant::now())
-    });
-    let synced = file.sync_all();
-    #[cfg(test)]
-    if let Some((id, started)) = sync_timing {
-        eprintln!(
-            "NIR_STORAGE_SYNC_END id={id} seconds={:.6} ok={}",
-            started.elapsed().as_secs_f64(),
-            synced.is_ok()
-        );
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
     }
-    synced?;
-    drop(file);
-    fs::rename(&temp, path)?;
-    Ok(())
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("E_STORAGE_PATH")?;
+    let primary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let (temp, mut file) = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&primary)
+    {
+        Ok(file) => (primary, file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !primary.is_dir() => {
+            let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let fallback = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&fallback)?;
+            (fallback, file)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let write_res = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        #[cfg(test)]
+        let sync_timing = std::env::var_os("NIR_STORAGE_TIMINGS").map(|_| {
+            use std::sync::atomic::AtomicUsize;
+            static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+            let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            eprintln!("NIR_STORAGE_SYNC_BEGIN id={id} bytes={}", bytes.len());
+            (id, std::time::Instant::now())
+        });
+        let synced = file.sync_all();
+        #[cfg(test)]
+        if let Some((id, started)) = sync_timing {
+            eprintln!(
+                "NIR_STORAGE_SYNC_END id={id} seconds={:.6} ok={}",
+                started.elapsed().as_secs_f64(),
+                synced.is_ok()
+            );
+        }
+        synced?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            let mut last_err = None;
+            for attempt in 0..4 {
+                match fs::rename(&temp, path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e.into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            fs::rename(&temp, path)?;
+            let dir_path = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(dir) = fs::File::open(dir_path) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_res
 }
 
 pub struct Storage {
     pub root: PathBuf,
     release: String,
+    save_slots: u32,
     _lock: fs::File,
 }
 pub(crate) struct StartupStorage {
@@ -176,11 +283,19 @@ impl Storage {
         Ok(Self {
             root,
             release: release.into(),
+            save_slots: nir_format::DEFAULT_SAVE_SLOTS,
             _lock: lock,
         })
     }
+    pub fn with_save_slots(mut self, save_slots: u32) -> Self {
+        self.save_slots = save_slots.clamp(1, nir_format::MAX_SAVE_SLOTS);
+        self
+    }
+    pub fn save_slots(&self) -> u32 {
+        self.save_slots
+    }
     fn slot(&self, slot: u32) -> Result<PathBuf> {
-        ensure!(slot < 3, "E_SAVE_SLOT");
+        ensure!(slot < self.save_slots, "E_SAVE_SLOT");
         Ok(self
             .root
             .join("releases")

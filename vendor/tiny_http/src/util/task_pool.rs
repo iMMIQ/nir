@@ -29,6 +29,10 @@ struct Sharing {
 /// Minimum number of active threads.
 static MIN_THREADS: usize = 4;
 
+/// Maximum number of active threads to prevent unbounded thread spawning under
+/// concurrent keep-alive connection floods.
+static MAX_THREADS: usize = 64;
+
 struct Registration<'a> {
     nb: &'a AtomicUsize,
 }
@@ -71,7 +75,9 @@ impl TaskPool {
 
         // Queued jobs already reserve waiting workers. Counting them as available
         // again can strand a connection behind long-lived keep-alive readers.
-        if queue.len() >= self.sharing.waiting_tasks.load(Ordering::Acquire) {
+        if queue.len() >= self.sharing.waiting_tasks.load(Ordering::Acquire)
+            && self.sharing.active_tasks.load(Ordering::Acquire) < MAX_THREADS
+        {
             self.add_thread(Some(code));
         } else {
             queue.push_back(code);

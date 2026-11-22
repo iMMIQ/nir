@@ -32,9 +32,38 @@ Cue 中的 `dialogue` effect 指向文本 ID，同时给出 `reveal_us`。块末
 
 `schemas/*.schema.json` 用于编辑器提示；`check` 还执行跨文件引用、类型、确定赋值、资源实际解码、字体覆盖与翻译契约检查，不能只用 JSON Schema 代替。
 
+## 声明式 `.nirs` 剧本前端
+
+除手写 `.nir.json` 片段外，模块 `sources` 也可直接引用 `.nirs` 声明式剧本文件；`novelc` 在编译期将其静态降级为标准 NIR IR 与对应文本契约，运行时零额外开销：
+
+```text
+@var score = 0
+@scene room
+@bg bg.room
+
+@function main
+@block start
+@show room dissolve 300
+@bgm audio.bgm
+Aya: 雨停了，要一起去站台吗？
+"站台上的灯一盏盏亮了起来。"
+@set score = score + 1
+@choice route
+- 一起去 -> walk if score >= 1
+- 再等一会儿 -> stay
+
+@block walk
+@end walked
+
+@block stay
+@end stayed
+```
+
+支持的指令包括 `@var`、`@scene`/`@bg`/`@sprite`、`@function`/`@block`、`@show`、`@bgm`/`@sfx`/`@stop_bgm`/`@stop_audio`、`@wait`、`@set`、`@unlock`、`@if ... -> ... else ...`、`@jump`、`@call`、`@return`、`@choice`（配 `- <label> -> <target> [if <expr>]`）和 `@end`；对白使用 `说话人: 正文`（兼容中文冒号），旁白使用 `"正文"` 或 `> 正文`。
+
 ## 场景用例
 
-用例位于 `tests/scenarios/*.toml`，登记在 `game.toml`。`await_choice` 驱动正式 Core 到指定选择，`choose` 使用 OptionId，结尾检查 outcome 和类型化的 `expect.variables`；旧 affection 断言兼容。示例有 `walk` 与 `stay` 两条路径。用例从合法新游戏入口运行，不任意拼造快照。
+用例位于 `tests/scenarios/*.toml`，登记在 `game.toml`。`await_choice` 驱动正式 Core 到指定选择，`choose` 使用 OptionId，结尾检查 outcome 和类型化的 `expect.variables`；旧 affection 断言兼容。示例有 `walk` 与 `stay` 两条路径。用例从合法新游戏入口运行，不任意拼造快照。开发期间还可用 `novelc dev --scenario <场景路径或名称>` 在热重载后自动从新游戏入口重放到指定场景点。
 
 ## 排查错误
 

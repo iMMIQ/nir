@@ -60,11 +60,13 @@ try {
     const releaseDigest=fixed[1];
     const raw=await fetchBytes(`releases/${releaseDigest}.json`);if(await hash(raw)!==releaseDigest)throw new Error('E_RELEASE_DIGEST');const release=JSON.parse(new TextDecoder().decode(raw));
     if(release.format!==1||!['dev','release'].includes(release.profile)||!release.engine||!release.objects||!release.launch)throw new Error('E_RELEASE_SCHEMA');
-    if(!(/^[0-9a-f]{64}$/).test(release.launch.html)||!(/^[0-9a-f]{64}$/).test(release.launch.bootstrap))throw new Error('E_LAUNCH_SCHEMA');
-    const launchFiles=await Promise.all(['index.html','bootstrap.js'].map(name=>fetchBytes(`releases/${releaseDigest}/${name}`)));
-    if(await hash(launchFiles[0])!==release.launch.html||await hash(launchFiles[1])!==release.launch.bootstrap)throw new Error('E_LAUNCH_DIGEST');
+    if(!(/^[0-9a-f]{64}$/).test(release.launch.html)||!(/^[0-9a-f]{64}$/).test(release.launch.bootstrap)||(release.launch.style!==undefined&&!(/^[0-9a-f]{64}$/).test(release.launch.style)))throw new Error('E_LAUNCH_SCHEMA');
+    const launchChecks=[['index.html',release.launch.html],['bootstrap.js',release.launch.bootstrap]];
+    if(release.launch.style)launchChecks.push(['style.css',release.launch.style]);
+    const launchFiles=await Promise.all(launchChecks.map(([name])=>fetchBytes(`releases/${releaseDigest}/${name}`)));
+    for(let i=0;i<launchChecks.length;i++)if(await hash(launchFiles[i])!==launchChecks[i][1])throw new Error('E_LAUNCH_DIGEST');
     mark('release_verified');
-    const objectUrl=(id)=>{const o=release.objects[id];if(!o||!(/^[0-9a-f]{64}$/).test(id)||!o.path.startsWith(`objects/${id}.`)||o.path.includes('..')||o.path.includes(':')||o.path.includes('\\'))throw new Error('E_OBJECT_REFERENCE');return new URL(o.path,base);};
+    const objectUrl=(id)=>{const o=release.objects[id];if(!o||!(/^[0-9a-f]{64}$/).test(id)||!o.path.startsWith(`objects/${id}.`)||o.path.includes('..')||o.path.includes(':')||o.path.includes('\\')||o.path.includes('?')||o.path.includes('#'))throw new Error('E_OBJECT_REFERENCE');const u=new URL(o.path,base);if(u.origin!==base.origin||!u.pathname.startsWith(`${base.pathname}objects/`))throw new Error('E_OBJECT_REFERENCE');return u;};
     const fetchObject=async(id,signal,observe=()=>{})=>{
         const o=release.objects[id],url=objectUrl(id),start_us=String(Math.round(performance.now()*1000));
         const r=await fetch(url,{signal});if(!r.ok)throw Object.assign(new Error(`E_HTTP: ${r.status}`),{code:'E_HTTP'});

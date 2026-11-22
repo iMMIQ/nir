@@ -117,8 +117,8 @@ pub(crate) fn characters_by_plan(p: &Program, title: &str) -> Result<CharacterSe
     let mut text = BTreeMap::new();
     for locale in p.locale_config.ui.keys() {
         let fluent = match locale.as_str() {
-            "zh-Hans" => include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
-            "en" => include_str!("../../nir-presentation/messages/en.ftl"),
+            "zh-Hans" => nir_format::ui_messages::ZH_HANS_FTL,
+            "en" => nir_format::ui_messages::EN_FTL,
             _ => anyhow::bail!("E_LOCALE: unsupported UI locale {locale}"),
         };
         let mut chars = common.clone();

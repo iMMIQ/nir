@@ -37,6 +37,11 @@ fn native_library(state: &OnCreateState) -> anyhow::Result<PathBuf> {
                 &[],
             )?
             .l()?;
+        if info.is_null() {
+            return Err(jni::errors::Error::NullPtr(
+                "getApplicationInfo returned null",
+            ));
+        }
         let field = env
             .get_field(
                 &info,
@@ -44,9 +49,20 @@ fn native_library(state: &OnCreateState) -> anyhow::Result<PathBuf> {
                 jni_sig!(java.lang.String),
             )?
             .l()?;
+        if field.is_null() {
+            return Err(jni::errors::Error::NullPtr(
+                "ApplicationInfo.nativeLibraryDir is null",
+            ));
+        }
         let raw = field.as_raw();
         let dir = unsafe { env.as_cast_raw::<jni::objects::JString>(&raw)? };
-        Ok(PathBuf::from(dir.to_string()).join("libplayer.so"))
+        let dir_str = dir.to_string();
+        if dir_str.is_empty() {
+            return Err(jni::errors::Error::NullPtr(
+                "ApplicationInfo.nativeLibraryDir is empty",
+            ));
+        }
+        Ok(PathBuf::from(dir_str).join("libplayer.so"))
     })
     .map_err(|e| anyhow::anyhow!("E_JNI: nativeLibraryDir lookup failed: {e:?}"))
 }

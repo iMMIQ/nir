@@ -55,19 +55,77 @@ pub(crate) struct PendingDialog {
     pub(crate) replies: mpsc::Receiver<DialogOutcome>,
     pub(crate) failure: DialogFailure,
 }
-/// Runs `task` on a new thread; the returned receiver yields one outcome.
+/// Runs `task` on a new thread on Windows/Linux (portal / Win32 allow off-thread
+/// dialogs), or synchronously on the calling main thread on macOS (AppKit
+/// requires `NSOpenPanel`/`NSSavePanel` on the main thread). In both cases the
+/// returned receiver yields one outcome.
 pub(crate) fn open(task: DialogTask) -> Result<PendingDialog> {
     let failure = task.failure();
     let (done, replies) = mpsc::channel::<DialogOutcome>();
-    thread::Builder::new()
-        .name("nir-dialog".into())
-        .spawn(move || {
-            let outcome = run(task);
-            let _ = done.send(outcome);
-        })
-        .map_err(|_| anyhow!("E_DIALOG_THREAD"))?;
-    Ok(PendingDialog { replies, failure })
+    #[cfg(target_os = "macos")]
+    {
+        let outcome = run_sync(task);
+        let _ = done.send(outcome);
+        Ok(PendingDialog { replies, failure })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        thread::Builder::new()
+            .name("nir-dialog".into())
+            .spawn(move || {
+                let outcome = run(task);
+                let _ = done.send(outcome);
+            })
+            .map_err(|_| anyhow!("E_DIALOG_THREAD"))?;
+        Ok(PendingDialog { replies, failure })
+    }
 }
+fn parse_imported_file(path: &std::path::Path) -> std::result::Result<Box<SaveEnvelope>, String> {
+    (|| -> anyhow::Result<_> {
+        use std::io::Read;
+        let max = nir_format::MAX_INPUT_BYTES;
+        let meta = fs::metadata(path)?;
+        anyhow::ensure!(
+            meta.len() <= max as u64,
+            "E_SAVE_SIZE: imported save exceeds {} bytes",
+            max
+        );
+        let file = fs::File::open(path)?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.take((max + 1) as u64).read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= max,
+            "E_SAVE_SIZE: imported save exceeds {} bytes",
+            max
+        );
+        Ok(nir_content::parse(&bytes, "imported save")?)
+    })()
+    .map(Box::new)
+    .map_err(|e| e.to_string())
+}
+#[cfg(target_os = "macos")]
+fn run_sync(task: DialogTask) -> DialogOutcome {
+    match task {
+        DialogTask::Export { job, json } => {
+            let picked = rfd::FileDialog::new()
+                .set_file_name("save.nir-save.json")
+                .save_file();
+            DialogOutcome::ExportSelected {
+                job,
+                path: picked,
+                json,
+            }
+        }
+        DialogTask::Import => match rfd::FileDialog::new()
+            .add_filter("NIR save", &["json"])
+            .pick_file()
+        {
+            None => DialogOutcome::ImportCancelled,
+            Some(path) => DialogOutcome::Imported(parse_imported_file(&path)),
+        },
+    }
+}
+#[cfg(not(target_os = "macos"))]
 fn run(task: DialogTask) -> DialogOutcome {
     match task {
         DialogTask::Export { job, json } => {
@@ -90,13 +148,7 @@ fn run(task: DialogTask) -> DialogOutcome {
             );
             match picked {
                 None => DialogOutcome::ImportCancelled,
-                Some(handle) => DialogOutcome::Imported(
-                    fs::read(handle.path())
-                        .map_err(anyhow::Error::from)
-                        .and_then(|bytes| Ok(nir_content::parse(&bytes, "imported save")?))
-                        .map(Box::new)
-                        .map_err(|e| e.to_string()),
-                ),
+                Some(handle) => DialogOutcome::Imported(parse_imported_file(handle.path())),
             }
         }
     }

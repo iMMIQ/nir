@@ -16,7 +16,7 @@ default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "LGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -44,6 +44,12 @@ unic-langid = "0.9"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 schemars = "1"
+tempfile = "3"
+winit = "0.30"
+pollster = "0.4"
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3"] }
+rfd = { version = "0.15", default-features = false }
+android-activity = { version = "0.6", features = ["native-activity"] }
 nir-format = { path = "crates/nir-format" }
 nir-core = { path = "crates/nir-core" }
 nir-content = { path = "crates/nir-content" }
@@ -54,7 +60,9 @@ nir-render-wgpu = { path = "crates/nir-render-wgpu" }
 nir-platform-web = { path = "crates/nir-platform-web" }
 nir-apk = { path = "crates/nir-apk" }
 nir-compiler = { path = "crates/nir-compiler" }
+nir-import-livemaker = { path = "crates/nir-import-livemaker" }
 nir-engine = { path = "crates/nir-engine" }
+player-desktop = { path = "apps/player-desktop" }
 
 [profile.release]
 opt-level = "s"

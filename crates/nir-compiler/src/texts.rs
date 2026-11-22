@@ -103,7 +103,7 @@ struct Sources {
 fn hash<T: Serialize>(value: &T) -> Result<String> {
     Ok(nir_content::digest(&serde_json::to_vec(value)?))
 }
-fn shape(c: &AuthorTextContract) -> Result<String> {
+pub fn shape(c: &AuthorTextContract) -> Result<String> {
     if !c.images.is_empty() {
         hash(&(&c.params, &c.gates, &c.pauses, &c.images))
     } else if c.pauses.is_empty() {

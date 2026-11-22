@@ -1,5 +1,5 @@
 struct VertexIn { @location(0) pos: vec2f, @location(1) uv: vec2f, @location(2) color: vec4f };
-struct VertexOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) color: vec4f };
+struct VertexOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) @interpolate(flat) color: vec4f };
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
 @vertex fn vs(v: VertexIn) -> VertexOut { var o: VertexOut; o.pos = vec4f(v.pos, 0.0, 1.0); o.uv = v.uv; o.color = v.color; return o; }

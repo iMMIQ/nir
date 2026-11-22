@@ -182,8 +182,14 @@ pub fn parse(b: &[u8]) -> Option<Gapless> {
 /// for an MP3 whose LAME tag reports `source` authored samples: the authored
 /// audio plus encoder delay and padding, rounded up to whole frames.
 pub fn untrimmed_samples(gapless: &Gapless, source: u64, samples_per_frame: u32) -> u64 {
-    let total = gapless.delay as u64 + source + gapless.padding as u64;
-    total.div_ceil(samples_per_frame as u64) * samples_per_frame as u64
+    let total = (gapless.delay as u64)
+        .saturating_add(source)
+        .saturating_add(gapless.padding as u64);
+    if samples_per_frame == 0 {
+        return total;
+    }
+    let spf = samples_per_frame as u64;
+    total.div_ceil(spf).saturating_mul(spf)
 }
 
 #[cfg(test)]

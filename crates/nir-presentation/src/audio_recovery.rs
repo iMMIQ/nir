@@ -1,6 +1,10 @@
 //! Host-owned output recovery controls. These never become story actions.
-use super::{DrawPacket, Messages, Screen, UiModel};
+use super::{DrawPacket, Messages, Screen, SemanticNode, UiModel};
+use nir_format::UiAction;
 use serde::Serialize;
+
+pub const RETRY_CONTROL_ID: u32 = u32::MAX - 2;
+pub const MENU_CONTROL_ID: u32 = u32::MAX - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +67,11 @@ impl Layout {
         messages: &Messages,
         focus: Option<Action>,
     ) {
+        // The modal audio recovery scrim covers the story screen; disable
+        // underlying controls so assistive tech and keyboard focus stay modal.
+        for node in &mut packet.semantics {
+            node.enabled = false;
+        }
         let msg = |key| messages.text(&model.ui_locale, key);
         let [x, y, w, _] = self.card;
         let size = if w < 220. { 12. } else { 16. };
@@ -93,7 +102,7 @@ impl Layout {
             model.theme.text,
         );
         packet.texts.last_mut().unwrap().height = 40.;
-        for (action, rect, label, enabled) in [
+        for (action, rect, label, enabled, semantic_id, ui_action) in [
             (
                 Action::Retry,
                 self.retry,
@@ -103,8 +112,17 @@ impl Layout {
                     "retry"
                 }),
                 self.status == Status::Failed,
+                RETRY_CONTROL_ID,
+                UiAction::Retry,
             ),
-            (Action::Menu, self.menu, msg("menu"), true),
+            (
+                Action::Menu,
+                self.menu,
+                msg("menu"),
+                true,
+                MENU_CONTROL_ID,
+                UiAction::Menu,
+            ),
         ] {
             packet.rect(
                 rect,
@@ -115,7 +133,7 @@ impl Layout {
                 },
             );
             packet.text(
-                label,
+                label.clone(),
                 rect[0] + 8.,
                 rect[1] + 4.,
                 rect[2] - 16.,
@@ -127,6 +145,15 @@ impl Layout {
                 },
             );
             packet.texts.last_mut().unwrap().height = 40.;
+            packet.semantics.push(SemanticNode {
+                value: None,
+                id: semantic_id,
+                label,
+                action: ui_action,
+                enabled,
+                rect,
+                locale: model.ui_locale.clone(),
+            });
             if enabled && focus == Some(action) {
                 let [x, y, w, h] = rect;
                 for edge in [

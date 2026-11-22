@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 HASH = re.compile(r"[0-9a-f]{64}\Z")
-MIME = {"html": "text/html", "js": "text/javascript", "json": "application/json",
+MIME = {"html": "text/html", "css": "text/css", "js": "text/javascript", "json": "application/json",
         "wasm": "application/wasm", "png": "image/png", "webp": "image/webp",
         "wav": "audio/wav", "mp3": "audio/mpeg",
         "otf": "font/otf", "ttf": "font/ttf", "txt": "text/plain"}
@@ -89,7 +89,7 @@ def verify(location, requested=None):
     assert hashlib.sha256(raw).hexdigest() == release_id, "release digest mismatch"
     release = strict_json(raw)
     assert release["format"] == 1 and release["profile"] in ("dev", "release")
-    assert set(release["launch"]) == {"html", "bootstrap"}
+    assert set(release["launch"]) <= {"html", "bootstrap", "style"} and {"html", "bootstrap"} <= set(release["launch"])
     objects = release["objects"]
     total = compressed_objects = compressed_bytes = 0
     for identity, obj in objects.items():
@@ -112,16 +112,18 @@ def verify(location, requested=None):
     for identity in [release["program"], *release["engine"].values(),
                      *release["launch"].values(), *release["notices"]]:
         assert identity in objects, f"missing release root: {identity}"
-    for name, identity, mime in [("index.html", release["launch"]["html"], "text/html"),
-                                 ("bootstrap.js", release["launch"]["bootstrap"], "text/javascript")]:
+    launch_items = [("index.html", release["launch"]["html"], "text/html"),
+                    ("bootstrap.js", release["launch"]["bootstrap"], "text/javascript")]
+    if "style" in release["launch"]:
+        launch_items.append(("style.css", release["launch"]["style"], "text/css"))
+    for name, identity, mime in launch_items:
         data = reader.get(f"releases/{release_id}/{name}", mime, True)
         assert hashlib.sha256(data).hexdigest() == identity, f"fixed launch mismatch: {name}"
         assert data == reader.get(objects[identity]["path"], mime, True)
     wasm = reader.get(objects[release["engine"]["wasm"]]["path"], "application/wasm", True)
     assert wasm.startswith(b"\0asm\x01\0\0\0"), "not actual WASM"
     if requested is None:
-        for name, identity, mime in [("index.html", release["launch"]["html"], "text/html"),
-                                     ("bootstrap.js", release["launch"]["bootstrap"], "text/javascript")]:
+        for name, identity, mime in launch_items:
             assert hashlib.sha256(reader.get(name, mime, False)).hexdigest() == identity, f"root launch mismatch: {name}"
     reader.missing("releases/" + "0" * 64 + ".json" if release_id != "0" * 64 else "releases/" + "f" * 64 + ".json")
     reader.missing("objects/" + "0" * 64 + ".json")

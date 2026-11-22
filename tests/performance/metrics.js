@@ -85,6 +85,7 @@ export async function installAdapterProbe(context) {
         let copiedOptions = null;
         try { copiedOptions = options ? { powerPreference: options.powerPreference, forceFallbackAdapter: options.forceFallbackAdapter } : {}; } catch {}
         window.__nirActualAdapters.push({ atMs: performance.now(), options: copiedOptions, ...readInfo(adapter) });
+        if (window.__nirActualAdapters.length > 64) window.__nirActualAdapters.shift();
         return adapter;
       };
       try { Object.defineProperty(target, 'requestAdapter', { configurable: true, value: wrapped }); return true; } catch { return false; }

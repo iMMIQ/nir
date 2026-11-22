@@ -148,10 +148,14 @@ impl ReadingState {
             .texts
             .iter()
             .map(|r| {
-                text.buffers[&TextEngine::key(r)]
-                    .layout_runs()
-                    .map(|l| l.line_top + l.line_height)
-                    .fold(0., f32::max)
+                text.buffers
+                    .get(&TextEngine::key(r))
+                    .map(|b| {
+                        b.layout_runs()
+                            .map(|l| l.line_top + l.line_height)
+                            .fold(0., f32::max)
+                    })
+                    .unwrap_or(r.line_height)
                     .max(m.theme.choice.item_height - 12.)
                     + 12.
             })
@@ -180,10 +184,15 @@ impl ReadingState {
                 // Shape the complete sentence, never its currently revealed
                 // prefix, so the panel does not move as characters appear.
                 text.layout_texts(std::slice::from_ref(run));
-                let bottom = text.buffers[&TextEngine::key(run)]
-                    .layout_runs()
-                    .map(|line| line.line_top + line.line_height)
-                    .fold(0., f32::max);
+                let bottom = text
+                    .buffers
+                    .get(&TextEngine::key(run))
+                    .map(|b| {
+                        b.layout_runs()
+                            .map(|line| line.line_top + line.line_height)
+                            .fold(0., f32::max)
+                    })
+                    .unwrap_or(run.line_height);
                 let needed = bottom.max(run.line_height * 2.) + rect[3] - run.height;
                 let fitted = needed.max(140.).min(rect[3]);
                 if fitted < rect[3] - 0.5 {
@@ -221,7 +230,9 @@ impl ReadingState {
                 | ScrollRegion::Saves => continue,
             };
             let shape = TextEngine::key(r);
-            let buffer = &text.buffers[&shape];
+            let Some(buffer) = text.buffers.get(&shape) else {
+                continue;
+            };
             let offsets = TextEngine::line_offsets(r);
             let visible = r.visible.unwrap_or(r.text.len());
             let mut bottom = 0f32;
@@ -276,9 +287,28 @@ impl ReadingState {
         if views.iter().any(|v| v.region == ScrollRegion::Dialogue) {
             if let Some(index) = p.dialogue_hint.take() {
                 p.texts.remove(index);
+                let adjust = |indices: &mut Vec<usize>| {
+                    indices.retain(|&i| i != index);
+                    for i in indices.iter_mut() {
+                        if *i > index {
+                            *i -= 1;
+                        }
+                    }
+                };
+                if let Some(layers) = &mut p.window_layers {
+                    adjust(&mut layers.texts);
+                }
+                if let Some(layers) = &mut p.menu_layers {
+                    adjust(&mut layers.texts);
+                }
             }
             if let Some(index) = p.dialogue_hint_quad.take() {
                 p.quads.remove(index);
+                if let Some(layers) = &mut p.menu_layers {
+                    if layers.position > index {
+                        layers.position -= 1;
+                    }
+                }
             }
         }
         self.choice_offset = p

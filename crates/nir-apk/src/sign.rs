@@ -226,12 +226,13 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
         &trailer[8..] == APK_SIG_BLOCK_MAGIC,
         "E_VERIFY_BLOCK: magic not found"
     );
+    const MAX_V2_PAIR_BYTES: u64 = 16 * 1024 * 1024;
     let block_size = u64::from_le_bytes(trailer[..8].try_into().unwrap());
-    ensure!(
-        block_size >= 24 && block_size + 8 <= cd_offset,
-        "E_VERIFY_BLOCK: bad size"
-    );
-    let block_start = cd_offset - block_size - 8;
+    let total_block = block_size
+        .checked_add(8)
+        .filter(|&total| block_size >= 24 && total <= cd_offset)
+        .context("E_VERIFY_BLOCK: bad size")?;
+    let block_start = cd_offset - total_block;
     let mut header = [0u8; 8];
     file.seek(SeekFrom::Start(block_start))
         .context("E_VERIFY_SEEK")?;
@@ -241,7 +242,10 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
         "E_VERIFY_BLOCK: size fields disagree"
     );
     // Walk the ID-value pairs.
-    let pairs_end = block_start + 8 + block_size - 24;
+    let pairs_end = block_start
+        .checked_add(8)
+        .and_then(|v| v.checked_add(block_size - 24))
+        .context("E_VERIFY_BLOCK: bad pair range")?;
     let mut position = block_start + 8;
     let mut v2_block: Option<Vec<u8>> = None;
     while position < pairs_end {
@@ -250,20 +254,28 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
             .context("E_VERIFY_SEEK")?;
         file.read_exact(&mut size_buf).context("E_VERIFY_READ")?;
         let pair_size = u64::from_le_bytes(size_buf);
-        ensure!(
-            pair_size >= 4 && position + 8 + pair_size <= pairs_end,
-            "E_VERIFY_BLOCK: malformed ID-value pair"
-        );
+        let next_pos = position
+            .checked_add(8)
+            .and_then(|v| v.checked_add(pair_size))
+            .filter(|&end| pair_size >= 4 && end <= pairs_end)
+            .context("E_VERIFY_BLOCK: malformed ID-value pair")?;
         let mut id_buf = [0u8; 4];
         file.read_exact(&mut id_buf).context("E_VERIFY_READ")?;
         let id = u32::from_le_bytes(id_buf);
-        let value_length = (pair_size - 4) as usize;
-        let mut value = vec![0u8; value_length];
-        file.read_exact(&mut value).context("E_VERIFY_READ")?;
-        if id == V2_BLOCK_ID && v2_block.is_none() {
+        let value_len_u64 = pair_size - 4;
+        if id == V2_BLOCK_ID {
+            ensure!(v2_block.is_none(), "E_VERIFY_BLOCK: duplicate v2 block");
+            ensure!(
+                value_len_u64 <= MAX_V2_PAIR_BYTES,
+                "E_VERIFY_BLOCK: v2 block exceeds limit"
+            );
+            let value_length = usize::try_from(value_len_u64)
+                .context("E_VERIFY_BLOCK: v2 block length overflow")?;
+            let mut value = vec![0u8; value_length];
+            file.read_exact(&mut value).context("E_VERIFY_READ")?;
             v2_block = Some(value);
         }
-        position += 8 + pair_size;
+        position = next_pos;
     }
     let v2_block = v2_block.context("E_VERIFY_BLOCK: no v2 block")?;
 
@@ -272,8 +284,20 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
     let signers = parse_elements(strip_prefix(&v2_block).context("E_VERIFY_BLOCK: v2 prefix")?)
         .context("E_VERIFY_BLOCK: signers")?;
     ensure!(!signers.is_empty(), "E_VERIFY_BLOCK: no signers");
+    let block_start_u32 =
+        u32::try_from(block_start).context("E_VERIFY_BLOCK: signing block offset exceeds ZIP32")?;
+    let mut eocd_patched = eocd.to_vec();
+    eocd_patched[16..20].copy_from_slice(&block_start_u32.to_le_bytes());
+    let cd_size_usize =
+        usize::try_from(cd_size).context("E_VERIFY_BLOCK: central dir too large")?;
+    let mut central_directory = vec![0u8; cd_size_usize];
+    file.seek(SeekFrom::Start(cd_offset))
+        .context("E_VERIFY_SEEK")?;
+    file.read_exact(&mut central_directory)
+        .context("E_VERIFY_READ")?;
+    file.seek(SeekFrom::Start(0)).context("E_VERIFY_SEEK")?;
+    let recomputed = content_digest(&mut file, block_start, &central_directory, &eocd_patched)?;
     let mut certificate = None;
-    let mut digest_out = None;
     for signer_bytes in &signers {
         let fields = parse_elements(signer_bytes).context("E_VERIFY_BLOCK: signer fields")?;
         ensure!(fields.len() == 3, "E_VERIFY_BLOCK: signer field count");
@@ -306,16 +330,6 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
             SigningIdentity::verify_der(public_key, signed_data, &signature),
             "E_VERIFY_SIGNATURE"
         );
-        // Recompute the content digest over the three protected sections.
-        let mut eocd_patched = eocd.to_vec();
-        eocd_patched[16..20].copy_from_slice(&(block_start as u32).to_le_bytes());
-        let mut central_directory = vec![0u8; cd_size as usize];
-        file.seek(SeekFrom::Start(cd_offset))
-            .context("E_VERIFY_SEEK")?;
-        file.read_exact(&mut central_directory)
-            .context("E_VERIFY_READ")?;
-        file.seek(SeekFrom::Start(0)).context("E_VERIFY_SEEK")?;
-        let recomputed = content_digest(&mut file, block_start, &central_directory, &eocd_patched)?;
         let stored = digest_entries
             .iter()
             .find(|(algorithm, _)| *algorithm == ALGORITHM_ECDSA_SHA256)
@@ -328,12 +342,13 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
             crate::key::certificate_spki(certificates[0])? == *public_key,
             "E_VERIFY_CERTIFICATE: does not match signing key"
         );
-        certificate = Some(certificates[0].to_vec());
-        digest_out = Some(recomputed);
+        if certificate.is_none() {
+            certificate = Some(certificates[0].to_vec());
+        }
     }
     Ok(Verified {
         signers: signers.len(),
-        content_digest: digest_out.unwrap(),
+        content_digest: recomputed,
         certificate_der: certificate.unwrap(),
     })
 }
@@ -341,19 +356,22 @@ pub fn verify_apk(path: &Path) -> Result<Verified> {
 /// Strips one u32 length prefix, validating that it covers the rest.
 fn strip_prefix(data: &[u8]) -> Option<&[u8]> {
     let length = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
-    let body = data.get(4..4 + length)?;
-    (4 + length == data.len()).then_some(body)
+    let end = 4usize.checked_add(length)?;
+    let body = data.get(4..end)?;
+    (end == data.len()).then_some(body)
 }
 
 /// Parses a concatenation of u32-length-prefixed elements.
 fn parse_elements(data: &[u8]) -> Option<Vec<&[u8]>> {
     let mut elements = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0usize;
     while offset < data.len() {
-        let length = u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?) as usize;
-        offset += 4;
-        elements.push(data.get(offset..offset + length)?);
-        offset += length;
+        let len_end = offset.checked_add(4)?;
+        let length = u32::from_le_bytes(data.get(offset..len_end)?.try_into().ok()?) as usize;
+        offset = len_end;
+        let end = offset.checked_add(length)?;
+        elements.push(data.get(offset..end)?);
+        offset = end;
     }
     Some(elements)
 }
@@ -458,5 +476,35 @@ mod tests {
             parse_algorithm_entries(&entry).unwrap(),
             vec![(0x0201, b"digest".to_vec())]
         );
+    }
+
+    #[test]
+    fn rejects_corrupt_and_duplicate_v2_blocks() {
+        // Length prefix overflow in parse_elements returns None rather than panicking.
+        let mut overflow = Vec::new();
+        overflow.extend_from_slice(&u32::MAX.to_le_bytes());
+        overflow.extend_from_slice(&[1, 2, 3]);
+        assert!(parse_elements(&overflow).is_none());
+
+        // Duplicate V2_BLOCK_ID inside signing block pairs must be rejected by verify_apk_v2.
+        let mut pairs = Vec::new();
+        for _ in 0..2 {
+            pairs.extend_from_slice(&(4u64 + 4).to_le_bytes());
+            pairs.extend_from_slice(&V2_BLOCK_ID.to_le_bytes());
+            pairs.extend_from_slice(&[0u8; 4]);
+        }
+        let block_size = (pairs.len() + 24) as u64;
+        let mut apk = Vec::new();
+        apk.extend_from_slice(&block_size.to_le_bytes());
+        apk.extend_from_slice(&pairs);
+        apk.extend_from_slice(&block_size.to_le_bytes());
+        apk.extend_from_slice(APK_SIG_BLOCK_MAGIC);
+        let cd_offset = apk.len() as u64;
+        apk.extend_from_slice(&crate::zip::eocd(0, 0, cd_offset).unwrap());
+        let path = std::env::temp_dir().join(format!("nir-apk-dup-v2-{}.apk", std::process::id()));
+        std::fs::write(&path, &apk).unwrap();
+        let err = verify_apk(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.to_string().contains("duplicate v2 block"), "{err}");
     }
 }

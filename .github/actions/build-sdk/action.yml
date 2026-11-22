@@ -1,0 +1,12 @@
+name: Build NIR SDK
+description: Installs pinned wasm-bindgen-cli 0.2.100 if needed and runs cargo xtask sdk.
+runs:
+  using: composite
+  steps:
+    - name: Ensure wasm-bindgen-cli 0.2.100 and build SDK
+      shell: bash
+      run: |
+        if [ "$("$HOME/.cargo/bin/wasm-bindgen" --version 2>/dev/null || true)" != 'wasm-bindgen 0.2.100' ]; then
+          cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
+        fi
+        cargo xtask sdk

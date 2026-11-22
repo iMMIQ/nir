@@ -320,11 +320,10 @@ impl Player {
             unreachable!();
         };
         let lease = job.finish()?;
-        if self.menu_effects.next_task == u32::MAX {
+        let Some(task) = self.menu_effects.alloc_task() else {
             self.fail_history_voice();
             return Ok(());
-        }
-        let task = self.menu_effects.alloc_task();
+        };
         voice.stage = Some(HistoryVoiceStage::Playing {
             task,
             _lease: lease,

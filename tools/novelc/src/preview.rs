@@ -40,19 +40,34 @@ struct DevStatus {
     release: String,
     building: bool,
     error: Option<String>,
+    scenario: Option<nir_compiler::ScenarioReplayPlan>,
 }
 impl DevStatus {
     fn json(&self) -> serde_json::Value {
-        serde_json::json!({"format":1,"release":self.release,"building":self.building,"stale":self.building || self.error.is_some(),"error":self.error})
+        serde_json::json!({"format":1,"release":self.release,"building":self.building,"stale":self.building || self.error.is_some(),"error":self.error,"scenario":self.scenario})
     }
 }
 // Poll metadata rather than decoding or hashing every large media file on every turn.
 // An editor's atomic rename, deletion or new file changes the sorted signature too.
 fn fingerprint(root: &Path) -> Result<String> {
-    fn walk(root: &Path, dir: &Path, out: &mut String) -> Result<()> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_ENTRIES: usize = 65_536;
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        entries: &mut usize,
+        out: &mut String,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            depth <= MAX_DEPTH,
+            "E_WATCH_LIMIT: directory nesting too deep"
+        );
         let mut files: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
         files.sort_by_key(|f| f.file_name());
         for file in files {
+            *entries += 1;
+            anyhow::ensure!(*entries <= MAX_ENTRIES, "E_WATCH_LIMIT: too many files");
             let name = file.file_name();
             if [
                 ".git",
@@ -70,7 +85,7 @@ fn fingerprint(root: &Path) -> Result<String> {
             }
             let kind = file.file_type()?;
             if kind.is_dir() {
-                walk(root, &file.path(), out)?;
+                walk(root, &file.path(), depth + 1, entries, out)?;
             } else {
                 let meta = fs::symlink_metadata(file.path())?;
                 let at = meta
@@ -89,7 +104,8 @@ fn fingerprint(root: &Path) -> Result<String> {
         Ok(())
     }
     let mut text = String::new();
-    walk(root, root, &mut text)?;
+    let mut entries = 0usize;
+    walk(root, root, 0, &mut entries, &mut text)?;
     // Caches remain ignored, but finishing/recovering a text transaction must
     // retry a candidate rejected while the journal was present.
     if root.join(".nir/text-transaction.json").try_exists()? {
@@ -100,9 +116,15 @@ fn fingerprint(root: &Path) -> Result<String> {
 fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
     fn copy_atomic(from: &Path, to: &Path) -> Result<()> {
         fs::create_dir_all(to.parent().unwrap())?;
-        let temporary = to.with_extension("next");
-        fs::copy(from, &temporary)?;
-        fs::rename(temporary, to)?;
+        let name = to
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("E_PREVIEW_PATH")?;
+        let temporary = to.with_file_name(format!(".{name}.{}.next", std::process::id()));
+        if let Err(err) = fs::copy(from, &temporary).and_then(|_| fs::rename(&temporary, to)) {
+            let _ = fs::remove_file(&temporary);
+            return Err(err.into());
+        }
         Ok(())
     }
     let release_path = format!("releases/{release}.json");
@@ -112,8 +134,13 @@ fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
     nir_content::validate_release(&manifest)?;
     for (hash, object) in &manifest.objects {
         let source = candidate.join(&object.path);
+        let target = out.join(&object.path);
         nir_content::verify(&fs::read(&source)?, hash)?;
-        copy_atomic(&source, &out.join(&object.path))?;
+        let already_present =
+            fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == object.bytes);
+        if !already_present {
+            copy_atomic(&source, &target)?;
+        }
         let compressed = candidate.join(format!("{}.gz", object.path));
         if compressed.try_exists()? {
             let mut decoded = Vec::new();
@@ -122,19 +149,34 @@ fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
                 .read_to_end(&mut decoded)?;
             anyhow::ensure!(decoded.len() as u64 == object.bytes, "E_GZIP_SIZE");
             nir_content::verify(&decoded, hash)?;
-            copy_atomic(&compressed, &out.join(format!("{}.gz", object.path)))?;
+            let gz_target = out.join(format!("{}.gz", object.path));
+            let gz_src_len = fs::metadata(&compressed).map(|m| m.len()).ok();
+            let gz_present = gz_src_len.is_some_and(|len| {
+                fs::metadata(&gz_target).is_ok_and(|m| m.is_file() && m.len() == len)
+            });
+            if !gz_present {
+                copy_atomic(&compressed, &gz_target)?;
+            }
         }
     }
     copy_atomic(&candidate.join(&release_path), &out.join(&release_path))?;
-    for (name, hash) in [
+    let mut launch_items: Vec<(&str, &String)> = vec![
         ("index.html", &manifest.launch.html),
         ("bootstrap.js", &manifest.launch.bootstrap),
-    ] {
+    ];
+    if let Some(style) = &manifest.launch.style {
+        launch_items.push(("style.css", style));
+    }
+    for (name, hash) in launch_items {
         let source = candidate.join(format!("releases/{release}/{name}"));
         nir_content::verify(&fs::read(&source)?, hash)?;
         copy_atomic(&source, &out.join(format!("releases/{release}/{name}")))?;
     }
-    for name in ["index.html", "bootstrap.js", "NOTICE.txt"] {
+    let mut root_items = vec!["index.html", "bootstrap.js", "NOTICE.txt"];
+    if manifest.launch.style.is_some() {
+        root_items.push("style.css");
+    }
+    for name in root_items {
         copy_atomic(&candidate.join(name), &out.join(name))?;
     }
     // The only mutable runtime pointer is replaced after the complete object closure exists.
@@ -144,7 +186,12 @@ fn publish(candidate: &Path, out: &Path, release: &str) -> Result<()> {
     )?;
     Ok(())
 }
-pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
+pub fn dev(
+    root: &Path,
+    sdk: &Path,
+    port: u16,
+    scenario: Option<nir_compiler::ScenarioReplayPlan>,
+) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let sdk = fs::canonicalize(sdk)?;
     let out = root.join("dist/full/web");
@@ -161,6 +208,7 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
     )?;
     let status = Arc::new(Mutex::new(DevStatus {
         release: initial.release,
+        scenario,
         ..Default::default()
     }));
     let watched = status.clone();
@@ -240,21 +288,62 @@ pub fn dev(root: &Path, sdk: &Path, port: u16) -> Result<()> {
 pub fn serve(directory: &Path, host: &str, port: u16) -> Result<()> {
     serve_inner(directory, host, port, None)
 }
+const PREVIEW_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+
+fn is_loopback_bind(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+fn valid_loopback_host(header: &str) -> bool {
+    let trimmed = header.trim();
+    if let Some(rest) = trimmed.strip_prefix("[::1]") {
+        return rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok());
+    }
+    let host = trimmed.split(':').next().unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost")
+        && trimmed
+            .split_once(':')
+            .is_none_or(|(_, p)| p.parse::<u16>().is_ok())
+}
+
 fn serve_inner(
     directory: &Path,
     host: &str,
     port: u16,
     dev: Option<Arc<Mutex<DevStatus>>>,
 ) -> Result<()> {
-    let root = fs::canonicalize(directory).context("E_SERVE: directory missing")?;
-    let server =
-        tiny_http::Server::http((host, port)).map_err(|e| anyhow::anyhow!("E_LISTEN: {e}"))?;
+    let root = Arc::new(fs::canonicalize(directory).context("E_SERVE: directory missing")?);
+    let server = Arc::new(
+        tiny_http::Server::http((host, port)).map_err(|e| anyhow::anyhow!("E_LISTEN: {e}"))?,
+    );
+    let loopback_only = is_loopback_bind(host);
     println!(
         "NIR preview: http://{host}:{port}/\nServing {}",
         root.display()
     );
-    for request in server.incoming_requests() {
-        serve_request(request, &root, dev.as_ref())?;
+    let workers = thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(2, 8);
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let server = server.clone();
+        let root = root.clone();
+        let dev = dev.clone();
+        handles.push(thread::spawn(move || {
+            for request in server.incoming_requests() {
+                if let Err(err) =
+                    serve_request_with_policy(request, &root, dev.as_ref(), loopback_only)
+                {
+                    eprintln!("NIR preview request error: {err}");
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
     Ok(())
 }
@@ -291,11 +380,55 @@ fn accepts_gzip(value: &str) -> bool {
     gzip.or(wildcard).unwrap_or(0.0) > 0.0
 }
 
+#[cfg(test)]
 fn serve_request(
     request: tiny_http::Request,
     root: &Path,
     dev: Option<&Arc<Mutex<DevStatus>>>,
 ) -> Result<()> {
+    serve_request_with_policy(request, root, dev, true)
+}
+
+fn serve_request_with_policy(
+    request: tiny_http::Request,
+    root: &Path,
+    dev: Option<&Arc<Mutex<DevStatus>>>,
+    loopback_only: bool,
+) -> Result<()> {
+    // Reject DNS-rebinding Host headers when serving on loopback.
+    if loopback_only {
+        let host_ok = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Host"))
+            .is_none_or(|h| valid_loopback_host(h.value.as_str()));
+        if !host_ok {
+            let r = tiny_http::Response::from_string("Forbidden host")
+                .with_status_code(403)
+                .with_header(
+                    tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes("Content-Security-Policy", PREVIEW_CSP).unwrap(),
+                );
+            let _ = request.respond(r);
+            return Ok(());
+        }
+    }
+    let is_head = match request.method() {
+        tiny_http::Method::Get => false,
+        tiny_http::Method::Head => true,
+        _ => {
+            let r = tiny_http::Response::from_string("Method not allowed")
+                .with_status_code(405)
+                .with_header(tiny_http::Header::from_bytes("Allow", "GET, HEAD").unwrap())
+                .with_header(
+                    tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+                );
+            let _ = request.respond(r);
+            return Ok(());
+        }
+    };
     // Windows canonicalize yields \\?\ prefixed paths; comparisons against a
     // plain root would otherwise reject every served file.
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -310,16 +443,37 @@ fn serve_request(
     if let Some(dev) = &dev {
         if raw == "/__nir_dev/status" || raw == "/__nir_dev/client.js" {
             let (body, mime) = if raw.ends_with("status") {
-                (dev.lock().unwrap().json().to_string(), "application/json")
+                (
+                    dev.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .json()
+                        .to_string(),
+                    "application/json",
+                )
             } else {
                 (
                     include_str!("preview-client.js").into(),
                     "text/javascript; charset=utf-8",
                 )
             };
-            let r = tiny_http::Response::from_string(body)
-                .with_header(tiny_http::Header::from_bytes("Content-Type", mime).unwrap())
-                .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap());
+            let len = body.len();
+            let mut r = if is_head {
+                tiny_http::Response::empty(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Length", len.to_string()).unwrap(),
+                    )
+                    .boxed()
+            } else {
+                tiny_http::Response::from_string(body).boxed()
+            };
+            for (k, v) in [
+                ("Content-Type", mime),
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Content-Security-Policy", PREVIEW_CSP),
+            ] {
+                r.add_header(tiny_http::Header::from_bytes(k, v).unwrap());
+            }
             let _ = request.respond(r);
             return Ok(());
         }
@@ -334,7 +488,11 @@ fn serve_request(
     } else {
         root.join(path)
     };
-    let safe = !path.contains('%') && !path.contains('\\') && !path.split('/').any(|p| p == "..");
+    let safe = !path.contains('%')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !path.split('/').any(|p| p == "..");
     let resolved = if safe {
         fs::canonicalize(&full).ok()
     } else {
@@ -344,6 +502,7 @@ fn serve_request(
         let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
         let mime = match ext {
             "html" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
             "js" => "text/javascript; charset=utf-8",
             "json" => "application/json",
             "txt" => "text/plain; charset=utf-8",
@@ -384,13 +543,48 @@ fn serve_request(
             .and_then(|sidecar| fs::canonicalize(sidecar).ok())
             .filter(|sidecar| sidecar.starts_with(root) && sidecar.is_file());
         let source = gzip.as_ref().unwrap_or(&file);
-        let bytes = if timing {
-            fs::metadata(source)?.len()
-        } else {
-            0
+        let meta_len = match fs::metadata(source) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                let r = tiny_http::Response::from_string("Not found")
+                    .with_status_code(404)
+                    .with_header(
+                        tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+                    );
+                let _ = request.respond(r);
+                return Ok(());
+            }
         };
-        let mut r = tiny_http::Response::from_file(fs::File::open(source)?).boxed();
-        for (k,v) in [("Content-Type",mime),("Cache-Control",cache),("X-Content-Type-Options","nosniff"),("Content-Security-Policy","default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")]{r.add_header(tiny_http::Header::from_bytes(k,v).unwrap());}
+        let bytes = if timing { meta_len } else { 0 };
+        let mut r = if is_head {
+            tiny_http::Response::empty(200)
+                .with_header(
+                    tiny_http::Header::from_bytes("Content-Length", meta_len.to_string()).unwrap(),
+                )
+                .boxed()
+        } else {
+            match fs::File::open(source) {
+                Ok(opened) => tiny_http::Response::from_file(opened).boxed(),
+                Err(_) => {
+                    let r = tiny_http::Response::from_string("Not found")
+                        .with_status_code(404)
+                        .with_header(
+                            tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff")
+                                .unwrap(),
+                        );
+                    let _ = request.respond(r);
+                    return Ok(());
+                }
+            }
+        };
+        for (k, v) in [
+            ("Content-Type", mime),
+            ("Cache-Control", cache),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Content-Security-Policy", PREVIEW_CSP),
+        ] {
+            r.add_header(tiny_http::Header::from_bytes(k, v).unwrap());
+        }
         if let Some(id) = timing_id {
             r.add_header(tiny_http::Header::from_bytes("X-NIR-Serve-Id", id.to_string()).unwrap());
         }
@@ -415,8 +609,16 @@ fn serve_request(
         }
         let _ = result;
     } else {
-        let result =
-            request.respond(tiny_http::Response::from_string("Not found").with_status_code(404));
+        let result = request.respond(
+            tiny_http::Response::from_string("Not found")
+                .with_status_code(404)
+                .with_header(
+                    tiny_http::Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes("Content-Security-Policy", PREVIEW_CSP).unwrap(),
+                ),
+        );
         if let Some(id) = timing_id {
             log_serve_timing(id, "not_found", &raw, received.elapsed(), 0);
         }
@@ -609,6 +811,7 @@ mod tests {
             "asset-worker.js",
             "index.html",
             "bootstrap.js",
+            "style.css",
             "THIRD-PARTY.txt",
             "compiler.sha256",
         ] {

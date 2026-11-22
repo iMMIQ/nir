@@ -352,6 +352,7 @@ fn test_sdk() -> tempfile::TempDir {
         "asset-worker.js",
         "index.html",
         "bootstrap.js",
+        "style.css",
         "THIRD-PARTY.txt",
         "compiler.sha256",
     ] {
@@ -673,8 +674,8 @@ fn template_font_covers_bundled_diagnostic_messages() {
     .unwrap();
     let master_face = ttf_parser::Face::parse(&master, 0).unwrap();
     for messages in [
-        include_str!("../../nir-presentation/messages/en.ftl"),
-        include_str!("../../nir-presentation/messages/zh-Hans.ftl"),
+        nir_format::ui_messages::EN_FTL,
+        nir_format::ui_messages::ZH_HANS_FTL,
     ] {
         for line in messages.lines() {
             // rain-letters has no Japanese text plan and never displays this

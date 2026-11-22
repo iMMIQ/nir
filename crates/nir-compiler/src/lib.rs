@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 mod diagnostics;
-pub mod import;
 pub use diagnostics::diagnostic;
 mod project;
 mod release;
 mod scenario;
+pub mod script;
 pub use project::*;
 pub use release::*;
 pub use scenario::*;
+pub use script::{lower_nirs, NirsOutput};
 
 mod config;
 pub use config::{
@@ -25,6 +26,6 @@ pub use optimize::{
 
 mod texts;
 pub use texts::{
-    text_migrate, text_recover, text_review, text_status, text_update, AuthorTextContract,
-    AuthorTextDoc, TextRevisions,
+    shape as shape_text, text_migrate, text_recover, text_review, text_status, text_update,
+    AuthorTextContract, AuthorTextDoc, RevisionRecord, TextRevisions,
 };

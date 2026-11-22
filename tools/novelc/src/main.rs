@@ -271,7 +271,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Import { command } => match command {
             ImportCommand::Inspect { source } => {
-                let report = import::inspect(&source)?;
+                let report = nir_import_livemaker::inspect(&source)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if !report.errors.is_empty() {
                     bail!("E_IMPORT_INSPECT: some scripts could not be parsed; see report");
@@ -288,8 +288,8 @@ fn run(cli: Cli) -> Result<()> {
                 title,
                 locale,
             } => {
-                let report = import::convert(
-                    &import::ImportOptions {
+                let report = nir_import_livemaker::convert(
+                    &nir_import_livemaker::ImportOptions {
                         source,
                         out,
                         entry,
@@ -384,7 +384,22 @@ fn run(cli: Cli) -> Result<()> {
                 p.program.locales.len()
             );
             let m = sdk_manifest(&sdk)?;
-            println!("SDK: {} ({} files)\nRuntime: desktop WebGPU; PNG/WebP images, PCM WAV/MP3 audio; zh-Hans/en\nMedia defaults: images -> WebP q92, audio -> MP3 160kbps (see build --help)\nPreview: http://127.0.0.1:4173",sdk.display(),m.files.len());
+            let mut targets = vec!["web (WebGPU/WebGL2)"];
+            if m.files.contains_key("windows/player-windows.exe") {
+                targets.push("windows (DX12)");
+            }
+            if m.files.contains_key("linux/player-linux") {
+                targets.push("linux (Vulkan)");
+            }
+            if m.files.contains_key("android/lib/arm64-v8a/libplayer.so") {
+                targets.push("android (Vulkan, arm64-v8a)");
+            }
+            println!(
+                "SDK: {} ({} files)\nTargets: {}\nMedia: PNG/WebP images, PCM WAV/MP3 audio (defaults: WebP q92, MP3 160kbps; see build --help)\nLocales: UI zh-Hans/en, text zh-Hans/en/ja\nPreview: http://127.0.0.1:4173",
+                sdk.display(),
+                m.files.len(),
+                targets.join(", ")
+            );
         }
         Command::Check { locked } => {
             let p = load_project(&cli.project)?;
@@ -484,7 +499,7 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Dev { port, scenario } => {
-            if let Some(s) = scenario {
+            let plan = if let Some(s) = scenario {
                 let p = load_project(&cli.project)?;
                 let s = s.to_string_lossy();
                 if !p.manifest.inputs.scenarios.iter().any(|x| x == s.as_ref()) {
@@ -493,9 +508,17 @@ fn run(cli: Cli) -> Result<()> {
                 for id in test_project(&cli.project)? {
                     println!("PASS {id}");
                 }
-                println!("Scenario verified from new_game; preview opens at its legal entry.");
-            }
-            dev(&cli.project, &sdk, port)?;
+                let plan = load_scenario_plan(&cli.project, s.as_ref())?;
+                println!(
+                    "Scenario '{}' verified from new_game; preview will replay {} choice step(s) from the legal entry.",
+                    plan.id,
+                    plan.choices.len()
+                );
+                Some(plan)
+            } else {
+                None
+            };
+            dev(&cli.project, &sdk, port, plan)?;
         }
         Command::Serve {
             directory,

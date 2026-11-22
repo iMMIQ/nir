@@ -10,6 +10,7 @@ import tarfile
 
 PATTERNS = {
     "private_key": rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+    "nir_signing_key": rb"-----BEGIN NIR APK SIGNING KEY-----\r?\n[A-Za-z0-9+/=]{16,}",
     "access_token": rb"(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{50,}|AKIA[A-Z0-9]{16}|sk-[A-Za-z0-9_-]{30,}|xox[baprs]-[A-Za-z0-9-]{20,})",
     "url_credentials": rb"https?://[^\s/<>\"\x00]+:[^\s/<>\"\x00]+@",
 }

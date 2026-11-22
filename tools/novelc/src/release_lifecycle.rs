@@ -106,7 +106,19 @@ impl Reader {
                 if !immutable && !(cache.contains("no-cache") || cache.contains("no-store")) {
                     bail!("E_VERIFY_CACHE: mutable policy missing for {path}");
                 }
-                Ok(response.bytes()?.to_vec())
+                const MAX_REMOTE_BYTES: u64 = 128 * 1024 * 1024;
+                if let Some(len) = response.content_length() {
+                    if len > MAX_REMOTE_BYTES {
+                        bail!("E_VERIFY_SIZE: {path} exceeds remote fetch limit");
+                    }
+                }
+                use std::io::Read;
+                let mut buf = Vec::new();
+                response.take(MAX_REMOTE_BYTES + 1).read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_REMOTE_BYTES {
+                    bail!("E_VERIFY_SIZE: {path} exceeds remote fetch limit");
+                }
+                Ok(buf)
             }
         }
     }
@@ -123,6 +135,7 @@ impl Reader {
 fn mime_for(path: &str) -> Result<&'static str> {
     match path.rsplit('.').next().unwrap_or("") {
         "html" => Ok("text/html"),
+        "css" => Ok("text/css"),
         "js" => Ok("text/javascript"),
         "json" => Ok("application/json"),
         "wasm" => Ok("application/wasm"),
@@ -158,6 +171,8 @@ pub fn verify(location: &str, requested: Option<&str>) -> Result<serde_json::Val
     nir_content::verify(&raw, &digest)?;
     let manifest: ReleaseManifest = nir_content::parse(&raw, "release")?;
     nir_content::validate_release(&manifest)?;
+    let mut verified_cache: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
     for (id, object) in &manifest.objects {
         if object.path
             != format!(
@@ -189,34 +204,48 @@ pub fn verify(location: &str, requested: Option<&str>) -> Result<serde_json::Val
                 }
             }
         }
+        // Retain small verified metadata/launch/WASM objects so subsequent
+        // checks do not re-fetch them from remote origins.
+        if id == &manifest.launch.html
+            || id == &manifest.launch.bootstrap
+            || manifest.launch.style.as_deref() == Some(id.as_str())
+            || id == &manifest.engine.wasm
+            || id == &manifest.program
+            || object.path.ends_with(".json")
+        {
+            verified_cache.insert(id.clone(), bytes);
+        }
     }
-    for (name, id) in [
+    let mut launch_items: Vec<(&str, &String)> = vec![
         ("index.html", &manifest.launch.html),
         ("bootstrap.js", &manifest.launch.bootstrap),
-    ] {
+    ];
+    if let Some(style) = &manifest.launch.style {
+        launch_items.push(("style.css", style));
+    }
+    for (name, id) in launch_items {
         let bytes = reader.get(&format!("releases/{digest}/{name}"), mime_for(name)?, true)?;
         nir_content::verify(&bytes, id)?;
-        if bytes != reader.get(&manifest.objects[id].path, mime_for(name)?, true)? {
+        let expected = verified_cache
+            .get(id)
+            .context("E_LAUNCH_BYTES: missing cached launch object")?;
+        if &bytes != expected {
             bail!("E_LAUNCH_BYTES: {name}");
         }
         if requested.is_none() {
             nir_content::verify(&reader.get(name, mime_for(name)?, false)?, id)?;
         }
     }
-    let wasm = reader.get(
-        &manifest.objects[&manifest.engine.wasm].path,
-        "application/wasm",
-        true,
-    )?;
+    let wasm = verified_cache
+        .get(&manifest.engine.wasm)
+        .context("E_WASM_MISSING")?;
     if !wasm.starts_with(b"\0asm\x01\0\0\0") {
         bail!("E_WASM_MAGIC");
     }
-    let program_bytes = reader.get(
-        &manifest.objects[&manifest.program].path,
-        "application/json",
-        true,
-    )?;
-    let runtime: RuntimeExecutable = nir_content::parse(&program_bytes, "runtime root")?;
+    let program_bytes = verified_cache
+        .get(&manifest.program)
+        .context("E_PROGRAM_MISSING")?;
+    let runtime: RuntimeExecutable = nir_content::parse(program_bytes, "runtime root")?;
     if runtime.format != RUNTIME_FORMAT_VERSION || runtime.program.format != RUNTIME_FORMAT_VERSION
     {
         bail!("E_RUNTIME_VERSION");
@@ -252,8 +281,11 @@ pub fn verify(location: &str, requested: Option<&str>) -> Result<serde_json::Val
             .objects
             .get(&requirement.digest)
             .context("E_RUNTIME_OBJECT")?;
-        let bytes = reader.get(&object.path, "application/json", true)?;
-        nir_content::parse_runtime_object(&runtime.program, &key, &bytes)?;
+        let bytes = match verified_cache.get(&requirement.digest) {
+            Some(cached) => cached.as_slice(),
+            None => bail!("E_RUNTIME_OBJECT: missing {}", object.path),
+        };
+        nir_content::parse_runtime_object(&runtime.program, &key, bytes)?;
     }
     let absent = if digest == "0".repeat(64) {
         "f".repeat(64)
@@ -360,10 +392,14 @@ pub fn stage(source: &Path, directory: &Path, requested: Option<&str>) -> Result
             object.bytes,
         )?;
     }
-    for (name, id) in [
+    let mut launch_items: Vec<(&str, &String)> = vec![
         ("index.html", &manifest.launch.html),
         ("bootstrap.js", &manifest.launch.bootstrap),
-    ] {
+    ];
+    if let Some(style) = &manifest.launch.style {
+        launch_items.push(("style.css", style));
+    }
+    for (name, id) in launch_items {
         copy_immutable(
             &source.join(format!("releases/{digest}/{name}")),
             &directory.join(format!("releases/{digest}/{name}")),
@@ -379,40 +415,67 @@ pub fn stage(source: &Path, directory: &Path, requested: Option<&str>) -> Result
     verify(directory.to_str().context("E_PATH_UTF8")?, Some(&digest))?;
     Ok(digest)
 }
-struct StageLock(PathBuf);
+struct StageLock {
+    _file: fs::File,
+}
 impl StageLock {
     fn acquire(root: &Path) -> Result<Self> {
-        let path = root.join(".stage.lock");
-        fs::OpenOptions::new()
+        // Use an OS advisory lock so crashes or panic=abort never leave a
+        // permanently wedged lock file behind.
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)
-            .context("E_STAGE_BUSY: another import is in progress")?;
-        Ok(Self(path))
+            .truncate(false)
+            .open(root.join(".stage.lock"))
+            .context("E_STAGE_BUSY: cannot open stage lock")?;
+        file.try_lock()
+            .map_err(|_| anyhow::anyhow!("E_STAGE_BUSY: another import is in progress"))?;
+        Ok(Self { _file: file })
     }
 }
-impl Drop for StageLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
+struct PointerLock {
+    _file: fs::File,
 }
-struct PointerLock(PathBuf);
 impl PointerLock {
     fn acquire(root: &Path) -> Result<Self> {
         fs::create_dir_all(root.join("channels"))?;
-        let path = root.join("channels/.stable.lock");
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)
-            .context("E_CHANNEL_BUSY: another local promotion is in progress")?;
-        Ok(Self(path))
+            .truncate(false)
+            .open(root.join("channels/.stable.lock"))
+            .context("E_CHANNEL_BUSY: cannot open channel lock")?;
+        file.try_lock().map_err(|_| {
+            anyhow::anyhow!("E_CHANNEL_BUSY: another local promotion is in progress")
+        })?;
+        Ok(Self { _file: file })
     }
 }
-impl Drop for PointerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+fn write_synced_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = dest.parent().context("E_PATH")?;
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("E_PATH")?;
+    let tmp = parent.join(format!(".{name}.{}.next", uuid::Uuid::new_v4()));
+    let res = (|| -> Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, dest)?;
+        #[cfg(unix)]
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    res
 }
 pub fn promote(directory: &Path, target: &str, expected: &str) -> Result<()> {
     if !hash(target) {
@@ -435,28 +498,23 @@ pub fn promote(directory: &Path, target: &str, expected: &str) -> Result<()> {
     if manifest.profile != "release" {
         bail!("E_RELEASE_PROFILE: promotion requires a release build");
     }
-    for (name, id) in [
+    let mut launch_items: Vec<(&str, &String)> = vec![
         ("index.html", &manifest.launch.html),
         ("bootstrap.js", &manifest.launch.bootstrap),
-    ] {
+    ];
+    if let Some(style) = &manifest.launch.style {
+        launch_items.push(("style.css", style));
+    }
+    for (name, id) in launch_items {
         let bytes = fs::read(directory.join(&manifest.objects[id].path))?;
         nir_content::verify(&bytes, id)?;
-        let tmp = directory.join(format!("{name}.next"));
-        fs::write(&tmp, bytes)?;
-        fs::rename(tmp, directory.join(name))?;
+        write_synced_atomic(&directory.join(name), &bytes)?;
     }
     let notice = manifest.notices.first().context("E_NOTICE")?;
     let bytes = fs::read(directory.join(&manifest.objects[notice].path))?;
     nir_content::verify(&bytes, notice)?;
-    let tmp = directory.join("NOTICE.txt.next");
-    fs::write(&tmp, bytes)?;
-    fs::rename(tmp, directory.join("NOTICE.txt"))?;
-    let tmp = directory.join("channels/stable.json.next");
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec(
-        &serde_json::json!({"format":1,"release":target}),
-    )?)?;
-    file.sync_all()?;
-    fs::rename(tmp, directory.join("channels/stable.json"))?;
+    write_synced_atomic(&directory.join("NOTICE.txt"), &bytes)?;
+    let channel_bytes = serde_json::to_vec(&serde_json::json!({"format":1,"release":target}))?;
+    write_synced_atomic(&directory.join("channels/stable.json"), &channel_bytes)?;
     Ok(())
 }

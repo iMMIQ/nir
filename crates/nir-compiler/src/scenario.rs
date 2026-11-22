@@ -2,8 +2,37 @@ use crate::{load_project, relative};
 use anyhow::{bail, Result};
 use nir_core::{Core, CoreInput, TaskState, ValidatedProgram};
 use nir_format::{Effect, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioReplayPlan {
+    pub id: String,
+    pub text_locale: String,
+    pub choices: Vec<String>,
+}
+
+pub fn load_scenario_plan(root: &Path, file: &str) -> Result<ScenarioReplayPlan> {
+    let p = load_project(root)?;
+    let path = relative(root, root, file)?;
+    let s: Scenario = toml::from_str(&std::fs::read_to_string(path)?)?;
+    if s.format != 1 || s.entry != p.program.entry {
+        bail!("E_SCENARIO: invalid entry/format");
+    }
+    let choices = s
+        .steps
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::Choose { option_id } => Some(option_id),
+            Step::AwaitChoice { .. } => None,
+        })
+        .collect();
+    Ok(ScenarioReplayPlan {
+        id: s.id,
+        text_locale: s.text_locale,
+        choices,
+    })
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scenario {
@@ -105,4 +134,18 @@ pub fn test_project(root: &Path) -> Result<Vec<String>> {
         passed.push(s.id);
     }
     Ok(passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_scenario_plan_extracts_ordered_choices_from_example() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/rain-letters");
+        let plan = load_scenario_plan(&root, "tests/scenarios/walk.toml").unwrap();
+        assert_eq!(plan.id, "walk");
+        assert!(!plan.text_locale.is_empty());
+        assert_eq!(plan.choices, vec!["walk".to_owned()]);
+    }
 }

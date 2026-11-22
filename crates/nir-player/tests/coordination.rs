@@ -2034,8 +2034,9 @@ fn theme_components_preserve_semantics_gates_and_viewport_bounds() {
     for (width, height) in [(1280., 800.), (390., 844.), (844., 390.)] {
         for component in [DialogueComponent::Bottom, DialogueComponent::Top] {
             for choice in [ChoiceComponent::Standard, ChoiceComponent::Compact] {
-                m.theme.slots.dialogue = component;
-                m.theme.slots.choice = choice;
+                let theme = std::sync::Arc::make_mut(&mut m.theme);
+                theme.slots.dialogue = component;
+                theme.slots.choice = choice;
                 m.prefs.font_scale = 1.5;
                 m.dialogue.as_mut().unwrap().gate = true;
                 let packet = project(&m, width, height, &messages);
@@ -2371,7 +2372,9 @@ fn dialogue_opacity_multiplies_author_colors_without_fading_scene() {
     model.paused = false;
     let messages = Messages::default();
     for background in [None, Some("test-box".into())] {
-        model.theme.dialogue.background = background;
+        std::sync::Arc::make_mut(&mut model.theme)
+            .dialogue
+            .background = background;
         model.dialogue_appearance = DialogueAppearance::default();
         let before = project(&model, 1280., 800., &messages);
         model.dialogue_appearance = DialogueAppearance {
@@ -3268,8 +3271,7 @@ fn authored_history_controls_adapt_to_portrait_and_retire_when_a_control_is_clip
         assert!(body.y >= control.rect[1] + 52.);
         let ui = p.model();
         let mut disabled = ui.clone();
-        disabled
-            .theme
+        std::sync::Arc::make_mut(&mut disabled.theme)
             .image_menus
             .get_mut("history")
             .unwrap()
@@ -4976,7 +4978,7 @@ fn custom_dialogue_rect_has_a_static_hint_without_changing_text_bounds() {
     use nir_presentation::{project, Messages};
     let p = interface_player(HidePolicy::ContinueStory, false);
     let mut model = p.model();
-    model.theme.dialogue.rect = Some([10., 500., 1200., 180.]);
+    std::sync::Arc::make_mut(&mut model.theme).dialogue.rect = Some([10., 500., 1200., 180.]);
     let messages = Messages::default();
     for (width, height) in [(1280., 720.), (390., 844.), (844., 390.)] {
         let packet = project(&model, width, height, &messages);
@@ -4993,7 +4995,7 @@ fn custom_dialogue_rect_has_a_static_hint_without_changing_text_bounds() {
             .unwrap();
         assert!(hint.y >= text.y + text.height || hint.y + hint.line_height <= text.y);
     }
-    model.theme.dialogue.rect = Some([0., 0., 1280., 720.]);
+    std::sync::Arc::make_mut(&mut model.theme).dialogue.rect = Some([0., 0., 1280., 720.]);
     let packet = project(&model, 1280., 720., &messages);
     let hint = packet
         .texts
@@ -5016,9 +5018,10 @@ fn independent_text_rect_tracks_stage_letterboxing_and_keeps_window_geometry() {
     use nir_presentation::{project, Messages};
     let p = interface_player(HidePolicy::ContinueStory, false);
     let mut model = p.model();
-    model.theme.dialogue.rect = Some([100., 400., 1000., 250.]);
-    model.theme.dialogue.text_rect = Some([270., 550., 650., 80.]);
-    model.theme.dialogue.opacity = 0.;
+    let theme = std::sync::Arc::make_mut(&mut model.theme);
+    theme.dialogue.rect = Some([100., 400., 1000., 250.]);
+    theme.dialogue.text_rect = Some([270., 550., 650., 80.]);
+    theme.dialogue.opacity = 0.;
     for (width, height) in [(1280., 720.), (390., 844.), (844., 390.)] {
         let packet = project(&model, width, height, &Messages::default());
         let text = packet
@@ -5042,8 +5045,9 @@ fn independent_text_rect_tracks_stage_letterboxing_and_keeps_window_geometry() {
 fn dialogue_quake_moves_body_ruby_and_images_inside_a_stationary_surface() {
     use nir_presentation::{Messages, ReadingState, TextEngine};
     let mut model = playing().model();
-    model.theme.dialogue.rect = Some([160., 450., 960., 200.]);
-    model.theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
+    let theme = std::sync::Arc::make_mut(&mut model.theme);
+    theme.dialogue.rect = Some([160., 450., 960., 200.]);
+    theme.dialogue.text_rect = Some([200., 490., 880., 120.]);
     let dialogue = model.dialogue.as_mut().unwrap();
     dialogue.full_text = "Reader\u{fffc}".into();
     dialogue.visible_text = dialogue.full_text.clone();

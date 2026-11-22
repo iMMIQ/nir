@@ -2,12 +2,13 @@
 const PROTOCOL=1, MAX_CALLS=128, MAX_COMMANDS=248;
 let build=null,wasm=null,engine=null,canvas=null,view='{"nodes":[],"ready":false}',size={width:1,height:1,dpr:1},debug=false;
 const knownRequests=new Set(),knownContent=new Set(),adapters=[];
-let contextLost=false,watchedCanvas=null;
-function watchCanvas(){if(watchedCanvas===canvas)return;const owner=watchedCanvas=canvas;owner.addEventListener('webglcontextlost',e=>{e.preventDefault();if(owner!==canvas)return;contextLost=true;dirty=true;publish();});}
-let last=performance.now(),hidden=false,scheduled=null,clockActive=false,closed=false,outstanding=false,dirty=false,commands=[],revision=0;
+let contextLost=false,watchedCanvas=null,watchedHandler=null;
+function watchCanvas(){if(watchedCanvas===canvas)return;if(watchedCanvas&&watchedHandler)watchedCanvas.removeEventListener?.('webglcontextlost',watchedHandler);const owner=watchedCanvas=canvas;watchedHandler=e=>{e.preventDefault();if(owner!==canvas)return;contextLost=true;dirty=true;publish();};owner.addEventListener('webglcontextlost',watchedHandler);}
+let last=performance.now(),hidden=false,scheduled=null,scheduledRaf=false,clockActive=false,closed=false,outstanding=false,dirty=false,commands=[],revision=0;
 let storyElapsed=0,foregroundElapsed=0;
 const UI=new Set(['focus_control','navigate_focus','hover','set_touch_input','pointer_gesture','pointer_action','hit','control_value_action','primary_action','focus_value_action']);
-const ALLOWED=new Set([...UI,'action','host_event','content_ready','content_failed','content_skipped','resource','resource_decoded','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','resize']);
+const ALLOWED=new Set([...UI,'action','host_event','content_ready','content_failed','content_skipped','resource','resource_decoded','resource_fault','resource_failed','audio_positions_in','audio_ended_in','audio_failed_in','hidden','audio_blocked','simulate_device_loss','begin_recovery','set_profiling','set_tracing','resize']);
+const cancelScheduled=()=>{if(scheduled===null)return;if(scheduledRaf&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(scheduled);else clearTimeout(scheduled);scheduled=null;scheduledRaf=false;};
 const stamp=()=>performance.now();
 function resetClock(){last=stamp();storyElapsed=foregroundElapsed=0;}
 // Retain u32 remainders independently. Story/menu boundaries must not discard
@@ -24,8 +25,8 @@ function snapshot(initial=false){for(const id of knownRequests)if(!engine.accept
 function send(kind,id,value,transfer=[]){postMessage({protocol:PROTOCOL,build,kind,id,value},transfer);}
 function publish(){if(!engine||outstanding||!dirty||closed)return;outstanding=true;dirty=false;send('update',0,snapshot());}
 function draw(){if(engine.device_lost()||contextLost){dirty=true;return;}const w=Math.round(size.width*size.dpr),h=Math.round(size.height*size.dpr);if(canvas.width!==w)canvas.width=w;if(canvas.height!==h)canvas.height=h;view=engine.draw(size.width,size.height,size.dpr);collect();}
-function schedule(){if(closed||!engine||scheduled!==null)return;if(engine.needs_clock()||engine.pending_events()||storyElapsed||foregroundElapsed){if(!clockActive)last=stamp();clockActive=true;scheduled=setTimeout(frame,16);}else clockActive=false;}
-function frame(){scheduled=null;if(closed||!engine)return;try {if(engine.device_lost()||contextLost){resetClock();clockActive=false;dirty=true;publish();return;}const now=stamp(),before=JSON.parse(engine.host_state());engine.begin_turn();accrueElapsed(now,before);if(!hidden){const story=Math.min(storyElapsed,0xffffffff),foreground=Math.min(foregroundElapsed,0xffffffff);storyElapsed-=story;foregroundElapsed-=foreground;engine.tick_domains(story,foreground);}engine.continue_turn();collect();draw();publish();schedule();}catch(error){send('fatal',0,{code:'E_WORKER_RUNTIME',message:String(error)});closed=true;}}
+function schedule(){if(closed||!engine||scheduled!==null)return;if(engine.needs_clock()||engine.pending_events()||storyElapsed||foregroundElapsed){if(!clockActive)last=stamp();clockActive=true;if(typeof requestAnimationFrame==='function'){scheduledRaf=true;scheduled=requestAnimationFrame(frame);}else{scheduledRaf=false;scheduled=setTimeout(frame,16);}}else clockActive=false;}
+function frame(){scheduled=null;scheduledRaf=false;if(closed||!engine)return;try {if(engine.device_lost()||contextLost){resetClock();clockActive=false;dirty=true;publish();return;}const now=stamp(),before=JSON.parse(engine.host_state());engine.begin_turn();accrueElapsed(now,before);if(!hidden){const story=Math.min(storyElapsed,0xffffffff),foreground=Math.min(foregroundElapsed,0xffffffff);storyElapsed-=story;foregroundElapsed-=foreground;engine.tick_domains(story,foreground);}engine.continue_turn();collect();draw();publish();schedule();}catch(error){send('fatal',0,{code:'E_WORKER_RUNTIME',message:String(error)});closed=true;}}
 function objectUrl(raw,digest,root){const url=new URL(raw);if(url.origin!==new URL(root).origin||!/^[0-9a-f]{64}$/.test(digest)||!url.pathname.endsWith(`/objects/${digest}.js`))throw new Error('E_WORKER_IDENTITY');return url.href;}
 async function dispatch(message){
  const {kind,id,value}=message;
@@ -46,11 +47,11 @@ async function dispatch(message){
   send('reply',id,{protocol:PROTOCOL,build,role:'runtime',timeOrigin:performance.timeOrigin,offscreen:typeof OffscreenCanvas==='function'});return;
  }
  if(kind==='ack'){outstanding=false;publish();return;}
- if(kind==='dispose'){closed=true;clearTimeout(scheduled);engine?.free();engine=null;close();return;}
+ if(kind==='dispose'){closed=true;cancelScheduled();if(watchedCanvas&&watchedHandler){watchedCanvas.removeEventListener?.('webglcontextlost',watchedHandler);watchedCanvas=watchedHandler=null;}engine?.free();engine=null;close();return;}
  if(!wasm)throw new Error('E_WORKER_NOT_READY');
  if(kind==='probe'){send('reply',id,await wasm.probe_backend());return;}
  if(kind==='inspect-save'){
-  if(typeof value?.json!=='string'||typeof value.release!=='string'||typeof value.game!=='string'||!Number.isInteger(value.slot)||value.slot<0||value.slot>2)throw new Error('E_WORKER_PROTOCOL');
+  if(typeof value?.json!=='string'||typeof value.release!=='string'||typeof value.game!=='string'||!Number.isInteger(value.slot)||value.slot<0||value.slot>=64)throw new Error('E_WORKER_PROTOCOL');
   // Read-only auxiliary validation: no Player pump, draw, or clock mutation.
   send('reply',id,wasm.inspect_save_slot(value.json,value.slot,value.release,value.game));return;
  }
@@ -58,27 +59,30 @@ async function dispatch(message){
   if(engine)throw new Error('E_WORKER_OWNER');canvas=value.canvas;size=value.size;
   if(!(canvas instanceof OffscreenCanvas))throw new Error('E_CANVAS');
   watchCanvas();
-  engine=await wasm.Engine.create(value.executable,value.release,value.title,canvas,value.preferences,value.backend,value.audio_sample_rate);engine.set_profiling(value.profiling);resetClock();
+  engine=await wasm.Engine.create(value.executable,value.release,value.title,canvas,value.preferences,value.backend,value.audio_sample_rate);engine.set_profiling(value.profiling);if(debug&&typeof engine.set_tracing==='function')engine.set_tracing(true);resetClock();
   // Actually configure/draw the requested backend before Ready, not just an API check.
   engine.begin_turn();engine.continue_turn();collect();draw();dirty=false;
   if(debug)self.__nirWorker={role:'runtime',loseContext:()=>{const extension=canvas.getContext('webgl2').getExtension('WEBGL_lose_context');if(!extension)throw new Error('E_CONTEXT_LOSS_UNAVAILABLE');extension.loseContext();},state:()=>JSON.parse(engine.state()),queues:()=>({inbox:queue.length,outbound:commands.length,unacknowledged:outstanding?1:0})};
   send('reply',id,{snapshot:snapshot(true),role:'runtime',protocol:PROTOCOL,build});schedule();return;
  }
  if(kind==='gpu'){
-  clearTimeout(scheduled);scheduled=null;
+  cancelScheduled();
   const replacement=value.canvas||canvas;const gpu=await wasm.create_gpu(replacement,value.backend);canvas=replacement;engine.replace_gpu(gpu);contextLost=false;watchCanvas();resetClock();
   engine.begin_turn();engine.continue_turn();collect();draw();send('reply',id,{snapshot:snapshot()});schedule();return;
  }
  if(kind!=='batch'||!Array.isArray(value)||value.length>MAX_CALLS)throw new Error('E_WORKER_PROTOCOL');
- const before=JSON.parse(engine.host_state());engine.begin_turn();const results=[];
+ const before=JSON.parse(engine.host_state());let current=before,stateDirty=false;engine.begin_turn();const results=[];
  for(const call of value){
   if(!ALLOWED.has(call.method)||!Array.isArray(call.args))throw new Error('E_WORKER_METHOD');
-  const current=JSON.parse(engine.host_state());
-  if(UI.has(call.method)&&(call.session!==current.session||call.interaction!==current.interaction)){results.push(null);continue;}
+  if(UI.has(call.method)){
+   if(stateDirty){current=JSON.parse(engine.host_state());stateDirty=false;}
+   if(call.session!==current.session||call.interaction!==current.interaction){results.push(null);continue;}
+  }
   if(call.method==='resize'){size=call.args[0];results.push(null);continue;}
   if(call.method==='simulate_device_loss')contextLost=true;
   if(call.method==='hidden'){hidden=call.args[0];resetClock();}
   results.push(engine[call.method](...call.args));
+  if(!UI.has(call.method))stateDirty=true;
  }
  // Input is consumed before any subsequent clock catch-up.
  engine.continue_turn();collect();draw();dirty=false;

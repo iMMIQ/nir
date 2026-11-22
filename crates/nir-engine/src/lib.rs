@@ -6,8 +6,8 @@ use nir_presentation::{DrawPacket, Messages, ReadingState, Screen, SlotView};
 use nir_render_wgpu::Renderer;
 use std::collections::{BTreeSet, VecDeque};
 mod story_clock;
-fn js(error: impl std::fmt::Display) -> String {
-    error.to_string()
+fn host_err(code: &str, location: &str, message: &str) -> Diagnostic {
+    Diagnostic::new(code, location, message)
 }
 pub struct Engine {
     player: Player,
@@ -98,7 +98,7 @@ impl Engine {
         title: String,
         preferences: Option<Preferences>,
         renderer: Renderer,
-    ) -> std::result::Result<Self, String> {
+    ) -> Result<Self> {
         Self::new_with_audio_sample_rate(executable, release, title, preferences, renderer, None)
     }
     pub fn new_with_audio_sample_rate(
@@ -108,9 +108,13 @@ impl Engine {
         preferences: Option<Preferences>,
         renderer: Renderer,
         audio_decode_sample_rate: Option<u32>,
-    ) -> std::result::Result<Self, String> {
+    ) -> Result<Self> {
         if executable.format != 2 {
-            return Err(js("E_RUNTIME_VERSION: expected RuntimeExecutable v2"));
+            return Err(host_err(
+                "E_RUNTIME_VERSION",
+                "engine",
+                "expected RuntimeExecutable v2",
+            ));
         }
         let mut player = Player::new_runtime_with_audio_sample_rate(
             executable.program,
@@ -118,12 +122,9 @@ impl Engine {
             title,
             preferences,
             audio_decode_sample_rate,
-        )
-        .map_err(js)?;
+        )?;
         let [physical_width, physical_height] = renderer.surface_extent();
-        player
-            .reserve_render_surfaces(physical_width, physical_height)
-            .map_err(js)?;
+        player.reserve_render_surfaces(physical_width, physical_height)?;
         let mut e = Self {
             player,
             renderer,
@@ -217,7 +218,7 @@ impl Engine {
         })
         .to_string()
     }
-    pub fn continue_turn(&mut self) -> std::result::Result<(), String> {
+    pub fn continue_turn(&mut self) -> Result<()> {
         self.pump(vec![])
     }
     pub fn pending_events(&self) -> usize {
@@ -235,15 +236,14 @@ impl Engine {
     pub fn accepts_content(&self, request: u32) -> bool {
         self.player.accepts_content(request)
     }
-    pub fn content_ready(
-        &mut self,
-        request: u32,
-        objects: Vec<Vec<u8>>,
-    ) -> std::result::Result<(), String> {
+    pub fn content_ready(&mut self, request: u32, objects: Vec<Vec<u8>>) -> Result<()> {
         if !self.player.accepts_content(request) {
             return Ok(());
         }
-        if objects.len() > 128 || objects.iter().map(Vec::len).sum::<usize>() > MAX_INPUT_BYTES {
+        let total_bytes = objects
+            .iter()
+            .try_fold(0usize, |acc, item| acc.checked_add(item.len()));
+        if objects.len() > 128 || total_bytes.is_none_or(|total| total > MAX_INPUT_BYTES) {
             return self.content_failed(request, "E_CONTENT_LIMIT".into());
         }
         self.pump(vec![AppEvent::ContentReady { request, objects }])
@@ -251,15 +251,30 @@ impl Engine {
     pub fn take_commands(&mut self) -> Vec<AppCommand> {
         std::mem::take(&mut self.outbox)
     }
-    pub fn event(&mut self, event: AppEvent) -> std::result::Result<(), String> {
+    pub fn event(&mut self, event: AppEvent) -> Result<()> {
         self.pump(vec![event])
     }
     pub fn preferences(&self) -> &Preferences {
         &self.player.preferences
     }
-    pub fn input(&mut self, action: UiAction, sequence: u32) -> std::result::Result<(), String> {
-        self.action(
-            serde_json::to_string(&action).unwrap(),
+    pub fn set_tracing(&mut self, enabled: bool) {
+        self.player.set_tracing(enabled);
+    }
+    pub fn retained_assets(&self) -> BTreeSet<String> {
+        self.player.retained_assets()
+    }
+    pub fn escape_action(&self) -> UiAction {
+        self.player.escape_action()
+    }
+    pub fn save_slots(&self) -> u32 {
+        self.player.save_slots()
+    }
+    pub fn screen(&self) -> nir_presentation::Screen {
+        self.player.screen
+    }
+    pub fn input(&mut self, action: UiAction, sequence: u32) -> Result<()> {
+        self.dispatch_action(
+            action,
             self.player.current_interaction(),
             sequence,
             self.player.generation.session,
@@ -322,7 +337,7 @@ impl Engine {
     ) -> Option<UiAction> {
         nir_presentation::control_value_action(&self.packet, id, expected, direction)
     }
-    pub fn focus_control(&mut self, id: Option<u32>) -> std::result::Result<(), String> {
+    pub fn focus_control(&mut self, id: Option<u32>) -> Result<()> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.native_storage_focus_wait = false;
@@ -335,7 +350,7 @@ impl Engine {
     /// Keyboard focus that lands on a choice row of a typed-result interaction
     /// moves the semantic selection cursor. The observation rides the normal
     /// action path; it carries no input identity and cannot progress the story.
-    fn sync_focus_selection(&mut self) -> std::result::Result<(), String> {
+    fn sync_focus_selection(&mut self) -> Result<()> {
         let option = self
             .keyboard_focus
             .node(&self.packet, self.input_identity(), self.player.screen)
@@ -363,7 +378,7 @@ impl Engine {
             session: self.player.generation.session,
         }])
     }
-    pub fn navigate_focus(&mut self, direction: u8) -> std::result::Result<Option<u32>, String> {
+    pub fn navigate_focus(&mut self, direction: u8) -> Result<Option<u32>> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.native_storage_focus_wait = false;
@@ -487,7 +502,7 @@ impl Engine {
     pub fn set_touch_input(&mut self, touch: bool) {
         self.visual_invalidated |= self.reading.set_touch_input(touch);
     }
-    pub fn hover(&mut self, x: f32, y: f32) -> std::result::Result<(), String> {
+    pub fn hover(&mut self, x: f32, y: f32) -> Result<()> {
         let hover = nir_presentation::ControlTarget::at(&self.packet, x, y)
             .map(|target| (target, self.input_identity(), self.player.screen));
         if self.hovered_control != hover {
@@ -497,10 +512,8 @@ impl Engine {
         if self.reading.hover_history_bar(x, y) {
             self.visual_invalidated = true;
         }
-        let model = self.player.model();
-        let image_choice = model.screen == nir_presentation::Screen::Story
-            && model.choices.iter().any(|choice| choice.image.is_some());
-        if !model.authored_menu && !image_choice {
+        let image_choice = self.player.has_image_choice();
+        if !self.player.has_authored_menu() && !image_choice {
             return Ok(());
         }
         let id = self
@@ -517,18 +530,12 @@ impl Engine {
                     self.packet.menu_controls.get(&node.id).cloned()
                 }
             });
-        if id != model.hovered_image {
+        if id.as_deref() != self.player.hovered_image() {
             self.input(UiAction::HoverImage { id }, 0)?;
         }
         Ok(())
     }
-    pub fn pointer_gesture(
-        &mut self,
-        phase: u8,
-        x: f32,
-        y: f32,
-        button: u8,
-    ) -> std::result::Result<bool, String> {
+    pub fn pointer_gesture(&mut self, phase: u8, x: f32, y: f32, button: u8) -> Result<bool> {
         let identity = self.input_identity();
         if phase == 2 || phase == 3 || !self.ready || self.player.is_loading() {
             self.visual_invalidated |= self.pressed_control.take().is_some();
@@ -544,17 +551,25 @@ impl Engine {
             self.visual_invalidated |= consumed;
             return Ok(consumed);
         }
-        let packet = self.reading.project(
-            &self.player.model(),
-            identity,
-            self.width,
-            self.height,
-            &self.messages,
-            &mut self.renderer.text,
-        );
+        if self.packet.history_bar.is_none() && !self.visual_invalidated {
+            return Ok(false);
+        }
+        let fresh_packet = if self.visual_invalidated {
+            Some(self.reading.project(
+                &self.player.model(),
+                identity,
+                self.width,
+                self.height,
+                &self.messages,
+                &mut self.renderer.text,
+            ))
+        } else {
+            None
+        };
+        let packet = fresh_packet.as_ref().unwrap_or(&self.packet);
         let consumed = self
             .reading
-            .history_bar_gesture(phase, x, y, button, identity, &packet);
+            .history_bar_gesture(phase, x, y, button, identity, packet);
         if consumed {
             if let Some(window) = packet
                 .history_bar
@@ -580,19 +595,10 @@ impl Engine {
     pub fn is_ready(&self) -> bool {
         self.ready
     }
-    pub fn content_failed(
-        &mut self,
-        request: u32,
-        message: String,
-    ) -> std::result::Result<(), String> {
+    pub fn content_failed(&mut self, request: u32, message: String) -> Result<()> {
         self.pump(vec![AppEvent::ContentFailed { request, message }])
     }
-    pub fn content_skipped(
-        &mut self,
-        request: u32,
-        code: String,
-        detail: String,
-    ) -> std::result::Result<(), String> {
+    pub fn content_skipped(&mut self, request: u32, code: String, detail: String) -> Result<()> {
         self.pump(vec![AppEvent::ContentSkipped {
             request,
             code,
@@ -605,12 +611,7 @@ impl Engine {
     pub fn retained_descriptors(&self) -> String {
         serde_json::to_string(&self.player.retained_descriptors()).unwrap()
     }
-    pub fn resource(
-        &mut self,
-        request: u32,
-        id: String,
-        bytes: &[u8],
-    ) -> std::result::Result<bool, String> {
+    pub fn resource(&mut self, request: u32, id: String, bytes: &[u8]) -> Result<bool> {
         if self.upload_start_us == 0 {
             self.upload_start_us = Micros(profile_clock_us()).0;
         }
@@ -621,12 +622,12 @@ impl Engine {
             .player
             .asset_descriptor(&id)
             .cloned()
-            .ok_or_else(|| js("E_ASSET: unknown resource"))?;
+            .ok_or_else(|| host_err("E_ASSET", &id, "unknown resource"))?;
         if bytes.len() as u64 != asset.bytes {
-            return Err(js("E_ASSET_SIZE: object length mismatch"));
+            return Err(host_err("E_ASSET_SIZE", &id, "object length mismatch"));
         }
         if asset.kind != AssetKind::Image || !self.renderer.image_started(request, &id) {
-            nir_content::verify(bytes, &asset.object).map_err(js)?;
+            nir_content::verify(bytes, &asset.object)?;
         }
         match asset.kind {
             AssetKind::Image => {
@@ -634,7 +635,7 @@ impl Engine {
                     let start = Micros(profile_clock_us());
                     let result = self.renderer.prepare_image(request, &id, bytes);
                     self.resource_stage("decode_allocate", request, &id, start, bytes.len());
-                    result.map_err(js)?;
+                    result?;
                 }
                 return self.finish_image_upload(request, &id);
             }
@@ -643,7 +644,7 @@ impl Engine {
                     self.renderer
                         .text
                         .add_font_asset(&id, bytes.to_vec())
-                        .map_err(js)?;
+                        .map_err(|msg| host_err("E_FONT", &id, &msg))?;
                 }
             }
             AssetKind::Audio => {}
@@ -662,7 +663,7 @@ impl Engine {
         width: u32,
         height: u32,
         pixels: &[u8],
-    ) -> std::result::Result<bool, String> {
+    ) -> Result<bool> {
         if self.upload_start_us == 0 {
             self.upload_start_us = Micros(profile_clock_us()).0;
         }
@@ -673,9 +674,13 @@ impl Engine {
             .player
             .asset_descriptor(&id)
             .cloned()
-            .ok_or_else(|| js("E_ASSET: unknown resource"))?;
+            .ok_or_else(|| host_err("E_ASSET", &id, "unknown resource"))?;
         if asset.kind != AssetKind::Image {
-            return Err(js("E_ASSET: decoded delivery accepts images only"));
+            return Err(host_err(
+                "E_ASSET",
+                &id,
+                "decoded delivery accepts images only",
+            ));
         }
         if !self.renderer.image_started(request, &id) {
             let start = Micros(profile_clock_us());
@@ -683,7 +688,7 @@ impl Engine {
                 self.renderer
                     .prepare_image_decoded(request, &id, width, height, pixels.to_vec());
             self.resource_stage("decode_admit", request, &id, start, pixels.len());
-            result.map_err(js)?;
+            result?;
         }
         self.finish_image_upload(request, &id)
     }
@@ -694,7 +699,7 @@ impl Engine {
         code: String,
         stage: String,
         cause: String,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<()> {
         let mut d = Diagnostic::new(&code, self.player.core().location(), cause).classified(
             ErrorDomain::Prepare,
             "prepare",
@@ -707,11 +712,7 @@ impl Engine {
             diagnostic: Box::new(d),
         }])
     }
-    pub fn resource_failed(
-        &mut self,
-        request: u32,
-        message: String,
-    ) -> std::result::Result<(), String> {
+    pub fn resource_failed(&mut self, request: u32, message: String) -> Result<()> {
         self.pump(vec![AppEvent::AssetFailed { request, message }])
     }
     pub fn action(
@@ -720,8 +721,17 @@ impl Engine {
         interaction: u32,
         sequence: u32,
         session: u32,
-    ) -> std::result::Result<(), String> {
-        let mut action: UiAction = nir_content::parse(json.as_bytes(), "action").map_err(js)?;
+    ) -> Result<()> {
+        let action: UiAction = nir_content::parse(json.as_bytes(), "action")?;
+        self.dispatch_action(action, interaction, sequence, session)
+    }
+    fn dispatch_action(
+        &mut self,
+        mut action: UiAction,
+        interaction: u32,
+        sequence: u32,
+        session: u32,
+    ) -> Result<()> {
         let identity = (
             self.player.generation.session,
             self.player.current_interaction(),
@@ -867,16 +877,12 @@ impl Engine {
     pub fn hit(&self, x: f32, y: f32) -> String {
         serde_json::to_string(&self.packet.hit(x, y)).unwrap()
     }
-    pub fn tick(&mut self, delta_us: u32) -> std::result::Result<(), String> {
+    pub fn tick(&mut self, delta_us: u32) -> Result<()> {
         self.pump(vec![AppEvent::Tick {
             delta_us: delta_us as u64,
         }])
     }
-    pub fn tick_domains(
-        &mut self,
-        story_us: u32,
-        foreground_us: u32,
-    ) -> std::result::Result<(), String> {
+    pub fn tick_domains(&mut self, story_us: u32, foreground_us: u32) -> Result<()> {
         self.pump(vec![AppEvent::TickDomains {
             story_us: story_us as u64,
             foreground_us: foreground_us as u64,
@@ -887,18 +893,17 @@ impl Engine {
         domain: TimeDomain,
         session: u32,
         positions: Vec<AudioPosition>,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<()> {
         if positions.len() > MAX_TASKS {
-            return Err("E_AUDIO_POSITION: observation limit".into());
+            return Err(host_err("E_AUDIO_POSITION", "audio", "observation limit"));
         }
         self.player
             .observe_audio_positions(domain, session, &positions)
-            .map_err(js)
     }
-    pub fn hidden(&mut self, value: bool) -> std::result::Result<(), String> {
+    pub fn hidden(&mut self, value: bool) -> Result<()> {
         self.pump(vec![AppEvent::Hidden(value)])
     }
-    pub fn audio_blocked(&mut self, value: bool) -> std::result::Result<(), String> {
+    pub fn audio_blocked(&mut self, value: bool) -> Result<()> {
         // This host-owned token can change without admitting a Player event.
         // Invalidate paused affordances even when no Story clock remains.
         self.state_dirty |= value != self.audio_output_wait.is_some();
@@ -981,27 +986,17 @@ impl Engine {
                     .node(&self.packet, self.input_identity(), self.player.screen)
                     .is_some_and(|node| node.id == nir_presentation::storage_recovery::CONTROL_ID))
     }
-    pub fn audio_ended(&mut self, task: u32, session: u32) -> std::result::Result<(), String> {
+    pub fn audio_ended(&mut self, task: u32, session: u32) -> Result<()> {
         self.audio_ended_in(TimeDomain::Story, task, session)
     }
-    pub fn audio_ended_in(
-        &mut self,
-        domain: TimeDomain,
-        task: u32,
-        session: u32,
-    ) -> std::result::Result<(), String> {
+    pub fn audio_ended_in(&mut self, domain: TimeDomain, task: u32, session: u32) -> Result<()> {
         self.pump(vec![AppEvent::AudioEnded {
             domain,
             task,
             session,
         }])
     }
-    pub fn audio_failed(
-        &mut self,
-        task: u32,
-        session: u32,
-        message: String,
-    ) -> std::result::Result<(), String> {
+    pub fn audio_failed(&mut self, task: u32, session: u32, message: String) -> Result<()> {
         self.audio_failed_in(TimeDomain::Story, task, session, message)
     }
     pub fn audio_failed_in(
@@ -1010,7 +1005,7 @@ impl Engine {
         task: u32,
         session: u32,
         message: String,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<()> {
         self.pump(vec![AppEvent::AudioFailed {
             domain,
             task,
@@ -1018,35 +1013,41 @@ impl Engine {
             message,
         }])
     }
-    pub fn host_event(&mut self, kind: String, json: String) -> std::result::Result<(), String> {
+    pub fn host_event(&mut self, kind: String, json: String) -> Result<()> {
         let event = match kind.as_str() {
             "assets_cancelled" => {
-                let v: serde_json::Value =
-                    nir_content::parse(json.as_bytes(), "assets_cancelled").map_err(js)?;
+                let v: serde_json::Value = nir_content::parse(json.as_bytes(), "assets_cancelled")?;
                 let request = v["request"]
                     .as_u64()
                     .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| js("E_HOST_PROTOCOL: invalid assets_cancelled request"))?;
+                    .ok_or_else(|| {
+                        host_err(
+                            "E_HOST_PROTOCOL",
+                            "host_event",
+                            "invalid assets_cancelled request",
+                        )
+                    })?;
                 AppEvent::AssetsCancelled { request }
             }
-            "preferences" => AppEvent::Preferences(
-                nir_content::parse(json.as_bytes(), "preferences").map_err(js)?,
-            ),
-            "profile_values" => AppEvent::ProfileValues(
-                nir_content::parse(json.as_bytes(), "profile_values").map_err(js)?,
-            ),
-            "profile_values_recovered" => AppEvent::ProfileValuesRecovered(
-                nir_content::parse(json.as_bytes(), "profile_values_recovered").map_err(js)?,
-            ),
-            "profile" => {
-                AppEvent::Profile(nir_content::parse(json.as_bytes(), "profile").map_err(js)?)
+            "preferences" => {
+                AppEvent::Preferences(nir_content::parse(json.as_bytes(), "preferences")?)
             }
-            "preferences_recovered" => AppEvent::PreferencesRecovered(
-                nir_content::parse(json.as_bytes(), "preferences_recovered").map_err(js)?,
-            ),
-            "profile_recovered" => AppEvent::ProfileRecovered(
-                nir_content::parse(json.as_bytes(), "profile_recovered").map_err(js)?,
-            ),
+            "profile_values" => {
+                AppEvent::ProfileValues(nir_content::parse(json.as_bytes(), "profile_values")?)
+            }
+            "profile_values_recovered" => AppEvent::ProfileValuesRecovered(nir_content::parse(
+                json.as_bytes(),
+                "profile_values_recovered",
+            )?),
+            "profile" => AppEvent::Profile(nir_content::parse(json.as_bytes(), "profile")?),
+            "preferences_recovered" => AppEvent::PreferencesRecovered(nir_content::parse(
+                json.as_bytes(),
+                "preferences_recovered",
+            )?),
+            "profile_recovered" => AppEvent::ProfileRecovered(nir_content::parse(
+                json.as_bytes(),
+                "profile_recovered",
+            )?),
             "persistence_failed" | "persistence_read_failed" => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1054,8 +1055,7 @@ impl Engine {
                     kind: PersistenceKind,
                     message: String,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "persistence_failed").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "persistence_failed")?;
                 if kind == "persistence_read_failed" {
                     AppEvent::PersistenceReadFailed {
                         kind: reply.kind,
@@ -1074,8 +1074,7 @@ impl Engine {
                 struct Reply {
                     kind: PersistenceKind,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "persistence_stored").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "persistence_stored")?;
                 AppEvent::PersistenceStored(reply.kind)
             }
             "slot_loaded" => {
@@ -1085,8 +1084,7 @@ impl Engine {
                     job: u32,
                     envelope: Box<SaveEnvelope>,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "slot_loaded").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "slot_loaded")?;
                 AppEvent::SlotLoaded {
                     job: reply.job,
                     envelope: reply.envelope,
@@ -1099,17 +1097,14 @@ impl Engine {
                     job: u32,
                     message: String,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "slot_load_failed").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "slot_load_failed")?;
                 AppEvent::SlotLoadFailed {
                     job: reply.job,
                     message: reply.message,
                 }
             }
             "loaded" => AppEvent::Loaded {
-                envelope: Box::new(
-                    nir_content::parse::<SaveEnvelope>(json.as_bytes(), "save").map_err(js)?,
-                ),
+                envelope: Box::new(nir_content::parse::<SaveEnvelope>(json.as_bytes(), "save")?),
             },
             "load_failed" => AppEvent::LoadFailed(json),
             "export_failed" => {
@@ -1119,8 +1114,7 @@ impl Engine {
                     job: u32,
                     message: String,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "export_failed").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "export_failed")?;
                 AppEvent::ExportFailed {
                     job: reply.job,
                     message: reply.message,
@@ -1132,8 +1126,7 @@ impl Engine {
                 struct Reply {
                     job: u32,
                 }
-                let reply: Reply =
-                    nir_content::parse(json.as_bytes(), "export_reply").map_err(js)?;
+                let reply: Reply = nir_content::parse(json.as_bytes(), "export_reply")?;
                 if kind == "exported" {
                     AppEvent::Exported { job: reply.job }
                 } else {
@@ -1142,65 +1135,81 @@ impl Engine {
             }
             "host_failed" => AppEvent::HostFailed(json),
             "slots" => {
-                let rows: Vec<serde_json::Value> =
-                    nir_content::parse(json.as_bytes(), "slots").map_err(js)?;
-                let slots = (0..3)
+                #[derive(serde::Deserialize)]
+                struct SlotRow {
+                    slot: u32,
+                    #[serde(default)]
+                    label: String,
+                    #[serde(default)]
+                    error: Option<String>,
+                    #[serde(default)]
+                    revision: Option<u32>,
+                }
+                let rows: Vec<SlotRow> = nir_content::parse(json.as_bytes(), "slots")?;
+                let slots = (0..self.player.save_slots())
                     .map(|slot| {
-                        let row = rows
-                            .iter()
-                            .find(|r| r["slot"].as_u64() == Some(slot as u64));
+                        let row = rows.iter().find(|r| r.slot == slot);
                         SlotView {
                             slot,
-                            label: row
-                                .and_then(|r| r["label"].as_str())
-                                .unwrap_or_default()
-                                .to_owned(),
-                            exists: row.is_some_and(|r| !r["error"].is_string()),
-                            error: row.and_then(|r| r["error"].as_str()).map(str::to_owned),
+                            label: row.map(|r| r.label.clone()).unwrap_or_default(),
+                            exists: row.is_some_and(|r| r.error.is_none()),
+                            error: row.and_then(|r| r.error.clone()),
                         }
                     })
                     .collect();
                 let revisions = rows
                     .iter()
-                    .filter_map(|r| {
-                        Some((r["slot"].as_u64()? as u32, r["revision"].as_u64()? as u32))
-                    })
+                    .filter_map(|r| Some((r.slot, r.revision?)))
                     .collect();
                 AppEvent::Slots(slots, revisions)
             }
             "saved" => {
-                let v: serde_json::Value =
-                    nir_content::parse(json.as_bytes(), "saved").map_err(js)?;
+                #[derive(serde::Deserialize)]
+                struct SavedReply {
+                    job: u32,
+                    slot: u32,
+                    revision: u32,
+                }
+                let v: SavedReply = nir_content::parse(json.as_bytes(), "saved")?;
                 AppEvent::Saved {
-                    job: v["job"].as_u64().unwrap_or(0) as u32,
-                    slot: v["slot"].as_u64().unwrap_or(0) as u32,
-                    revision: v["revision"].as_u64().unwrap_or(0) as u32,
+                    job: v.job,
+                    slot: v.slot,
+                    revision: v.revision,
                 }
             }
             "save_pending" => {
-                let v: serde_json::Value =
-                    nir_content::parse(json.as_bytes(), "save_pending").map_err(js)?;
+                #[derive(serde::Deserialize)]
+                struct SavePendingReply {
+                    job: u32,
+                    #[serde(default)]
+                    message: Option<String>,
+                }
+                let v: SavePendingReply = nir_content::parse(json.as_bytes(), "save_pending")?;
                 AppEvent::SavePending {
-                    job: v["job"].as_u64().unwrap_or(0) as u32,
-                    message: v["message"]
-                        .as_str()
-                        .unwrap_or("E_STORAGE_UNCERTAIN")
-                        .into(),
+                    job: v.job,
+                    message: v.message.unwrap_or_else(|| "E_STORAGE_UNCERTAIN".into()),
                 }
             }
             "save_failed" => {
-                let v: serde_json::Value =
-                    nir_content::parse(json.as_bytes(), "save_failed").map_err(js)?;
+                #[derive(serde::Deserialize)]
+                struct SaveFailedReply {
+                    job: u32,
+                    #[serde(default)]
+                    code: Option<String>,
+                    #[serde(default)]
+                    message: Option<String>,
+                }
+                let v: SaveFailedReply = nir_content::parse(json.as_bytes(), "save_failed")?;
                 AppEvent::SaveFault {
-                    job: v["job"].as_u64().unwrap_or(0) as u32,
+                    job: v.job,
                     diagnostic: Box::new(Diagnostic::new(
-                        v["code"].as_str().unwrap_or("E_STORAGE"),
+                        v.code.as_deref().unwrap_or("E_STORAGE"),
                         "save",
-                        v["message"].as_str().unwrap_or("E_STORAGE"),
+                        v.message.as_deref().unwrap_or("E_STORAGE"),
                     )),
                 }
             }
-            _ => return Err(js("E_HOST_PROTOCOL: unknown event")),
+            _ => return Err(host_err("E_HOST_PROTOCOL", "host_event", "unknown event")),
         };
         if let AppEvent::AssetsCancelled { request } = &event {
             self.renderer.cancel_upload(*request);
@@ -1208,31 +1217,26 @@ impl Engine {
         }
         self.pump(vec![event])
     }
-    pub fn draw(
-        &mut self,
-        width: f32,
-        height: f32,
-        dpr: f32,
-    ) -> std::result::Result<String, String> {
+    pub fn draw(&mut self, width: f32, height: f32, dpr: f32) -> Result<String> {
         if width < 1. || height < 1. || !width.is_finite() || !height.is_finite() {
-            return Err(js("E_VIEWPORT"));
+            return Err(host_err("E_VIEWPORT", "draw", "invalid viewport"));
         }
         let dpr = if dpr.is_finite() {
-            dpr.clamp(1., 2.)
+            let max_dpr = if cfg!(target_os = "android") { 4. } else { 2. };
+            dpr.clamp(1., max_dpr)
         } else {
             1.
         };
         if (self.width, self.height, self.dpr) != (width, height, dpr) {
             self.player
-                .reserve_render_surfaces((width * dpr) as u32, (height * dpr) as u32)
-                .map_err(js)?;
+                .reserve_render_surfaces((width * dpr) as u32, (height * dpr) as u32)?;
             self.width = width;
             self.height = height;
             self.dpr = dpr;
             self.visual_invalidated = true;
             self.renderer
                 .resize((width * dpr) as u32, (height * dpr) as u32);
-            self.player.viewport_changed().map_err(js)?;
+            self.player.viewport_changed()?;
             self.pump(vec![])?;
         }
         // Boot and an unprepared overlay must not address missing media.
@@ -1323,7 +1327,7 @@ impl Engine {
                 if let Some(layout) = self.native_audio_recovery_layout() {
                     layout.paint(
                         &mut projected,
-                        &self.player.model(),
+                        &model,
                         &self.messages,
                         self.native_audio_recovery_focus,
                     );
@@ -1332,11 +1336,14 @@ impl Engine {
                 let draw_start = self.profile_start();
                 let needs_render = self.visual_invalidated || !self.packet.visual_eq(&projected);
                 self.packet = projected;
-                self.profile_end("draw", draw_start);
                 if needs_render {
                     self.visual_invalidated = true;
-                    self.renderer.render(&self.packet, dpr).map_err(js)?;
+                    let rendered = self.renderer.render(&self.packet, dpr);
+                    self.profile_end("draw", draw_start);
+                    rendered?;
                     self.visual_invalidated = false;
+                } else {
+                    self.profile_end("draw", draw_start);
                 }
                 self.renderer.retain(&self.player.retained_assets());
                 self.state_dirty = false;
@@ -1473,7 +1480,7 @@ impl Engine {
     pub fn simulate_device_loss(&self) {
         self.renderer.destroy();
     }
-    pub fn begin_recovery(&mut self) -> std::result::Result<(), String> {
+    pub fn begin_recovery(&mut self) -> Result<()> {
         self.ready = false;
         self.pump(vec![AppEvent::DeviceLost])
     }
@@ -1488,14 +1495,18 @@ impl Engine {
     pub fn rebind_surface(
         &mut self,
         surface: nir_render_wgpu::wgpu::Surface<'static>,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<()> {
         self.renderer.rebind_surface(surface);
         self.visual_invalidated = true;
         Ok(())
     }
-    pub fn replace_gpu(&mut self, replacement: Renderer) -> std::result::Result<(), String> {
+    pub fn replace_gpu(&mut self, replacement: Renderer) -> Result<()> {
         if replacement.backend != self.renderer.backend {
-            return Err(js("E_RENDER_BACKEND: recovery must use the active backend"));
+            return Err(host_err(
+                "E_RENDER_BACKEND",
+                "replace_gpu",
+                "recovery must use the active backend",
+            ));
         }
         self.renderer = replacement;
         self.renderer.set_profiling_clock(if self.profiling {
@@ -1549,7 +1560,7 @@ impl Engine {
     }
     /// Row-budgeted image upload with the soft time-slice check, followed by
     /// the shared ready tail. Returns `false` when more rows remain.
-    fn finish_image_upload(&mut self, request: u32, id: &str) -> std::result::Result<bool, String> {
+    fn finish_image_upload(&mut self, request: u32, id: &str) -> Result<bool> {
         // PNG decode is atomic. Yield before the next incremental
         // upload step when it used this turn's soft time allowance.
         if Micros(profile_clock_us())
@@ -1560,18 +1571,15 @@ impl Engine {
             return Ok(false);
         }
         let start = Micros(profile_clock_us());
-        let (complete, used) = self
-            .renderer
-            .upload_image_step(id, self.upload_remaining)
-            .map_err(js)?;
+        let (complete, used) = self.renderer.upload_image_step(id, self.upload_remaining)?;
         self.resource_stage("upload_enqueued", request, id, start, used);
-        self.upload_remaining -= used;
+        self.upload_remaining = self.upload_remaining.saturating_sub(used);
         if !complete {
             return Ok(false);
         }
         self.asset_ready(request, id)
     }
-    fn asset_ready(&mut self, request: u32, id: &str) -> std::result::Result<bool, String> {
+    fn asset_ready(&mut self, request: u32, id: &str) -> Result<bool> {
         self.pump(vec![AppEvent::AssetReady {
             request,
             asset: id.to_string(),
@@ -1594,7 +1602,7 @@ impl Engine {
             profile_clock_us,
         );
     }
-    fn pump(&mut self, events: Vec<AppEvent>) -> std::result::Result<(), String> {
+    fn pump(&mut self, events: Vec<AppEvent>) -> Result<()> {
         // Include host-owned pause token changes made immediately before
         // pump, and inspect every VM pump rather than delayed host snapshots.
         self.observe_story_clock();
@@ -1643,7 +1651,7 @@ impl Engine {
         while !commands.is_empty() {
             rounds += 1;
             if rounds > 32 {
-                return Err(js("E_HOST_BUDGET: command cycle"));
+                return Err(host_err("E_HOST_BUDGET", "pump", "command cycle"));
             }
             let mut events = vec![];
             for command in commands {
@@ -1717,10 +1725,7 @@ impl Engine {
     /// Locale preferences can arrive while the boot resource job is still
     /// loading fonts. Keep the candidate paused and shape it only after every
     /// face in both candidate plans has been installed in the renderer.
-    fn prepare_locale_candidate(
-        &mut self,
-        request: u32,
-    ) -> std::result::Result<Option<AppEvent>, String> {
+    fn prepare_locale_candidate(&mut self, request: u32) -> Result<Option<AppEvent>> {
         if !self.player.accepts_locale(request) {
             if self.pending_locale == Some(request) {
                 self.pending_locale = None;

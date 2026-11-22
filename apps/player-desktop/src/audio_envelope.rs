@@ -53,15 +53,20 @@ impl Ramp {
             ),
         })
     }
+    /// True while a finite ramp or owned fade envelope is still in progress.
+    pub fn is_active(&self) -> bool {
+        self.owner.is_some() || (self.duration_us > 0 && self.sampled_us < self.duration_us)
+    }
     fn next_frame(&mut self, rate: u32) -> f32 {
+        if self.duration_us == 0 {
+            self.sampled_us = 0;
+            self.frames = self.frames.saturating_add(1);
+            return self.to;
+        }
         self.sampled_us = ((self.frames as u128 * 1_000_000) / rate.max(1) as u128)
             .min(self.duration_us as u128) as u64;
-        let p = if self.duration_us == 0 {
-            1.
-        } else {
-            (self.frames as f64 * 1_000_000. / (self.duration_us as f64 * rate as f64)).min(1.)
-                as f32
-        };
+        let p = (self.frames as f64 * 1_000_000. / (self.duration_us as f64 * rate as f64)).min(1.)
+            as f32;
         self.frames = self.frames.saturating_add(1);
         nir_format::interpolate(self.from, self.to, p, nir_format::Easing::Linear)
     }
@@ -105,7 +110,12 @@ impl<I: Iterator<Item = f32>> Iterator for EnvelopeSamples<I> {
         self.input.size_hint()
     }
 }
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+))]
 impl<I: rodio::Source> rodio::Source for EnvelopeSamples<I> {
     fn current_span_len(&self) -> Option<usize> {
         self.input.current_span_len()

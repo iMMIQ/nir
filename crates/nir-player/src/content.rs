@@ -1379,16 +1379,29 @@ impl Player {
                 }
             }
             // Preserve the existing finite content envelope even across many loads.
-            if serde_json::to_vec(&p)
-                .map_err(|e| Diagnostic::new("E_MODULE", "content", e.to_string()))?
-                .len()
-                > MAX_INPUT_BYTES
-            {
-                return Err(Diagnostic::new(
-                    "E_LIMIT",
-                    "content",
-                    "resident program exceeds 16 MiB",
-                ));
+            struct CountingWriter(usize);
+            impl std::io::Write for CountingWriter {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0 = self.0.saturating_add(buf.len());
+                    if self.0 > MAX_INPUT_BYTES {
+                        return Err(std::io::Error::other("E_LIMIT"));
+                    }
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut counter = CountingWriter(0);
+            if let Err(e) = serde_json::to_writer(&mut counter, &p) {
+                if counter.0 > MAX_INPUT_BYTES {
+                    return Err(Diagnostic::new(
+                        "E_LIMIT",
+                        "content",
+                        "resident program exceeds 16 MiB",
+                    ));
+                }
+                return Err(Diagnostic::new("E_MODULE", "content", e.to_string()));
             }
             let validated = ValidatedProgram::new(p)?;
             self.admit_live_program(validated)?;

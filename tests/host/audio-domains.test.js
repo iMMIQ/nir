@@ -321,3 +321,15 @@ test('output recovery keys preserve explicit navigation and consume only reading
     }
     assert.equal(audioRecoveryConsumesKey(true,'Escape',null),false);
 });
+
+test('recreateClosed replaces a Safari/iOS closed context while keeping live contexts intact',()=>{
+    const domains=new AudioDomains(Context,()=>{});
+    const initial=domains.context('story','voice');
+    assert.equal(domains.recreateClosed('story','voice'),initial);
+    initial.state='closed';
+    const fresh=domains.recreateClosed('story','voice');
+    assert.notEqual(fresh,initial);
+    assert.equal(domains.context('story','voice'),fresh);
+    assert.equal(fresh.state,'suspended');
+    domains.close();
+});
