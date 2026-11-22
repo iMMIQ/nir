@@ -85,6 +85,8 @@ pub struct Runtime {
     requested_assets: BTreeMap<AssetId, bool>,
     commands: Vec<HostCommand>,
     last_packet: DrawPacket,
+    asset_epoch: u64,
+    last_rendered_asset_epoch: u64,
     pub dirty: bool,
     pub paused_by_host: bool,
     profile_dirty: bool,
@@ -143,6 +145,8 @@ impl Runtime {
             requested_assets: BTreeMap::new(),
             commands: Vec::new(),
             last_packet: DrawPacket::default(),
+            asset_epoch: 0,
+            last_rendered_asset_epoch: 0,
             dirty: true,
             paused_by_host: false,
             profile_dirty: false,
@@ -192,7 +196,21 @@ impl Runtime {
     pub fn mark_asset_loaded(&mut self, id: AssetId) {
         self.loaded_assets.insert(id);
         self.requested_assets.remove(&id);
+        self.asset_epoch = self.asset_epoch.wrapping_add(1);
         self.dirty = true;
+    }
+
+    /// Forces a full GPU redraw after shared fallback fonts load asynchronously.
+    pub fn mark_fonts_changed(&mut self) {
+        self.asset_epoch = self.asset_epoch.wrapping_add(1);
+        self.dirty = true;
+    }
+
+    /// Removes LRU-evicted GPU texture IDs from `loaded_assets` so returning to a prior scene reloads them cleanly!
+    pub fn mark_assets_evicted(&mut self, ids: &[AssetId]) {
+        for id in ids {
+            self.loaded_assets.remove(id);
+        }
     }
 
     pub fn mark_asset_failed(&mut self, id: AssetId, err: &str) {
@@ -212,12 +230,24 @@ impl Runtime {
         self.step_vm();
     }
 
+    fn channel_character_gain(&self, bus: AudioBus, character: Option<&str>) -> f32 {
+        if bus == AudioBus::Voice {
+            if let Some(ch) = character {
+                if let Some(&mult) = self.prefs.character_volumes.get(ch) {
+                    return mult.clamp(0.0, 1.0);
+                }
+            }
+        }
+        1.0
+    }
+
     /// Live hot-reload of an updated compiled program without resetting reading state!
     pub fn apply_hot_reload(&mut self, new_program: Arc<NirProgram>) {
         self.program = new_program.clone();
         self.vm.hot_reload(new_program);
         self.loaded_assets.clear();
         self.requested_assets.clear();
+        self.asset_epoch = self.asset_epoch.wrapping_add(1);
         if self.screen == Screen::Story {
             self.step_vm();
         } else {
@@ -249,12 +279,11 @@ impl Runtime {
             if is_choice_hit {
                 if let Some(se) = self.vm.choice.as_ref().and_then(|c| c.hover_se) {
                     self.request_asset(se, true);
-                    let gain = self.prefs.effective_bus_gain(AudioBus::Sfx, None);
                     self.commands.push(HostCommand::PlayAudio {
                         channel: ChannelId(6),
                         bus: AudioBus::Sfx,
                         asset: se,
-                        gain,
+                        gain: 1.0,
                         looped: false,
                         fade_in_us: 0,
                         loop_region: None,
@@ -533,12 +562,12 @@ impl Runtime {
                     AudioBus::Voice => self.prefs.voice_volume = v,
                     AudioBus::Sfx => self.prefs.sfx_volume = v,
                 }
-                // Update live channels immediately!
+                // Host mixers apply master & bus gains via SavePreferences; keep channel gain un-attenuated twice.
                 for ch in &self.vm.audio {
                     if ch.bus == bus {
                         let gain = ch.gain
                             * ch.envelope
-                            * self.prefs.effective_bus_gain(bus, ch.character.as_deref());
+                            * self.channel_character_gain(bus, ch.character.as_deref());
                         self.commands.push(HostCommand::SetAudioGain {
                             channel: ch.channel,
                             gain,
@@ -550,6 +579,11 @@ impl Runtime {
             }
             UiAction::SetTextSpeed(speed) => {
                 self.prefs.text_speed = speed.clamp(0.0, 8.0);
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::SetFontScale(scale) => {
+                self.prefs.font_scale = scale.clamp(0.75, 1.50);
                 self.commands
                     .push(HostCommand::SavePreferences(self.prefs.clone()));
             }
@@ -731,8 +765,10 @@ impl Runtime {
             toast: self.toast.as_ref().map(|(m, _)| m.as_str()),
         };
         let next = nir_ui::project(&ctx, width, height, &self.messages);
-        let changed = size_changed || !self.last_packet.visual_eq(&next);
+        let assets_updated = self.last_rendered_asset_epoch != self.asset_epoch;
+        let changed = size_changed || assets_updated || !self.last_packet.visual_eq(&next);
         self.last_packet = next;
+        self.last_rendered_asset_epoch = self.asset_epoch;
         self.dirty = false;
         changed.then_some(&self.last_packet)
     }
@@ -777,7 +813,7 @@ impl Runtime {
                     if channel == ChannelId(1) && bus == AudioBus::Voice {
                         self.voice_playing = true;
                     }
-                    let eff = gain * self.prefs.effective_bus_gain(bus, character.as_deref());
+                    let eff = gain * self.channel_character_gain(bus, character.as_deref());
                     self.request_asset(asset, true);
                     self.commands.push(HostCommand::PlayAudio {
                         channel,
@@ -803,13 +839,13 @@ impl Runtime {
                     });
                 }
                 VmIntent::SetAudioGain { channel, gain } => {
-                    let bus = self
+                    let (bus, ch_name) = self
                         .vm
                         .audio
                         .iter()
                         .find(|c| c.channel == channel)
-                        .map_or(AudioBus::Bgm, |c| c.bus);
-                    let eff = gain * self.prefs.effective_bus_gain(bus, None);
+                        .map_or((AudioBus::Bgm, None), |c| (c.bus, c.character.as_deref()));
+                    let eff = gain * self.channel_character_gain(bus, ch_name);
                     self.commands
                         .push(HostCommand::SetAudioGain { channel, gain: eff });
                 }
@@ -909,12 +945,11 @@ impl Runtime {
         {
             pinned.insert(bgm);
             self.request_asset(bgm, true);
-            let gain = self.prefs.effective_bus_gain(AudioBus::Bgm, None);
             self.commands.push(HostCommand::PlayAudio {
                 channel: ChannelId(0),
                 bus: AudioBus::Bgm,
                 asset: bgm,
-                gain,
+                gain: 1.0,
                 looped: true,
                 fade_in_us: 300_000,
                 loop_region: None,
@@ -1169,5 +1204,36 @@ mod tests {
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "Replay line");
         rt.dispatch(UiAction::Advance);
         assert_eq!(rt.screen, Screen::Gallery);
+    }
+
+    #[test]
+    fn async_asset_and_font_loads_always_trigger_redraw_and_eviction_reloads() {
+        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
+            .unwrap();
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        assert!(rt.prepare_frame(1280.0, 720.0).is_none());
+
+        // Texture finishing decode asynchronously does NOT change DrawPacket fields,
+        // yet prepare_frame MUST emit a redraw!
+        rt.mark_asset_loaded(AssetId(7));
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        assert!(rt.prepare_frame(1280.0, 720.0).is_none());
+
+        // Fallback font load MUST also emit a redraw!
+        rt.mark_fonts_changed();
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+
+        // Evicted assets are removed from loaded_assets so re-requesting emits LoadAsset again.
+        rt.take_commands();
+        rt.mark_assets_evicted(&[AssetId(7)]);
+        rt.request_asset(AssetId(7), true);
+        let cmds = rt.take_commands();
+        assert!(cmds.iter().any(|c| matches!(c, HostCommand::LoadAsset { id: AssetId(7), urgent: true })));
+
+        // SetFontScale updates prefs cleanly and persists them.
+        rt.dispatch(UiAction::SetFontScale(1.2));
+        assert!((rt.prefs.font_scale - 1.2).abs() < 0.001);
+        let pcmds = rt.take_commands();
+        assert!(pcmds.iter().any(|c| matches!(c, HostCommand::SavePreferences(_))));
     }
 }

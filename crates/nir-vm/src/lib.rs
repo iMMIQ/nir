@@ -149,9 +149,18 @@ impl Vm {
         if self.outcome.is_some() {
             return false;
         }
+        let has_running_timeline = self.timelines.iter().any(|tl| {
+            let (fps, duration_frames) = self
+                .program
+                .timelines
+                .get(tl.timeline.0 as usize)
+                .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
+            let total_us = ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
+            tl.elapsed_us < total_us
+        });
         !self.tweens.is_empty()
             || !self.shakes.is_empty()
-            || !self.timelines.is_empty()
+            || has_running_timeline
             || self.transition.is_some()
             || self.window_reveal.is_some()
             || matches!(
@@ -705,9 +714,7 @@ impl Vm {
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     existing.parent = parent;
-                    if asset.is_some() {
-                        existing.asset = asset;
-                    }
+                    existing.asset = asset;
                     existing.transform = (**transform).clone();
                     existing.text = None;
                 } else {
@@ -727,6 +734,11 @@ impl Vm {
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     existing.asset = asset;
+                    if asset.is_some() {
+                        existing.transform.color = [1.0, 1.0, 1.0, 1.0];
+                        existing.transform.width = 0.0;
+                        existing.transform.height = 0.0;
+                    }
                     existing.text = None;
                 } else {
                     self.pending_layers.push(LayerState {
@@ -1696,6 +1708,7 @@ impl Vm {
                         color: None,
                         ruby: None,
                         speed: cur_speed,
+                        inline_image: None,
                     });
                 }
                 RichSpan::Emphasis(s) => {
@@ -1710,6 +1723,7 @@ impl Vm {
                         color: None,
                         ruby: None,
                         speed: cur_speed,
+                        inline_image: None,
                     });
                 }
                 RichSpan::Color { text, rgba } => {
@@ -1724,6 +1738,7 @@ impl Vm {
                         color: Some(*rgba),
                         ruby: None,
                         speed: cur_speed,
+                        inline_image: None,
                     });
                 }
                 RichSpan::Ruby { base, ruby } => {
@@ -1738,6 +1753,7 @@ impl Vm {
                         color: None,
                         ruby: Some(ruby.clone()),
                         speed: cur_speed,
+                        inline_image: None,
                     });
                 }
                 RichSpan::Pause { duration_us, click } => {
@@ -1748,9 +1764,9 @@ impl Vm {
                         triggered: false,
                     });
                 }
-                RichSpan::InlineImage { .. } => {
+                RichSpan::InlineImage { asset, .. } => {
                     let start = full.len();
-                    full.push('\u{fffc}');
+                    full.push('\u{3000}');
                     grapheme_cursor += 1;
                     spans.push(ResolvedSpan {
                         byte_start: start,
@@ -1759,6 +1775,7 @@ impl Vm {
                         color: None,
                         ruby: None,
                         speed: cur_speed,
+                        inline_image: Some(*asset),
                     });
                 }
                 RichSpan::Var(var_id) => {
@@ -1777,6 +1794,7 @@ impl Vm {
                         color: None,
                         ruby: None,
                         speed: cur_speed,
+                        inline_image: None,
                     });
                 }
                 RichSpan::Speed(mult) => {
@@ -1876,7 +1894,6 @@ impl Vm {
 
         // 2b. Timelines (60Hz keyframed sequences)
         if !self.timelines.is_empty() {
-            visual_changed = true;
             let mut tl_idx = 0;
             while tl_idx < self.timelines.len() {
                 let tl_id = self.timelines[tl_idx].timeline;
@@ -1886,10 +1903,23 @@ impl Vm {
                     .get(tl_id.0 as usize)
                     .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
                 let total_us = ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
+                if self.timelines[tl_idx].elapsed_us >= total_us && !self.timelines[tl_idx].scrap_on_end {
+                    let done_layer = self.timelines[tl_idx].layer;
+                    if matches!(self.wait, WaitReason::Timeline { layer, .. } if layer == done_layer)
+                    {
+                        self.wait = WaitReason::None;
+                    }
+                    tl_idx += 1;
+                    continue;
+                }
+                visual_changed = true;
                 self.timelines[tl_idx].elapsed_us = if reduced_motion {
                     total_us
                 } else {
-                    self.timelines[tl_idx].elapsed_us.saturating_add(delta_us)
+                    self.timelines[tl_idx]
+                        .elapsed_us
+                        .saturating_add(delta_us)
+                        .min(total_us)
                 };
                 let cur_frame =
                     ((self.timelines[tl_idx].elapsed_us as f64 / 1_000_000.0) * fps as f64) as u32;
@@ -1897,14 +1927,17 @@ impl Vm {
                 self.trigger_timeline_sounds(&mut tl_tmp, cur_frame);
                 self.timelines[tl_idx] = tl_tmp;
                 if self.timelines[tl_idx].elapsed_us >= total_us {
-                    let done = self.timelines.remove(tl_idx);
-                    if done.scrap_on_end {
+                    let done_layer = self.timelines[tl_idx].layer;
+                    if self.timelines[tl_idx].scrap_on_end {
+                        self.timelines.remove(tl_idx);
                         self.layers
-                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                            .retain(|l| l.id != done_layer && l.parent != Some(done_layer));
                         self.pending_layers
-                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                            .retain(|l| l.id != done_layer && l.parent != Some(done_layer));
+                    } else {
+                        tl_idx += 1;
                     }
-                    if matches!(self.wait, WaitReason::Timeline { layer, .. } if layer == done.layer)
+                    if matches!(self.wait, WaitReason::Timeline { layer, .. } if layer == done_layer)
                     {
                         self.wait = WaitReason::None;
                     }
@@ -2095,12 +2128,22 @@ impl Vm {
                 skippable: true,
             } => {
                 if let Some(pos) = self.timelines.iter().position(|t| t.layer == layer) {
-                    let done = self.timelines.remove(pos);
-                    if done.scrap_on_end {
+                    if self.timelines[pos].scrap_on_end {
+                        let done = self.timelines.remove(pos);
                         self.layers
                             .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
                         self.pending_layers
                             .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                    } else {
+                        let tl_id = self.timelines[pos].timeline;
+                        let (fps, duration_frames) = self
+                            .program
+                            .timelines
+                            .get(tl_id.0 as usize)
+                            .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
+                        let total_us =
+                            ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
+                        self.timelines[pos].elapsed_us = total_us;
                     }
                 }
                 self.wait = WaitReason::None;
@@ -2244,6 +2287,13 @@ impl Vm {
         }
         if let Some(p) = self.dialogue_portrait {
             set.insert(p);
+        }
+        if let Some(dlg) = &self.dialogue {
+            for sp in &dlg.spans {
+                if let Some(img) = sp.inline_image {
+                    set.insert(img);
+                }
+            }
         }
         if let Some(style) = self
             .program

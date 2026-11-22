@@ -648,16 +648,70 @@ async function main() {
   );
   document.title = engine.title();
 
+  const fallbackFontUrls = (() => {
+    const out = [];
+    if (Array.isArray(cfg.fallbackFonts)) {
+      for (const u of cfg.fallbackFonts) {
+        if (typeof u === 'string' && u) out.push(new URL(u, location.href).href);
+      }
+    }
+    if (typeof cfg.fallbackFontUrl === 'string' && cfg.fallbackFontUrl) {
+      const href = new URL(cfg.fallbackFontUrl, location.href).href;
+      if (!out.includes(href)) out.push(href);
+    }
+    if (out.length === 0) {
+      out.push(new URL('./fallback-cjk.otf', import.meta.url).href);
+    }
+    return out;
+  })();
+
+  // Start fetching shared Web CJK fallback font in parallel with WASM + header (browser immutable-cached!)
+  const fallbackFontPromise = (async () => {
+    const loaded = [];
+    for (const url of fallbackFontUrls) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          if (bytes.byteLength >= 256) {
+            loaded.push(bytes);
+          }
+        }
+      } catch { /* optional fallback font */ }
+    }
+    return loaded;
+  })();
+
   const loadAllFonts = async () => {
     const fonts = JSON.parse(engine.font_assets_json() || '[]');
+    let bundledCount = 0;
     await Promise.all(fonts.map(async (f) => {
       try {
         const bytes = await pak.getAssetBytes(f.offset, f.size);
         engine.load_font(f.id, bytes);
+        bundledCount += 1;
       } catch { /* ignore */ }
     }));
+    return bundledCount;
   };
-  await loadAllFonts();
+  const bundledFontCount = await loadAllFonts();
+  let fallbackFontsLoaded = 0;
+  const applyFallbackFonts = (fontBlobs) => {
+    for (const bytes of fontBlobs) {
+      try {
+        engine.load_fallback_font(bytes);
+        fallbackFontsLoaded += 1;
+      } catch { /* ignore invalid font */ }
+    }
+    if (globalThis.__nir) {
+      globalThis.__nir.fallbackFonts = fallbackFontsLoaded;
+    }
+  };
+  if (bundledFontCount === 0) {
+    // Wait for shared CJK fallback font when the .nirpak has no bundled font so frame 1 is never blank!
+    setProgress(96, 'Loading CJK font…');
+    applyFallbackFonts(await fallbackFontPromise);
+  }
 
   const audio = new WebAudioMixer();
   try { audio.applyPreferences(JSON.parse(initialSaves.prefsJson)); } catch { /* default */ }
@@ -1026,8 +1080,19 @@ async function main() {
     gameId: engine.game_id(),
     backend: engine.backend_info(),
     pakMode: pak.mode,
+    fallbackFonts: fallbackFontsLoaded,
     error: null,
   };
+
+  if (bundledFontCount > 0) {
+    // Background-attach CJK fallback font after bundled fonts so missing UI/CJK glyphs render cleanly!
+    fallbackFontPromise.then((blobs) => {
+      if (blobs.length > 0) {
+        applyFallbackFonts(blobs);
+        scheduleFrame();
+      }
+    });
+  }
 
   const frame = (ts) => {
     rafId = 0;

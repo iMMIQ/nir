@@ -376,6 +376,17 @@ mod wasm_host {
             Ok(())
         }
 
+        /// Loads a shared fallback font (e.g. Web Pan-CJK fallback `.otf`/`.ttf`) used whenever
+        /// a `.nirpak` ships no bundled font or lacks CJK/UI/symbol glyphs.
+        #[wasm_bindgen]
+        pub fn load_fallback_font(&mut self, bytes: Uint8Array) -> Result<(), JsValue> {
+            self.renderer
+                .load_fallback_font(bytes.to_vec())
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.runtime.mark_fonts_changed();
+            Ok(())
+        }
+
         #[wasm_bindgen]
         pub fn upload_image_bitmap(
             &mut self,
@@ -386,6 +397,10 @@ mod wasm_host {
             self.renderer
                 .upload_image_bitmap(id, bitmap)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let evicted = self.renderer.take_evicted_assets();
+            if !evicted.is_empty() {
+                self.runtime.mark_assets_evicted(&evicted);
+            }
             self.runtime.mark_asset_loaded(id);
             Ok(())
         }
@@ -401,6 +416,10 @@ mod wasm_host {
             self.renderer
                 .upload_ktx2_bytes(id, &raw)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let evicted = self.renderer.take_evicted_assets();
+            if !evicted.is_empty() {
+                self.runtime.mark_assets_evicted(&evicted);
+            }
             self.runtime.mark_asset_loaded(id);
             Ok(())
         }
@@ -533,7 +552,10 @@ mod wasm_host {
                 }
             }
             if let Some(pin) = pinned {
-                self.renderer.evict_lru(&pin);
+                let evicted = self.renderer.evict_lru(&pin);
+                if !evicted.is_empty() {
+                    self.runtime.mark_assets_evicted(&evicted);
+                }
             }
             if js_cmds.is_empty() {
                 String::new()
@@ -548,19 +570,43 @@ mod wasm_host {
         width: u32,
         height: u32,
     ) -> Result<Renderer, String> {
-        for (backends, kind) in [
-            (wgpu::Backends::BROWSER_WEBGPU, RendererBackend::WebGpu),
-            (wgpu::Backends::GL, RendererBackend::WebGl2),
-        ] {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends,
-                ..Default::default()
-            });
-            let target = wgpu::SurfaceTarget::Canvas(canvas.clone());
-            if let Ok(surface) = instance.create_surface(target) {
-                if let Ok(r) = Renderer::new(instance, surface, width, height, kind).await {
+        // Probe WebGPU adapter BEFORE creating a canvas surface! Calling `canvas.getContext("webgpu")`
+        // permanently locks the HTMLCanvasElement to WebGPU and breaks the WebGL2 fallback if no
+        // WebGPU adapter is available (e.g. insecure HTTP origins, older GPUs, or software GL).
+        let gpu_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..Default::default()
+        });
+        let has_webgpu_adapter = gpu_instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .is_ok();
+        if has_webgpu_adapter {
+            if let Ok(surface) =
+                gpu_instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            {
+                if let Ok(r) =
+                    Renderer::new(gpu_instance, surface, width, height, RendererBackend::WebGpu)
+                        .await
+                {
                     return Ok(r);
                 }
+            }
+        }
+
+        let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        if let Ok(surface) = gl_instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas)) {
+            if let Ok(r) =
+                Renderer::new(gl_instance, surface, width, height, RendererBackend::WebGl2).await
+            {
+                return Ok(r);
             }
         }
         Err("Failed to initialize WebGPU or WebGL2 renderer".into())

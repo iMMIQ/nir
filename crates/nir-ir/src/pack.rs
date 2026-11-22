@@ -230,7 +230,11 @@ pub fn collect_all_chars_parts(
             entry.collect_chars(&mut chars);
         }
     }
-    for ftl in [crate::ui_messages::EN_FTL, crate::ui_messages::ZH_HANS_FTL] {
+    for ftl in [
+        crate::ui_messages::EN_FTL,
+        crate::ui_messages::ZH_HANS_FTL,
+        "鉴赏 / 回想Gallery",
+    ] {
         chars.extend(ftl.chars());
     }
     chars.retain(|c| !c.is_control());

@@ -1,13 +1,15 @@
 use crate::TextRun;
-use nir_ir::AssetId;
+use nir_ir::{AssetId, TextAlign};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 /// Cached shaped `cosmic-text` buffer paired with precomputed line byte offsets
-/// so typewriter clipping never re-runs `LineIter` / `BidiParagraphs` per frame!
+/// and total shaped height so typewriter clipping and vertical centering never re-shape per frame!
 pub struct CachedTextBuffer {
     pub buffer: cosmic_text::Buffer,
     pub line_offsets: Vec<usize>,
+    pub content_height: f32,
+    pub effective_size: f32,
 }
 
 /// Zero-alloc-key CPU text shaping cache backed by `cosmic-text`.
@@ -17,6 +19,7 @@ pub struct TextEngine {
     recency: HashMap<u64, u64>,
     clock: u64,
     families: BTreeMap<AssetId, &'static str>,
+    fallback_families: Vec<&'static str>,
     fallback_dirty: bool,
     #[cfg(not(target_arch = "wasm32"))]
     system_fonts_loaded: bool,
@@ -62,6 +65,7 @@ impl Default for TextEngine {
             recency: HashMap::new(),
             clock: 0,
             families: BTreeMap::new(),
+            fallback_families: Vec::new(),
             fallback_dirty: false,
             #[cfg(not(target_arch = "wasm32"))]
             system_fonts_loaded: false,
@@ -77,17 +81,70 @@ impl TextEngine {
         }
         let before: HashSet<_> = self.fonts.db().faces().map(|f| f.id).collect();
         self.fonts.db_mut().load_font_data(bytes);
-        let family = self
+        let new_names: Vec<String> = self
             .fonts
             .db()
             .faces()
-            .find(|face| !before.contains(&face.id))
-            .and_then(|face| face.families.first().map(|f| f.0.clone()))
-            .ok_or_else(|| format!("E_FONT: no font face in asset {}", id.0))?;
-        let static_family = intern_family(&family);
+            .filter(|face| !before.contains(&face.id))
+            .filter_map(|face| face.families.first().map(|f| f.0.clone()))
+            .collect();
+        let Some(first) = new_names.first().cloned() else {
+            return Err(format!("E_FONT: no font face in asset {}", id.0));
+        };
+        let static_family = intern_family(&first);
         self.families.insert(id, static_family);
         if self.families.len() == 1 {
-            self.fonts.db_mut().set_sans_serif_family(family);
+            self.fonts.db_mut().set_sans_serif_family(first);
+        }
+        self.buffers.clear();
+        self.recency.clear();
+        self.fallback_dirty = true;
+        Ok(())
+    }
+
+    /// Registers a shared fallback font (e.g. Web Pan-CJK fallback `.otf`/`.ttf`/`.ttc`)
+    /// consulted AFTER any game-bundled fonts so missing glyphs (SC/TC/JP/symbols) never tofu!
+    pub fn add_fallback_font(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let before: HashSet<_> = self.fonts.db().faces().map(|f| f.id).collect();
+        self.fonts.db_mut().load_font_data(bytes);
+        let mut added = Vec::new();
+        for face in self.fonts.db().faces() {
+            if before.contains(&face.id) {
+                continue;
+            }
+            if let Some((name, _)) = face.families.first() {
+                if !added.iter().any(|n: &String| n == name) {
+                    added.push(name.clone());
+                }
+            }
+        }
+        if added.is_empty() {
+            return Err("E_FONT: no font face in fallback font".into());
+        }
+        // Prefer SC / JP faces first when loading a multi-face CJK TTC.
+        added.sort_by_key(|name| {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains(" sc") {
+                0u8
+            } else if lower.contains(" jp") {
+                1u8
+            } else if lower.contains(" tc") {
+                2u8
+            } else if lower.contains(" hk") {
+                3u8
+            } else {
+                4u8
+            }
+        });
+        let had_any = !self.families.is_empty() || !self.fallback_families.is_empty();
+        if !had_any {
+            self.fonts.db_mut().set_sans_serif_family(added[0].clone());
+        }
+        for name in added {
+            let interned = intern_family(&name);
+            if !self.fallback_families.contains(&interned) {
+                self.fallback_families.push(interned);
+            }
         }
         self.buffers.clear();
         self.recency.clear();
@@ -97,6 +154,10 @@ impl TextEngine {
 
     pub fn has_font(&self, id: AssetId) -> bool {
         self.families.contains_key(&id)
+    }
+
+    pub fn has_any_font(&self) -> bool {
+        !self.families.is_empty() || !self.fallback_families.is_empty()
     }
 
     pub fn line_offsets(text: &str, rich: bool) -> Vec<usize> {
@@ -116,9 +177,16 @@ impl TextEngine {
     }
 
     fn ensure_fonts_ready(&mut self) {
-        if self.fallback_dirty && !self.families.is_empty() {
-            let mut unique = Vec::with_capacity(self.families.len());
+        if self.fallback_dirty && (!self.families.is_empty() || !self.fallback_families.is_empty())
+        {
+            let mut unique =
+                Vec::with_capacity(self.families.len() + self.fallback_families.len());
             for &fam in self.families.values() {
+                if !unique.contains(&fam) {
+                    unique.push(fam);
+                }
+            }
+            for &fam in &self.fallback_families {
                 if !unique.contains(&fam) {
                     unique.push(fam);
                 }
@@ -139,42 +207,29 @@ impl TextEngine {
             self.fallback_dirty = false;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if self.families.is_empty() && !self.system_fonts_loaded {
+        if self.families.is_empty() && self.fallback_families.is_empty() && !self.system_fonts_loaded
+        {
             self.fonts.db_mut().load_system_fonts();
             self.system_fonts_loaded = true;
         }
     }
 
-    fn shape_entry(&mut self, r: &TextRun, cache_key: u64, with_emphasis: bool) {
-        if self.buffers.contains_key(&cache_key) {
-            self.clock = self.clock.wrapping_add(1);
-            self.recency.insert(cache_key, self.clock);
-            return;
-        }
-        self.ensure_fonts_ready();
-
-        let primary = r
-            .font_assets
-            .iter()
-            .find_map(|id| self.families.get(id).copied())
-            .or_else(|| self.families.values().next().copied());
-        let attrs = match primary {
-            Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
-            None => cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif),
-        };
+    fn build_buffer(
+        fonts: &mut cosmic_text::FontSystem,
+        r: &TextRun,
+        attrs: &cosmic_text::Attrs<'_>,
+        rich: bool,
+        align: Option<cosmic_text::Align>,
+        size: f32,
+        line_height: f32,
+    ) -> cosmic_text::Buffer {
         let mut b = cosmic_text::Buffer::new(
-            &mut self.fonts,
-            cosmic_text::Metrics::new(r.size.max(6.0), r.line_height.max(8.0)),
+            fonts,
+            cosmic_text::Metrics::new(size.max(6.0), line_height.max(8.0)),
         );
-        b.set_size(&mut self.fonts, Some(r.width.max(1.0)), None);
-        let rich = with_emphasis && !r.emphasis.is_empty();
+        b.set_size(fonts, Some(r.width.max(1.0)), None);
         if !rich {
-            b.set_text(
-                &mut self.fonts,
-                &r.text,
-                &attrs,
-                cosmic_text::Shaping::Advanced,
-            );
+            b.set_text(fonts, &r.text, attrs, cosmic_text::Shaping::Advanced);
         } else {
             let mut spans = Vec::new();
             let mut pos = 0;
@@ -197,21 +252,102 @@ impl TextEngine {
             if pos < r.text.len() {
                 spans.push((&r.text[pos..], attrs.clone()));
             }
-            b.set_rich_text(
-                &mut self.fonts,
-                spans,
-                &attrs,
-                cosmic_text::Shaping::Advanced,
-                None,
-            );
+            b.set_rich_text(fonts, spans, attrs, cosmic_text::Shaping::Advanced, None);
         }
-        b.shape_until_scroll(&mut self.fonts, false);
+        if let Some(al) = align {
+            for line in &mut b.lines {
+                line.set_align(Some(al));
+            }
+        }
+        b.shape_until_scroll(fonts, false);
+        b
+    }
+
+    fn measure_buffer(b: &cosmic_text::Buffer) -> (usize, f32) {
+        let mut count = 0usize;
+        let mut bottom = 0.0f32;
+        for run in b.layout_runs() {
+            count += 1;
+            bottom = bottom.max(run.line_top + run.line_height);
+        }
+        (count, bottom)
+    }
+
+    fn shape_entry(&mut self, r: &TextRun, cache_key: u64, with_emphasis: bool) {
+        if self.buffers.contains_key(&cache_key) {
+            self.clock = self.clock.wrapping_add(1);
+            self.recency.insert(cache_key, self.clock);
+            return;
+        }
+        self.ensure_fonts_ready();
+
+        let primary = r
+            .font_assets
+            .iter()
+            .find_map(|id| self.families.get(id).copied())
+            .or_else(|| self.families.values().next().copied())
+            .or_else(|| self.fallback_families.first().copied());
+        let attrs = match primary {
+            Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
+            None => cosmic_text::Attrs::new().family(cosmic_text::Family::SansSerif),
+        };
+        let align = match r.align {
+            TextAlign::Left => None,
+            TextAlign::Center => Some(cosmic_text::Align::Center),
+            TextAlign::Right => Some(cosmic_text::Align::Right),
+        };
+        let rich = with_emphasis && !r.emphasis.is_empty();
+
+        let mut cur_size = r.size.max(6.0);
+        let mut cur_lh = r.line_height.max(cur_size * 1.05);
+        let mut b = Self::build_buffer(&mut self.fonts, r, &attrs, rich, align, cur_size, cur_lh);
+        let (mut run_count, mut content_h) = Self::measure_buffer(&b);
+
+        if r.auto_fit && r.height > 1.0 && !r.text.is_empty() {
+            let want_single_line = !r.text.contains('\n') && r.height < r.size * 1.95;
+            let overflows = |rc: usize, ch: f32| {
+                (want_single_line && rc > 1) || ch > r.height + 1.0
+            };
+
+            // Stage 1: For multi-line dialogue text, gently tighten excess line-height first
+            // (absorbs LiveMaker extra leading / font-metric differences without shrinking text!).
+            if !want_single_line && content_h > r.height + 1.0 {
+                let tight_lh = (cur_size * 1.15).max(cur_size + 2.0);
+                if cur_lh > tight_lh + 0.5 {
+                    let needed_ratio = (r.height / content_h).clamp(0.75, 0.98);
+                    cur_lh = (cur_lh * needed_ratio).max(tight_lh);
+                    b = Self::build_buffer(&mut self.fonts, r, &attrs, rich, align, cur_size, cur_lh);
+                    (run_count, content_h) = Self::measure_buffer(&b);
+                }
+            }
+
+            // Stage 2: Smoothly scale font size down if text STILL overflows container bounds.
+            let min_size = (r.size * 0.52).max(8.5).min(cur_size);
+            let mut steps = 0u8;
+            while overflows(run_count, content_h) && cur_size > min_size + 0.25 && steps < 5 {
+                steps += 1;
+                let factor = if want_single_line && run_count > 1 {
+                    (1.0 / (run_count as f32).sqrt()).clamp(0.74, 0.86)
+                } else {
+                    (r.height / content_h.max(1.0)).sqrt().clamp(0.76, 0.93)
+                };
+                let next_size = (cur_size * factor).max(min_size);
+                let ratio = next_size / cur_size;
+                cur_size = next_size;
+                cur_lh = (cur_lh * ratio).max(cur_size * 1.12);
+                b = Self::build_buffer(&mut self.fonts, r, &attrs, rich, align, cur_size, cur_lh);
+                (run_count, content_h) = Self::measure_buffer(&b);
+            }
+        }
+
         let line_offsets = Self::line_offsets(&r.text, rich);
         self.buffers.insert(
             cache_key,
             CachedTextBuffer {
                 buffer: b,
                 line_offsets,
+                content_height: content_h,
+                effective_size: cur_size,
             },
         );
         self.clock = self.clock.wrapping_add(1);
@@ -251,5 +387,57 @@ impl TextEngine {
                 self.recency.remove(&k);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_font_loads_and_auto_fit_shrinks_overflowing_dialogue() {
+        let mut engine = TextEngine::default();
+        let noto = std::path::Path::new("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc");
+        if noto.is_file() {
+            let bytes = std::fs::read(noto).unwrap();
+            engine.add_fallback_font(bytes).unwrap();
+            assert!(engine.has_any_font());
+        }
+
+        // Long 6-line dialogue stuffed into a 70px tall box: auto_fit MUST shrink it to fit!
+        let mut run = TextRun {
+            text: "这是一段非常非常长的测试台词，第一行第二行第三行第四行第五行，在窄屏或字体行距偏大时绝对不应该被硬裁剪掉底部文字，自动缩放应当让整段字幕完整放进对话框内。".into(),
+            visible_bytes: None,
+            x: 0.0,
+            y: 0.0,
+            width: 240.0,
+            height: 76.0,
+            size: 24.0,
+            line_height: 36.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([0.0, 0.0, 240.0, 76.0]),
+            font_assets: Vec::new(),
+            align: TextAlign::Left,
+            valign_center: false,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        };
+        run.compute_key();
+        engine.layout_texts(std::slice::from_ref(&run));
+        let entry = engine.buffers.get(&run.cache_key).expect("shaped buffer cached");
+        assert!(
+            entry.effective_size < 24.0,
+            "auto_fit should shrink overflowing dialogue font (got {})",
+            entry.effective_size
+        );
+        assert!(
+            entry.content_height <= 82.0,
+            "auto_fit should bring dialogue height near box height (got {})",
+            entry.content_height
+        );
     }
 }

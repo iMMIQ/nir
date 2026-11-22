@@ -13,6 +13,7 @@ rollback = 回退
 exit = 返回标题
 auto = 自动
 skip = 已读快进
+skip-compact = 快进
 language = 正文与界面语言
 pending-language = 下一段生效
 font-size = 字号

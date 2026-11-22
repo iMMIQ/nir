@@ -1,4 +1,4 @@
-use nir_ir::{AssetId, BlendMode, TextShadow, Transition, UiAction};
+use nir_ir::{AssetId, BlendMode, TextAlign, TextShadow, Transition, UiAction};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
@@ -67,6 +67,11 @@ pub struct TextRun {
     pub scroll: f32,
     pub clip: Option<[f32; 4]>,
     pub font_assets: Vec<AssetId>,
+    pub align: TextAlign,
+    pub valign_center: bool,
+    pub auto_fit: bool,
+    /// Inline image slots `(byte_offset_in_text, asset_id)` rendered inside `\u{3000}` gaps.
+    pub inline_images: Vec<(usize, AssetId)>,
     /// Precomputed 64-bit shaping cache key — zero String allocation per frame!
     pub cache_key: u64,
 }
@@ -76,10 +81,15 @@ impl TextRun {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.text.hash(&mut h);
         self.width.to_bits().hash(&mut h);
+        if self.auto_fit {
+            self.height.to_bits().hash(&mut h);
+        }
         self.size.to_bits().hash(&mut h);
         self.line_height.to_bits().hash(&mut h);
         self.emphasis.hash(&mut h);
         self.font_assets.hash(&mut h);
+        (self.align as u8).hash(&mut h);
+        self.auto_fit.hash(&mut h);
         self.cache_key = h.finish();
     }
 
@@ -92,11 +102,16 @@ impl TextRun {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.text.hash(&mut h);
         self.width.to_bits().hash(&mut h);
+        if self.auto_fit {
+            self.height.to_bits().hash(&mut h);
+        }
         self.size.to_bits().hash(&mut h);
         self.line_height.to_bits().hash(&mut h);
         let empty: &[(usize, usize)] = &[];
         empty.hash(&mut h);
         self.font_assets.hash(&mut h);
+        (self.align as u8).hash(&mut h);
+        self.auto_fit.hash(&mut h);
         h.finish()
     }
 

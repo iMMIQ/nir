@@ -1214,6 +1214,80 @@ pub fn subset_font(
     Ok(out)
 }
 
+/// Discovers a system Pan-CJK OpenType/TrueType font (preferring Noto Sans CJK SC/JP)
+/// suitable for generating the shared Web fallback font (`fallback-cjk.otf`).
+pub fn find_system_cjk_font() -> Option<(PathBuf, u32)> {
+    let candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ];
+    for p in candidates {
+        let path = PathBuf::from(p);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read(&path) else { continue };
+        let count = ttf_parser::fonts_in_collection(&raw).unwrap_or(1);
+        let mut best_idx = 0u32;
+        for idx in 0..count {
+            if let Ok(face) = ttf_parser::Face::parse(&raw, idx) {
+                let is_sc = face.names().into_iter().any(|n| {
+                    n.to_string()
+                        .is_some_and(|s| s.contains("CJK SC") && !s.contains("Mono"))
+                });
+                if is_sc {
+                    best_idx = idx;
+                    break;
+                }
+            }
+        }
+        return Some((path, best_idx));
+    }
+    None
+}
+
+/// Builds a compact standalone Pan-CJK BMP fallback OpenType font (covering ALL 20,992 BMP CJK
+/// Unified Ideographs + Kana + Fullwidth/Halfwidth + Punctuation + Symbols + Basic Latin)
+/// for sharing across Web games with zero missing glyphs.
+pub fn build_web_cjk_fallback_font(source_path: &Path, face_index: u32) -> Result<Vec<u8>> {
+    let raw = fs::read(source_path)
+        .with_context(|| format!("reading source CJK font `{}`", source_path.display()))?;
+    let face = ttf_parser::Face::parse(&raw, face_index)
+        .map_err(|_| anyhow::anyhow!("E_FONT: invalid face {face_index} in `{}`", source_path.display()))?;
+    let source = hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(&raw)?, face_index)?;
+    let mut input = hb_subset::SubsetInput::new().context("E_FONT_SUBSET")?;
+    input.flags().remove_unrecognized_tables().retain_legacy_names();
+    input.layout_feature_tag_set().clear();
+
+    let ranges: &[(u32, u32)] = &[
+        (0x0020, 0x017F), // Basic Latin, Latin-1, Latin Extended-A
+        (0x2000, 0x27BF), // General Punctuation, Arrows, Math (−), Symbols (♥♪★☆), Dingbats
+        (0x3000, 0x33FF), // CJK Symbols & Punctuation, Hiragana, Katakana, Bopomofo, Enclosed CJK
+        (0x4E00, 0x9FFF), // Full BMP CJK Unified Ideographs (SC + TC + JP Kanji)
+        (0xF900, 0xFAFF), // CJK Compatibility Ideographs
+        (0xFE10, 0xFE6F), // Vertical & Small Form Variants
+        (0xFF00, 0xFFEF), // Halfwidth & Fullwidth Forms
+    ];
+    for &(lo, hi) in ranges {
+        for cp in lo..=hi {
+            if let Some(ch) = char::from_u32(cp) {
+                if face.glyph_index(ch).is_some() {
+                    input.unicode_set().insert(ch);
+                }
+            }
+        }
+    }
+    let subset = input
+        .subset_font(&source)
+        .context("E_FONT_SUBSET: harfbuzz Pan-CJK fallback subset failed")?;
+    let out = subset.underlying_blob().to_vec();
+    Ok(out)
+}
+
 pub fn detect_asset_kind_and_codec(path: &Path) -> Option<(AssetKind, MediaCodec)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {

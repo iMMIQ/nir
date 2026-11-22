@@ -13,6 +13,7 @@ rollback = Back
 exit = Return to title
 auto = Auto
 skip = Skip read
+skip-compact = Skip
 language = Text & interface language
 pending-language = Applies to the next line
 font-size = Text size

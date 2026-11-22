@@ -145,6 +145,17 @@ fn main() -> Result<()> {
             run(Command::new("cargo").args(["build", "-p", "novelc", "--release"]))?;
             let novelc = if cfg!(windows) { "novelc.exe" } else { "novelc" };
             fs::copy(format!("target/release/{novelc}"), format!("dist/{novelc}"))?;
+
+            // 5. Generate compact shared Pan-CJK Web fallback font if not yet present
+            let fallback_font = Path::new("dist/sdk/fallback-cjk.otf");
+            if !fallback_font.is_file() {
+                let status = Command::new(format!("dist/{novelc}"))
+                    .args(["build-fallback-font", "--out", "dist/sdk/fallback-cjk.otf"])
+                    .status();
+                if !status.is_ok_and(|s| s.success()) {
+                    println!("SDK: skipped fallback-cjk.otf (no system Noto Sans CJK found)");
+                }
+            }
             println!("SDK ready: dist/sdk & dist/{novelc}");
         }
         Some("check-architecture") => {

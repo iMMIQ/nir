@@ -681,6 +681,8 @@ pub fn package_web(built: &BuiltBundle, sdk_web_dir: &Path, out_dir: &Path) -> R
         "app.js",
         "player_web.js",
         "player_web_bg.wasm",
+        "fallback-cjk.otf",
+        "fallback-cjk.ttf",
     ] {
         let src = sdk_web_dir.join(name);
         if src.is_file() {

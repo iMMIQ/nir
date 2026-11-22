@@ -363,7 +363,7 @@ fn eval_style_branch(
                             .and_then(|e| eval_layout_i32(e, stage, &obj_sizes))
                             .unwrap_or(6)
                             .clamp(0, 40) as f32;
-                        line_height = Some(fs as f32 + ls + 4.0);
+                        line_height = Some(fs as f32 + ls);
                     }
                 }
                 if let Some(c) = props

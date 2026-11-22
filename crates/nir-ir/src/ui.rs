@@ -185,4 +185,5 @@ pub enum UiAction {
     SetLocale(String),
     ScrollHistory(i32),
     Quit,
+    SetFontScale(f32),
 }

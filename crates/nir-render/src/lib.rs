@@ -87,6 +87,7 @@ pub struct Renderer {
     white_tex: GpuTexture,
     textures: HashMap<AssetId, GpuTexture>,
     last_pinned: BTreeSet<AssetId>,
+    evicted_ids: Vec<AssetId>,
     texture_bytes: u64,
     texture_limit: u64,
     texture_epoch: u64,
@@ -581,14 +582,24 @@ impl Renderer {
         height: u32,
         backend: RendererBackend,
     ) -> Result<Self> {
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await
-            .map_err(|e| rerr(e.to_string()))?;
+        {
+            Ok(a) => a,
+            Err(_) => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: true,
+                })
+                .await
+                .map_err(|e| rerr(e.to_string()))?,
+        };
         let info = adapter.get_info();
         let adapter_info = format!("{:?} / {} / {}", info.backend, info.name, info.driver);
         let desired_compression = wgpu::Features::TEXTURE_COMPRESSION_BC
@@ -850,6 +861,7 @@ impl Renderer {
             white_tex,
             textures: HashMap::new(),
             last_pinned: BTreeSet::new(),
+            evicted_ids: Vec::new(),
             texture_bytes: 0,
             texture_limit: default_cache_limit_for(backend),
             texture_epoch: 0,
@@ -893,6 +905,17 @@ impl Renderer {
         self.text
             .add_font_asset(id, bytes)
             .map_err(|e| NirError::new("E_FONT", "load_font", e))
+    }
+
+    /// Loads a shared fallback font (e.g. Web Pan-CJK fallback) used after bundled game fonts.
+    pub fn load_fallback_font(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.text
+            .add_fallback_font(bytes)
+            .map_err(|e| NirError::new("E_FONT", "load_fallback_font", e))
+    }
+
+    pub fn has_any_font(&self) -> bool {
+        self.text.has_any_font()
     }
 
     pub fn set_texture_cache_limit(&mut self, bytes: u64) {
@@ -1273,7 +1296,9 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
                 color_space: wgpu::PredefinedColorSpace::Srgb,
-                premultiplied_alpha: true,
+                // WebGL2 lacks `UNRESTRICTED_EXTERNAL_TEXTURE_COPIES` and uploads the already-premultiplied
+                // `ImageBitmap` verbatim when `premultiplied_alpha: false`; WebGPU expects `true`.
+                premultiplied_alpha: self.backend != RendererBackend::WebGl2,
             },
             wgpu::Extent3d {
                 width: w,
@@ -1283,6 +1308,9 @@ impl Renderer {
         );
         if mips > 1 {
             self.generate_mipmaps(&texture, mips);
+        } else if self.backend == RendererBackend::WebGl2 {
+            // Flush queued GLES `CopyExternalImageToTexture` before JS host calls `bitmap.close()`!
+            self.queue.submit(None);
         }
         let view = texture.create_view(&Default::default());
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1318,9 +1346,16 @@ impl Renderer {
     }
 
     /// Graceful LRU eviction when VRAM exceeds `texture_limit`, preserving `pinned` active assets.
-    pub fn evict_lru(&mut self, pinned: &BTreeSet<AssetId>) {
+    /// Returns all texture `AssetId`s evicted since the previous call so `Runtime` can reload them later.
+    pub fn evict_lru(&mut self, pinned: &BTreeSet<AssetId>) -> Vec<AssetId> {
         self.last_pinned = pinned.clone();
         self.evict_lru_keeping(None);
+        std::mem::take(&mut self.evicted_ids)
+    }
+
+    /// Drains any texture `AssetId`s evicted implicitly during texture uploads.
+    pub fn take_evicted_assets(&mut self) -> Vec<AssetId> {
+        std::mem::take(&mut self.evicted_ids)
     }
 
     fn evict_lru_keeping(&mut self, just_uploaded: Option<AssetId>) {
@@ -1341,6 +1376,7 @@ impl Renderer {
             }
             if let Some(tex) = self.textures.remove(&id) {
                 self.texture_bytes = self.texture_bytes.saturating_sub(tex.bytes);
+                self.evicted_ids.push(id);
                 evicted_any = true;
             }
         }
@@ -1364,6 +1400,11 @@ impl Renderer {
             (rgba[2] * 255.0) as u8,
             (rgba[3] * 255.0) as u8,
         );
+        let y_draw = if r.valign_center && entry.content_height > 0.0 {
+            y + ((r.height - entry.content_height) * 0.5).max(0.0)
+        } else {
+            y
+        };
         let mut bounds = TextBounds {
             left: (x * dpr) as i32,
             top: (y * dpr) as i32,
@@ -1395,17 +1436,17 @@ impl Renderer {
                 }
                 let row = TextBounds {
                     left: bounds.left,
-                    top: bounds.top.max(((y + run.line_top - r.scroll) * dpr) as i32),
+                    top: bounds.top.max(((y_draw + run.line_top - r.scroll) * dpr) as i32),
                     right: bounds.right.min(((x + right + 1.0) * dpr) as i32),
                     bottom: bounds
                         .bottom
-                        .min(((y + run.line_top + run.line_height - r.scroll) * dpr) as i32),
+                        .min(((y_draw + run.line_top + run.line_height - r.scroll) * dpr) as i32),
                 };
                 if row.bottom > row.top {
                     areas.push(TextArea {
                         buffer: buf,
                         left: x * dpr,
-                        top: (y - r.scroll) * dpr,
+                        top: (y_draw - r.scroll) * dpr,
                         scale: dpr,
                         bounds: row,
                         default_color: color,
@@ -1417,7 +1458,7 @@ impl Renderer {
             areas.push(TextArea {
                 buffer: buf,
                 left: x * dpr,
-                top: (y - r.scroll) * dpr,
+                top: (y_draw - r.scroll) * dpr,
                 scale: dpr,
                 bounds,
                 default_color: color,
@@ -1488,6 +1529,45 @@ impl Renderer {
             )
             .map_err(|e| rerr(e.to_string()))?;
 
+        let mut inline_quads: Vec<Quad> = Vec::new();
+        for r in &p.texts {
+            if r.inline_images.is_empty() {
+                continue;
+            }
+            if let Some(entry) = self.text.buffers.get(&r.cache_key) {
+                let y_draw = if r.valign_center && entry.content_height > 0.0 {
+                    r.y + ((r.height - entry.content_height) * 0.5).max(0.0)
+                } else {
+                    r.y
+                };
+                let icon_sz = entry.effective_size.max(8.0);
+                let offsets = &entry.line_offsets;
+                for &(byte_off, asset) in &r.inline_images {
+                    if let Some(vis) = r.visible_bytes {
+                        if byte_off >= vis {
+                            continue;
+                        }
+                    }
+                    'find_glyph: for run in entry.buffer.layout_runs() {
+                        let base = *offsets.get(run.line_i).unwrap_or(&0);
+                        for g in run.glyphs {
+                            if base + g.start == byte_off {
+                                let w = g.w.max(icon_sz);
+                                let gx = r.x + g.x + (w - icon_sz) * 0.5;
+                                let gy = y_draw + run.line_top - r.scroll
+                                    + (run.line_height - icon_sz) * 0.5;
+                                let mut q = Quad::image([gx, gy, icon_sz, icon_sz], asset);
+                                q.color[3] = r.color[3];
+                                q.clip = r.clip;
+                                inline_quads.push(q);
+                                break 'find_glyph;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Build indexed vertices (4 vertices per quad instead of 6!)
         let mut verts = std::mem::take(&mut self.scratch_verts);
         verts.clear();
@@ -1522,6 +1602,10 @@ impl Renderer {
             }
         };
         append(&mut verts, &p.quads, p.width, p.height);
+        let inline_quad_start = verts.len() / 4;
+        if !inline_quads.is_empty() {
+            append(&mut verts, &inline_quads, p.width, p.height);
+        }
 
         // Determine whether transition offscreen passes need re-rendering (skip static source/target!)
         let mut render_from = false;
@@ -1590,6 +1674,7 @@ impl Renderer {
         for q in p
             .quads
             .iter()
+            .chain(inline_quads.iter())
             .chain(p.transition_from.iter())
             .chain(p.transition_to.iter())
         {
@@ -1680,6 +1765,17 @@ impl Renderer {
             });
             let phys = [self.config.width, self.config.height];
             self.paint_quads(&mut pass, &p.quads, 0, p.width, p.height, phys, p);
+            if !inline_quads.is_empty() {
+                self.paint_quads(
+                    &mut pass,
+                    &inline_quads,
+                    inline_quad_start,
+                    p.width,
+                    p.height,
+                    phys,
+                    p,
+                );
+            }
             pass.set_scissor_rect(0, 0, phys[0], phys[1]);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)

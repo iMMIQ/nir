@@ -98,6 +98,8 @@ pub struct ResolvedSpan {
     pub color: Option<[f32; 4]>,
     pub ruby: Option<String>,
     pub speed: f32,
+    #[serde(default)]
+    pub inline_image: Option<AssetId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

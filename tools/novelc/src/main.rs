@@ -161,6 +161,18 @@ enum Cmd {
         #[command(subcommand)]
         action: I18nCmd,
     },
+    /// Generate a compact shared Pan-CJK Web fallback font (`.otf`) from a system CJK font
+    BuildFallbackFont {
+        /// Output font path (e.g. `dist/sdk/fallback-cjk.otf`)
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional source `.ttc`/`.otf`/`.ttf` path (auto-detects system Noto Sans CJK when omitted)
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Optional face index inside a `.ttc` collection
+        #[arg(long)]
+        face_index: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -258,6 +270,31 @@ fn main() -> Result<()> {
         } => {
             let path = nir_build::extract_translations(&project, &lang)?;
             println!("Updated translation file: {}", path.display());
+            Ok(())
+        }
+        Cmd::BuildFallbackFont {
+            out,
+            source,
+            face_index,
+        } => {
+            let (src_path, idx) = if let Some(s) = source {
+                (s, face_index.unwrap_or(0))
+            } else {
+                let (detected, auto_idx) = nir_build::optimize::find_system_cjk_font()
+                    .context("no system Noto Sans CJK font found; pass --source <font.ttc|otf|ttf>")?;
+                (detected, face_index.unwrap_or(auto_idx))
+            };
+            let bytes = nir_build::optimize::build_web_cjk_fallback_font(&src_path, idx)?;
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&out, &bytes)?;
+            println!(
+                "Generated Pan-CJK fallback font: {} ({:.2} MiB, source={} face #{idx})",
+                out.display(),
+                bytes.len() as f64 / (1024.0 * 1024.0),
+                src_path.display()
+            );
             Ok(())
         }
     }

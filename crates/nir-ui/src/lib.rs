@@ -276,9 +276,60 @@ fn project_layer_texts(
             scroll: 0.0,
             clip: None,
             font_assets: b.text_fonts.clone(),
+            align: lt.align,
+            valign_center: false,
+            auto_fit: false,
+            inline_images: Vec::new(),
             cache_key: 0,
         });
     }
+}
+
+fn project_layers_and_timelines(
+    program: &NirProgram,
+    layers: &[LayerState],
+    timelines: &[ActiveTimeline],
+    stage_rect: [f32; 4],
+    scale: f32,
+) -> Vec<Quad> {
+    if timelines.is_empty() {
+        return project_layers(program, layers, stage_rect, scale);
+    }
+    // Sort layers by (z_order, id) and interleave each timeline right at its host layer's z_order!
+    let mut ordered: Vec<&LayerState> = layers.iter().collect();
+    ordered.sort_by_key(|l| (l.transform.z_order, l.id.0));
+
+    let mut out = Vec::with_capacity(layers.len() + timelines.len() * 2);
+    let mut emitted_tl = vec![false; timelines.len()];
+    for layer in ordered {
+        let one = project_layers(program, std::slice::from_ref(layer), stage_rect, scale);
+        out.extend(one);
+        for (idx, tl) in timelines.iter().enumerate() {
+            if !emitted_tl[idx] && tl.layer == layer.id {
+                emitted_tl[idx] = true;
+                out.extend(project_timelines(
+                    program,
+                    layers,
+                    std::slice::from_ref(tl),
+                    stage_rect,
+                    scale,
+                ));
+            }
+        }
+    }
+    // Any timeline whose host layer is absent renders on top cleanly.
+    for (idx, tl) in timelines.iter().enumerate() {
+        if !emitted_tl[idx] {
+            out.extend(project_timelines(
+                program,
+                layers,
+                std::slice::from_ref(tl),
+                stage_rect,
+                scale,
+            ));
+        }
+    }
+    out
 }
 
 fn project_timelines(
@@ -503,9 +554,8 @@ impl<'a> Builder<'a> {
             border,
         ));
 
-        let size = (rect[3] * 0.44).clamp(14.0, 24.0);
-        let pad_x = 14.0;
-        let pad_y = (rect[3] - size * 1.2) * 0.5;
+        let size = (rect[3] * 0.46).clamp(10.0, 22.0);
+        let pad_x = (rect[2] * 0.10).clamp(3.0, 14.0);
         let text_color = if !enabled {
             self.theme.muted
         } else if is_hover {
@@ -517,17 +567,21 @@ impl<'a> Builder<'a> {
             text: label.clone(),
             visible_bytes: None,
             x: rect[0] + pad_x,
-            y: rect[1] + pad_y.max(2.0),
+            y: rect[1] + 1.0,
             width: (rect[2] - pad_x * 2.0).max(8.0),
-            height: rect[3],
+            height: (rect[3] - 2.0).max(8.0),
             size,
-            line_height: size * 1.3,
+            line_height: size * 1.22,
             color: text_color,
             emphasis: Vec::new(),
             shadow: None,
             scroll: 0.0,
             clip: Some(rect),
             font_assets: self.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
             cache_key: 0,
         });
         self.pkt.hits.push(HitRegion {
@@ -598,10 +652,14 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
                 special: SpecialQuad::StageTransition,
             });
         } else {
-            let layer_quads = project_layers(prog, &ctx.vm.layers, stage_rect, scale);
-            b.pkt.quads.extend(layer_quads);
-            let tl_quads = project_timelines(prog, &ctx.vm.layers, &ctx.vm.timelines, stage_rect, scale);
-            b.pkt.quads.extend(tl_quads);
+            let stage_quads = project_layers_and_timelines(
+                prog,
+                &ctx.vm.layers,
+                &ctx.vm.timelines,
+                stage_rect,
+                scale,
+            );
+            b.pkt.quads.extend(stage_quads);
             project_layer_texts(&mut b, &ctx.vm.layers, stage_rect, scale);
         }
 
@@ -624,9 +682,9 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
 
     // Lightweight Toast notification (replaces 1,500 lines of recovery UI state machines!)
     if let Some(msg) = ctx.toast {
-        let tw = (width * 0.5).clamp(240.0, 520.0);
-        let th = 40.0;
-        let rect = [(width - tw) * 0.5, 18.0, tw, th];
+        let tw = (width * 0.5).clamp(200.0, 520.0).min((width - 24.0).max(160.0));
+        let th = 38.0;
+        let rect = [(width - tw) * 0.5, 14.0, tw, th];
         b.pkt.quads.push(Quad::solid(rect, [0.08, 0.11, 0.16, 0.92]));
         b.pkt.quads.push(Quad::solid(
             [rect[0], rect[1] + th - 2.0, tw, 2.0],
@@ -635,18 +693,22 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         b.push_text(TextRun {
             text: msg.to_owned(),
             visible_bytes: None,
-            x: rect[0] + 16.0,
-            y: rect[1] + 9.0,
-            width: tw - 32.0,
-            height: th,
-            size: 16.0,
-            line_height: 22.0,
+            x: rect[0] + 12.0,
+            y: rect[1] + 2.0,
+            width: (tw - 24.0).max(32.0),
+            height: th - 4.0,
+            size: 15.0,
+            line_height: 20.0,
             color: b.theme.text,
             emphasis: Vec::new(),
             shadow: None,
             scroll: 0.0,
             clip: Some(rect),
             font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
             cache_key: 0,
         });
     }
@@ -670,37 +732,49 @@ fn project_title(
         return;
     }
 
-    // Sleek built-in title screen
+    // Sleek built-in title screen (responsive from narrow mobile to 4K desktop)
     let w = b.pkt.width;
     let h = b.pkt.height;
     b.pkt
         .quads
         .push(Quad::solid([0.0, 0.0, w, h], [0.04, 0.06, 0.10, 0.45]));
 
-    let title_size = (h * 0.075).clamp(30.0, 64.0);
+    let title_size = (h * 0.075).clamp(22.0, 60.0);
+    let title_y = (h * 0.14).clamp(20.0, h * 0.22);
+    let title_h = (title_size * 2.1).min(h * 0.28);
     b.push_text(TextRun {
         text: prog.meta.title.clone(),
         visible_bytes: None,
         x: w * 0.08,
-        y: h * 0.22,
+        y: title_y,
         width: w * 0.84,
-        height: title_size * 2.0,
+        height: title_h,
         size: title_size,
         line_height: title_size * 1.25,
         color: b.theme.text,
         emphasis: Vec::new(),
         shadow: b.theme.text_shadow,
         scroll: 0.0,
-        clip: None,
+        clip: Some([w * 0.08, title_y, w * 0.84, title_h]),
         font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: false,
+        auto_fit: true,
+        inline_images: Vec::new(),
         cache_key: 0,
     });
 
-    let bw = (w * 0.24).clamp(200.0, 320.0);
-    let bh = 48.0;
+    let has_save = ctx.slots.iter().any(|s| s.exists);
+    let has_gallery = !prog.ui.gallery.is_empty();
+    let btn_count = if has_gallery { 4usize } else { 3usize };
+
+    let bw = (w * 0.28).clamp(180.0, 320.0).min((w * 0.84).max(160.0));
     let bx = w * 0.08;
-    let mut by = h * 0.46;
-    let gap = 12.0;
+    let start_y = (title_y + title_h + 14.0).max(h * 0.40);
+    let avail_h = (h - start_y - 16.0).max(110.0);
+    let gap = (avail_h * 0.05).clamp(6.0, 12.0);
+    let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(30.0, 48.0);
+    let mut by = start_y.min((h - (bh * btn_count as f32 + gap * (btn_count - 1) as f32) - 12.0).max(12.0));
 
     b.button(
         [bx, by, bw, bh],
@@ -711,7 +785,6 @@ fn project_title(
     );
     by += bh + gap;
 
-    let has_save = ctx.slots.iter().any(|s| s.exists);
     b.button(
         [bx, by, bw, bh],
         messages.get(loc, "load"),
@@ -721,7 +794,7 @@ fn project_title(
     );
     by += bh + gap;
 
-    if !prog.ui.gallery.is_empty() {
+    if has_gallery {
         b.button(
             [bx, by, bw, bh],
             if loc.starts_with("zh") {
@@ -803,6 +876,10 @@ fn project_ui_node(
                 scroll: 0.0,
                 clip: Some(rect),
                 font_assets: b.ui_fonts.clone(),
+                align: TextAlign::Left,
+                valign_center: false,
+                auto_fit: true,
+                inline_images: Vec::new(),
                 cache_key: 0,
             });
         }
@@ -835,6 +912,18 @@ fn project_ui_node(
     }
 }
 
+fn estimate_display_units(s: &str) -> f32 {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                0.62
+            } else {
+                1.05
+            }
+        })
+        .sum()
+}
+
 fn project_story_hud(
     b: &mut Builder<'_>,
     ctx: &UiContext<'_>,
@@ -847,13 +936,23 @@ fn project_story_hud(
     let h = b.pkt.height;
     let alpha = ctx.vm.dialogue_alpha();
 
-    // Dialogue box
+    // Suppress dialogue chrome when an image/positioned ChoiceMenu (e.g. LiveMaker .lpm menu) is active
+    // so the dialogue box and HUD toolbar never cover menu icons or steal clicks!
+    let choice_hides_dialogue = ctx.vm.choice.as_ref().is_some_and(|c| {
+        c.background.is_some()
+            || c.items
+                .iter()
+                .any(|it| it.image.is_some() || it.rect.is_some())
+    });
+
     let prog = ctx.vm.program();
     let style = prog
         .ui
         .dialogue_styles
         .get(ctx.vm.dialogue_style as usize);
-    if alpha > 0.01 {
+    let mut dialogue_top_y: Option<f32> = None;
+
+    if alpha > 0.01 && !choice_hides_dialogue {
         if let Some(dlg) = &ctx.vm.dialogue {
             let dlg_rect_cfg = style.and_then(|s| s.dialogue_rect).or(b.theme.dialogue_rect);
             let dlg_bg_cfg = style.and_then(|s| s.dialogue_bg).or(b.theme.dialogue_bg);
@@ -864,17 +963,34 @@ fn project_story_hud(
                 .unwrap_or(b.theme.line_height);
             let style_text_color = style.and_then(|s| s.text_color).unwrap_or(b.theme.text);
 
+            let ui_s = scale.clamp(0.55, 1.35);
+            let scaled_shadow = b.theme.text_shadow.map(|mut s| {
+                let ss = scale.clamp(0.5, 2.0);
+                s.offset = [s.offset[0] * ss, s.offset[1] * ss];
+                s
+            });
+
+            // 1. Dialogue box rect (clamped safely inside viewport)
             let box_rect = if let Some(r) = dlg_rect_cfg {
-                [
+                let raw = [
                     stage_rect[0] + r[0] * scale,
                     stage_rect[1] + r[1] * scale,
-                    r[2] * scale,
-                    r[3] * scale,
-                ]
+                    (r[2] * scale).max(64.0),
+                    (r[3] * scale).max(40.0),
+                ];
+                let bx = raw[0].clamp(0.0, (w - 64.0).max(0.0));
+                let by = raw[1].clamp(0.0, (h - 40.0).max(0.0));
+                let bw = raw[2].min((w - bx).max(64.0));
+                let bh = raw[3].min((h - by).max(40.0));
+                [bx, by, bw, bh]
             } else {
-                let bh = (h * 0.27).clamp(150.0, 240.0);
-                let bw = (w * 0.88).min(1160.0);
-                [(w - bw) * 0.5, h - bh - 18.0, bw, bh]
+                let bh = (stage_rect[3] * 0.28).clamp(88.0, 220.0).min((h * 0.36).max(80.0));
+                let bw = (stage_rect[2] * 0.92).min((w - 16.0).max(180.0));
+                let bx = (stage_rect[0] + (stage_rect[2] - bw) * 0.5).clamp(8.0, (w - bw - 8.0).max(0.0));
+                let margin_b = (12.0 * scale).clamp(6.0, 18.0);
+                let by = (stage_rect[1] + stage_rect[3] - bh - margin_b)
+                    .clamp(8.0, (h - bh - 6.0).max(8.0));
+                [bx, by, bw, bh]
             };
 
             if let Some(bg) = dlg_bg_cfg {
@@ -893,7 +1009,9 @@ fn project_story_hud(
                 ));
             }
 
-            // Dialogue-bound face portrait decoration (visible only while dialogue box is shown)
+            // 2. Dialogue-bound face portrait decoration (fitted inside box_rect when auto-placed,
+            //    and tracked so text_rect never overlaps the face icon!)
+            let mut face_outer_rect: Option<[f32; 4]> = None;
             if let Some(face_id) = ctx.vm.dialogue_portrait {
                 if let Some(meta) = prog.asset(face_id) {
                     let (orig_w, orig_h) = if let Some(tr) = meta.trim {
@@ -906,77 +1024,221 @@ fn project_story_hud(
                     } else {
                         (0.0, 0.0, orig_w, orig_h)
                     };
-                    let (fx, fy) = if let Some([px, py]) = style.and_then(|s| s.face_pos) {
-                        (stage_rect[0] + (px + dx) * scale, stage_rect[1] + (py + dy) * scale)
-                    } else {
-                        (box_rect[0] + 16.0 + dx * scale, box_rect[1] + (box_rect[3] - orig_h * scale).max(0.0) * 0.5 + dy * scale)
-                    };
-                    let mut q = Quad::image([fx, fy, dw * scale, dh * scale], face_id);
+                    let (fx_out, fy_out, fw_out, fh_out, draw_rect) =
+                        if let Some([px, py]) = style.and_then(|s| s.face_pos) {
+                            let fx0 = stage_rect[0] + px * scale;
+                            let fy0 = stage_rect[1] + py * scale;
+                            (
+                                fx0,
+                                fy0,
+                                orig_w * scale,
+                                orig_h * scale,
+                                [
+                                    fx0 + dx * scale,
+                                    fy0 + dy * scale,
+                                    dw * scale,
+                                    dh * scale,
+                                ],
+                            )
+                        } else {
+                            let margin = (10.0 * scale).clamp(4.0, 14.0);
+                            let max_h = (box_rect[3] - margin * 2.0).max(24.0);
+                            let max_w = (box_rect[2] * 0.28).max(24.0);
+                            let fit = (max_h / (orig_h * scale).max(1.0))
+                                .min(max_w / (orig_w * scale).max(1.0))
+                                .min(1.0);
+                            let s = scale * fit;
+                            let fw = orig_w * s;
+                            let fh = orig_h * s;
+                            let fx0 = box_rect[0] + margin;
+                            let fy0 = box_rect[1] + (box_rect[3] - fh) * 0.5;
+                            (
+                                fx0,
+                                fy0,
+                                fw,
+                                fh,
+                                [fx0 + dx * s, fy0 + dy * s, dw * s, dh * s],
+                            )
+                        };
+                    let mut q = Quad::image(draw_rect, face_id);
                     q.color[3] = alpha;
                     b.pkt.quads.push(q);
+                    face_outer_rect = Some([fx_out, fy_out, fw_out, fh_out]);
                 }
             }
 
+            // 3. Dialogue text rect (scaled + safely clamped + indented around any overlapping face icon!)
             let shake = ctx.vm.dialogue_shake;
-            let text_rect = if let Some(tr) = text_rect_cfg {
-                [
-                    stage_rect[0] + (tr[0] + shake[0]) * scale,
-                    stage_rect[1] + (tr[1] + shake[1]) * scale,
-                    tr[2] * scale,
-                    tr[3] * scale,
-                ]
+            let mut text_rect = if let Some(tr) = text_rect_cfg {
+                let raw_x = stage_rect[0] + (tr[0] + shake[0]) * scale;
+                let raw_y = stage_rect[1] + (tr[1] + shake[1]) * scale;
+                let raw_w = (tr[2] * scale).max(40.0);
+                let raw_h = (tr[3] * scale).max(24.0);
+                let x = raw_x.clamp(2.0, (w - 42.0).max(2.0));
+                let y = raw_y.clamp(2.0, (h - 26.0).max(2.0));
+                [x, y, raw_w.min((w - x - 2.0).max(40.0)), raw_h.min((h - y - 2.0).max(24.0))]
             } else {
+                let pad_x = (22.0 * scale).clamp(10.0, 28.0);
+                let pad_y = (14.0 * scale).clamp(8.0, 20.0);
                 [
-                    box_rect[0] + 28.0 + shake[0] * scale,
-                    box_rect[1] + (if dlg.speaker.is_empty() { 22.0 } else { 52.0 }) + shake[1] * scale,
-                    box_rect[2] - 56.0,
-                    box_rect[3] - 86.0,
+                    box_rect[0] + pad_x + shake[0] * scale,
+                    box_rect[1] + pad_y + shake[1] * scale,
+                    (box_rect[2] - pad_x * 2.0).max(48.0),
+                    (box_rect[3] - pad_y * 2.0).max(28.0),
                 ]
             };
 
-            // Speaker name badge
+            if let Some(fr) = face_outer_rect {
+                let v_ov = (fr[1] + fr[3]).min(text_rect[1] + text_rect[3])
+                    - fr[1].max(text_rect[1]);
+                let h_ov = (fr[0] + fr[2]).min(text_rect[0] + text_rect[2])
+                    - fr[0].max(text_rect[0]);
+                if v_ov > text_rect[3] * 0.15 && h_ov > 2.0 {
+                    let gap = (12.0 * scale).clamp(6.0, 16.0);
+                    let face_cx = fr[0] + fr[2] * 0.5;
+                    let box_cx = box_rect[0] + box_rect[2] * 0.5;
+                    let min_text_w = (box_rect[2] * 0.35).max(60.0);
+                    if face_cx <= box_cx {
+                        let right = text_rect[0] + text_rect[2];
+                        let desired_x = text_rect[0].max(fr[0] + fr[2] + gap);
+                        let clamped_x = desired_x.min((right - min_text_w).max(text_rect[0]));
+                        text_rect[2] = (right - clamped_x).max(32.0);
+                        text_rect[0] = clamped_x;
+                    } else {
+                        let desired_right = (text_rect[0] + text_rect[2]).min(fr[0] - gap);
+                        let next_w = (desired_right - text_rect[0]).max(min_text_w.min(text_rect[2]));
+                        text_rect[2] = next_w.max(32.0);
+                    }
+                }
+            }
+
+            // 4. Speaker nameplate (explicit `name_rect` OR floating pill above `box_rect` OR reserved
+            //    header row above `text_rect` — NEVER overlaps line 1 of subtitles or face portrait!)
+            let mut speaker_top_pill_rect: Option<[f32; 4]> = None;
             if !dlg.speaker.is_empty() {
                 let mut sc = dlg.speaker_color.unwrap_or(b.theme.accent);
                 sc[3] *= alpha;
-                let sp_size = (style_font_size * ctx.prefs.font_scale * 0.92).clamp(16.0, 32.0);
-                let name_box = style
-                    .and_then(|s| s.name_rect)
-                    .map(|nr| {
-                        [
-                            stage_rect[0] + nr[0] * scale,
-                            stage_rect[1] + nr[1] * scale,
-                            nr[2] * scale,
-                            nr[3] * scale,
-                        ]
-                    })
-                    .unwrap_or([box_rect[0] + 28.0, box_rect[1] + 14.0, box_rect[2] - 56.0, sp_size * 1.5]);
-                b.push_text(TextRun {
-                    text: dlg.speaker.clone(),
-                    visible_bytes: None,
-                    x: name_box[0],
-                    y: name_box[1],
-                    width: name_box[2],
-                    height: name_box[3],
-                    size: sp_size,
-                    line_height: sp_size * 1.3,
-                    color: sc,
-                    emphasis: Vec::new(),
-                    shadow: b.theme.text_shadow,
-                    scroll: 0.0,
-                    clip: Some(box_rect),
-                    font_assets: b.text_fonts.clone(),
-                    cache_key: 0,
-                });
+                let sp_size = (style_font_size * scale * ctx.prefs.font_scale * 0.88).clamp(11.0, 34.0);
+                if let Some(nr) = style.and_then(|s| s.name_rect) {
+                    let name_box = [
+                        stage_rect[0] + nr[0] * scale,
+                        stage_rect[1] + nr[1] * scale,
+                        (nr[2] * scale).max(24.0),
+                        (nr[3] * scale).max(16.0),
+                    ];
+                    b.push_text(TextRun {
+                        text: dlg.speaker.clone(),
+                        visible_bytes: None,
+                        x: name_box[0],
+                        y: name_box[1],
+                        width: name_box[2],
+                        height: name_box[3],
+                        size: sp_size,
+                        line_height: sp_size * 1.22,
+                        color: sc,
+                        emphasis: Vec::new(),
+                        shadow: scaled_shadow,
+                        scroll: 0.0,
+                        clip: Some(name_box),
+                        font_assets: b.text_fonts.clone(),
+                        align: TextAlign::Left,
+                        valign_center: true,
+                        auto_fit: true,
+                        inline_images: Vec::new(),
+                        cache_key: 0,
+                    });
+                } else {
+                    let tab_h = (sp_size * 1.48).clamp(22.0, 44.0);
+                    let tab_gap = (4.0 * ui_s).clamp(2.0, 6.0);
+                    let tab_y = box_rect[1] - tab_h - tab_gap;
+                    if tab_y >= 4.0 {
+                        let pad_x = (14.0 * ui_s).clamp(8.0, 20.0);
+                        let units = estimate_display_units(&dlg.speaker);
+                        let min_w = (72.0 * ui_s).clamp(52.0, 110.0);
+                        let max_w = (box_rect[2] * 0.55).max(min_w).min((w - 16.0).max(80.0));
+                        let tab_w = (units * sp_size + pad_x * 2.0).clamp(min_w, max_w);
+                        let tab_x = box_rect[0].clamp(4.0, (w - tab_w - 4.0).max(4.0));
+                        let tab_rect = [tab_x, tab_y, tab_w, tab_h];
+                        b.pkt.quads.push(Quad::solid(
+                            tab_rect,
+                            [0.06, 0.08, 0.13, 0.88 * alpha],
+                        ));
+                        let mut accent_bar = sc;
+                        accent_bar[3] *= 0.85;
+                        b.pkt.quads.push(Quad::solid(
+                            [tab_rect[0], tab_rect[1] + tab_rect[3] - 2.0, tab_rect[2], 2.0],
+                            accent_bar,
+                        ));
+                        b.push_text(TextRun {
+                            text: dlg.speaker.clone(),
+                            visible_bytes: None,
+                            x: tab_rect[0] + pad_x,
+                            y: tab_rect[1] + 1.0,
+                            width: (tab_rect[2] - pad_x * 2.0).max(20.0),
+                            height: (tab_rect[3] - 3.0).max(14.0),
+                            size: sp_size,
+                            line_height: sp_size * 1.22,
+                            color: sc,
+                            emphasis: Vec::new(),
+                            shadow: scaled_shadow,
+                            scroll: 0.0,
+                            clip: Some(tab_rect),
+                            font_assets: b.text_fonts.clone(),
+                            align: TextAlign::Left,
+                            valign_center: true,
+                            auto_fit: true,
+                            inline_images: Vec::new(),
+                            cache_key: 0,
+                        });
+                        speaker_top_pill_rect = Some(tab_rect);
+                    } else {
+                        // Box sits at top of viewport (e.g. NVL mode): reserve top band inside text_rect!
+                        let header_h = (sp_size * 1.38).min(text_rect[3] * 0.35);
+                        let name_box = [text_rect[0], text_rect[1], text_rect[2], header_h];
+                        let push_down = header_h + (4.0 * ui_s).clamp(2.0, 6.0);
+                        text_rect[1] += push_down;
+                        text_rect[3] = (text_rect[3] - push_down).max(20.0);
+                        b.push_text(TextRun {
+                            text: dlg.speaker.clone(),
+                            visible_bytes: None,
+                            x: name_box[0],
+                            y: name_box[1],
+                            width: name_box[2],
+                            height: name_box[3],
+                            size: sp_size,
+                            line_height: sp_size * 1.22,
+                            color: sc,
+                            emphasis: Vec::new(),
+                            shadow: scaled_shadow,
+                            scroll: 0.0,
+                            clip: Some(name_box),
+                            font_assets: b.text_fonts.clone(),
+                            align: TextAlign::Left,
+                            valign_center: true,
+                            auto_fit: true,
+                            inline_images: Vec::new(),
+                            cache_key: 0,
+                        });
+                    }
+                }
             }
 
-            // Dialogue text with grapheme-cluster clipping reveal
-            let fsize = (style_font_size * ctx.prefs.font_scale).clamp(16.0, 44.0);
-            let lh = (style_line_height * ctx.prefs.font_scale).clamp(24.0, 62.0);
+            // 5. Dialogue text — properly scaled by viewport `scale`, with automatic overflow fit
+            //    and inline image support so subtitles are ALWAYS crisp and never clipped!
+            let fsize = (style_font_size * scale * ctx.prefs.font_scale).clamp(10.0, 72.0);
+            let lh = (style_line_height * scale * ctx.prefs.font_scale)
+                .max(fsize * 1.15)
+                .min(fsize * 1.85);
             let emphasis: Vec<(usize, usize)> = dlg
                 .spans
                 .iter()
                 .filter(|s| s.emphasis)
                 .map(|s| (s.byte_start, s.byte_end))
+                .collect();
+            let inline_images: Vec<(usize, AssetId)> = dlg
+                .spans
+                .iter()
+                .filter_map(|s| s.inline_image.map(|id| (s.byte_start, id)))
                 .collect();
             let mut tc = style_text_color;
             tc[3] *= alpha;
@@ -995,28 +1257,60 @@ fn project_story_hud(
                 line_height: lh,
                 color: tc,
                 emphasis,
-                shadow: b.theme.text_shadow,
+                shadow: scaled_shadow,
                 scroll: 0.0,
                 clip: Some(text_rect),
                 font_assets: b.text_fonts.clone(),
+                align: TextAlign::Left,
+                valign_center: false,
+                auto_fit: true,
+                inline_images,
                 cache_key: 0,
             });
 
-            // Compact bottom quick-action toolbar
-            let bar_h = 30.0;
-            let bar_y = box_rect[1] + box_rect[3] - bar_h - 8.0;
+            // 6. Responsive non-overlapping quick-action toolbar docked OUTSIDE `text_rect` & box art!
+            //    Prefers top-right edge above `box_rect` -> bottom letterbox margin -> top-right viewport.
+            let bar_h = (26.0 * ui_s).clamp(22.0, 32.0);
+            let gap = (4.0 * ui_s).clamp(2.0, 6.0);
+            let margin = (4.0 * ui_s).clamp(2.0, 8.0);
             let buttons: [(&str, UiAction, bool); 7] = [
                 ("auto", UiAction::ToggleAuto, ctx.auto),
-                ("skip", UiAction::ToggleSkip, ctx.skip),
+                ("skip-compact", UiAction::ToggleSkip, ctx.skip),
                 ("history-compact", UiAction::OpenHistory, false),
                 ("rollback", UiAction::Rollback, false),
                 ("save", UiAction::OpenSaves { save_mode: true }, !ctx.replay_active),
                 ("hide-interface", UiAction::ToggleHideUi, false),
                 ("menu", UiAction::OpenMenu, false),
             ];
-            let btn_w = ((box_rect[2] - 48.0) / buttons.len() as f32).clamp(56.0, 108.0);
-            let total_w = btn_w * buttons.len() as f32 + 6.0 * (buttons.len() - 1) as f32;
-            let mut bx = box_rect[0] + box_rect[2] - total_w - 16.0;
+            let n = buttons.len() as f32;
+            let min_comfortable_w = n * 34.0 + (n - 1.0) * gap;
+
+            let top_y = box_rect[1] - bar_h - margin;
+            let top_min_l = speaker_top_pill_rect.map_or(box_rect[0].max(4.0), |sr| {
+                sr[0] + sr[2] + (8.0 * ui_s).clamp(4.0, 12.0)
+            });
+            let top_max_r = (box_rect[0] + box_rect[2]).min(w - 4.0);
+            let below_y = (box_rect[1] + box_rect[3]).max(stage_rect[1] + stage_rect[3]) + margin;
+
+            let (bar_min_l, bar_max_r, bar_y, bar_centered) =
+                if top_y >= 4.0 && (top_max_r - top_min_l) >= min_comfortable_w {
+                    (top_min_l, top_max_r, top_y, false)
+                } else if below_y + bar_h + 4.0 <= h {
+                    (6.0, (w - 6.0).max(126.0), below_y, true)
+                } else {
+                    (6.0, (w - 6.0).max(126.0), 6.0, false)
+                };
+
+            let avail_w = (bar_max_r - bar_min_l).max(120.0);
+            let max_btn_w = ((avail_w - gap * (n - 1.0)) / n).max(16.0);
+            let btn_w = max_btn_w.min((64.0 * ui_s).clamp(40.0, 74.0));
+            let total_w = btn_w * n + gap * (n - 1.0);
+            let mut bx = if bar_centered {
+                bar_min_l + ((avail_w - total_w) * 0.5).max(0.0)
+            } else {
+                (bar_max_r - total_w).max(bar_min_l)
+            };
+
             for (key, action, active) in buttons {
                 let enabled = !matches!(action, UiAction::OpenSaves { save_mode: true }) || !ctx.replay_active;
                 b.button(
@@ -1026,8 +1320,17 @@ fn project_story_hud(
                     enabled,
                     active,
                 );
-                bx += btn_w + 6.0;
+                bx += btn_w + gap;
             }
+
+            let mut top_bound = box_rect[1];
+            if let Some(sr) = speaker_top_pill_rect {
+                top_bound = top_bound.min(sr[1]);
+            }
+            if bar_y < box_rect[1] && bar_y > 12.0 {
+                top_bound = top_bound.min(bar_y);
+            }
+            dialogue_top_y = Some(top_bound);
         }
     }
 
@@ -1036,20 +1339,32 @@ fn project_story_hud(
         if let Some(bg) = choice.background {
             b.pkt.quads.push(Quad::image(stage_rect, bg));
         }
-        let count = choice.items.len();
-        let cw = (w * 0.52).clamp(280.0, 620.0);
-        let ch = 52.0;
-        let gap = 14.0;
-        let total_h = count as f32 * ch + count.saturating_sub(1) as f32 * gap;
-        let mut cy = (h * 0.42 - total_h * 0.5).max(36.0);
+        let (mx, my) = match choice.menu_size {
+            Some([mw, mh]) if mw > 0 && mh > 0 => (
+                stage_rect[2] / mw as f32,
+                stage_rect[3] / mh as f32,
+            ),
+            _ => (scale, scale),
+        };
+        let plain_count = choice.items.iter().filter(|it| it.rect.is_none()).count().max(1);
+        let cw = (w * 0.54).clamp(220.0, 620.0).min((w - 28.0).max(180.0));
+        let avail_top = 18.0f32;
+        let avail_bottom = dialogue_top_y
+            .map_or(h - 24.0, |dy| (dy - 14.0).max(h * 0.35))
+            .max(avail_top + 64.0);
+        let avail_h = (avail_bottom - avail_top).max(64.0);
+        let gap = (avail_h * 0.04).clamp(6.0, 14.0);
+        let ch = ((avail_h - gap * (plain_count - 1) as f32) / plain_count as f32).clamp(32.0, 52.0);
+        let total_h = plain_count as f32 * ch + plain_count.saturating_sub(1) as f32 * gap;
+        let mut cy = (avail_top + (avail_h - total_h) * 0.5).max(avail_top);
         let mut hovered_preview: Option<(AssetId, [f32; 2])> = None;
         for (i, item) in choice.items.iter().enumerate() {
             let rect = if let Some(r) = item.rect {
                 [
-                    stage_rect[0] + r[0] * scale,
-                    stage_rect[1] + r[1] * scale,
-                    r[2] * scale,
-                    r[3] * scale,
+                    stage_rect[0] + r[0] * mx,
+                    stage_rect[1] + r[1] * my,
+                    r[2] * mx,
+                    r[3] * my,
                 ]
             } else {
                 let r = [(w - cw) * 0.5, cy, cw, ch];
@@ -1118,10 +1433,10 @@ fn project_story_hud(
                 };
                 b.pkt.quads.push(Quad::image(
                     [
-                        stage_rect[0] + (px + dx) * scale,
-                        stage_rect[1] + (py + dy) * scale,
-                        dw * scale,
-                        dh * scale,
+                        stage_rect[0] + (px + dx) * mx,
+                        stage_rect[1] + (py + dy) * my,
+                        dw * mx,
+                        dh * my,
                     ],
                     prev_asset,
                 ));
@@ -1136,49 +1451,52 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
     b.pkt
         .quads
         .push(Quad::solid([0.0, 0.0, w, h], [0.03, 0.05, 0.09, 0.78]));
-    let pw = (w * 0.80).clamp(320.0, 960.0);
-    let ph = (h * 0.80).clamp(320.0, 640.0);
+    let pw = (w * 0.86).clamp(280.0, 960.0).min((w - 16.0).max(200.0));
+    let ph = (h * 0.86).clamp(260.0, 660.0).min((h - 16.0).max(200.0));
     let px = (w - pw) * 0.5;
     let py = (h - ph) * 0.5;
+    let pad = (pw * 0.035).clamp(12.0, 24.0);
+    let hdr_h = (ph * 0.11).clamp(36.0, 56.0);
+    let back_w = (pw * 0.18).clamp(68.0, 104.0);
+    let back_h = (hdr_h * 0.72).clamp(28.0, 38.0);
     b.pkt.quads.push(Quad::solid([px, py, pw, ph], b.theme.surface));
     b.pkt
         .quads
         .push(Quad::solid([px, py, pw, 2.0], b.theme.accent));
+    let title_size = (hdr_h * 0.48).clamp(16.0, 26.0);
     b.push_text(TextRun {
         text: title,
         visible_bytes: None,
-        x: px + 24.0,
-        y: py + 18.0,
-        width: pw - 160.0,
-        height: 40.0,
-        size: 26.0,
-        line_height: 34.0,
+        x: px + pad,
+        y: py + (hdr_h - back_h) * 0.5,
+        width: (pw - pad * 3.0 - back_w).max(60.0),
+        height: back_h,
+        size: title_size,
+        line_height: title_size * 1.25,
         color: b.theme.text,
         emphasis: Vec::new(),
         shadow: None,
         scroll: 0.0,
-        clip: None,
+        clip: Some([px + pad, py, (pw - pad * 2.0 - back_w).max(60.0), hdr_h]),
         font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
         cache_key: 0,
     });
     b.button(
-        [px + pw - 124.0, py + 14.0, 100.0, 38.0],
+        [px + pw - pad - back_w, py + (hdr_h - back_h) * 0.5, back_w, back_h],
         messages.get(loc, "back"),
         UiAction::CloseOverlay,
         true,
         false,
     );
-    [px + 24.0, py + 72.0, pw - 48.0, ph - 96.0]
+    [px + pad, py + hdr_h + 8.0, (pw - pad * 2.0).max(120.0), (ph - hdr_h - pad - 8.0).max(100.0)]
 }
 
 fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "menu"), messages, loc);
-    let bw = area[2].min(360.0);
-    let bx = area[0] + (area[2] - bw) * 0.5;
-    let mut by = area[1] + 12.0;
-    let bh = 46.0;
-    let gap = 12.0;
-
     let items: [(&str, UiAction, bool, bool); 6] = [
         ("close", UiAction::CloseOverlay, true, true),
         ("save", UiAction::OpenSaves { save_mode: true }, !ctx.replay_active, false),
@@ -1196,6 +1514,13 @@ fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Mes
             false,
         ),
     ];
+    let bw = area[2].min(360.0);
+    let bx = area[0] + (area[2] - bw) * 0.5;
+    let n = items.len() as f32;
+    let gap = (area[3] * 0.025).clamp(5.0, 12.0);
+    let bh = ((area[3] - gap * (n - 1.0)) / n).clamp(28.0, 46.0);
+    let total_h = bh * n + gap * (n - 1.0);
+    let mut by = area[1] + ((area[3] - total_h) * 0.5).max(0.0);
     for (key, action, enabled, primary) in items {
         b.button([bx, by, bw, bh], messages.get(loc, key), action, enabled, primary);
         by += bh + gap;
@@ -1211,17 +1536,17 @@ fn project_saves_overlay(
 ) {
     let title = messages.get(loc, if save_mode { "save" } else { "load" });
     let area = overlay_shell(b, title, messages, loc);
-    let cols = if area[2] >= 640.0 { 2 } else { 1 };
-    let gap = 12.0;
+    let cols = if area[2] >= 560.0 { 2 } else { 1 };
+    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = 66.0;
+    let cell_h = (area[3] * 0.14).clamp(40.0, 64.0);
 
     for (idx, slot) in ctx.slots.iter().take(12).enumerate() {
         let col = idx % cols;
         let row = idx / cols;
         let x = area[0] + col as f32 * (cell_w + gap);
         let y = area[1] + row as f32 * (cell_h + gap);
-        if y + cell_h > area[1] + area[3] {
+        if y + cell_h > area[1] + area[3] + 1.0 {
             break;
         }
         let label = if slot.exists {
@@ -1241,9 +1566,45 @@ fn project_saves_overlay(
 
 fn project_settings_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "settings"), messages, loc);
+    let has_locales = !ctx.vm.program().meta.locales.is_empty();
+    let total_rows = 5 + usize::from(has_locales);
+    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
+    let row_h = ((area[3] - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(30.0, 46.0);
+    let btn_w = (area[2] * 0.14).clamp(40.0, 56.0);
+    let btn_gap = 8.0;
+    let right_x = area[0] + area[2];
+    let plus_x = right_x - btn_w;
+    let minus_x = (plus_x - btn_gap - btn_w).max(area[0] + 80.0);
+    let label_w = (minus_x - area[0] - 8.0).max(64.0);
+    let label_size = (row_h * 0.42).clamp(13.0, 18.0);
     let mut y = area[1];
-    let row_h = 46.0;
-    let gap = 12.0;
+
+    let mut push_setting_row = |b: &mut Builder<'_>, text: String, dec: UiAction, inc: UiAction| {
+        b.push_text(TextRun {
+            text,
+            visible_bytes: None,
+            x: area[0],
+            y,
+            width: label_w,
+            height: row_h,
+            size: label_size,
+            line_height: label_size * 1.25,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([area[0], y, label_w, row_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Left,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+        b.button([minus_x, y, btn_w, row_h], "−".into(), dec, true, false);
+        b.button([plus_x, y, btn_w, row_h], "+".into(), inc, true, false);
+        y += row_h + gap;
+    };
 
     let sliders: [(&str, AudioBus, f32); 3] = [
         ("music", AudioBus::Bgm, ctx.prefs.bgm_volume),
@@ -1251,104 +1612,72 @@ fn project_settings_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: 
         ("sfx", AudioBus::Sfx, ctx.prefs.sfx_volume),
     ];
     for (key, bus, val) in sliders {
-        b.push_text(TextRun {
-            text: format!("{}: {}%", messages.get(loc, key), (val * 100.0).round() as u32),
-            visible_bytes: None,
-            x: area[0],
-            y: y + 10.0,
-            width: 240.0,
-            height: row_h,
-            size: 18.0,
-            line_height: 24.0,
-            color: b.theme.text,
-            emphasis: Vec::new(),
-            shadow: None,
-            scroll: 0.0,
-            clip: None,
-            font_assets: b.ui_fonts.clone(),
-            cache_key: 0,
-        });
-        b.button(
-            [area[0] + 250.0, y, 54.0, row_h],
-            "−".into(),
+        push_setting_row(
+            b,
+            format!("{}: {}%", messages.get(loc, key), (val * 100.0).round() as u32),
             UiAction::SetVolume {
                 bus,
                 value: (val - 0.1).clamp(0.0, 1.0),
             },
-            true,
-            false,
-        );
-        b.button(
-            [area[0] + 314.0, y, 54.0, row_h],
-            "+".into(),
             UiAction::SetVolume {
                 bus,
                 value: (val + 0.1).clamp(0.0, 1.0),
             },
-            true,
-            false,
         );
-        y += row_h + gap;
     }
 
     // Text speed
-    b.push_text(TextRun {
-        text: format!("{}: {:.1}x", messages.get(loc, "text-speed"), ctx.prefs.text_speed),
-        visible_bytes: None,
-        x: area[0],
-        y: y + 10.0,
-        width: 240.0,
-        height: row_h,
-        size: 18.0,
-        line_height: 24.0,
-        color: b.theme.text,
-        emphasis: Vec::new(),
-        shadow: None,
-        scroll: 0.0,
-        clip: None,
-        font_assets: b.ui_fonts.clone(),
-        cache_key: 0,
-    });
-    b.button(
-        [area[0] + 250.0, y, 54.0, row_h],
-        "−".into(),
+    push_setting_row(
+        b,
+        format!("{}: {:.1}x", messages.get(loc, "text-speed"), ctx.prefs.text_speed),
         UiAction::SetTextSpeed((ctx.prefs.text_speed - 0.5).clamp(0.5, 4.0)),
-        true,
-        false,
-    );
-    b.button(
-        [area[0] + 314.0, y, 54.0, row_h],
-        "+".into(),
         UiAction::SetTextSpeed((ctx.prefs.text_speed + 0.5).clamp(0.5, 4.0)),
-        true,
-        false,
     );
-    y += row_h + gap;
 
-    // Language switchers
-    let mut lx = area[0];
-    for locale in &ctx.vm.program().meta.locales {
-        let active = locale == &ctx.prefs.text_locale;
-        b.button(
-            [lx, y, 110.0, row_h],
-            locale.clone(),
-            UiAction::SetLocale(locale.clone()),
-            true,
-            active,
-        );
-        lx += 120.0;
+    // Font scale (`字号`)
+    push_setting_row(
+        b,
+        format!("{}: {}%", messages.get(loc, "font-size"), (ctx.prefs.font_scale * 100.0).round() as u32),
+        UiAction::SetFontScale((ctx.prefs.font_scale - 0.1).clamp(0.75, 1.50)),
+        UiAction::SetFontScale((ctx.prefs.font_scale + 0.1).clamp(0.75, 1.50)),
+    );
+
+    // Language switchers (fit cleanly inside area width)
+    let locales = &ctx.vm.program().meta.locales;
+    if !locales.is_empty() && y + row_h <= area[1] + area[3] + 2.0 {
+        let lgap = 8.0;
+        let lw = ((area[2] - lgap * (locales.len().saturating_sub(1)) as f32)
+            / locales.len() as f32)
+            .clamp(56.0, 110.0);
+        let mut lx = area[0];
+        for locale in locales {
+            if lx + lw > right_x + 1.0 {
+                break;
+            }
+            let active = locale == &ctx.prefs.text_locale;
+            b.button(
+                [lx, y, lw, row_h],
+                locale.clone(),
+                UiAction::SetLocale(locale.clone()),
+                true,
+                active,
+            );
+            lx += lw + lgap;
+        }
     }
 }
 
 fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "history"), messages, loc);
-    let row_h = 64.0;
-    let visible_rows = ((area[3] - 48.0) / row_h).max(1.0) as usize;
+    let nav_h = 36.0;
+    let row_h = (area[3] * 0.16).clamp(48.0, 68.0);
+    let visible_rows = ((area[3] - nav_h - 10.0) / row_h).max(1.0) as usize;
     let total = ctx.vm.history.len();
     let end = total.saturating_sub(ctx.history_scroll);
     let start = end.saturating_sub(visible_rows);
 
     let mut y = area[1];
+    let fsize = (row_h * 0.28).clamp(13.0, 18.0);
     for entry in ctx.vm.history.range(start..end) {
         let text = if entry.speaker.is_empty() {
             entry.text.clone()
@@ -1358,33 +1687,38 @@ fn project_history_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
         b.push_text(TextRun {
             text,
             visible_bytes: None,
-            x: area[0] + 8.0,
+            x: area[0] + 6.0,
             y,
-            width: area[2] - 16.0,
+            width: (area[2] - 12.0).max(40.0),
             height: row_h - 6.0,
-            size: 18.0,
-            line_height: 26.0,
+            size: fsize,
+            line_height: fsize * 1.38,
             color: b.theme.text,
             emphasis: Vec::new(),
             shadow: None,
             scroll: 0.0,
             clip: Some([area[0], y, area[2], row_h - 4.0]),
             font_assets: b.text_fonts.clone(),
+            align: TextAlign::Left,
+            valign_center: false,
+            auto_fit: true,
+            inline_images: Vec::new(),
             cache_key: 0,
         });
         y += row_h;
     }
 
-    let by = area[1] + area[3] - 40.0;
+    let by = area[1] + area[3] - nav_h;
+    let nav_w = ((area[2] - 12.0) * 0.5).clamp(80.0, 124.0);
     b.button(
-        [area[0], by, 120.0, 38.0],
+        [area[0], by, nav_w, nav_h],
         messages.get(loc, "scroll-back"),
         UiAction::ScrollHistory(3),
         start > 0,
         false,
     );
     b.button(
-        [area[0] + 132.0, by, 120.0, 38.0],
+        [area[0] + nav_w + 10.0, by, nav_w, nav_h],
         messages.get(loc, "scroll-forward"),
         UiAction::ScrollHistory(-3),
         ctx.history_scroll > 0,
@@ -1404,17 +1738,17 @@ fn project_gallery_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
         messages,
         loc,
     );
-    let cols = 3;
-    let gap = 14.0;
+    let cols = (area[2] / 190.0).floor().clamp(2.0, 4.0) as usize;
+    let gap = 12.0;
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = 110.0;
+    let cell_h = (cell_w * 0.62).clamp(72.0, 120.0);
 
     for (idx, item) in prog.ui.gallery.iter().enumerate() {
         let col = idx % cols;
         let row = idx / cols;
         let x = area[0] + col as f32 * (cell_w + gap);
         let y = area[1] + row as f32 * (cell_h + gap);
-        if y + cell_h > area[1] + area[3] {
+        if y + cell_h > area[1] + area[3] + 1.0 {
             break;
         }
         let unlocked = item
@@ -1446,11 +1780,288 @@ fn project_gallery_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &
 
 fn project_ended_overlay(b: &mut Builder<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "ending"), messages, loc);
+    let bw = area[2].min(240.0);
     b.button(
-        [area[0] + (area[2] - 240.0) * 0.5, area[1] + 60.0, 240.0, 50.0],
+        [area[0] + (area[2] - bw) * 0.5, area[1] + (area[3] - 48.0).max(0.0) * 0.35, bw, 48.0],
         messages.get(loc, "exit"),
         UiAction::ReturnTitle,
         true,
         true,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn rects_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
+        let x_ov = (a[0] + a[2]).min(b[0] + b[2]) - a[0].max(b[0]);
+        let y_ov = (a[1] + a[3]).min(b[1] + b[3]) - a[1].max(b[1]);
+        x_ov > 0.5 && y_ov > 0.5
+    }
+
+    fn livemaker_like_program() -> Arc<NirProgram> {
+        let mut ui = UiTheme::default();
+        ui.dialogue_rect = Some([0.0, 440.0, 800.0, 160.0]);
+        ui.text_rect = Some([32.0, 456.0, 736.0, 128.0]);
+        ui.font_size = 24.0;
+        ui.line_height = 34.0;
+        ui.dialogue_styles.push(DialogueStyleDef {
+            name: StrId(1),
+            dialogue_bg: None,
+            dialogue_rect: ui.dialogue_rect,
+            text_rect: ui.text_rect,
+            font_size: Some(24.0),
+            line_height: Some(34.0),
+            text_color: Some([1.0, 1.0, 1.0, 1.0]),
+            face_pos: None,
+            name_rect: None,
+        });
+        Arc::new(NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.lm.test".into(),
+                title: "LiveMaker Test".into(),
+                version: "1.0".into(),
+                stage_width: 800,
+                stage_height: 600,
+                default_locale: "zh-Hans".into(),
+                locales: vec!["zh-Hans".into()],
+                entry_func: FuncId(0),
+                save_slots: 6,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec![
+                "main".into(),
+                "(標準)".into(),
+                "小红".into(),
+                "face".into(),
+                "btn".into(),
+                "end".into(),
+            ],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![
+                Op::SetDialogueStyle(0),
+                Op::SetDialoguePortrait(Some(AssetId(0))),
+                Op::Say {
+                    speaker: Some(StrId(2)),
+                    speaker_color: None,
+                    text: TextId(0),
+                    voice: None,
+                    reveal_us: 0,
+                    append: false,
+                },
+                Op::End { outcome: StrId(5) },
+            ],
+            texts: BTreeMap::from([(
+                "zh-Hans".into(),
+                vec![TextEntry::plain(
+                    "这是一段比较长的测试台词，用来验证在不同屏幕分辨率下字幕不会超出对话框，也不会和人物头像、角色名牌以及底部快捷按钮互相遮挡。",
+                )],
+            )]),
+            ui,
+            assets: vec![AssetMeta {
+                id: AssetId(0),
+                name: StrId(3),
+                kind: AssetKind::Image,
+                codec: MediaCodec::Png,
+                width: 180,
+                height: 180,
+                trim: None,
+                duration_us: 0,
+                sample_rate: 0,
+                channels: 0,
+                loop_region: None,
+                offset: 0,
+                size: 16,
+                delta: None,
+            }],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![MenuTemplate {
+                size: [1280, 720],
+                background: None,
+                items: vec![MenuItemDef {
+                    name: StrId(4),
+                    label: StrId(4),
+                    rect: [960.0, 540.0, 200.0, 80.0],
+                    image: Some(AssetId(0)),
+                    hover_image: None,
+                    disabled_image: None,
+                    preview_image: None,
+                    preview_pos: [0.0, 0.0],
+                }],
+            }],
+        })
+    }
+
+    #[test]
+    fn story_hud_scales_font_indents_face_and_never_overlaps_icons_across_viewports() {
+        let prog = livemaker_like_program();
+        let mut vm = Vm::new(prog, Some("zh-Hans".into())).unwrap();
+        vm.step(1000).unwrap();
+        let prefs = Preferences::default();
+        let msgs = Messages::default();
+
+        for (vw, vh) in [(1280.0, 720.0), (800.0, 600.0), (640.0, 360.0), (390.0, 844.0)] {
+            let ctx = UiContext {
+                vm: &vm,
+                screen: Screen::Story,
+                prefs: &prefs,
+                auto: false,
+                skip: false,
+                interface_hidden: false,
+                replay_active: false,
+                slots: &[],
+                history_scroll: 0,
+                hovered_hit: None,
+                toast: None,
+            };
+            let pkt = project(&ctx, vw, vh, &msgs);
+            let (_, scale) = fit_stage(800.0, 600.0, vw, vh);
+
+            // 1. Dialogue font size scales cleanly with stage scale (no fixed unscaled 24px!).
+            let dlg_run = pkt
+                .texts
+                .iter()
+                .find(|t| t.text.contains("测试台词"))
+                .expect("dialogue text run missing");
+            let expected_size = (24.0 * scale).clamp(10.0, 72.0);
+            assert!(
+                (dlg_run.size - expected_size).abs() < 0.05,
+                "viewport {vw}x{vh}: expected font size {expected_size}, got {}",
+                dlg_run.size
+            );
+            assert!(dlg_run.auto_fit, "dialogue text must enable auto_fit");
+            let dlg_rect = [dlg_run.x, dlg_run.y, dlg_run.width, dlg_run.height];
+
+            // 2. Face portrait fits inside box and does NOT overlap dialogue text!
+            let face_quad = pkt
+                .quads
+                .iter()
+                .find(|q| q.asset == Some(AssetId(0)))
+                .expect("face portrait quad missing");
+            assert!(
+                !rects_overlap(face_quad.rect, dlg_rect),
+                "viewport {vw}x{vh}: face {:?} overlaps dialogue {:?}",
+                face_quad.rect,
+                dlg_rect
+            );
+
+            // 3. Speaker nameplate does NOT overlap dialogue text or face!
+            let sp_run = pkt
+                .texts
+                .iter()
+                .find(|t| t.text == "小红")
+                .expect("speaker text missing");
+            let sp_rect = [sp_run.x, sp_run.y, sp_run.width, sp_run.height];
+            assert!(
+                !rects_overlap(sp_rect, dlg_rect),
+                "viewport {vw}x{vh}: speaker {:?} overlaps dialogue {:?}",
+                sp_rect,
+                dlg_rect
+            );
+
+            // 4. All 7 toolbar buttons fit inside viewport, do NOT overlap each other,
+            //    and do NOT overlap dialogue text or speaker nameplate!
+            assert_eq!(pkt.hits.len(), 7, "viewport {vw}x{vh}: expected 7 HUD buttons");
+            for (i, h) in pkt.hits.iter().enumerate() {
+                assert!(
+                    h.rect[0] >= -0.5 && h.rect[0] + h.rect[2] <= vw + 0.5,
+                    "viewport {vw}x{vh}: button {i} ({}) overflows horizontally: {:?}",
+                    h.label,
+                    h.rect
+                );
+                assert!(
+                    h.rect[1] >= -0.5 && h.rect[1] + h.rect[3] <= vh + 0.5,
+                    "viewport {vw}x{vh}: button {i} ({}) overflows vertically: {:?}",
+                    h.label,
+                    h.rect
+                );
+                assert!(
+                    !rects_overlap(h.rect, dlg_rect),
+                    "viewport {vw}x{vh}: button {} {:?} overlaps dialogue {:?}",
+                    h.label,
+                    h.rect,
+                    dlg_rect
+                );
+                assert!(
+                    !rects_overlap(h.rect, sp_rect),
+                    "viewport {vw}x{vh}: button {} {:?} overlaps speaker {:?}",
+                    h.label,
+                    h.rect,
+                    sp_rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lpm_choice_menu_hides_dialogue_hud_and_scales_by_menu_size() {
+        let prog = livemaker_like_program();
+        let mut vm = Vm::new(prog, Some("zh-Hans".into())).unwrap();
+        vm.step(1000).unwrap();
+        // Activate a 1280x720 LPM menu on top of an 800x600 stage!
+        vm.choice = Some(nir_vm::ChoiceState {
+            items: vec![nir_vm::OfferedChoice {
+                index: 0,
+                label: "btn".into(),
+                image: Some(AssetId(0)),
+                hover_image: None,
+                disabled_image: None,
+                preview: None,
+                rect: Some([960.0, 540.0, 200.0, 80.0]),
+                target_pc: 0,
+                value: None,
+                choice_index: None,
+                disabled: false,
+            }],
+            result_var: None,
+            index_var: None,
+            cancel_pc: None,
+            timeout_us: None,
+            elapsed_us: 0,
+            default_idx: None,
+            background: None,
+            menu_size: Some([1280, 720]),
+            hover_se: None,
+            click_se: None,
+            fade_out_us: 0,
+        });
+        let prefs = Preferences::default();
+        let msgs = Messages::default();
+        let ctx = UiContext {
+            vm: &vm,
+            screen: Screen::Story,
+            prefs: &prefs,
+            auto: false,
+            skip: false,
+            interface_hidden: false,
+            replay_active: false,
+            slots: &[],
+            history_scroll: 0,
+            hovered_hit: None,
+            toast: None,
+        };
+        let pkt = project(&ctx, 800.0, 600.0, &msgs);
+        // Only the LPM button hit exists — dialogue HUD & 7 buttons are suppressed!
+        assert_eq!(pkt.hits.len(), 1);
+        let r = pkt.hits[0].rect;
+        // 960/1280 * 800 = 600, 540/720 * 600 = 450, 200/1280*800 = 125, 80/720*600 = 66.67 -> fits inside 800x600!
+        assert!((r[0] - 600.0).abs() < 0.5 && (r[1] - 450.0).abs() < 0.5);
+        assert!(r[0] + r[2] <= 800.5 && r[1] + r[3] <= 600.5);
+    }
 }

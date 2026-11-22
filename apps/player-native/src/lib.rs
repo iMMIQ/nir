@@ -467,6 +467,10 @@ impl NativeApp {
                     self.pending_decodes.remove(&id);
                     if let Some(renderer) = &mut self.renderer {
                         let _ = renderer.upload_rgba_premultiplied(id, width, height, &rgba);
+                        let evicted = renderer.take_evicted_assets();
+                        if !evicted.is_empty() {
+                            self.runtime.mark_assets_evicted(&evicted);
+                        }
                     }
                     self.runtime.mark_asset_loaded(id);
                 }
@@ -474,6 +478,10 @@ impl NativeApp {
                     self.pending_decodes.remove(&id);
                     if let Some(renderer) = &mut self.renderer {
                         let _ = renderer.upload_decoded_ktx2(id, &ktx);
+                        let evicted = renderer.take_evicted_assets();
+                        if !evicted.is_empty() {
+                            self.runtime.mark_assets_evicted(&evicted);
+                        }
                     }
                     self.runtime.mark_asset_loaded(id);
                 }
@@ -540,7 +548,10 @@ impl NativeApp {
                 }
                 HostCommand::HintPinnedAssets(pinned) => {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.evict_lru(&pinned);
+                        let evicted = renderer.evict_lru(&pinned);
+                        if !evicted.is_empty() {
+                            self.runtime.mark_assets_evicted(&evicted);
+                        }
                     }
                 }
                 HostCommand::PlayAudio {
