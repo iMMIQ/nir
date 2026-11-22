@@ -160,13 +160,20 @@ fn assemble(
     let mut writer = zip::ZipWriter::new(file);
     writer.add_bytes("AndroidManifest.xml", zip::Method::Store, manifest_xml)?;
     for (name, source) in entries {
-        let stored = name.starts_with("lib/");
-        let method = if stored {
+        let is_lib = name.starts_with("lib/");
+        let is_pak = name.ends_with(".nirpak");
+        let method = if is_lib || is_pak {
             zip::Method::Store
         } else {
             zip::Method::Deflate
         };
-        let alignment = u16::from(stored) * LIB_ALIGNMENT;
+        let alignment = if is_lib {
+            LIB_ALIGNMENT
+        } else if is_pak {
+            4
+        } else {
+            0
+        };
         match source {
             EntrySource::Bytes(bytes) => {
                 writer.add_bytes_aligned(name, method, bytes, alignment)?

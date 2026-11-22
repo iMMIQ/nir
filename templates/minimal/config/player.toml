@@ -1,5 +1,0 @@
-format = 1
-
-[defaults]
-prefetch_content = true
-prefetch_media = false

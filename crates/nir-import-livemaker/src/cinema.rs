@@ -5,6 +5,7 @@
 //! The byte layout and predecessor clock come from the original engine's
 //! TFilmManager/TCustomFrameList/TCustomImageFrameList stream readers. The
 //! default TLiveCinema frame rate is 60; the file itself has no frame-rate field.
+#![allow(dead_code)]
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 

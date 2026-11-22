@@ -1,4 +1,0 @@
-format = 1
-id = "theme.story"
-base = "builtin.reader"
-tokens = "tokens.json"

@@ -1,0 +1,32 @@
+[package]
+name = "player-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "player_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "player-native"
+path = "src/main.rs"
+
+[dependencies]
+nir-ir.workspace = true
+nir-vm.workspace = true
+nir-ui.workspace = true
+nir-render.workspace = true
+nir-runtime.workspace = true
+anyhow.workspace = true
+memmap2.workspace = true
+pollster.workspace = true
+rodio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+symphonia.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity.workspace = true

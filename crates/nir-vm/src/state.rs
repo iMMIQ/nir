@@ -1,0 +1,255 @@
+use nir_ir::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerState {
+    pub id: LayerId,
+    pub parent: Option<LayerId>,
+    pub asset: Option<AssetId>,
+    pub transform: Transform2D,
+    pub shake_offset: [f32; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveTween {
+    pub target: TweenTarget,
+    pub prop: TweenProp,
+    pub from: f32,
+    pub to: f32,
+    pub elapsed_us: u64,
+    pub duration_us: u64,
+    pub easing: Easing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveShake {
+    pub target: TweenTarget,
+    pub spec: ShakeSpec,
+    pub elapsed_us: u64,
+    pub seed: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageTransitionState {
+    pub from_layers: Vec<LayerState>,
+    pub transition: Transition,
+    pub elapsed_us: u64,
+    pub duration_us: u64,
+}
+
+impl StageTransitionState {
+    pub fn progress(&self) -> f32 {
+        if self.duration_us == 0 {
+            1.0
+        } else {
+            (self.elapsed_us as f64 / self.duration_us as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowRevealState {
+    pub to_visible: bool,
+    pub transition: Transition,
+    pub from_alpha: f32,
+    pub elapsed_us: u64,
+    pub duration_us: u64,
+}
+
+impl WindowRevealState {
+    pub fn alpha(&self) -> f32 {
+        let t = if self.duration_us == 0 {
+            1.0
+        } else {
+            (self.elapsed_us as f64 / self.duration_us as f64).clamp(0.0, 1.0) as f32
+        };
+        let to = if self.to_visible { 1.0 } else { 0.0 };
+        self.from_alpha + (to - self.from_alpha) * t
+    }
+}
+
+/// Flattened span inside an instantiated dialogue (variables already interpolated).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedSpan {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub emphasis: bool,
+    pub color: Option<[f32; 4]>,
+    pub ruby: Option<String>,
+    pub speed: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DialoguePausePoint {
+    pub grapheme_index: usize,
+    pub duration_us: u64,
+    pub click: bool,
+    pub triggered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DialogueState {
+    pub text_id: TextId,
+    pub speaker: String,
+    pub speaker_color: Option<[f32; 4]>,
+    pub full_text: String,
+    pub spans: Vec<ResolvedSpan>,
+    pub pauses: Vec<DialoguePausePoint>,
+    pub voice: Option<AssetId>,
+    pub reveal_us: u64,
+    pub elapsed_us: u64,
+    pub visible_graphemes: usize,
+    pub total_graphemes: usize,
+    pub paused_for_click: bool,
+    pub pause_remaining_us: u64,
+    pub finished: bool,
+    pub already_read: bool,
+}
+
+impl DialogueState {
+    /// Byte offset in `full_text` corresponding to `visible_graphemes`.
+    pub fn visible_byte_len(&self) -> usize {
+        if self.finished || self.visible_graphemes >= self.total_graphemes {
+            return self.full_text.len();
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        self.full_text
+            .grapheme_indices(true)
+            .nth(self.visible_graphemes)
+            .map_or(self.full_text.len(), |(idx, _)| idx)
+    }
+
+    pub fn visible_text(&self) -> &str {
+        &self.full_text[..self.visible_byte_len()]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfferedChoice {
+    pub index: u16,
+    pub label: String,
+    pub image: Option<AssetId>,
+    pub hover_image: Option<AssetId>,
+    pub rect: Option<[f32; 4]>,
+    pub target_pc: u32,
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChoiceState {
+    pub items: Vec<OfferedChoice>,
+    pub result_var: Option<VarId>,
+    pub cancel_pc: Option<u32>,
+    pub timeout_us: Option<u64>,
+    pub elapsed_us: u64,
+    pub default_idx: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioChannelState {
+    pub channel: ChannelId,
+    pub bus: AudioBus,
+    pub asset: AssetId,
+    pub gain: f32,
+    pub envelope: f32,
+    pub looped: bool,
+    pub loop_region: Option<AudioLoopRegion>,
+    pub character: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub text_id: TextId,
+    pub speaker: String,
+    pub text: String,
+    pub voice: Option<AssetId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallFrame {
+    pub func: FuncId,
+    pub return_pc: u32,
+    pub locals: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WaitReason {
+    None,
+    Dialogue,
+    Choice,
+    Timer { remaining_us: u64, skippable: bool },
+    StageTransition,
+    Tween,
+    Shake,
+    Video { asset: AssetId, skippable: bool },
+}
+
+/// Typed host commands emitted by `Vm::step` / `Vm::tick` — zero JSON serialization!
+#[derive(Debug, Clone, PartialEq)]
+pub enum VmIntent {
+    PlayAudio {
+        channel: ChannelId,
+        bus: AudioBus,
+        asset: AssetId,
+        gain: f32,
+        looped: bool,
+        fade_in_us: u64,
+        loop_region: Option<AudioLoopRegion>,
+        character: Option<String>,
+    },
+    StopAudio {
+        channel: ChannelId,
+        fade_out_us: u64,
+    },
+    SetAudioGain {
+        channel: ChannelId,
+        gain: f32,
+    },
+    PauseAudioBus {
+        bus: AudioBus,
+        paused: bool,
+    },
+    PlayVideo {
+        asset: AssetId,
+        skippable: bool,
+    },
+    StopVideo,
+    ProfileChanged,
+    Checkpoint,
+}
+
+/// Lightweight, version-resilient save snapshot (~2–4 KB typical).
+/// Stores variables by name and tracks `last_label` so saves survive minor script edits & hot-reload!
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SaveSnapshot {
+    pub format: u32,
+    pub game_id: String,
+    pub version: String,
+    pub saved_at_unix: u64,
+    pub summary: String,
+    pub pc: u32,
+    pub last_label: Option<String>,
+    pub vars: BTreeMap<String, Value>,
+    pub frames: Vec<CallFrame>,
+    pub layers: Vec<LayerState>,
+    pub dialogue_visible: bool,
+    pub dialogue: Option<DialogueState>,
+    pub choice: Option<ChoiceState>,
+    pub wait: WaitReason,
+    pub audio: Vec<AudioChannelState>,
+    pub audio_paused: [bool; 3],
+    pub history: Vec<HistoryEntry>,
+    pub locale: String,
+    pub rng_word_pos: u128,
+    pub outcome: Option<String>,
+}
+
+pub const SAVE_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProfileData {
+    pub flags: BTreeSet<String>,
+    pub values: BTreeMap<String, Value>,
+    pub read_texts: BTreeSet<u32>,
+}

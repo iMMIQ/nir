@@ -1,0 +1,21 @@
+# Minimal NIR v2 Starter Template
+character narrator "旁白" color=#9cc5e8
+var chapter = 1
+
+label start:
+"欢迎使用 NIR v2 视觉小说引擎。"
+narrator: "这是一个零样板项目：只需编辑 scripts/main.nirs，并把图片、音频、字体放进 assets/ 目录即可。"
+
+menu:
+  - "前往花园" -> garden
+  - "留在房间" -> home
+
+label garden:
+$ chapter = 2
+"微风拂过院落，新的一页就此展开（第 {chapter} 节）。"
+end_game garden
+
+label home:
+$ chapter = 2
+"窗外安静如初，你泡了一杯热茶继续书写故事（第 {chapter} 节）。"
+end_game home

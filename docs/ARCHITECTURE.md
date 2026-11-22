@@ -1,136 +1,42 @@
-# 架构与决策
+# NIR v2 Architecture
 
-## 依赖方向
+## Crate Layering
 
-| 库 | 职责 |
-|---|---|
-| nir-format | 版本化 DTO、显式类型标签、类型化能力位图（`CapabilitySet`）、共享 UI Fluent 消息与稳定诊断 |
-| nir-core | 纯同步确定性状态机（`vm/*`）、统一源/运行时校验（`validate/*`）、表达式、任务、快照 |
-| nir-content | 有界严格 JSON、内容身份、发行与执行索引校验 |
-| nir-assets | 联合预算、去重占用、准备集合、不可复制 ReadyLease |
-| nir-presentation | Fluent、只读界面投影、场景层次、cosmic-text 排版 |
-| nir-player | 事件队列、准备提交、暂停所有权、存储作业和恢复候选 |
-| nir-render-wgpu | WebGPU/WebGL2/DX12/Vulkan/Metal 表面、线性预乘合批合成、转场与 glyphon |
-| nir-platform-web | 浏览器画布接口及模块化宿主（`src_js/*` + `host.js`）、Web Audio、IndexedDB、Worker 调度 |
-| nir-apk | 纯 Rust Android 二进制清单（AXML）、ZIP 打包与 APK v2 签名 |
-| nir-compiler | 工程解析、声明式脚本降级、验证、执行模块、场景测试、构建与锁 |
-| nir-import-livemaker | 独立外部引擎导入器（LiveMaker LSB / LiveNovel 迁移），隔离解析器依赖不污染主编译器 |
-| nir-engine | Web 与原生共用的 Player 与渲染器组装、阅读导航、资源交付和设备恢复 |
+```
+Core Runtime Stack (no GPU / browser / compiler deps):
+  nir-ir          Flat u32-indexed bytecode, Persistent Scene Graph types, native 64-bit Value,
+                  declarative UiTheme/UiNode/UiAction, binary .nirpak container, LAME gapless parser
+  nir-vm          Stack/register bytecode VM, Persistent Scene Graph + Tween/Shake/Transition evaluator,
+                  version-resilient SaveSnapshot (vars by name + label relocation), hot-reload, asset lookahead
+  nir-ui          Zero-alloc u64-key TextEngine (cosmic-text), DrawPacket projection, responsive built-in Galgame UI
+  nir-runtime     Single-owner Runtime orchestrating VM, Auto/Skip/Rollback(32)/Replay, exact dirty gating,
+                  predictive lookahead HostCommands, live hot-reload
 
-入口分别为 `apps/player-web`（浏览器绑定）、`apps/player-desktop`（Windows/Linux/macOS/Android 共用的原生窗口、音频与本地存储外壳）、`apps/player-windows`、`apps/player-linux` 与 `apps/player-android`（平台入口）、`tools/novelc`（作者工具）、`xtask`（SDK 构建）。依赖检查基于 Cargo 实际解析图（含目标条件依赖），同时检查传递依赖：核心无浏览器/GPU，播放器不链接编译器与导入器。
+GPU Renderer:
+  nir-render      wgpu 25 + glyphon 0.9 compositor, 4 blend pipelines (Normal/Add/Multiply/Screen),
+                  RuleMask transitions, LRU texture cache, wasm32 createImageBitmap zero-copy upload
 
-## ADR-001：一个同步剧情流
+Thin Platform Hosts (never link compiler/importer/hb-subset):
+  player-native   Unified Windows / Linux / macOS winit host (memmap2 .nirpak, decode worker, rodio+symphonia, atomic JSON saves)
+  player-android  Thin Android NDK cdylib wrapping player-native (direct AssetManager game.nirpak read)
+  player-web      Single-WASM wasm-bindgen host + modern single-page host/{index.html,style.css,app.js}
 
-`Core.step(input, semantic_budget)` 不做 I/O。语义操作消耗预算，耗尽后保持可调度；一百万次未悬挂操作触发带逻辑位置的 `E_FUEL`。ValidatedProgram 将规范化函数/块转换成连续指令表，索引顺序与发行的 Executable 一致；稳定操作 ID 同时进入 ResumeMap 和快照。每个指令的 SemanticCost 为 1，不执行控制流优化。
+Build, Optimization & Multi-Engine Conversion Toolchain:
+  nir-apk         Pure-Rust Android binary manifest (AXML), aligned ZIP, and APK Signature Scheme v2 signer
+  nir-build       Zero-boilerplate project scanner, .nirs compiler, Alpha Auto-Trim, WebP, gapless MP3,
+                  HarfBuzz font subsetting, dead-asset tree-shaking, Web/Native/Android packagers
+  nir-import-core Pluggable EngineImporter trait, layered ArchiveVfs, auto CJK decoder, VN-IR,
+                  Playable-First ConversionReport, .nirs project emitter
+  nir-import-livemaker  LiveMaker / LiveNovel (LSB 116/117, GAL/GaleX, Cinema) plugin
+  nir-import-krkr       KiriKiri2 / KAG3 (XP3 archive reader, .ks parser, macros, TJS expressions) plugin
+  novelc          Developer CLI (init / check / build / convert / dev / serve / i18n)
+```
 
-表达式没有副作用，I32 运算溢出为可定位错误。局部变量采用控制流交集做确定赋值分析。ChaCha8 版本固定且保存完整流状态。Story 时钟使用 u64 微秒，JSON 中写十进制字符串。GPU/音频句柄不进入核心快照。
+Enforced automatically by `python3 scripts/check_architecture.py`.
 
-## ADR-002：准备后原子提交
+## Key Design Principles
 
-Activate 冻结 Cue、表达式结果及正文实例。资源配方经过获取 → 校验/解码 → GPU/字体准备 → 全句排版预检 → ReadyLease → 同步提交。首版只有单模块、小型依赖图，配方以资源集合加固定阶段实现，没有通用并行图调度器。
-
-旧场景与候选场景共同参与预算准入。资源准备期间保持旧画面并暂停 Story 逻辑，已启动的音频由设备时钟继续播放；资源屏障不能挂起音频设备。请求号、会话、设备、表面、字体排版和语言代次共同决定准备是否仍可提交。过时和重复完成不能推进剧情。失败保留准备状态以供重试。
-
-联合账本上限 128 MiB，按源字节、解码图像、GPU 纹理、声明的音频解码尺寸、字体和转场表面保守估算；检查点另预留 32 MiB，序列化总量限制 16 MiB / 32 个。资源在不再被当前/候选/活动任务引用时释放。这个值是应用准入估算，不是浏览器进程或驱动总内存测量。
-
-## ADR-003：可视 UI 属于 Rust
-
-Presentation 生成 DrawPacket 和辅助 SemanticTree。宿主仅映射隐藏语义按钮、焦点框、启动/致命错误壳；可玩界面没有 DOM 排版替代。正文先整句塑形，再按字素簇边界裁切揭示；普通揭示不重排。长段落随揭示滚动，回看保留已实例化语言与文本。
-
-场景采用固定设计舞台、响应式信箱缩放。Group 传递平移、缩放、透明度和裁切，兄弟按 order 稳定排序，子树连续合成。Dissolve 分别渲染完整源/目标层，再在线性空间混合，避免用两层透明叠加产生暗带。图片在上传前转换为线性预乘值，颜色纹理使用 sRGB 格式。Group 不提供独立滤镜/隔离混合模式。
-
-## ADR-004：暂停与持久化有独立所有权
-
-菜单、后台、准备、设备恢复和读档分别持有暂停原因，释放一个原因不会恢复其他原因。静止画面停止 GPU 提交；下次输入或回调补计前台经过的时间。音频使用 Web Audio 的真实完成事件，静音只改变增益，不取消等待。
-
-读档依次校验版本、精确发行身份、快照摘要和逻辑结构，在候选 Core 中准备资源，成功后才换会话；成功后保持暂停。存档写入以 IndexedDB 事务完成为成功点，同槽 expected_revision 防止迟到覆盖。保存作业不因会话切换而被误判失效。Profile 单调并集持久化，与回退分离。
-
-Player 的 `PersistProfile.keys` 只发送本次新加入的已读／解锁键，重复记录不再次发送。宿主与已有持久化集合做并集，保留其他发行或标签页的进度；不以命令里的键集合替换完整存储。这样，长期阅读不会为每句复制并跨 Worker 传输全部已读记录。回想期间仍不向玩家 Profile 写入。
-
-共享原生宿主的存储 worker 最多接纳64个物理批次，包括排队、执行和未交付owner的完成结果。连续Profile请求每批最多合并64个逻辑请求，相邻偏好只保留最新完整快照；不等待凑批。存档、读档、列表、导出及异类写入保持FIFO屏障。完成通道容量1，另最多一条producer阻塞回复；每个回执携带逻辑请求数清理outstanding。偏好与进度失败按类型非阻塞报告，失败进度保留到后续合并；存档、读档及导出保留各自请求身份。内部线程异常终止仍是未解决的Fatal路径。它限制批次和回复数量，不保证全部payload字节预算或底层`fsync`延迟。
-
-原生导出文件选择在独立对话框线程中进行，返回目标后由存储worker写入；Android无文件选择器，提交同一导出请求，文件名包含时间与唯一请求号。取消选择不写文件，写入及对话框失败保留当前阅读；较早的导出完成不能清掉较新的失败。Web导出分配/下载发起异常进入同一请求身份的失败事件，成功回执只表示浏览器接受下载，不表示外部文件系统已完成写入。
-
-同一次剧情步进中的连续进度意图合为一次持久化命令。诊断 Trace 保留原顺序，遇到音频、资源准备、检查点等其他意图就结束该批，不跨剧情步进合并，不延迟到定时器。
-
-回退点保留原来的最多 32 份、JSON 总量最多 16 MiB 的限制，账本仍预留 32 MiB。快照进入回退缓存时只测量一次精确 JSON 字节数，之后用不可变快照对应的大小更新总量；计数写入器不额外分配完整 JSON。取出、清空、克隆和回想返回都保留独立的计账。此内部元数据不写入存档，不改变快照内容、摘要或回退顺序。
-
-检查点为 Cue/交互边界，可包含无对白的转场状态。回退保留更早检查点；普通读档开启新的回退链。历史最多 1000 条 / 4 MiB 文本，旧项被移出回看，不改变剧情语义。
-
-## ADR-005：设备损失不重播剧情
-
-宿主观察真实 `GPUDevice.lost`，保留逻辑快照，重新创建设备与表面，再从描述重新获取字体/纹理和转场层。GPU 创建期间的异步完成排队。恢复不调用新游戏、不重放赋值或随机操作，完成后保持暂停。
-
-wgpu 25.0.2 的浏览器 device-lost 回调原本在 Promise 完成前释放 Rust Closure，本仓库修正其 JS 所有权，详见 vendor 说明。其余上游代码保留原样。
-
-## ADR-006：发行固定身份
-
-`resolve` 对实际 WASM、JS、启动页、第三方许可和配套 CLI 哈希建立 SDK 锁。编译器输出 SHA-256 对象、不可变发行清单和最后写入的 channel。浏览器固定首次选中的发行，只从该图加载；WASM、正文和媒体均校验实际字节。JS 先校验再按不可变同源 URL import，部署者必须保证不可变 URL 不被重写。
-
-不接受跨版本存档迁移。源内容路径须位于工程根内；拒绝绝对路径、`..`、符号链接逃逸、路径归一化冲突、未知字段、重复键与身份、缺文件和 LFS 指针。构建保守收集所有已声明 Cue 的运行依赖，不进行剧情可达性消除。未用源资源不复制为运行对象。
-
-## ADR-007：有界 owner 调度与分块上传
-
-WebHost 的输入与异步完成只进入 OwnerInbox，默认通过版本化 RPC 交给独占 Runtime Worker 调用 Engine；Worker 独立推进时钟及 OffscreenCanvas 绘制。DOM、Web Audio 与 IndexedDB 留在主线程，校验及图像解码交给独立 Asset Worker。启动回退使用相同 Engine。详见 [Web 执行域](WEB-EXECUTION.md)。宿主 inbox 与 Player inbox 均限制为 256 项，输入在 128 项处停止准入，给完成事件留出空间；溢出报告 `E_EVENT_QUEUE`，不会无声丢弃。宿主每轮最多处理 16 项，在原子工作之间检查 4 ms 时间片，每轮最多接纳一个资源交付。设备重建期间仍处理控制消息，其余完成留在队列。按请求取消资源回调，独立存档回执不随剧情会话取消。
-
-Engine 每轮提供 10,000 单位共享工作预算，事件处理、Core 指令和 Story 时钟边界共同消耗；同轮的后续 Player.pump 不会重新领取预算。CoreStep 返回 work_used 与 remaining_time_us；预算耗尽后由 Player 保留未完成事件和时间，在下一轮继续。选择输入在时间事件前处理；切换会话后丢弃旧会话的时间余量。宿主将前台单次补时限制为 250 ms。
-
-每帧的重投影按脏标记门控：投影与语义 JSON 是玩家模型和阅读状态的纯函数，仅在泵入非时钟事件、该轮实际消耗了工作（超出每事件一项的准入成本）、直接视图变更置位 `visual_invalidated`（焦点、悬停、手势、滚动）、历史仍在装载，或连续 16 个干净帧的安全阀触发时才重建；干净帧复用缓存的绘制包与语义字符串。音频位置观测不置脏，因为观测结果不进入投影输入；误漏的变更由安全阀兜底重投影。
-
-PauseToken 为不可复制的独立所有权对象，Drop 只释放本持有人。内部具名原因保持幂等，外部持有人可对相同原因分别取得令牌。prepare/content/locale 内部资源屏障只持有 Story 逻辑暂停；菜单持有逻辑暂停，并独立暂停 Voice/Sfx 总线，BGM 默认继续；作者菜单音乐存在时独立暂停 Story/BGM。后台、故障、设备恢复、读档后暂停和外部显式令牌同时持有整个域的音频暂停。两个计数分别维护，外部令牌即使命名为 prepare 也仍是显式暂停。音频暂停依据音频令牌计数与上次已发送状态比较，因而能观察两轮之间的令牌取得或释放。
-
-资源流水线全局最多四项同时执行，涵盖获取、音频解码和等待 owner 交付；取消的不可中断解码完成前仍占用名额。共享获取按消费者计数，最后一个消费者离开时触发 AbortController。失败的准备请求进入不可提交状态，迟到的成功、失败及展示完成均不改变场景；重试使用新请求号。图像以完整行分块转换为预乘颜色并上传，每轮最多 2 MiB，全部行完成后才进入可绘制纹理表。取消与设备重建释放未完成纹理。原生宿主可在 worker 线程先校验并解码图像，再经 `resource_decoded` 交付已预乘像素：编码字节的摘要校验由宿主证明，引擎仍复核尺寸与像素长度，上传沿用同一行预算路径。
-
-这些上限分别约束事件数量、语义工作和图像上传量。PNG 解码、字体加载/塑形、快照序列化及单条语义操作仍是原子工作；4 ms 是工作间的让出检查，不是浏览器长任务硬上限。Web 的校验、图像解码及排版/GPU 已移入独立 Worker；尚未实现完整 DAG、通用资源协议或所有缓存层的实测内存回报。
-
-## ADR-008：异步请求的终态预留
-
-宿主在启动资源、音频、存储及设备恢复工作前，从同一有界 inbox 预留一个完成槽。预留、排队与正在执行的回执只计算一次容量；完成与取消各释放一次，重复回调不再交付。图像上传进度复用原槽，直到最后一片才成为终态。普通工作最多占 248 项，总容量 256，最后 8 项供控制工作使用；输入仍受 128 项水位限制。
-
-没有名额时不启动对应外部操作，并向当前请求报告容量错误。取消资源请求释放逻辑回执槽，同时中止尚可取消的共享获取；不可取消的解码仍占用全局四个资源执行名额，直至物理工作结束。逻辑槽释放不等于浏览器已释放实际内存。
-
-读档和导入绑定发起会话，后续请求或返回标题取消旧候选；回执到达时再次检查会话。保存写入属于独立作业，场景切换不取消其事务回执，仍由槽修订检查防止覆盖。设备恢复有控制槽，恢复期间普通回执留在队列，待新设备准备好后继续处理。每次 owner 运行先检查设备丢失，避免等待轮询期间继续上传或绘制。
-
-宿主测试检查 `accepted = completed + cancelled + active`，并以固定种子交错预留、进度、重复回调、取消与清空。浏览器测试在 IndexedDB 事务实际完成后延迟通知，验证保存可跨会话收尾而旧读档不可替换新会话；反复准备、暂停和设备重建后检查活动槽归零。该账本约束主线程宿主；Worker RPC 同样保留控制容量与取消后的物理占位，但不代表通用资源 DAG 或完整物理内存预算已经完成。
-
-## ADR-009：结构化诊断与有界本地追踪
-
-错误身份与本地化提示分离。format 只定义可序列化诊断数据，compiler 维护作者源位置索引，player 决定恢复政策，presentation 的 Fluent bundle 生成提示。源位置不参与剧情执行/内容身份；旧错误可读，但不能将缺少来源的错误包装成虚构的精确诊断。
-
-追踪是旁路观测，不进入逻辑快照或计费。运行时记录以固定字段白名单写入有界环形存储，显式启用、显式导出、不自动上传。请求预留时捕获身份，跨会话完成不重新绑定来源。阶段时钟分开描述逻辑观测、CPU 原子工作和 GPU 提交，未测量的 GPU/物理内存字段明确标记。
-
-使用同一剧情在追踪开/关下的逻辑 trace 和结局对照约束旁路行为；性能报告保留环境、样本和统计口径。参见 [诊断说明](DIAGNOSTICS.md)。
-
-## ADR-010：作品配置显式解析，主题使用封闭组件契约
-
-编译器将 game.toml、player.toml、theme.toml 和颜色 token 分别进行严格解析，逐字段记录作者来源或 SDK 默认来源。运行 Program 只带已解析的数字、枚举与偏好默认值，来源不进入发行对象。当前只有 web-standard，不设计未使用的通用覆盖系统。
-
-主题绑定固定 dialogue.main/choice.main 槽的类型化内置组件，组件不拥有剧情、存储或输入解释权。配置不能删除系统菜单、修改动作或释放 Gate。VM 加载时再次验证配置，防止手工 Executable 绕过作者检查。旧 JSON 颜色入口兼容，新增 Props/组件会改变 Program 修订；精确发行存档兼容策略维持。
-
-玩家持久化偏好覆盖作品默认值；系统减少动态只参与首次偏好选择。播放器通过 ApplyPreferences 同步验证后的运行偏好，PersistPreferences 才写存储，避免仅启动就覆盖玩家历史设置。测试工程只承载验证，标题页不再固定绘制该工程的宣传文案。
-
-## ADR-011：阅读视口与开发重载
-
-阅读偏移留在 `nir-presentation::ReadingState`，由入口使用同一个 TextEngine 测量、投影，渲染器只消费 TextRun 的滚动和裁切参数。翻页属于 UI 动作；入口以会话、交互实例和输入序号拒绝陈旧动作，并在同一 owner turn 内以最新模型重新计算阅读范围，避免连续 Advance 误跳过新揭示长文。核心逻辑快照不加入像素偏移。
-
-`novelc dev` 在候选目录执行正式锁定构建，验证对象闭包后最后替换发行通道。浏览器只在候选成功且身份改变时完整重载；失败保留旧会话。此处选择明确的新游戏入口语义，安全热更新及存档迁移继续留待独立设计与验证。
-
-## 原生字体流水线
-
-字体派生由 `nir-compiler` 完成，HarfBuzz 静态链接到 `novelc`，不进入 Core、Player 或 WASM。编译器直接嵌入 UI 的 Fluent 源数据用于字符覆盖，不依赖呈现库或 GPU。`assets.font` 选择静态 face、subset/full 和预留字符；完整母版属于作者输入，Program 只记录生成字体的对象身份。生成前补齐 Unicode 规范等价字符，生成时保留 OpenType 布局闭包，生成后检查覆盖。
-
-内容缓存封装校验和并原子写入 `.nir/cache/fonts`；缓存状态不进入 Program/Release 身份。许可文本自动作为发行通知收集，来源和编译报告留在作者侧。现已实现简中/英文 UI 与正文的有序 FontPlan，以及共享字体字集去重；这仍是字体专用流水线，不代表 NIR-0004 的通用 Artifact DAG、跨项目缓存、章节增量字体或其他文字系统认证已实现。细节见[作者字体说明](AUTHOR-FONTS.md)与[语言/字体计划](LOCALE-FONTS.md)。
-
-## 文本修订边界
-
-作者文本整数版本与 checked-in revisions.json 由 nir-compiler 校验；更新和人工复核只在 CLI 发生。研发阶段在 v1 上破坏性迭代，运行 Program/Executable 保持版本 1，包含生成的 contract_digest；nir-format 提供平台无关的契约摘要编码及 span 契约检查，Core 独立验证它们。哈希仅依赖 SHA-256/序列化，不引入文件系统、编译器或宿主。
-
-Snapshot 保持版本 1，但使用新结构，冻结对白/历史的源、语义、契约身份，Profile 已读键按 MeaningRevision。来源路径、人工确认摘要和修订事务日志不进入运行包。精确发行兼容仍然成立；源工程迁移不等于存档迁移。详见 [文本修订](TEXT-REVISIONS.md)。
-
-## ADR-015：发行隔离与双渲染后端
-
-release manifest v1 记录 profile 和固定启动文件摘要；根入口选择频道后进入固定发行目录。stage 不切频道，promote/rollback 使用本地串行锁、预期发行校验和原子指针替换。发行验证直接读取本地或 HTTP(S) 上的实际文件。
-
-存档按游戏、profile、发行和槽位隔离，历史续玩打开对应固定发行；偏好/Profile 按游戏及环境共享。
-
-标准 WASM 同时包含 WebGPU/WebGL2；宿主探测并完成启动回退，已绑定的画布须替换后才能改变后端。运行中设备恢复保持后端，恢复纹理和转场而不重放剧情。详细流程见 [M4](M4-RELEASE.md)。
+- **Persistent Scene Graph**: Scripts mutate persistent named layers (`bg`, `aki`, `layer_0`, ...) and commit transitions with `StageCommit`. This eliminates state explosion and provides a direct 1:1 target for LiveMaker, KAG3, Ren'Py, and custom scripts.
+- **Exact Dirty Gating**: Frames are re-projected and rendered strictly when VM state, animations, hover state, or newly decoded assets mark `Runtime::dirty` (idle CPU/GPU usage drops to ~0%).
+- **Single `.nirpak` Binary Container**: Header (zlib-compressed `NirProgram`) + CRC32 + 64-byte aligned raw asset blobs, enabling zero-copy `mmap` slicing on native, direct `AssetManager` reads on Android, and single-request streaming fetch on Web.
+- **Playable-First Multi-Engine Import**: Importers emit readable `.nirs` + `assets/` projects and record `Exact` / `Adapted` / `Fallback` diagnostics in `conversion_report.json` (`--strict` fails on any `Fallback`).

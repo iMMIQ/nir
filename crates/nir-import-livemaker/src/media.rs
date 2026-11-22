@@ -1,4 +1,5 @@
 //! Offline, bounded GAL and audio conversion. No external image/audio process.
+#![allow(dead_code)]
 use anyhow::{bail, ensure, Context, Result};
 use image::{ImageEncoder, RgbaImage};
 use std::io::{Cursor, Read};

@@ -1,23 +1,11 @@
-project_format = 1
 [game]
 id = "org.nir.rain-letters"
-slug = "rain-letters"
 title = "雨后书简 · Rain Letters"
-version = "0.1.0"
-source_locale = "zh-Hans"
-title_scene = "station"
-[engine]
-api = "nir-player/0.1"
-capability_profile = "web-v1"
-runtime_preset = "web-standard"
-[stage]
-width = 1280
-height = 720
-[inputs]
-modules = ["content/ch01/module.toml"]
-asset_catalogs = ["assets/catalog.toml"]
-theme = "themes/rain/theme.toml"
-player = "config/player.toml"
-locales = "config/locales.toml"
-scenarios = ["tests/scenarios/walk.toml", "tests/scenarios/stay.toml"]
-notices = ["credits/README.md", "credits/FONT-LICENSE.txt", "assets/fonts/ABeeZee-OFL.txt", "assets/fonts/ABeeZee-SOURCE.md", "assets/fonts/Noto-OFL.txt"]
+version = "0.2.0"
+locale = "zh-Hans"
+stage = [1280, 720]
+save_slots = 12
+default_reveal_ms = 26
+title_bg = "source/station"
+title_bgm = "source/bgm"
+font = "source/reader"

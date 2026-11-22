@@ -6,15 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-nir-compiler.workspace = true
+nir-ir.workspace = true
+nir-build.workspace = true
+nir-import-core.workspace = true
 nir-import-livemaker.workspace = true
-nir-content.workspace = true
-nir-format.workspace = true
-clap.workspace = true
+nir-import-krkr.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-flate2.workspace = true
-tiny_http = "0.12"
-uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+tiny_http.workspace = true

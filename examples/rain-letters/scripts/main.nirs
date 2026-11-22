@@ -1,0 +1,42 @@
+# 雨后书简 · Rain Letters — NIR v2 Zero-Boilerplate Showcase
+character aki "秋 · Aki" color=#7ec8f8
+var walked = false
+var bells_heard = 0
+
+label start:
+bgm "source/bgm" fade=600 vol=0.75
+bg "source/station" with dissolve 450
+"细雨停歇后的小站，铁轨上还留着晚霞的倒影。"
+show aki "source/aki" at center with dissolve 300
+aki [voice=source/voice]: "你终于来了。{w=0.3}列车还要再等一会儿，趁雨刚停，要一起走走吗？"
+
+menu:
+  - "沿着河岸走走" -> route_walk
+  - "留在站台听铃声" -> route_stay
+
+label route_walk:
+$ walked = true
+bg "source/river" with dissolve 500
+show aki "source/aki" at right with dissolve 250
+tween aki x 640 500 ease_out
+aki: "河风真凉爽。{b}把这封信带给明天的自己吧。{/b}"
+sfx "source/bell" vol=0.8
+$ bells_heard += 1
+unlock "cg:river_dusk"
+jump epilogue
+
+label route_stay:
+sfx "source/bell" vol=0.9
+$ bells_heard += 1
+shake bg amp=6,4 ms=300
+aki: "站台的铃声响了——{ruby=雨后|あめあがり}的空气里总带着一点离别的味道。"
+jump epilogue
+
+label epilogue:
+if walked:
+  "你们把书简折好放进了风衣口袋（共听见 {bells_heard} 次铃声）。"
+else:
+  "远处的列车灯光渐近，信笺安静地留在长椅上（共听见 {bells_heard} 次铃声）。"
+endif
+stop_bgm 600
+end_game good

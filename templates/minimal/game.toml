@@ -1,21 +1,7 @@
-project_format = 1
 [game]
 id = "org.nir.template.minimal"
-slug = "my-story"
 title = "新的故事 · My Story"
-version = "0.1.0"
-source_locale = "zh-Hans"
-[engine]
-api = "nir-player/0.1"
-capability_profile = "web-v1"
-[stage]
-width = 1280
-height = 720
-[inputs]
-modules = ["content/main/module.toml"]
-asset_catalogs = ["assets/catalog.toml"]
-theme = "theme/theme.toml"
-player = "config/player.toml"
-locales = "config/locales.toml"
-scenarios = ["tests/garden.toml", "tests/home.toml"]
-notices = ["NOTICE.md", "assets/fonts/SOURCE.md"]
+version = "0.2.0"
+locale = "zh-Hans"
+stage = [1280, 720]
+font = "fonts/NotoSansCJKsc-Regular"

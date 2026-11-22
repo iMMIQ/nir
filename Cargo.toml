@@ -2,19 +2,25 @@
 resolver = "2"
 exclude = ["vendor/wgpu", "vendor/tiny_http", "vendor/hb-subset"]
 members = [
-    "crates/*",
-    "apps/player-web",
-    "apps/player-desktop",
-    "apps/player-windows",
-    "apps/player-linux",
+    "crates/nir-ir",
+    "crates/nir-vm",
+    "crates/nir-ui",
+    "crates/nir-render",
+    "crates/nir-runtime",
+    "crates/nir-apk",
+    "crates/nir-build",
+    "crates/nir-import-core",
+    "crates/nir-import-livemaker",
+    "crates/nir-import-krkr",
+    "apps/player-native",
     "apps/player-android",
+    "apps/player-web",
     "tools/novelc",
     "xtask",
 ]
-default-members = ["tools/novelc", "crates/nir-core", "crates/nir-player"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "LGPL-3.0-or-later"
@@ -26,10 +32,14 @@ thiserror = "2"
 sha2 = "0.10"
 flate2 = "1"
 toml = "0.8"
+memmap2 = "0.9"
 rand_chacha = { version = "0.3", features = ["serde1"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = "0.6"
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
 unicode-segmentation = "=1.12.0"
+unicode-script = "0.5"
+unicode-normalization = "0.1"
 cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash"] }
 glyphon = "=0.9.0"
 wgpu = { version = "=25.0.2", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
@@ -38,31 +48,39 @@ wasm-bindgen-futures = "=0.4.50"
 js-sys = "=0.3.77"
 web-sys = "=0.3.77"
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
 fluent-bundle = "0.15"
 unic-langid = "0.9"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-schemars = "1"
 tempfile = "3"
 winit = "0.30"
 pollster = "0.4"
-rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav", "mp3", "vorbis"] }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "pcm", "wav", "ogg", "vorbis", "flac"] }
 rfd = { version = "0.15", default-features = false }
 android-activity = { version = "0.6", features = ["native-activity"] }
-nir-format = { path = "crates/nir-format" }
-nir-core = { path = "crates/nir-core" }
-nir-content = { path = "crates/nir-content" }
-nir-assets = { path = "crates/nir-assets" }
-nir-presentation = { path = "crates/nir-presentation" }
-nir-player = { path = "crates/nir-player" }
-nir-render-wgpu = { path = "crates/nir-render-wgpu" }
-nir-platform-web = { path = "crates/nir-platform-web" }
+encoding_rs = "0.8"
+roxmltree = "0.20"
+lewton = "0.10"
+ttf-parser = "0.25"
+hb-subset = { version = "0.3", features = ["bundled"] }
+webp = "0.3"
+mp3lame-encoder = "0.2"
+tiny_http = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+# Internal workspace crates
+nir-ir = { path = "crates/nir-ir" }
+nir-vm = { path = "crates/nir-vm" }
+nir-ui = { path = "crates/nir-ui" }
+nir-render = { path = "crates/nir-render" }
+nir-runtime = { path = "crates/nir-runtime" }
 nir-apk = { path = "crates/nir-apk" }
-nir-compiler = { path = "crates/nir-compiler" }
+nir-build = { path = "crates/nir-build" }
+nir-import-core = { path = "crates/nir-import-core" }
 nir-import-livemaker = { path = "crates/nir-import-livemaker" }
-nir-engine = { path = "crates/nir-engine" }
-player-desktop = { path = "apps/player-desktop" }
+nir-import-krkr = { path = "crates/nir-import-krkr" }
 
 [profile.release]
 opt-level = "s"

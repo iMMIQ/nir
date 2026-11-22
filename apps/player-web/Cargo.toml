@@ -9,18 +9,21 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-nir-engine.workspace = true
-nir-format.workspace = true
-nir-content.workspace = true
-nir-player.workspace = true
-nir-render-wgpu.workspace = true
-nir-platform-web.workspace = true
+nir-ir.workspace = true
+nir-vm.workspace = true
+nir-ui.workspace = true
+nir-render.workspace = true
+nir-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-serde_json.workspace = true
-console_error_panic_hook = "0.1"
-
-[dependencies.web-sys]
-workspace = true
-features = ["OffscreenCanvas"]
+web-sys = { workspace = true, features = [
+    "HtmlCanvasElement",
+    "ImageBitmap",
+    "Window",
+    "Document",
+] }

@@ -1,9 +1,41 @@
 //! Bounded LiveMaker binary reader. The byte layout is documented by
 //! https://pylivemaker.readthedocs.io/en/latest/livemaker.lsb.html .
 //! This reader does not execute expressions, load DLLs, or launch game binaries.
+#![allow(dead_code)]
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+fn decode_x87_f80(bytes: [u8; 10]) -> Option<f64> {
+    let mantissa = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let exp_sign = u16::from_le_bytes([bytes[8], bytes[9]]);
+    let sign = (exp_sign & 0x8000) != 0;
+    let exp = (exp_sign & 0x7FFF) as i32;
+    if exp == 0 && mantissa == 0 {
+        return Some(if sign { -0.0 } else { 0.0 });
+    }
+    if exp == 0x7FFF {
+        return None; // NaN or Infinity
+    }
+    let val = (mantissa as f64) * 2.0_f64.powi(exp - 16383 - 63);
+    if !val.is_finite() {
+        return None;
+    }
+    Some(if sign { -val } else { val })
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    let digest = h.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 pub(super) const NAMES: [&str; 64] = [
     "If",
@@ -138,7 +170,7 @@ impl<'a> Reader<'a> {
                 let value = match self.u8()? {
                     0 => Literal::Variable(self.string()?),
                     1 => Literal::Int(self.i32()?),
-                    2 => nir_format::Float80::from_le_bytes(self.bytes(10)?.try_into()?)
+                    2 => decode_x87_f80(self.bytes(10)?.try_into()?)
                         .map(Literal::Float)
                         .unwrap_or(Literal::Unsupported),
                     3 => Literal::Int(self.u8()?.into()),
@@ -216,7 +248,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<String> {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub(super) enum Literal {
     Int(i32),
-    Float(nir_format::Float80),
+    Float(f64),
     String(String),
     Variable(String),
     Unsupported,
@@ -228,20 +260,6 @@ pub(super) struct Expression {
     pub functions: BTreeMap<usize, u8>,
 }
 impl Expression {
-    /// Recognize a bounded pure sum through compiler temporaries, without
-    /// executing source code or accepting writes to source variables.
-    pub fn is_sum_of_variables(&self, left: &str, right: &str) -> bool {
-        use super::ui_expr::{normalize, Op, Term};
-        if left == right {
-            return false;
-        }
-        let Ok(Some(Term::Apply { op: Op::Add, args })) = normalize(self) else {
-            return false;
-        };
-        matches!(args.as_slice(), [Term::Read { name: a }, Term::Read { name: b }]
-            if (a == left && b == right) || (a == right && b == left))
-    }
-
     pub fn flag(&self) -> Result<bool> {
         match &self.literal {
             Some(Literal::Int(n)) => Ok(*n != 0),
@@ -576,7 +594,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Script> {
     }
     r.done()?;
     Ok(Script {
-        source_sha256: nir_content::digest(data),
+        source_sha256: sha256_hex(data),
         version,
         commands,
     })
@@ -841,7 +859,7 @@ pub(super) fn project_settings(data: &[u8]) -> Result<BTreeMap<String, Literal>>
         let name = r.string()?;
         let value = match kind {
             1 => Literal::Int(r.i32()?),
-            2 => nir_format::Float80::from_le_bytes(r.bytes(10)?.try_into()?)
+            2 => decode_x87_f80(r.bytes(10)?.try_into()?)
                 .map(Literal::Float)
                 .unwrap_or(Literal::Unsupported),
             3 => Literal::Int(r.u8()?.into()),
@@ -963,8 +981,8 @@ pub(super) mod tests {
         );
     }
     #[test]
-    fn extended_literals_preserve_all_ten_bytes_without_host_float_rounding() {
-        let bits = (0x3fffu128 << 64) | (1u128 << 63) | 1;
+    fn extended_literals_decode_x87_to_f64() {
+        let bits = (0x3fffu128 << 64) | (1u128 << 63); // exact 1.0 in x87 80-bit
         let mut bytes = vec![];
         u32b(&mut bytes, 1);
         bytes.push(1);
@@ -973,7 +991,7 @@ pub(super) mod tests {
         bytes.push(2);
         bytes.extend_from_slice(&bits.to_le_bytes()[..10]);
         let expression = Reader::new(&bytes).expr().unwrap();
-        assert!(matches!(expression.literal, Some(Literal::Float(v)) if v.bits() == bits));
+        assert!(matches!(expression.literal, Some(Literal::Float(v)) if (v - 1.0).abs() < 1e-12));
         assert!(Reader::new(&bytes[..bytes.len() - 1]).expr().is_err());
     }
 
@@ -1270,33 +1288,6 @@ pub(super) mod tests {
         let expression = Reader::new(&bytes).expr().unwrap();
         assert_eq!(expression.functions.get(&0), Some(&37));
         assert!(expression.literal.is_none());
-    }
-    #[test]
-    fn pure_sum_recognizes_compiler_temporaries_but_rejects_side_effects_and_other_units() {
-        let variable = |name: &str| Literal::Variable(name.into());
-        let mut expression = Expression {
-            literal: None,
-            functions: BTreeMap::new(),
-            operations: vec![
-                (
-                    2,
-                    "____0".into(),
-                    vec![variable("delay"), variable("remaining")],
-                ),
-                (1, "____arg".into(), vec![variable("____0")]),
-            ],
-        };
-        assert!(expression.is_sum_of_variables("delay", "remaining"));
-        expression.operations[0].0 = 4;
-        assert!(!expression.is_sum_of_variables("delay", "remaining"));
-        expression.operations[0].0 = 2;
-        expression.operations[0].1 = "source_variable".into();
-        assert!(!expression.is_sum_of_variables("delay", "remaining"));
-        expression.operations[0].1 = "____source_variable".into();
-        assert!(!expression.is_sum_of_variables("delay", "remaining"));
-        expression.operations[0].1 = "____0".into();
-        expression.functions.insert(0, 1);
-        assert!(!expression.is_sum_of_variables("delay", "remaining"));
     }
     pub fn settings_file(settings: &[(&str, i32)]) -> Vec<u8> {
         let mut bytes = vec![];

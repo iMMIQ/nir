@@ -1,0 +1,24 @@
+[package]
+name = "nir-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nir-ir.workspace = true
+nir-apk.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+image.workspace = true
+webp.workspace = true
+mp3lame-encoder.workspace = true
+symphonia.workspace = true
+ttf-parser.workspace = true
+hb-subset.workspace = true
+unicode-normalization.workspace = true
+tempfile.workspace = true

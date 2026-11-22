@@ -1,0 +1,19 @@
+[package]
+name = "nir-import-krkr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nir-import-core.workspace = true
+anyhow.workspace = true
+flate2.workspace = true
+image.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+nir-build.workspace = true
+nir-ir.workspace = true
+nir-vm.workspace = true
+tempfile.workspace = true

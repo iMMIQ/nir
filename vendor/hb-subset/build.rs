@@ -23,6 +23,9 @@ fn build_harfbuzz() -> Vec<PathBuf> {
         build.flag("/bigobj");
     } else {
         build.flag("-std=c++11");
+        if env::var("CARGO_CFG_UNIX").is_ok() {
+            build.define("HAVE_PTHREAD", None);
+        }
     }
     build
         .file("harfbuzz/src/harfbuzz-subset.cc")

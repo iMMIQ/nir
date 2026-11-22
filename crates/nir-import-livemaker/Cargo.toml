@@ -6,21 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-nir-format.workspace = true
-nir-core.workspace = true
-nir-content.workspace = true
-nir-compiler.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
+nir-import-core.workspace = true
 anyhow.workspace = true
-image = { workspace = true, features = ["jpeg"] }
+encoding_rs.workspace = true
 flate2.workspace = true
-tempfile.workspace = true
-encoding_rs = "0.8"
-roxmltree = "=0.20.0"
-lewton = "=0.10.2"
+image.workspace = true
+lewton.workspace = true
+roxmltree.workspace = true
+serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-nir-player.workspace = true
-nir-presentation.workspace = true
+nir-build.workspace = true
+nir-ir.workspace = true
+nir-vm.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
