@@ -216,10 +216,11 @@ class PakSource {
   }
 }
 
-// --- Lightweight IndexedDB persistence with single-key `slots_index` fast startup ---
+// --- Lightweight IndexedDB persistence with optional same-origin Cloud Sync ---
 class SaveStore {
-  constructor(dbName) {
+  constructor(dbName, saveApi = null) {
     this.dbName = dbName;
+    this.saveApi = saveApi ? saveApi.replace(/\/+$/, '') : null;
     this.db = null;
     this.slotIndex = {};
   }
@@ -231,6 +232,21 @@ class SaveStore {
       req.onerror = () => reject(req.error);
     });
   }
+  _remotePut(key, val, keepalive = false) {
+    if (!this.saveApi) return;
+    fetch(`${this.saveApi}/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: val,
+      keepalive,
+    }).catch(() => {});
+  }
+  _remoteDel(key) {
+    if (!this.saveApi) return;
+    fetch(`${this.saveApi}/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    }).catch(() => {});
+  }
   async get(key) {
     if (!this.db) return null;
     return new Promise((resolve) => {
@@ -240,7 +256,8 @@ class SaveStore {
       req.onerror = () => resolve(null);
     });
   }
-  async set(key, val) {
+  async set(key, val, { remote = true, keepalive = false } = {}) {
+    if (remote) this._remotePut(key, val, keepalive);
     if (!this.db) return;
     await new Promise((resolve) => {
       const tx = this.db.transaction('kv', 'readwrite');
@@ -249,7 +266,8 @@ class SaveStore {
       tx.onerror = () => resolve();
     });
   }
-  async del(key) {
+  async del(key, { remote = true } = {}) {
+    if (remote) this._remoteDel(key);
     if (!this.db) return;
     await new Promise((resolve) => {
       const tx = this.db.transaction('kv', 'readwrite');
@@ -268,38 +286,67 @@ class SaveStore {
         saved_at_unix: snap.saved_at_unix ?? 0,
         summary: snap.summary ?? '',
       };
-      await this.set('slots_index', JSON.stringify(this.slotIndex));
+      await this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
     } catch { /* ignore */ }
   }
   async deleteSlot(slot) {
     await this.del(`slot_${slot}`);
     delete this.slotIndex[slot];
-    await this.set('slots_index', JSON.stringify(this.slotIndex));
+    await this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
   }
-  /// Reads prefs, profile, and slot summaries in a SINGLE IndexedDB readonly transaction!
-  async loadInitialState(slotCount = 24) {
-    if (!this.db) {
-      return {
-        prefsJson: '{}',
-        profileJson: '{}',
-        slots: Array.from({ length: slotCount }, (_, slot) => ({
-          slot, exists: false, saved_at_unix: 0, summary: '',
-        })),
-      };
+  async _fetchRemoteBundle() {
+    if (!this.saveApi) return null;
+    try {
+      const res = await fetch(`${this.saveApi}/bundle`, { cache: 'no-store' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
     }
-    const { prefsRaw, profileRaw, indexRaw } = await new Promise((resolve) => {
-      const tx = this.db.transaction('kv', 'readonly');
-      const os = tx.objectStore('kv');
-      const rPrefs = os.get('prefs');
-      const rProfile = os.get('profile');
-      const rIdx = os.get('slots_index');
-      tx.oncomplete = () => resolve({
-        prefsRaw: rPrefs.result ?? null,
-        profileRaw: rProfile.result ?? null,
-        indexRaw: rIdx.result ?? null,
-      });
-      tx.onerror = () => resolve({ prefsRaw: null, profileRaw: null, indexRaw: null });
-    });
+  }
+  static _mergeProfile(localRaw, remoteRaw) {
+    if (!remoteRaw) return localRaw;
+    if (!localRaw) return remoteRaw;
+    try {
+      const a = JSON.parse(localRaw) || {};
+      const b = JSON.parse(remoteRaw) || {};
+      const merged = { ...b, ...a };
+      if (Array.isArray(a.read_texts) || Array.isArray(b.read_texts)) {
+        merged.read_texts = Array.from(new Set([...(b.read_texts || []), ...(a.read_texts || [])]));
+      }
+      if (Array.isArray(a.flags) || Array.isArray(b.flags)) {
+        merged.flags = Array.from(new Set([...(b.flags || []), ...(a.flags || [])]));
+      }
+      if (a.vars || b.vars) {
+        merged.vars = { ...(b.vars || {}), ...(a.vars || {}) };
+      }
+      return JSON.stringify(merged);
+    } catch {
+      return localRaw;
+    }
+  }
+  /// Reads prefs, profile, and slot summaries in a SINGLE IndexedDB readonly transaction,
+  /// optionally reconciling with same-origin cloud saves (`saveApi`)!
+  async loadInitialState(slotCount = 24) {
+    const remotePromise = this._fetchRemoteBundle();
+    let prefsRaw = null;
+    let profileRaw = null;
+    let indexRaw = null;
+    if (this.db) {
+      ({ prefsRaw, profileRaw, indexRaw } = await new Promise((resolve) => {
+        const tx = this.db.transaction('kv', 'readonly');
+        const os = tx.objectStore('kv');
+        const rPrefs = os.get('prefs');
+        const rProfile = os.get('profile');
+        const rIdx = os.get('slots_index');
+        tx.oncomplete = () => resolve({
+          prefsRaw: rPrefs.result ?? null,
+          profileRaw: rProfile.result ?? null,
+          indexRaw: rIdx.result ?? null,
+        });
+        tx.onerror = () => resolve({ prefsRaw: null, profileRaw: null, indexRaw: null });
+      }));
+    }
 
     if (indexRaw) {
       try {
@@ -307,7 +354,7 @@ class SaveStore {
       } catch {
         this.slotIndex = {};
       }
-    } else {
+    } else if (this.db) {
       // One-time migration from legacy per-slot keys using a single readonly transaction!
       const legacy = await new Promise((resolve) => {
         const tx = this.db.transaction('kv', 'readonly');
@@ -334,7 +381,48 @@ class SaveStore {
         }
       }
       if (Object.keys(this.slotIndex).length > 0) {
-        this.set('slots_index', JSON.stringify(this.slotIndex));
+        this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
+      }
+    }
+
+    const remote = await remotePromise;
+    if (remote && typeof remote === 'object') {
+      if (!prefsRaw && typeof remote.prefs === 'string') {
+        prefsRaw = remote.prefs;
+        await this.set('prefs', prefsRaw, { remote: false });
+      }
+      if (typeof remote.profile === 'string') {
+        const mergedProfile = SaveStore._mergeProfile(profileRaw, remote.profile);
+        if (mergedProfile && mergedProfile !== profileRaw) {
+          profileRaw = mergedProfile;
+          await this.set('profile', profileRaw, { remote: false });
+        }
+      }
+      if (remote.slots && typeof remote.slots === 'object') {
+        let idxChanged = false;
+        for (const [key, raw] of Object.entries(remote.slots)) {
+          const m = /^slot_(\d+)$/.exec(key);
+          if (!m || typeof raw !== 'string') continue;
+          const slot = Number(m[1]);
+          try {
+            const rSnap = JSON.parse(raw);
+            const rTs = Number(rSnap.saved_at_unix ?? 0);
+            const lTs = Number(this.slotIndex[slot]?.saved_at_unix ?? -1);
+            if (!this.slotIndex[slot]?.exists || rTs > lTs) {
+              await this.set(`slot_${slot}`, raw, { remote: false });
+              this.slotIndex[slot] = {
+                slot,
+                exists: true,
+                saved_at_unix: rTs,
+                summary: rSnap.summary ?? '',
+              };
+              idxChanged = true;
+            }
+          } catch { /* ignore corrupt remote slot */ }
+        }
+        if (idxChanged) {
+          await this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
+        }
       }
     }
 
@@ -516,18 +604,34 @@ class WebAudioMixer {
 
 async function main() {
   setProgress(5, 'Initializing NIR Engine…');
-  let pak = new PakSource('./game.nirpak');
-  const wasmUrl = new URL('./player_web.js', import.meta.url).href;
-  const store = new SaveStore('nir_saves_v2');
+  if (typeof globalThis.WebAssembly === 'undefined') {
+    throw new ReferenceError('WebAssembly is not defined');
+  }
+  const cfg = globalThis.__NIR_CONFIG__ || {};
+  const qs = new URLSearchParams(location.search);
+  const pakUrl = cfg.pakUrl || qs.get('pak') || qs.get('file') || './game.nirpak';
+  const wasmJsUrl = cfg.wasmJsUrl
+    ? new URL(cfg.wasmJsUrl, location.href).href
+    : new URL('./player_web.js', import.meta.url).href;
+  const wasmBinUrl = cfg.wasmUrl ? new URL(cfg.wasmUrl, location.href).href : null;
+  const gameKey = cfg.gameId || qs.get('game') || null;
+  const saveApi = cfg.saveApi || qs.get('save_api') || null;
+
+  let pak = new PakSource(pakUrl);
+  const store = new SaveStore(gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2', saveApi);
 
   const [{ default: initWasm, WebEngine }, headerBytes, initialSaves] = await Promise.all([
-    import(/* @vite-ignore */ wasmUrl),
+    import(/* @vite-ignore */ wasmJsUrl),
     pak.open(),
     store.open().then(() => store.loadInitialState(24)).catch(() => ({
       prefsJson: '{}', profileJson: '{}', slots: [],
     })),
   ]);
-  await initWasm();
+  if (wasmBinUrl) {
+    await initWasm({ module_or_path: wasmBinUrl });
+  } else {
+    await initWasm();
+  }
 
   setProgress(92, 'Starting GPU renderer…');
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -905,7 +1009,7 @@ async function main() {
         store.deleteSlot(cmd.slot);
         break;
       case 'save_profile':
-        store.set('profile', cmd.profile_json);
+        store.set('profile', cmd.profile_json, { keepalive: true });
         break;
       case 'save_preferences':
         audio.applyPreferences(cmd.prefs);
@@ -916,6 +1020,14 @@ async function main() {
 
   setProgress(100, 'Ready');
   loaderEl?.classList.add('hidden');
+  globalThis.__nir = {
+    ready: true,
+    title: engine.title(),
+    gameId: engine.game_id(),
+    backend: engine.backend_info(),
+    pakMode: pak.mode,
+    error: null,
+  };
 
   const frame = (ts) => {
     rafId = 0;
@@ -948,6 +1060,21 @@ async function main() {
 }
 
 main().catch((err) => {
-  setProgress(0, `Error: ${err?.message ?? err}`);
+  const msg = String(err?.message ?? err);
+  setProgress(0, `Error: ${msg}`);
+  if (loaderEl) {
+    loaderEl.classList.remove('hidden');
+    loaderEl.dataset.error = 'true';
+    const diagUrl = globalThis.__NIR_CONFIG__?.diagnosticsUrl;
+    if (diagUrl && !loaderEl.querySelector('.loader-diag')) {
+      const link = document.createElement('a');
+      link.className = 'loader-diag';
+      link.href = diagUrl;
+      link.textContent = '打开浏览器环境检测页 →';
+      link.style.cssText = 'display:inline-block;margin-top:12px;color:#88c9ff;font-size:13px;';
+      loaderEl.querySelector('.loader-card')?.appendChild(link);
+    }
+  }
+  globalThis.__nir = { ready: false, error: msg };
   console.error(err);
 });
