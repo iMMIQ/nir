@@ -24,8 +24,8 @@ allowed = {
     # Build, packaging & multi-engine converter toolchain
     "nir-apk": set(),
     "nir-build": {"nir-ir", "nir-apk"},
-    "nir-import-core": set(),
-    "nir-import-livemaker": {"nir-import-core"},
+    "nir-import-core": {"nir-ir"},
+    "nir-import-livemaker": {"nir-ir", "nir-import-core"},
     "nir-import-krkr": {"nir-import-core"},
     "novelc": {
         "nir-ir",

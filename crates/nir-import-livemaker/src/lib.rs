@@ -7,13 +7,18 @@
 //! Zero LiveMaker hacks leak into the NIR VM or runtime.
 
 mod cinema;
+mod events;
+mod expr;
+mod layout;
+mod livenovel;
+mod lpm;
 mod lsb;
 mod media;
 
 use anyhow::{Context, Result};
 use nir_import_core::{
-    sanitize_ident, ArchiveSource, CompositeVfs, ConversionReport, DirArchive, EngineImporter,
-    EngineProbe, ImportOptions, VnChoice, VnConst, VnProject, VnStmt,
+    sanitize_ident, ArchiveSource, CompositeVfs, ConversionReport, DirArchive, DirectImport,
+    EngineImporter, EngineProbe, ImportOptions, VnChoice, VnConst, VnProject, VnStmt,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -173,6 +178,14 @@ impl EngineImporter for LiveMakerImporter {
         report.assets_converted = project.assets.len();
 
         Ok((project, report))
+    }
+
+    fn import_direct(
+        &self,
+        source: &Path,
+        opts: &ImportOptions,
+    ) -> Option<Result<(DirectImport, ConversionReport)>> {
+        Some(livenovel::import_direct(source, opts))
     }
 }
 

@@ -569,6 +569,20 @@ pub(super) fn png(image: &RgbaImage) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Fast-compression PNG for intermediate handoff into `nir-build`'s WebP/trim optimizer.
+pub(super) fn png_fast(image: &RgbaImage) -> Result<Vec<u8>> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let mut bytes = Vec::with_capacity((image.width() * image.height()) as usize);
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )?;
+    Ok(bytes)
+}
+
 #[allow(clippy::chunks_exact_to_as_chunks)] // Rust 1.85 MSRV
 pub(super) fn audio(data: &[u8], gain: f32) -> Result<Vec<u8>> {
     ensure!(

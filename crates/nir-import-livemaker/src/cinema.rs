@@ -180,9 +180,10 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Cinema> {
     // TFilmManager's shared loader (14cf5c) distinguishes these prefixes,
     // then passes the version to the same frame-list readers.
     let version = match r.take(13)? {
+        b"LiveCinema113" => 113,
         b"LiveCinema112" => 112,
         b"LiveMotion111" => 111,
-        _ => bail!("E_IMPORT_CINEMA_VERSION: expected LiveCinema112 or LiveMotion111"),
+        _ => bail!("E_IMPORT_CINEMA_VERSION: expected LiveCinema112/113 or LiveMotion111"),
     };
     let size = [r.positive(8192)?, r.positive(8192)?];
     let background = r.int()?;
@@ -218,6 +219,9 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Cinema> {
         let period = period as u32;
         let parameter = r.int()?;
         let flags = [r.flag()?, r.flag()?, r.flag()?];
+        if version >= 113 {
+            let _extra_113 = r.int()?;
+        }
         let start = if let Some(previous) = previous {
             clips[previous]
                 .start()
@@ -397,6 +401,28 @@ mod tests {
             motion[..13].copy_from_slice(header);
             assert!(parse(&motion).is_err());
         }
+    }
+    #[test]
+    fn cinema113_reads_extra_per_clip_field_cleanly() {
+        let base = fixture();
+        // Rebuild fixture as LiveCinema113 with 4 extra bytes after flags in each of the 2 clips.
+        let mut out = b"LiveCinema113".to_vec();
+        out.extend_from_slice(&base[13..42]);
+        // Each clip in fixture starts with 1 (kind) + 24 (6 ints) + 3 (flags) = 28 bytes before image body.
+        let clip0_start = 42;
+        let clip0_len = 28 + 135 + 4 + 9;
+        let clip1_start = clip0_start + clip0_len;
+        out.extend_from_slice(&base[clip0_start..clip0_start + 28]);
+        integer(&mut out, 0);
+        out.extend_from_slice(&base[clip0_start + 28..clip1_start]);
+        out.extend_from_slice(&base[clip1_start..clip1_start + 28]);
+        integer(&mut out, 0);
+        out.extend_from_slice(&base[clip1_start + 28..]);
+
+        let film = parse(&out).unwrap();
+        assert_eq!(film.version, 113);
+        assert_eq!(film.clips.len(), 2);
+        assert_eq!(film.clips[1].start(), 90);
     }
     #[test]
     fn image_stream_keeps_transforms_and_uses_predecessor_end() {

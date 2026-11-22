@@ -1638,6 +1638,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
+ "nir-ir",
  "serde",
  "serde_json",
 ]

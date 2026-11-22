@@ -3,12 +3,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerText {
+    pub text: String,
+    pub font_size: f32,
+    pub color: [f32; 4],
+    pub align: TextAlign,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayerState {
     pub id: LayerId,
     pub parent: Option<LayerId>,
     pub asset: Option<AssetId>,
     pub transform: Transform2D,
     pub shake_offset: [f32; 2],
+    #[serde(default)]
+    pub text: Option<LayerText>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveTimeline {
+    pub timeline: TimelineId,
+    pub layer: LayerId,
+    pub elapsed_us: u64,
+    pub scrap_on_end: bool,
+    #[serde(default)]
+    pub triggered_sounds: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,19 +203,39 @@ pub struct OfferedChoice {
     pub label: String,
     pub image: Option<AssetId>,
     pub hover_image: Option<AssetId>,
+    #[serde(default)]
+    pub disabled_image: Option<AssetId>,
+    #[serde(default)]
+    pub preview: Option<(AssetId, [f32; 2])>,
     pub rect: Option<[f32; 4]>,
     pub target_pc: u32,
     pub value: Option<Value>,
+    #[serde(default)]
+    pub choice_index: Option<Value>,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceState {
     pub items: Vec<OfferedChoice>,
     pub result_var: Option<VarId>,
+    #[serde(default)]
+    pub index_var: Option<VarId>,
     pub cancel_pc: Option<u32>,
     pub timeout_us: Option<u64>,
     pub elapsed_us: u64,
     pub default_idx: Option<u16>,
+    #[serde(default)]
+    pub background: Option<AssetId>,
+    #[serde(default)]
+    pub menu_size: Option<[u32; 2]>,
+    #[serde(default)]
+    pub hover_se: Option<AssetId>,
+    #[serde(default)]
+    pub click_se: Option<AssetId>,
+    #[serde(default)]
+    pub fade_out_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,6 +275,8 @@ pub enum WaitReason {
     Tween,
     Shake,
     Video { asset: AssetId, skippable: bool },
+    Timeline { layer: LayerId, skippable: bool },
+    Modal(ModalKind),
 }
 
 /// Typed host commands emitted by `Vm::step` / `Vm::tick` — zero JSON serialization!
@@ -267,6 +309,7 @@ pub enum VmIntent {
         skippable: bool,
     },
     StopVideo,
+    OpenModal(ModalKind),
     ProfileChanged,
     Checkpoint,
 }
@@ -286,6 +329,12 @@ pub struct SaveSnapshot {
     pub frames: Vec<CallFrame>,
     pub layers: Vec<LayerState>,
     pub dialogue_visible: bool,
+    #[serde(default)]
+    pub dialogue_style: u16,
+    #[serde(default)]
+    pub dialogue_portrait: Option<AssetId>,
+    #[serde(default)]
+    pub timelines: Vec<ActiveTimeline>,
     pub dialogue: Option<DialogueState>,
     pub choice: Option<ChoiceState>,
     pub wait: WaitReason,
@@ -309,6 +358,9 @@ pub struct RollbackCheckpoint {
     pub frames: Vec<CallFrame>,
     pub layers: Vec<LayerState>,
     pub dialogue_visible: bool,
+    pub dialogue_style: u16,
+    pub dialogue_portrait: Option<AssetId>,
+    pub timelines: Vec<ActiveTimeline>,
     pub dialogue: Option<DialogueState>,
     pub choice: Option<ChoiceState>,
     pub wait: WaitReason,

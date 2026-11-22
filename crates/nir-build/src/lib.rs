@@ -14,9 +14,10 @@ use anyhow::{bail, Context, Result};
 use nir_ir::*;
 use optimize::{detect_asset_kind_and_codec, optimize_audio, optimize_image, subset_font, OptimizeConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -105,6 +106,14 @@ pub struct BuiltBundle {
     pub media_blobs: Vec<Vec<u8>>,
     pub nirpak: Vec<u8>,
     pub summary: BuildSummary,
+}
+
+/// Asset input for `build_direct_program`, decoupled from filesystem layout or importer crates.
+pub struct DirectAssetSource {
+    pub name: String,
+    pub kind: AssetKind,
+    pub codec: MediaCodec,
+    pub loader: Arc<dyn Fn() -> Result<Vec<u8>> + Send + Sync>,
 }
 
 struct DiscoveredAsset {
@@ -486,7 +495,7 @@ fn compile_project_with_compression(
     let mut trimmed_sprites = 0usize;
     let mut saved_bytes = 0i64;
 
-    for (new_idx, (&orig_idx, res)) in kept_indices.iter().zip(results.into_iter()).enumerate() {
+    for (new_idx, (&orig_idx, res)) in kept_indices.iter().zip(results).enumerate() {
         let src = &discovered[orig_idx];
         let out = res?;
         let name_str = StrId(strings.len() as u32);
@@ -540,6 +549,9 @@ fn compile_project_with_compression(
         texts: texts_by_locale,
         ui,
         assets: assets_meta,
+        asset_lookup: BTreeMap::new(),
+        timelines: Vec::new(),
+        menus: Vec::new(),
     };
 
     let blob_refs: Vec<&[u8]> = media_blobs.iter().map(Vec::as_slice).collect();
@@ -708,6 +720,526 @@ pub fn package_android(
     Ok(())
 }
 
+/// Optimizes, tree-shakes, remaps, and packs a direct-to-IR `NirProgram` + lazy raw assets
+/// into a production `.nirpak` bundle using the exact same parallel optimizer pipeline as `.nirs`.
+pub fn build_direct_program(
+    program: NirProgram,
+    raw_assets: Vec<DirectAssetSource>,
+    extra_keep: &BTreeSet<AssetId>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+) -> Result<BuiltBundle> {
+    build_direct_program_with_compression(
+        program,
+        raw_assets,
+        extra_keep,
+        cache_dir,
+        opt,
+        flate2::Compression::default(),
+    )
+}
+
+pub fn build_direct_program_with_compression(
+    mut program: NirProgram,
+    raw_assets: Vec<DirectAssetSource>,
+    extra_keep: &BTreeSet<AssetId>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+    compression: flate2::Compression,
+) -> Result<BuiltBundle> {
+    let total_scanned = raw_assets.len();
+
+    // 1. Collect all referenced AssetIds across ops, meta, ui, timelines, menus, and asset_lookup.
+    let mut used = collect_program_assets(&program);
+    for &id in extra_keep {
+        if (id.0 as usize) < total_scanned {
+            used.insert(id);
+        }
+    }
+    used.retain(|id| (id.0 as usize) < total_scanned);
+
+    // 2. Build dense remap table 0..N for kept assets.
+    let mut remap = BTreeMap::<AssetId, AssetId>::new();
+    let mut kept_indices = Vec::with_capacity(used.len());
+    for old_id in &used {
+        let new_id = AssetId(kept_indices.len() as u32);
+        remap.insert(*old_id, new_id);
+        kept_indices.push(old_id.0 as usize);
+    }
+
+    // 3. Remap every AssetId reference in the program.
+    remap_program_assets(&mut program, &remap);
+
+    // 4. Collect characters once if any font is kept and font subsetting is enabled.
+    let has_fonts = kept_indices
+        .iter()
+        .any(|&idx| raw_assets[idx].kind == AssetKind::Font);
+    let used_chars = if opt.enabled && opt.subset_fonts && has_fonts {
+        program.collect_all_chars()
+    } else {
+        BTreeSet::new()
+    };
+
+    // 5. Load & optimize kept assets in parallel across CPU cores!
+    struct DirectAssetOut {
+        bytes: Vec<u8>,
+        codec: MediaCodec,
+        width: u32,
+        height: u32,
+        trim: Option<SpriteTrim>,
+        duration_us: u64,
+        sample_rate: u32,
+        channels: u16,
+        loop_region: Option<AudioLoopRegion>,
+        saved_bytes: i64,
+        features: u32,
+        trimmed: bool,
+    }
+
+    let optimize_one = |orig_idx: usize| -> Result<DirectAssetOut> {
+        let src = &raw_assets[orig_idx];
+        let raw = (src.loader)()
+            .with_context(|| format!("loading direct asset `{}`", src.name))?;
+        let mut features = 0u32;
+        let mut trimmed = false;
+        let out = match src.kind {
+            AssetKind::Image => {
+                let res = optimize_image(&raw, src.codec, opt, cache_dir)?;
+                if res.codec == MediaCodec::Webp {
+                    features |= FEATURE_WEBP;
+                }
+                if res.trim.is_some() {
+                    features |= FEATURE_TRIMMED;
+                    trimmed = true;
+                }
+                DirectAssetOut {
+                    bytes: res.bytes,
+                    codec: res.codec,
+                    width: res.width,
+                    height: res.height,
+                    trim: res.trim,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: res.saved_bytes,
+                    features,
+                    trimmed,
+                }
+            }
+            AssetKind::Audio => {
+                let res = optimize_audio(&raw, src.codec, opt, cache_dir)?;
+                match res.codec {
+                    MediaCodec::Mp3 => features |= FEATURE_MP3,
+                    MediaCodec::Ogg => features |= FEATURE_OGG,
+                    _ => {}
+                }
+                DirectAssetOut {
+                    bytes: res.bytes,
+                    codec: res.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: res.duration_us,
+                    sample_rate: res.sample_rate,
+                    channels: res.channels,
+                    loop_region: res.loop_region,
+                    saved_bytes: res.saved_bytes,
+                    features,
+                    trimmed: false,
+                }
+            }
+            AssetKind::Font => {
+                let orig_len = raw.len() as i64;
+                let sub = subset_font(&raw, &used_chars, opt, cache_dir)?;
+                DirectAssetOut {
+                    bytes: sub.clone(),
+                    codec: src.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: orig_len - sub.len() as i64,
+                    features: 0,
+                    trimmed: false,
+                }
+            }
+            AssetKind::Video => {
+                features |= FEATURE_VIDEO;
+                DirectAssetOut {
+                    bytes: raw,
+                    codec: src.codec,
+                    width: 0,
+                    height: 0,
+                    trim: None,
+                    duration_us: 0,
+                    sample_rate: 0,
+                    channels: 0,
+                    loop_region: None,
+                    saved_bytes: 0,
+                    features,
+                    trimmed: false,
+                }
+            }
+            AssetKind::Raw => DirectAssetOut {
+                bytes: raw,
+                codec: src.codec,
+                width: 0,
+                height: 0,
+                trim: None,
+                duration_us: 0,
+                sample_rate: 0,
+                channels: 0,
+                loop_region: None,
+                saved_bytes: 0,
+                features: 0,
+                trimmed: false,
+            },
+        };
+        Ok(out)
+    };
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(kept_indices.len().max(1));
+
+    let results: Vec<Result<DirectAssetOut>> = if worker_count <= 1 || kept_indices.len() <= 1 {
+        kept_indices.iter().map(|&idx| optimize_one(idx)).collect()
+    } else {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let next_task = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<DirectAssetOut>>>> =
+            (0..kept_indices.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..worker_count {
+                s.spawn(|| loop {
+                    let i = next_task.fetch_add(1, Ordering::Relaxed);
+                    if i >= kept_indices.len() {
+                        break;
+                    }
+                    let res = optimize_one(kept_indices[i]);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap())
+            .collect()
+    };
+
+    let mut assets_meta = Vec::with_capacity(kept_indices.len());
+    let mut media_blobs = Vec::with_capacity(kept_indices.len());
+    let mut features = 0u32;
+    let mut trimmed_sprites = 0usize;
+    let mut saved_bytes = 0i64;
+
+    for (new_idx, (&orig_idx, res)) in kept_indices.iter().zip(results).enumerate() {
+        let src = &raw_assets[orig_idx];
+        let out = res?;
+        let name_str = StrId(program.strings.len() as u32);
+        program.strings.push(src.name.clone());
+        features |= out.features;
+        saved_bytes += out.saved_bytes;
+        if out.trimmed {
+            trimmed_sprites += 1;
+        }
+        assets_meta.push(AssetMeta {
+            id: AssetId(new_idx as u32),
+            name: name_str,
+            kind: src.kind,
+            codec: out.codec,
+            width: out.width,
+            height: out.height,
+            trim: out.trim,
+            duration_us: out.duration_us,
+            sample_rate: out.sample_rate,
+            channels: out.channels,
+            loop_region: out.loop_region,
+            offset: 0,
+            size: out.bytes.len() as u64,
+        });
+        media_blobs.push(out.bytes);
+    }
+    program.features = features;
+    program.assets = assets_meta;
+
+    let blob_refs: Vec<&[u8]> = media_blobs.iter().map(Vec::as_slice).collect();
+    let nirpak = encode_nirpak_with_compression(&program, &blob_refs, compression)?;
+    let text_count = program
+        .texts
+        .get(&program.meta.default_locale)
+        .map_or(0, Vec::len);
+
+    let summary = BuildSummary {
+        game_id: program.meta.game_id.clone(),
+        title: program.meta.title.clone(),
+        scripts: program.funcs.len(),
+        ops: program.ops.len(),
+        texts: text_count,
+        total_assets_scanned: total_scanned,
+        packed_assets: program.assets.len(),
+        pruned_assets: total_scanned.saturating_sub(program.assets.len()),
+        trimmed_sprites,
+        saved_bytes,
+        nirpak_bytes: nirpak.len(),
+    };
+
+    Ok(BuiltBundle {
+        program,
+        media_blobs,
+        nirpak,
+        summary,
+    })
+}
+
+fn collect_ui_node_assets(node: &UiNode, out: &mut BTreeSet<AssetId>) {
+    match &node.widget {
+        UiWidget::Container { children, .. } | UiWidget::Stack { children, .. } => {
+            for ch in children {
+                collect_ui_node_assets(ch, out);
+            }
+        }
+        UiWidget::Image { asset } => {
+            out.insert(*asset);
+        }
+        UiWidget::Button {
+            image, hover_image, ..
+        } => {
+            if let Some(a) = image {
+                out.insert(*a);
+            }
+            if let Some(a) = hover_image {
+                out.insert(*a);
+            }
+        }
+        UiWidget::Text { .. } => {}
+    }
+}
+
+fn remap_ui_node_assets(node: &mut UiNode, remap: &BTreeMap<AssetId, AssetId>) {
+    let m = |id: AssetId| remap.get(&id).copied().unwrap_or(id);
+    match &mut node.widget {
+        UiWidget::Container { children, .. } | UiWidget::Stack { children, .. } => {
+            for ch in children {
+                remap_ui_node_assets(ch, remap);
+            }
+        }
+        UiWidget::Image { asset } => *asset = m(*asset),
+        UiWidget::Button {
+            image, hover_image, ..
+        } => {
+            *image = image.map(m);
+            *hover_image = hover_image.map(m);
+        }
+        UiWidget::Text { .. } => {}
+    }
+}
+
+fn collect_program_assets(program: &NirProgram) -> BTreeSet<AssetId> {
+    let mut out = BTreeSet::new();
+    if let Some(a) = program.meta.title_bg {
+        out.insert(a);
+    }
+    if let Some(a) = program.meta.title_bgm {
+        out.insert(a);
+    }
+    for &f in program
+        .meta
+        .ui_fonts
+        .iter()
+        .chain(program.meta.text_fonts.iter())
+    {
+        out.insert(f);
+    }
+    if let Some(a) = program.ui.dialogue_bg {
+        out.insert(a);
+    }
+    if let Some(ts) = &program.ui.title_screen {
+        if let Some(a) = ts.background {
+            out.insert(a);
+        }
+        if let Some(a) = ts.bgm {
+            out.insert(a);
+        }
+        for n in &ts.nodes {
+            collect_ui_node_assets(n, &mut out);
+        }
+    }
+    for g in &program.ui.gallery {
+        if let Some(t) = g.thumb {
+            out.insert(t);
+        }
+        for &a in &g.cg_assets {
+            out.insert(a);
+        }
+    }
+    for st in &program.ui.dialogue_styles {
+        if let Some(a) = st.dialogue_bg {
+            out.insert(a);
+        }
+    }
+    for tl in &program.timelines {
+        for clip in &tl.clips {
+            match &clip.kind {
+                TimelineClipKind::Image { asset, .. } | TimelineClipKind::Sound { asset, .. } => {
+                    out.insert(*asset);
+                }
+                TimelineClipKind::Box { .. } => {}
+            }
+        }
+    }
+    for menu in &program.menus {
+        if let Some(bg) = menu.background {
+            out.insert(bg);
+        }
+        for item in &menu.items {
+            if let Some(a) = item.image {
+                out.insert(a);
+            }
+            if let Some(a) = item.hover_image {
+                out.insert(a);
+            }
+            if let Some(a) = item.disabled_image {
+                out.insert(a);
+            }
+            if let Some(a) = item.preview_image {
+                out.insert(a);
+            }
+        }
+    }
+    for &id in program.asset_lookup.values() {
+        out.insert(id);
+    }
+    for table in program.texts.values() {
+        for entry in table {
+            for span in &entry.spans {
+                if let RichSpan::InlineImage { asset, .. } = span {
+                    out.insert(*asset);
+                }
+            }
+        }
+    }
+    for op in &program.ops {
+        match op {
+            Op::LayerSet { asset: Some(a), .. } | Op::LayerAsset { asset: Some(a), .. } => {
+                out.insert(*a);
+            }
+            Op::StageCommit { transition, .. } | Op::TextWindow { transition, .. } => {
+                if let Some(m) = transition.mask_asset() {
+                    out.insert(m);
+                }
+            }
+            Op::Say { voice: Some(a), .. } | Op::SetDialoguePortrait(Some(a)) => {
+                out.insert(*a);
+            }
+            Op::Choice { items, .. } => {
+                for item in items {
+                    if let Some(a) = item.image {
+                        out.insert(a);
+                    }
+                    if let Some(a) = item.hover_image {
+                        out.insert(a);
+                    }
+                    if let Some(a) = item.disabled_image {
+                        out.insert(a);
+                    }
+                    if let Some((a, _)) = item.preview {
+                        out.insert(a);
+                    }
+                }
+            }
+            Op::ChoiceList { click_se: Some(a), .. } => {
+                out.insert(*a);
+            }
+            Op::ChoiceMenu {
+                hover_se, click_se, ..
+            } => {
+                if let Some(a) = hover_se {
+                    out.insert(*a);
+                }
+                if let Some(a) = click_se {
+                    out.insert(*a);
+                }
+            }
+            Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => {
+                out.insert(*asset);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn remap_program_assets(program: &mut NirProgram, remap: &BTreeMap<AssetId, AssetId>) {
+    let m = |id: AssetId| remap.get(&id).copied().unwrap_or(id);
+    remap_ops_assets(&mut program.ops, remap);
+    program.meta.title_bg = program.meta.title_bg.map(m);
+    program.meta.title_bgm = program.meta.title_bgm.map(m);
+    for id in &mut program.meta.ui_fonts {
+        *id = m(*id);
+    }
+    for id in &mut program.meta.text_fonts {
+        *id = m(*id);
+    }
+    program.ui.dialogue_bg = program.ui.dialogue_bg.map(m);
+    if let Some(ts) = &mut program.ui.title_screen {
+        ts.background = ts.background.map(m);
+        ts.bgm = ts.bgm.map(m);
+        for n in &mut ts.nodes {
+            remap_ui_node_assets(n, remap);
+        }
+    }
+    for g in &mut program.ui.gallery {
+        g.thumb = g.thumb.map(m);
+        for a in &mut g.cg_assets {
+            *a = m(*a);
+        }
+    }
+    for st in &mut program.ui.dialogue_styles {
+        st.dialogue_bg = st.dialogue_bg.map(m);
+    }
+    for tl in &mut program.timelines {
+        for clip in &mut tl.clips {
+            match &mut clip.kind {
+                TimelineClipKind::Image { asset, .. } | TimelineClipKind::Sound { asset, .. } => {
+                    *asset = m(*asset);
+                }
+                TimelineClipKind::Box { .. } => {}
+            }
+        }
+    }
+    for menu in &mut program.menus {
+        menu.background = menu.background.map(m);
+        for item in &mut menu.items {
+            item.image = item.image.map(m);
+            item.hover_image = item.hover_image.map(m);
+            item.disabled_image = item.disabled_image.map(m);
+            item.preview_image = item.preview_image.map(m);
+        }
+    }
+    program
+        .asset_lookup
+        .retain(|_, id| remap.contains_key(id));
+    for id in program.asset_lookup.values_mut() {
+        *id = m(*id);
+    }
+    for table in program.texts.values_mut() {
+        for entry in table {
+            for span in &mut entry.spans {
+                if let RichSpan::InlineImage { asset, .. } = span {
+                    *asset = m(*asset);
+                }
+            }
+        }
+    }
+}
+
 fn remap_ops_assets(ops: &mut [Op], remap: &BTreeMap<AssetId, AssetId>) {
     let m = |id: AssetId| remap.get(&id).copied().unwrap_or(id);
     for op in ops {
@@ -723,11 +1255,25 @@ fn remap_ops_assets(ops: &mut [Op], remap: &BTreeMap<AssetId, AssetId>) {
             Op::Say { voice, .. } => {
                 *voice = voice.map(m);
             }
+            Op::SetDialoguePortrait(asset) => {
+                *asset = asset.map(m);
+            }
             Op::Choice { items, .. } => {
                 for item in items {
                     item.image = item.image.map(m);
                     item.hover_image = item.hover_image.map(m);
+                    item.disabled_image = item.disabled_image.map(m);
+                    item.preview = item.preview.map(|(a, pos)| (m(a), pos));
                 }
+            }
+            Op::ChoiceList { click_se, .. } => {
+                *click_se = click_se.map(m);
+            }
+            Op::ChoiceMenu {
+                hover_se, click_se, ..
+            } => {
+                *hover_se = hover_se.map(m);
+                *click_se = click_se.map(m);
             }
             Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => {
                 *asset = m(*asset);
@@ -845,5 +1391,126 @@ label ending:
             .find(|a| fast_prog.str(a.name) == "bg/sky")
             .unwrap();
         assert_eq!((fast_sky.width, fast_sky.height), (64, 64));
+    }
+
+    #[test]
+    fn build_direct_program_tree_shakes_remaps_and_optimizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_png = |rgba: [u8; 4], border_alpha: bool| -> Vec<u8> {
+            let mut img = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+            let range = if border_alpha { 20..44 } else { 0..64 };
+            for y in range.clone() {
+                for x in range.clone() {
+                    img.put_pixel(x, y, image::Rgba(rgba));
+                }
+            }
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+
+        let unused_png = make_png([10, 10, 10, 255], false);
+        let sprite_png = make_png([255, 80, 40, 255], true);
+        let dyn_png = make_png([40, 180, 255, 255], false);
+
+        let raw_assets = vec![
+            DirectAssetSource {
+                name: "unused".into(),
+                kind: AssetKind::Image,
+                codec: MediaCodec::Png,
+                loader: Arc::new(move || Ok(unused_png.clone())),
+            },
+            DirectAssetSource {
+                name: "sprite".into(),
+                kind: AssetKind::Image,
+                codec: MediaCodec::Png,
+                loader: Arc::new(move || Ok(sprite_png.clone())),
+            },
+            DirectAssetSource {
+                name: "dyn_bg".into(),
+                kind: AssetKind::Image,
+                codec: MediaCodec::Png,
+                loader: Arc::new(move || Ok(dyn_png.clone())),
+            },
+        ];
+
+        let mut lookup = BTreeMap::new();
+        lookup.insert("gfx/dyn_bg.png".into(), AssetId(2));
+
+        let prog = NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.direct".into(),
+                title: "Direct".into(),
+                version: "1.0".into(),
+                stage_width: 1280,
+                stage_height: 720,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into(), "btn".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![Op::LayerSet {
+                layer: LayerId(0),
+                parent: None,
+                asset: Some(AssetId(1)),
+                transform: Box::new(Transform2D::default()),
+            }],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: lookup,
+            timelines: vec![],
+            menus: vec![MenuTemplate {
+                size: [1280, 720],
+                background: None,
+                items: vec![MenuItemDef {
+                    name: StrId(1),
+                    label: StrId(1),
+                    rect: [0.0, 0.0, 64.0, 64.0],
+                    image: Some(AssetId(1)),
+                    hover_image: None,
+                    disabled_image: None,
+                    preview_image: None,
+                    preview_pos: [0.0, 0.0],
+                }],
+            }],
+        };
+
+        let built = build_direct_program(
+            prog,
+            raw_assets,
+            &BTreeSet::new(),
+            &dir.path().join("cache"),
+            &OptimizeConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(built.summary.total_assets_scanned, 3);
+        assert_eq!(built.summary.packed_assets, 2);
+        assert_eq!(built.summary.pruned_assets, 1);
+        assert_eq!(built.summary.trimmed_sprites, 1);
+
+        let (decoded, _) = decode_nirpak_header(&built.nirpak).unwrap();
+        // AssetId(1) -> remapped to AssetId(0); AssetId(2) -> remapped to AssetId(1)
+        assert_eq!(decoded.asset_lookup.get("gfx/dyn_bg.png"), Some(&AssetId(1)));
+        assert_eq!(decoded.menus[0].items[0].image, Some(AssetId(0)));
+        assert!(matches!(decoded.ops[0], Op::LayerSet { asset: Some(AssetId(0)), .. }));
     }
 }

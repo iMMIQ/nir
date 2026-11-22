@@ -1,10 +1,54 @@
 use crate::{AssetId, FuncId, StrId};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DialogueStyleDef {
+    pub name: StrId,
+    pub dialogue_bg: Option<AssetId>,
+    pub dialogue_rect: Option<[f32; 4]>,
+    pub text_rect: Option<[f32; 4]>,
+    pub font_size: Option<f32>,
+    pub line_height: Option<f32>,
+    pub text_color: Option<[f32; 4]>,
+    pub face_pos: Option<[f32; 2]>,
+    pub name_rect: Option<[f32; 4]>,
+}
+
+/// Interactive image-menu button definition (e.g. LiveMaker `.lpm` or custom visual menus).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MenuItemDef {
+    pub name: StrId,
+    pub label: StrId,
+    pub rect: [f32; 4],
+    pub image: Option<AssetId>,
+    pub hover_image: Option<AssetId>,
+    pub disabled_image: Option<AssetId>,
+    pub preview_image: Option<AssetId>,
+    pub preview_pos: [f32; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MenuTemplate {
+    pub size: [u32; 2],
+    pub background: Option<AssetId>,
+    pub items: Vec<MenuItemDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ModalKind {
+    Load = 0,
+    Save = 1,
+    Gallery = 2,
+    Replay = 3,
+}
+
 /// Unified visual theme & declarative UI overrides.
 /// Authors need zero config to get the built-in modern Galgame UI, or can override
 /// colors, box art, custom title/gallery screens, and widget trees declaratively.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiTheme {
     pub surface: [f32; 4],
     pub panel: [f32; 4],
@@ -20,6 +64,7 @@ pub struct UiTheme {
     pub text_shadow: Option<TextShadow>,
     pub title_screen: Option<UiScreenDef>,
     pub gallery: Vec<GalleryItem>,
+    pub dialogue_styles: Vec<DialogueStyleDef>,
 }
 
 impl Default for UiTheme {
@@ -42,6 +87,7 @@ impl Default for UiTheme {
             }),
             title_screen: None,
             gallery: Vec::new(),
+            dialogue_styles: Vec::new(),
         }
     }
 }

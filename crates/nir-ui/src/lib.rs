@@ -11,7 +11,7 @@ pub use messages::Messages;
 pub use text_engine::TextEngine;
 
 use nir_ir::*;
-use nir_vm::{LayerState, Vm};
+use nir_vm::{ActiveTimeline, LayerState, Vm};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -98,6 +98,10 @@ pub fn project_layers(
             cur_parent = p.parent;
         }
         if op <= 0.001 {
+            return;
+        }
+        // Text-only layers are projected into `DrawPacket.texts` by `project_layer_texts`.
+        if layer.text.is_some() && layer.asset.is_none() {
             return;
         }
 
@@ -200,6 +204,240 @@ pub fn project_layers(
         ordered_storage.sort_by_key(|l| (l.transform.z_order, l.id.0));
         for layer in ordered_storage {
             project_one(layer, &mut out);
+        }
+    }
+    out
+}
+
+fn layer_world_pose(layers: &[LayerState], layer: &LayerState) -> ([f32; 2], [f32; 2], f32) {
+    let mut px = layer.transform.x + layer.shake_offset[0];
+    let mut py = layer.transform.y + layer.shake_offset[1];
+    let mut sx = layer.transform.scale[0];
+    let mut sy = layer.transform.scale[1];
+    let mut op = layer.transform.opacity;
+    let mut cur_parent = layer.parent;
+    for _ in 0..16 {
+        let Some(pid) = cur_parent else { break };
+        let Some(p) = layers.iter().find(|l| l.id == pid) else { break };
+        px = p.transform.x + p.shake_offset[0] + px * p.transform.scale[0];
+        py = p.transform.y + p.shake_offset[1] + py * p.transform.scale[1];
+        sx *= p.transform.scale[0];
+        sy *= p.transform.scale[1];
+        op *= p.transform.opacity;
+        cur_parent = p.parent;
+    }
+    ([px, py], [sx, sy], op)
+}
+
+fn project_layer_texts(
+    b: &mut Builder<'_>,
+    layers: &[LayerState],
+    stage_rect: [f32; 4],
+    scale: f32,
+) {
+    for layer in layers {
+        let Some(lt) = &layer.text else { continue };
+        let ([px, py], [sx, sy], op) = layer_world_pose(layers, layer);
+        if op <= 0.001 || lt.text.is_empty() {
+            continue;
+        }
+        let mut color = lt.color;
+        color[3] *= op;
+        let size = (lt.font_size * sy * scale).clamp(8.0, 256.0);
+        let box_w = if layer.transform.width > 0.0 {
+            layer.transform.width * sx * scale
+        } else {
+            (lt.text.chars().count().max(1) as f32 * size * 1.1).max(64.0)
+        };
+        let box_h = if layer.transform.height > 0.0 {
+            layer.transform.height * sy * scale
+        } else {
+            size * 1.6
+        };
+        let base_x = stage_rect[0] + px * scale;
+        let x = match lt.align {
+            TextAlign::Left => base_x,
+            TextAlign::Center => base_x - box_w * 0.5,
+            TextAlign::Right => base_x - box_w,
+        };
+        let y = stage_rect[1] + py * scale;
+        b.push_text(TextRun {
+            text: lt.text.clone(),
+            visible_bytes: None,
+            x,
+            y,
+            width: box_w.max(8.0),
+            height: box_h.max(8.0),
+            size,
+            line_height: size * 1.25,
+            color,
+            emphasis: Vec::new(),
+            shadow: b.theme.text_shadow,
+            scroll: 0.0,
+            clip: None,
+            font_assets: b.text_fonts.clone(),
+            cache_key: 0,
+        });
+    }
+}
+
+fn project_timelines(
+    program: &NirProgram,
+    layers: &[LayerState],
+    timelines: &[ActiveTimeline],
+    stage_rect: [f32; 4],
+    scale: f32,
+) -> Vec<Quad> {
+    if timelines.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for active in timelines {
+        let Some(def) = program.timelines.get(active.timeline.0 as usize) else {
+            continue;
+        };
+        let ([base_x, base_y], [base_sx, base_sy], base_op) = layers
+            .iter()
+            .find(|l| l.id == active.layer)
+            .map(|l| layer_world_pose(layers, l))
+            .unwrap_or(([0.0, 0.0], [1.0, 1.0], 1.0));
+        if base_op <= 0.001 {
+            continue;
+        }
+        let fps = def.fps.max(1.0) as f64;
+        let frame = (active.elapsed_us as f64 / 1_000_000.0) * fps;
+        let mut active_clips: Vec<&TimelineClip> = def
+            .clips
+            .iter()
+            .filter(|c| {
+                let start = c.start_frame as f64;
+                let end = (c.start_frame + c.duration_frames) as f64;
+                frame >= start && frame <= end
+            })
+            .collect();
+        active_clips.sort_by_key(|c| c.z_order);
+
+        for clip in active_clips {
+            let t = if clip.duration_frames == 0 {
+                1.0
+            } else {
+                ((frame - clip.start_frame as f64) / clip.duration_frames as f64).clamp(0.0, 1.0)
+                    as f32
+            };
+            match &clip.kind {
+                TimelineClipKind::Image {
+                    asset,
+                    pivot,
+                    pos_start,
+                    pos_end,
+                    pos_easing,
+                    angle,
+                    angle_easing,
+                    scale_x,
+                    scale_y,
+                    scale_easing,
+                    opacity,
+                    clip_start: _,
+                    clip_end: _,
+                } => {
+                    let op = interpolate(opacity[0], opacity[1], t, Easing::Linear) * base_op;
+                    if op <= 0.001 {
+                        continue;
+                    }
+                    let lx = interpolate(pos_start[0], pos_end[0], t, pos_easing[0]);
+                    let ly = interpolate(pos_start[1], pos_end[1], t, pos_easing[1]);
+                    let sx = interpolate(scale_x[0], scale_x[1], t, scale_easing[0]) * base_sx;
+                    let sy = interpolate(scale_y[0], scale_y[1], t, scale_easing[1]) * base_sy;
+                    let deg = interpolate(angle[0], angle[1], t, *angle_easing);
+
+                    let asset_meta = program.asset(*asset);
+                    let (orig_w, orig_h) = asset_meta.map_or((0.0, 0.0), |a| {
+                        if let Some(tr) = a.trim {
+                            (tr.orig_w as f32, tr.orig_h as f32)
+                        } else {
+                            (a.width as f32, a.height as f32)
+                        }
+                    });
+                    if orig_w <= 0.0 || orig_h <= 0.0 {
+                        continue;
+                    }
+                    let (draw_off_x, draw_off_y, draw_w, draw_h) =
+                        if let Some(tr) = asset_meta.and_then(|a| a.trim) {
+                            (tr.x as f32, tr.y as f32, tr.w as f32, tr.h as f32)
+                        } else {
+                            (0.0, 0.0, orig_w, orig_h)
+                        };
+                    let cx = stage_rect[0] + (base_x + lx) * scale;
+                    let cy = stage_rect[1] + (base_y + ly) * scale;
+                    let local_x0 = (draw_off_x - pivot[0]) * sx;
+                    let local_y0 = (draw_off_y - pivot[1]) * sy;
+                    let local_w = draw_w * sx;
+                    let local_h = draw_h * sy;
+                    let rect = [
+                        cx + local_x0 * scale,
+                        cy + local_y0 * scale,
+                        local_w * scale,
+                        local_h * scale,
+                    ];
+                    let corners = if deg.abs() > 0.01 {
+                        let rad = deg.to_radians();
+                        let (sin, cos) = rad.sin_cos();
+                        let rot = |rx: f32, ry: f32| {
+                            [
+                                cx + (rx * cos - ry * sin) * scale,
+                                cy + (rx * sin + ry * cos) * scale,
+                            ]
+                        };
+                        Some([
+                            rot(local_x0, local_y0),
+                            rot(local_x0 + local_w, local_y0),
+                            rot(local_x0, local_y0 + local_h),
+                            rot(local_x0 + local_w, local_y0 + local_h),
+                        ])
+                    } else {
+                        None
+                    };
+                    out.push(Quad {
+                        rect,
+                        uv: [0.0, 0.0, 1.0, 1.0],
+                        corners,
+                        color: [1.0, 1.0, 1.0, op.clamp(0.0, 1.0)],
+                        asset: Some(*asset),
+                        blend: BlendMode::Normal,
+                        clip: None,
+                        special: SpecialQuad::None,
+                    });
+                }
+                TimelineClipKind::Box {
+                    pos_start,
+                    pos_end,
+                    size_start,
+                    size_end,
+                    color,
+                    opacity,
+                } => {
+                    let op = interpolate(opacity[0], opacity[1], t, Easing::Linear) * base_op;
+                    if op <= 0.001 {
+                        continue;
+                    }
+                    let lx = interpolate(pos_start[0], pos_end[0], t, Easing::Linear);
+                    let ly = interpolate(pos_start[1], pos_end[1], t, Easing::Linear);
+                    let lw = interpolate(size_start[0], size_end[0], t, Easing::Linear) * base_sx;
+                    let lh = interpolate(size_start[1], size_end[1], t, Easing::Linear) * base_sy;
+                    let mut c = *color;
+                    c[3] *= op.clamp(0.0, 1.0);
+                    out.push(Quad::solid(
+                        [
+                            stage_rect[0] + (base_x + lx) * scale,
+                            stage_rect[1] + (base_y + ly) * scale,
+                            lw * scale,
+                            lh * scale,
+                        ],
+                        c,
+                    ));
+                }
+                TimelineClipKind::Sound { .. } => {}
+            }
         }
     }
     out
@@ -362,6 +600,9 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         } else {
             let layer_quads = project_layers(prog, &ctx.vm.layers, stage_rect, scale);
             b.pkt.quads.extend(layer_quads);
+            let tl_quads = project_timelines(prog, &ctx.vm.layers, &ctx.vm.timelines, stage_rect, scale);
+            b.pkt.quads.extend(tl_quads);
+            project_layer_texts(&mut b, &ctx.vm.layers, stage_rect, scale);
         }
 
         // Story HUD (unless hidden)
@@ -607,9 +848,23 @@ fn project_story_hud(
     let alpha = ctx.vm.dialogue_alpha();
 
     // Dialogue box
+    let prog = ctx.vm.program();
+    let style = prog
+        .ui
+        .dialogue_styles
+        .get(ctx.vm.dialogue_style as usize);
     if alpha > 0.01 {
         if let Some(dlg) = &ctx.vm.dialogue {
-            let box_rect = if let Some(r) = b.theme.dialogue_rect {
+            let dlg_rect_cfg = style.and_then(|s| s.dialogue_rect).or(b.theme.dialogue_rect);
+            let dlg_bg_cfg = style.and_then(|s| s.dialogue_bg).or(b.theme.dialogue_bg);
+            let text_rect_cfg = style.and_then(|s| s.text_rect).or(b.theme.text_rect);
+            let style_font_size = style.and_then(|s| s.font_size).unwrap_or(b.theme.font_size);
+            let style_line_height = style
+                .and_then(|s| s.line_height)
+                .unwrap_or(b.theme.line_height);
+            let style_text_color = style.and_then(|s| s.text_color).unwrap_or(b.theme.text);
+
+            let box_rect = if let Some(r) = dlg_rect_cfg {
                 [
                     stage_rect[0] + r[0] * scale,
                     stage_rect[1] + r[1] * scale,
@@ -622,7 +877,7 @@ fn project_story_hud(
                 [(w - bw) * 0.5, h - bh - 18.0, bw, bh]
             };
 
-            if let Some(bg) = b.theme.dialogue_bg {
+            if let Some(bg) = dlg_bg_cfg {
                 let mut q = Quad::image(box_rect, bg);
                 q.color[3] = alpha;
                 b.pkt.quads.push(q);
@@ -638,8 +893,32 @@ fn project_story_hud(
                 ));
             }
 
+            // Dialogue-bound face portrait decoration (visible only while dialogue box is shown)
+            if let Some(face_id) = ctx.vm.dialogue_portrait {
+                if let Some(meta) = prog.asset(face_id) {
+                    let (orig_w, orig_h) = if let Some(tr) = meta.trim {
+                        (tr.orig_w as f32, tr.orig_h as f32)
+                    } else {
+                        (meta.width as f32, meta.height as f32)
+                    };
+                    let (dx, dy, dw, dh) = if let Some(tr) = meta.trim {
+                        (tr.x as f32, tr.y as f32, tr.w as f32, tr.h as f32)
+                    } else {
+                        (0.0, 0.0, orig_w, orig_h)
+                    };
+                    let (fx, fy) = if let Some([px, py]) = style.and_then(|s| s.face_pos) {
+                        (stage_rect[0] + (px + dx) * scale, stage_rect[1] + (py + dy) * scale)
+                    } else {
+                        (box_rect[0] + 16.0 + dx * scale, box_rect[1] + (box_rect[3] - orig_h * scale).max(0.0) * 0.5 + dy * scale)
+                    };
+                    let mut q = Quad::image([fx, fy, dw * scale, dh * scale], face_id);
+                    q.color[3] = alpha;
+                    b.pkt.quads.push(q);
+                }
+            }
+
             let shake = ctx.vm.dialogue_shake;
-            let text_rect = if let Some(tr) = b.theme.text_rect {
+            let text_rect = if let Some(tr) = text_rect_cfg {
                 [
                     stage_rect[0] + (tr[0] + shake[0]) * scale,
                     stage_rect[1] + (tr[1] + shake[1]) * scale,
@@ -659,14 +938,25 @@ fn project_story_hud(
             if !dlg.speaker.is_empty() {
                 let mut sc = dlg.speaker_color.unwrap_or(b.theme.accent);
                 sc[3] *= alpha;
-                let sp_size = (b.theme.font_size * ctx.prefs.font_scale * 0.92).clamp(16.0, 32.0);
+                let sp_size = (style_font_size * ctx.prefs.font_scale * 0.92).clamp(16.0, 32.0);
+                let name_box = style
+                    .and_then(|s| s.name_rect)
+                    .map(|nr| {
+                        [
+                            stage_rect[0] + nr[0] * scale,
+                            stage_rect[1] + nr[1] * scale,
+                            nr[2] * scale,
+                            nr[3] * scale,
+                        ]
+                    })
+                    .unwrap_or([box_rect[0] + 28.0, box_rect[1] + 14.0, box_rect[2] - 56.0, sp_size * 1.5]);
                 b.push_text(TextRun {
                     text: dlg.speaker.clone(),
                     visible_bytes: None,
-                    x: box_rect[0] + 28.0,
-                    y: box_rect[1] + 14.0,
-                    width: box_rect[2] - 56.0,
-                    height: sp_size * 1.5,
+                    x: name_box[0],
+                    y: name_box[1],
+                    width: name_box[2],
+                    height: name_box[3],
                     size: sp_size,
                     line_height: sp_size * 1.3,
                     color: sc,
@@ -680,15 +970,15 @@ fn project_story_hud(
             }
 
             // Dialogue text with grapheme-cluster clipping reveal
-            let fsize = (b.theme.font_size * ctx.prefs.font_scale).clamp(16.0, 44.0);
-            let lh = (b.theme.line_height * ctx.prefs.font_scale).clamp(24.0, 62.0);
+            let fsize = (style_font_size * ctx.prefs.font_scale).clamp(16.0, 44.0);
+            let lh = (style_line_height * ctx.prefs.font_scale).clamp(24.0, 62.0);
             let emphasis: Vec<(usize, usize)> = dlg
                 .spans
                 .iter()
                 .filter(|s| s.emphasis)
                 .map(|s| (s.byte_start, s.byte_end))
                 .collect();
-            let mut tc = b.theme.text;
+            let mut tc = style_text_color;
             tc[3] *= alpha;
             b.push_text(TextRun {
                 text: dlg.full_text.clone(),
@@ -743,12 +1033,16 @@ fn project_story_hud(
 
     // Choice buttons
     if let Some(choice) = &ctx.vm.choice {
+        if let Some(bg) = choice.background {
+            b.pkt.quads.push(Quad::image(stage_rect, bg));
+        }
         let count = choice.items.len();
         let cw = (w * 0.52).clamp(280.0, 620.0);
         let ch = 52.0;
         let gap = 14.0;
         let total_h = count as f32 * ch + count.saturating_sub(1) as f32 * gap;
         let mut cy = (h * 0.42 - total_h * 0.5).max(36.0);
+        let mut hovered_preview: Option<(AssetId, [f32; 2])> = None;
         for (i, item) in choice.items.iter().enumerate() {
             let rect = if let Some(r) = item.rect {
                 [
@@ -765,21 +1059,72 @@ fn project_story_hud(
             if let Some(img) = item.image {
                 let id = b.next_hit_id;
                 b.next_hit_id += 1;
-                let asset = if b.hovered == Some(id) {
+                let is_hover = !item.disabled && b.hovered == Some(id);
+                let asset = if item.disabled {
+                    item.disabled_image.unwrap_or(img)
+                } else if is_hover {
                     item.hover_image.unwrap_or(img)
                 } else {
                     img
                 };
-                b.pkt.quads.push(Quad::image(rect, asset));
+                // Restore SpriteTrim offset for image buttons if present
+                let mut q = if let Some(tr) = prog.asset(asset).and_then(|m| m.trim) {
+                    let rx = rect[2] / tr.orig_w.max(1) as f32;
+                    let ry = rect[3] / tr.orig_h.max(1) as f32;
+                    Quad::image(
+                        [
+                            rect[0] + tr.x as f32 * rx,
+                            rect[1] + tr.y as f32 * ry,
+                            tr.w as f32 * rx,
+                            tr.h as f32 * ry,
+                        ],
+                        asset,
+                    )
+                } else {
+                    Quad::image(rect, asset)
+                };
+                if item.disabled && item.disabled_image.is_none() {
+                    q.color = [0.55, 0.55, 0.55, 0.75];
+                }
+                b.pkt.quads.push(q);
+                if is_hover {
+                    if let Some(prev) = item.preview {
+                        hovered_preview = Some(prev);
+                    }
+                }
                 b.pkt.hits.push(HitRegion {
                     id,
                     rect,
                     action: UiAction::Choose(i as u16),
                     label: item.label.clone(),
-                    enabled: true,
+                    enabled: !item.disabled,
                 });
             } else {
-                b.button(rect, item.label.clone(), UiAction::Choose(i as u16), true, false);
+                b.button(
+                    rect,
+                    item.label.clone(),
+                    UiAction::Choose(i as u16),
+                    !item.disabled,
+                    false,
+                );
+            }
+        }
+        if let Some((prev_asset, [px, py])) = hovered_preview {
+            if let Some(meta) = prog.asset(prev_asset) {
+                let (dx, dy, dw, dh) = if let Some(tr) = meta.trim {
+                    (tr.x as f32, tr.y as f32, tr.w as f32, tr.h as f32)
+                } else {
+                    (0.0, 0.0, meta.width as f32, meta.height as f32)
+                };
+                b.pkt.quads.push(Quad::image(
+                    [
+                        stage_rect[0] + (px + dx) * scale,
+                        stage_rect[1] + (py + dy) * scale,
+                        dw * scale,
+                        dh * scale,
+                    ],
+                    prev_asset,
+                ));
             }
         }
     }

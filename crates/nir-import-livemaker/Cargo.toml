@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nir-ir.workspace = true
 nir-import-core.workspace = true
 anyhow.workspace = true
 encoding_rs.workspace = true

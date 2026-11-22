@@ -486,9 +486,12 @@ impl<'a> Compiler<'a> {
                             text: text_id,
                             image: None,
                             hover_image: None,
+                            disabled_image: None,
+                            preview: None,
                             rect: None,
                             target_pc: 0,
                             cond_var,
+                            disabled_var: None,
                             value: None,
                         });
                         patch_targets.push((opt_idx, target, oloc));

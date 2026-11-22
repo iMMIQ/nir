@@ -16,12 +16,58 @@ pub mod report;
 pub mod vfs;
 
 use anyhow::{bail, Result};
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 pub use emit::{emit_nirs_project, sanitize_ident};
 pub use ir::{VnCharacter, VnChoice, VnConst, VnProject, VnStmt};
 pub use report::{ConversionReport, Diagnostic, Fidelity};
 pub use vfs::{decode_text_bytes, ArchiveSource, CompositeVfs, DirArchive, MemoryArchive};
+
+/// Lazy or in-memory raw media payload supplied by a direct-to-IR engine importer.
+/// Using `Lazy` avoids holding thousands of decoded PNGs in RAM before tree-shaking
+/// and lets `nir-build` decode & optimize assets in parallel across all CPU cores.
+#[derive(Clone)]
+pub enum RawAssetData {
+    Bytes(Vec<u8>),
+    Lazy(Arc<dyn Fn() -> Result<Vec<u8>> + Send + Sync>),
+}
+
+impl std::fmt::Debug for RawAssetData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(b) => f.debug_tuple("Bytes").field(&b.len()).finish(),
+            Self::Lazy(_) => f.write_str("Lazy(<fn>)"),
+        }
+    }
+}
+
+impl RawAssetData {
+    pub fn load(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(b) => Ok(b.clone()),
+            Self::Lazy(func) => func(),
+        }
+    }
+}
+
+/// Asset record matching `program.assets[i]` produced by a direct-to-IR engine importer.
+#[derive(Clone, Debug)]
+pub struct RawAssetInput {
+    pub name: String,
+    pub kind: nir_ir::AssetKind,
+    pub codec: nir_ir::MediaCodec,
+    pub data: RawAssetData,
+}
+
+/// Complete direct-to-IR conversion output ready for `nir-build`'s parallel optimizer & packager.
+pub struct DirectImport {
+    pub program: nir_ir::NirProgram,
+    pub raw_assets: Vec<RawAssetInput>,
+    /// Extra `AssetId`s that must survive tree-shaking (e.g., runtime `asset_lookup` targets).
+    pub keep_assets: BTreeSet<nir_ir::AssetId>,
+}
 
 /// Options passed to an engine importer.
 #[derive(Clone, Debug)]
@@ -60,6 +106,16 @@ pub trait EngineImporter: Send + Sync {
     fn display_name(&self) -> &'static str;
     fn detect(&self, source: &Path) -> Option<EngineProbe>;
     fn import(&self, source: &Path, opts: &ImportOptions) -> Result<(VnProject, ConversionReport)>;
+
+    /// Optional direct-to-`NirProgram` compilation path for full-fidelity conversion
+    /// (preserving persistent layers, dynamic expressions, menus, timelines, and replays).
+    fn import_direct(
+        &self,
+        _source: &Path,
+        _opts: &ImportOptions,
+    ) -> Option<Result<(DirectImport, ConversionReport)>> {
+        None
+    }
 }
 
 /// Registry of available engine importers with automatic engine detection.
@@ -99,20 +155,14 @@ impl ImporterRegistry {
         matches
     }
 
-    /// Imports `source` using either an explicit `engine_id` or automatic detection.
-    pub fn import_auto(
-        &self,
-        source: &Path,
-        engine_id: Option<&str>,
-        opts: &ImportOptions,
-    ) -> Result<(VnProject, ConversionReport)> {
-        let importer = if let Some(id) = engine_id.filter(|s| *s != "auto") {
+    fn resolve_importer(&self, source: &Path, engine_id: Option<&str>) -> Result<&dyn EngineImporter> {
+        if let Some(id) = engine_id.filter(|s| *s != "auto") {
             self.by_id(id).ok_or_else(|| {
                 anyhow::anyhow!(
                     "unknown engine `{id}`; available engines: {}",
                     self.ids().join(", ")
                 )
-            })?
+            })
         } else {
             let probes = self.detect_all(source);
             let best = probes.first().ok_or_else(|| {
@@ -122,9 +172,18 @@ impl ImporterRegistry {
                     self.ids().join(", ")
                 )
             })?;
-            self.by_id(&best.engine_id).expect("probed importer exists")
-        };
+            Ok(self.by_id(&best.engine_id).expect("probed importer exists"))
+        }
+    }
 
+    /// Imports `source` using either an explicit `engine_id` or automatic detection.
+    pub fn import_auto(
+        &self,
+        source: &Path,
+        engine_id: Option<&str>,
+        opts: &ImportOptions,
+    ) -> Result<(VnProject, ConversionReport)> {
+        let importer = self.resolve_importer(source, engine_id)?;
         let (project, report) = importer.import(source, opts)?;
         if opts.strict && !report.is_strict_clean() {
             bail!(
@@ -136,5 +195,29 @@ impl ImporterRegistry {
             );
         }
         Ok((project, report))
+    }
+
+    /// Attempts direct-to-`NirProgram` import if supported by the detected engine plugin.
+    pub fn import_direct_auto(
+        &self,
+        source: &Path,
+        engine_id: Option<&str>,
+        opts: &ImportOptions,
+    ) -> Result<Option<(DirectImport, ConversionReport)>> {
+        let importer = self.resolve_importer(source, engine_id)?;
+        let Some(res) = importer.import_direct(source, opts) else {
+            return Ok(None);
+        };
+        let (direct, report) = res?;
+        if opts.strict && !report.is_strict_clean() {
+            bail!(
+                "strict direct import failed for {} ({}): {} fallback item(s) encountered\n{}",
+                direct.program.meta.title,
+                importer.id(),
+                report.fallback_count,
+                report.summary_text()
+            );
+        }
+        Ok(Some((direct, report)))
     }
 }

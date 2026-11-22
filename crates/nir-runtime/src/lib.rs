@@ -241,9 +241,27 @@ impl Runtime {
     }
 
     pub fn set_hover(&mut self, x: f32, y: f32) {
-        let next = self.last_packet.hit_test(x, y).map(|h| h.id);
+        let hit = self.last_packet.hit_test(x, y);
+        let next = hit.map(|h| h.id);
+        let is_choice_hit = hit.is_some_and(|h| matches!(h.action, UiAction::Choose(_)));
         if next != self.hovered_hit {
             self.hovered_hit = next;
+            if is_choice_hit {
+                if let Some(se) = self.vm.choice.as_ref().and_then(|c| c.hover_se) {
+                    self.request_asset(se, true);
+                    let gain = self.prefs.effective_bus_gain(AudioBus::Sfx, None);
+                    self.commands.push(HostCommand::PlayAudio {
+                        channel: ChannelId(6),
+                        bus: AudioBus::Sfx,
+                        asset: se,
+                        gain,
+                        looped: false,
+                        fade_in_us: 0,
+                        loop_region: None,
+                        character: None,
+                    });
+                }
+            }
             self.dirty = true;
         }
     }
@@ -410,6 +428,10 @@ impl Runtime {
                         bus: AudioBus::Voice,
                         paused: false,
                     });
+                    if matches!(self.vm.wait, WaitReason::Modal(_)) {
+                        self.vm.notify_modal_closed();
+                        self.step_vm();
+                    }
                 }
             }
             UiAction::OpenSaves { save_mode } => {
@@ -802,6 +824,20 @@ impl Runtime {
                 VmIntent::StopVideo => {
                     self.commands.push(HostCommand::StopVideo);
                 }
+                VmIntent::OpenModal(kind) => {
+                    if self.frozen_vm.is_some() && matches!(kind, ModalKind::Replay | ModalKind::Gallery) {
+                        self.dispatch(UiAction::ExitReplay);
+                        continue;
+                    }
+                    self.auto = false;
+                    self.skip = false;
+                    self.return_screen = Screen::Story;
+                    self.screen = match kind {
+                        ModalKind::Load => Screen::Saves { save_mode: false },
+                        ModalKind::Save => Screen::Saves { save_mode: true },
+                        ModalKind::Gallery | ModalKind::Replay => Screen::Gallery,
+                    };
+                }
                 VmIntent::ProfileChanged => {
                     // Debounce profile writes (flushed every 5s or on menu/save/quit/suspend)
                     // instead of writing disk / IndexedDB on every dialogue line!
@@ -972,6 +1008,9 @@ mod tests {
             )]),
             ui: UiTheme::default(),
             assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
         })
     }
 
@@ -1041,5 +1080,94 @@ mod tests {
         rt.tick(8_000);
         assert!(rt.dirty);
         assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+    }
+
+    #[test]
+    fn runtime_handles_open_modal_and_replay_exit_cleanly() {
+        let prog = Arc::new(NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.modal".into(),
+                title: "Modal Test".into(),
+                version: "1.0".into(),
+                stage_width: 1280,
+                stage_height: 720,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into(), "replay".into(), "done".into()],
+            vars: vec![],
+            funcs: vec![
+                FuncMeta {
+                    name: StrId(0),
+                    entry_pc: 0,
+                    param_count: 0,
+                    local_count: 0,
+                },
+                FuncMeta {
+                    name: StrId(1),
+                    entry_pc: 3,
+                    param_count: 0,
+                    local_count: 0,
+                },
+            ],
+            labels: vec![],
+            ops: vec![
+                // main: OpenModal(Load) -> Say -> End
+                Op::OpenModal(ModalKind::Load),
+                Op::Say {
+                    speaker: None,
+                    speaker_color: None,
+                    text: TextId(0),
+                    voice: None,
+                    reveal_us: 0,
+                    append: false,
+                },
+                Op::End { outcome: StrId(2) },
+                // replay func: Say -> OpenModal(Replay) -> should exit replay!
+                Op::Say {
+                    speaker: None,
+                    speaker_color: None,
+                    text: TextId(1),
+                    voice: None,
+                    reveal_us: 0,
+                    append: false,
+                },
+                Op::OpenModal(ModalKind::Replay),
+                Op::Ret { has_value: false },
+            ],
+            texts: BTreeMap::from([(
+                "en".into(),
+                vec![TextEntry::plain("After modal"), TextEntry::plain("Replay line")],
+            )]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        });
+
+        let mut rt = Runtime::new(prog, Preferences::default(), ProfileData::default(), vec![]).unwrap();
+        rt.dispatch(UiAction::NewGame);
+        assert_eq!(rt.screen, Screen::Saves { save_mode: false });
+        rt.dispatch(UiAction::CloseOverlay);
+        assert_eq!(rt.screen, Screen::Story);
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "After modal");
+
+        // Start replay from gallery -> advance past replay line -> OpenModal(Replay) exits replay!
+        rt.dispatch(UiAction::OpenGallery);
+        assert_eq!(rt.screen, Screen::Gallery);
+        rt.dispatch(UiAction::StartReplay(FuncId(1)));
+        assert_eq!(rt.screen, Screen::Story);
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "Replay line");
+        rt.dispatch(UiAction::Advance);
+        assert_eq!(rt.screen, Screen::Gallery);
     }
 }

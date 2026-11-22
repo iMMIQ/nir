@@ -1,6 +1,6 @@
 use crate::{
-    AudioBus, AudioLoopRegion, BinOp, Easing, ShakeSpec, Transform2D, Transition, TweenProp,
-    TweenTarget, UnaryOp, Value,
+    AudioBus, AudioLoopRegion, BinOp, Easing, ModalKind, ShakeSpec, TextAlign, Transform2D,
+    Transition, TweenProp, TweenTarget, UnaryOp, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,17 +21,45 @@ id_type!(AssetId);
 id_type!(TextId);
 id_type!(LayerId);
 id_type!(ChannelId);
+id_type!(TimelineId);
+id_type!(MenuId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum BuiltinFn {
+    ToInt = 0,
+    ToStr = 1,
+    CharLen = 2,
+    StrRepeat = 3,
+    AddDelimiter = 4,
+    ListPush = 5,
+    ListLen = 6,
+    ListGet = 7,
+    ListSet = 8,
+    ListJoin = 9,
+    ListSplit = 10,
+    ListCompact = 11,
+    Min = 12,
+    Max = 13,
+    RandInt = 14,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceItem {
     pub text: TextId,
     pub image: Option<AssetId>,
     pub hover_image: Option<AssetId>,
+    #[serde(default)]
+    pub disabled_image: Option<AssetId>,
+    #[serde(default)]
+    pub preview: Option<(AssetId, [f32; 2])>,
     pub rect: Option<[f32; 4]>,
     pub target_pc: u32,
     /// Optional condition expression entry PC (evaluates on stack before offering choice).
     /// When `None`, the option is unconditionally visible & enabled.
     pub cond_var: Option<VarId>,
+    #[serde(default)]
+    pub disabled_var: Option<VarId>,
     pub value: Option<Value>,
 }
 
@@ -174,6 +202,96 @@ pub enum Op {
         dst: VarId,
         key: StrId,
     },
+
+    // --- Pure Built-ins, Dynamic Media, Timelines, Dynamic Menus & Modals ---
+    CallBuiltin {
+        func: BuiltinFn,
+        argc: u8,
+    },
+    /// Pops a string path, normalizes slashes/case, looks up in `NirProgram::asset_lookup`,
+    /// pushes `Value::Int(asset_id)` or `Value::Null`.
+    ResolveAsset,
+    /// Pops `Value` (`Int(asset_id)`, `Str("#RRGGBB"/"$RRGGBB")`, or `Null`) and sets layer.
+    LayerSetDyn {
+        layer: LayerId,
+        parent: Option<LayerId>,
+        transform: Box<Transform2D>,
+    },
+    /// Pops `Value` (`Int(asset_id)`, `Str("#RRGGBB"/"$RRGGBB")`, or `Null`) and updates layer visual.
+    LayerAssetDyn {
+        layer: LayerId,
+    },
+    /// Renders dynamic or static text onto a scene layer (when `text` is `None`, pops value from stack).
+    LayerSetText {
+        layer: LayerId,
+        parent: Option<LayerId>,
+        transform: Option<Box<Transform2D>>,
+        text: Option<StrId>,
+        font_size: f32,
+        color: [f32; 4],
+        align: TextAlign,
+    },
+    /// Stops any active shake/oscillation on `target`.
+    ShakeStop {
+        target: TweenTarget,
+    },
+    /// Plays an audio asset whose `AssetId` (as `Value::Int`) is popped from the stack.
+    AudioPlayDyn {
+        channel: ChannelId,
+        bus: AudioBus,
+        gain: f32,
+        looped: bool,
+        fade_in_us: u64,
+    },
+    /// Smoothly changes absolute gain (`0.0..=2.0`) on an active audio channel.
+    AudioGain {
+        channel: ChannelId,
+        gain: f32,
+        duration_us: u64,
+        wait: bool,
+    },
+    /// Offers dynamic text choices popped from stack: `[labels, id_list]` (`id_list` on top).
+    ChoiceList {
+        result_var: Option<VarId>,
+        index_var: Option<VarId>,
+        cancelable: bool,
+        click_se: Option<AssetId>,
+        timeout_us: Option<u64>,
+    },
+    /// Offers an interactive `MenuTemplate` with dynamic filter lists popped from stack:
+    /// `[hidden_names, disabled_names]` (`disabled_names` on top).
+    ChoiceMenu {
+        menu: MenuId,
+        result_var: Option<VarId>,
+        index_var: Option<VarId>,
+        cancelable: bool,
+        hover_se: Option<AssetId>,
+        click_se: Option<AssetId>,
+        fade_in_us: u64,
+        fade_out_us: u64,
+        timeout_us: Option<u64>,
+    },
+    /// Starts a keyframed `TimelineDef` bound to `layer`.
+    TimelinePlay {
+        timeline: TimelineId,
+        layer: LayerId,
+        scrap_on_end: bool,
+        wait: bool,
+        click_skippable: bool,
+    },
+    /// Waits until the timeline bound to `layer` finishes.
+    WaitPlay {
+        layer: LayerId,
+        click_skippable: bool,
+    },
+    /// Suspends VM and opens a built-in host modal (Load/Save/Gallery/Replay).
+    OpenModal(ModalKind),
+    /// Switches active dialogue box style preset (`UiTheme::dialogue_styles[index]`).
+    SetDialogueStyle(u16),
+    /// Sets or clears the dialogue-bound portrait decoration.
+    SetDialoguePortrait(Option<AssetId>),
+    /// Pops `Value::Int(asset_id)` or `Value::Null` for the dialogue-bound portrait.
+    SetDialoguePortraitDyn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

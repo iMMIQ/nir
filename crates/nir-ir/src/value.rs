@@ -10,6 +10,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -20,6 +21,7 @@ impl Value {
             Self::Int(n) => *n != 0,
             Self::Float(f) => *f != 0.0 && !f.is_nan(),
             Self::Str(s) => !s.is_empty(),
+            Self::List(v) => !v.is_empty(),
         }
     }
 
@@ -28,6 +30,7 @@ impl Value {
             Self::Int(n) => Some(*n as f64),
             Self::Float(f) => Some(*f),
             Self::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Self::Str(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -37,6 +40,7 @@ impl Value {
             Self::Int(n) => Some(*n),
             Self::Float(f) if f.is_finite() => Some(*f as i64),
             Self::Bool(b) => Some(i64::from(*b)),
+            Self::Str(s) => s.trim().parse::<i64>().ok(),
             _ => None,
         }
     }
@@ -54,6 +58,11 @@ impl Value {
                 }
             }
             Self::Str(s) => s.clone(),
+            Self::List(v) => v
+                .iter()
+                .map(Self::to_display_string)
+                .collect::<Vec<_>>()
+                .join("\r\n"),
         }
     }
 }
@@ -75,6 +84,11 @@ pub enum BinOp {
     And = 11,
     Or = 12,
     Concat = 13,
+    BitAnd = 14,
+    BitOr = 15,
+    BitXor = 16,
+    Shl = 17,
+    Shr = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

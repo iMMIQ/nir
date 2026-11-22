@@ -43,11 +43,14 @@ pub struct Vm {
     pending_dirty: bool,
     pub tweens: Vec<ActiveTween>,
     pub shakes: Vec<ActiveShake>,
+    pub timelines: Vec<ActiveTimeline>,
     pub transition: Option<StageTransitionState>,
     pub window_reveal: Option<WindowRevealState>,
     pub dialogue_visible: bool,
     pub dialogue_opacity: f32,
     pub dialogue_shake: [f32; 2],
+    pub dialogue_style: u16,
+    pub dialogue_portrait: Option<AssetId>,
     pub dialogue: Option<DialogueState>,
     pub choice: Option<ChoiceState>,
     pub wait: WaitReason,
@@ -101,11 +104,14 @@ impl Vm {
             pending_dirty: false,
             tweens: Vec::new(),
             shakes: Vec::new(),
+            timelines: Vec::new(),
             transition: None,
             window_reveal: None,
             dialogue_visible: true,
             dialogue_opacity: 1.0,
             dialogue_shake: [0.0, 0.0],
+            dialogue_style: 0,
+            dialogue_portrait: None,
             dialogue: None,
             choice: None,
             wait: WaitReason::None,
@@ -145,9 +151,13 @@ impl Vm {
         }
         !self.tweens.is_empty()
             || !self.shakes.is_empty()
+            || !self.timelines.is_empty()
             || self.transition.is_some()
             || self.window_reveal.is_some()
-            || matches!(self.wait, WaitReason::Timer { .. })
+            || matches!(
+                self.wait,
+                WaitReason::Timer { .. } | WaitReason::Timeline { .. }
+            )
             || self
                 .dialogue
                 .as_ref()
@@ -246,6 +256,9 @@ impl Vm {
             frames: self.frames.clone(),
             layers: self.layers.clone(),
             dialogue_visible: self.dialogue_visible,
+            dialogue_style: self.dialogue_style,
+            dialogue_portrait: self.dialogue_portrait,
+            timelines: self.timelines.clone(),
             dialogue: self.dialogue.clone(),
             choice: self.choice.clone(),
             wait: self.wait.clone(),
@@ -305,11 +318,14 @@ impl Vm {
         self.pending_dirty = false;
         self.tweens.clear();
         self.shakes.clear();
+        self.timelines = cp.timelines;
         self.transition = None;
         self.window_reveal = None;
         self.dialogue_visible = cp.dialogue_visible;
         self.dialogue_opacity = 1.0;
         self.dialogue_shake = [0.0, 0.0];
+        self.dialogue_style = cp.dialogue_style;
+        self.dialogue_portrait = cp.dialogue_portrait;
         self.dialogue = cp.dialogue;
         self.choice = cp.choice;
         self.wait = cp.wait;
@@ -368,6 +384,9 @@ impl Vm {
             frames: self.frames.clone(),
             layers: self.layers.clone(),
             dialogue_visible: self.dialogue_visible,
+            dialogue_style: self.dialogue_style,
+            dialogue_portrait: self.dialogue_portrait,
+            timelines: self.timelines.clone(),
             dialogue: self.dialogue.clone(),
             choice: self.choice.clone(),
             wait: self.wait.clone(),
@@ -492,11 +511,14 @@ impl Vm {
             pending_dirty: false,
             tweens: Vec::new(),
             shakes: Vec::new(),
+            timelines: snap.timelines,
             transition: None,
             window_reveal: None,
             dialogue_visible: snap.dialogue_visible,
             dialogue_opacity: 1.0,
             dialogue_shake: [0.0, 0.0],
+            dialogue_style: snap.dialogue_style,
+            dialogue_portrait: snap.dialogue_portrait,
             dialogue: snap.dialogue,
             choice: snap.choice,
             wait: snap.wait,
@@ -687,6 +709,7 @@ impl Vm {
                         existing.asset = asset;
                     }
                     existing.transform = (**transform).clone();
+                    existing.text = None;
                 } else {
                     self.pending_layers.push(LayerState {
                         id: layer,
@@ -694,6 +717,7 @@ impl Vm {
                         asset,
                         transform: (**transform).clone(),
                         shake_offset: [0.0, 0.0],
+                        text: None,
                     });
                 }
                 self.pending_dirty = true;
@@ -703,6 +727,7 @@ impl Vm {
                 self.ensure_pending_synced();
                 if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
                     existing.asset = asset;
+                    existing.text = None;
                 } else {
                     self.pending_layers.push(LayerState {
                         id: layer,
@@ -710,6 +735,7 @@ impl Vm {
                         asset,
                         transform: Transform2D::default(),
                         shake_offset: [0.0, 0.0],
+                        text: None,
                     });
                 }
                 self.pending_dirty = true;
@@ -731,6 +757,7 @@ impl Vm {
                     .retain(|t| !matches!(t.target, TweenTarget::Layer(id) if id == layer));
                 self.shakes
                     .retain(|s| !matches!(s.target, TweenTarget::Layer(id) if id == layer));
+                self.timelines.retain(|tl| tl.layer != layer);
                 self.pending_dirty = true;
             }
             Op::LayerClear => {
@@ -739,6 +766,7 @@ impl Vm {
                     .retain(|t| !matches!(t.target, TweenTarget::Layer(_)));
                 self.shakes
                     .retain(|s| !matches!(s.target, TweenTarget::Layer(_)));
+                self.timelines.clear();
                 self.pending_dirty = true;
             }
             Op::StageCommit {
@@ -970,14 +998,23 @@ impl Vm {
                         .text(&self.locale, item.text)
                         .map(|e| self.instantiate_text(e).0)
                         .unwrap_or_default();
+                    let disabled = item.disabled_var.is_some_and(|dvar| {
+                        self.vars
+                            .get(dvar.0 as usize)
+                            .is_some_and(Value::as_bool)
+                    });
                     offered.push(OfferedChoice {
                         index: i as u16,
                         label,
                         image: item.image,
                         hover_image: item.hover_image,
+                        disabled_image: item.disabled_image,
+                        preview: item.preview,
                         rect: item.rect,
                         target_pc: item.target_pc,
                         value: item.value.clone(),
+                        choice_index: Some(Value::Int(i as i64)),
+                        disabled,
                     });
                 }
                 if offered.is_empty() {
@@ -989,10 +1026,16 @@ impl Vm {
                 self.choice = Some(ChoiceState {
                     items: offered,
                     result_var,
+                    index_var: None,
                     cancel_pc,
                     timeout_us,
                     elapsed_us: 0,
                     default_idx,
+                    background: None,
+                    menu_size: None,
+                    hover_se: None,
+                    click_se: None,
+                    fade_out_us: 0,
                 });
                 self.wait = WaitReason::Choice;
                 self.intents.push(VmIntent::Checkpoint);
@@ -1079,15 +1122,482 @@ impl Vm {
                 self.intents.push(VmIntent::ProfileChanged);
             }
             Op::ProfileGetVal { dst, key } => {
-                let val = self
-                    .profile
-                    .values
-                    .get(self.program.str(*key))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                if let Some(slot) = self.vars.get_mut(dst.0 as usize) {
-                    *slot = val;
+                if let Some(val) = self.profile.values.get(self.program.str(*key)).cloned() {
+                    if let Some(slot) = self.vars.get_mut(dst.0 as usize) {
+                        *slot = val;
+                    }
                 }
+            }
+
+            // --- Pure Built-ins, Dynamic Media, Timelines, Dynamic Menus & Modals ---
+            Op::CallBuiltin { func, argc } => {
+                let n = *argc as usize;
+                let mut args = vec![Value::Null; n];
+                for i in (0..n).rev() {
+                    args[i] = self.pop()?;
+                }
+                let res = self.eval_builtin(*func, args);
+                self.stack.push(res);
+            }
+            Op::ResolveAsset => {
+                let raw = self.pop()?.to_display_string();
+                let trimmed = raw.trim();
+                let resolved = if trimmed.is_empty() {
+                    Value::Null
+                } else if trimmed.starts_with('$') || trimmed.starts_with('#') {
+                    Value::Str(trimmed.to_owned())
+                } else if let Some(id) = resolve_asset_path(&self.program.asset_lookup, trimmed) {
+                    Value::Int(id.0 as i64)
+                } else {
+                    Value::Null
+                };
+                self.stack.push(resolved);
+            }
+            Op::LayerSetDyn {
+                layer,
+                parent,
+                transform,
+            } => {
+                let val = self.pop()?;
+                let (layer, parent) = (*layer, *parent);
+                let mut tf = (**transform).clone();
+                let asset = match &val {
+                    Value::Int(id) if *id >= 0 => Some(AssetId(*id as u32)),
+                    Value::Str(s) => {
+                        if let Some(rgba) = parse_solid_color(s) {
+                            tf.color = rgba;
+                            None
+                        } else {
+                            resolve_asset_path(&self.program.asset_lookup, s)
+                        }
+                    }
+                    _ => None,
+                };
+                self.ensure_pending_synced();
+                if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
+                    existing.parent = parent;
+                    existing.asset = asset;
+                    existing.transform = tf;
+                    existing.text = None;
+                } else {
+                    self.pending_layers.push(LayerState {
+                        id: layer,
+                        parent,
+                        asset,
+                        transform: tf,
+                        shake_offset: [0.0, 0.0],
+                        text: None,
+                    });
+                }
+                self.pending_dirty = true;
+            }
+            Op::LayerAssetDyn { layer } => {
+                let val = self.pop()?;
+                let layer = *layer;
+                let mut solid_color = None;
+                let asset = match &val {
+                    Value::Int(id) if *id >= 0 => Some(AssetId(*id as u32)),
+                    Value::Str(s) => {
+                        if let Some(rgba) = parse_solid_color(s) {
+                            solid_color = Some(rgba);
+                            None
+                        } else {
+                            resolve_asset_path(&self.program.asset_lookup, s)
+                        }
+                    }
+                    _ => None,
+                };
+                self.ensure_pending_synced();
+                if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
+                    existing.asset = asset;
+                    if let Some(c) = solid_color {
+                        existing.transform.color = c;
+                    } else if asset.is_some() {
+                        existing.transform.color = [1.0, 1.0, 1.0, 1.0];
+                    }
+                    existing.text = None;
+                } else {
+                    let mut tf = Transform2D::default();
+                    if let Some(c) = solid_color {
+                        tf.color = c;
+                    }
+                    self.pending_layers.push(LayerState {
+                        id: layer,
+                        parent: None,
+                        asset,
+                        transform: tf,
+                        shake_offset: [0.0, 0.0],
+                        text: None,
+                    });
+                }
+                self.pending_dirty = true;
+            }
+            Op::LayerSetText {
+                layer,
+                parent,
+                transform,
+                text,
+                font_size,
+                color,
+                align,
+            } => {
+                let text_str = match text {
+                    Some(sid) => self.program.str(*sid).to_owned(),
+                    None => self.pop()?.to_display_string(),
+                };
+                let (layer, parent, font_size, color, align) =
+                    (*layer, *parent, *font_size, *color, *align);
+                let ltext = LayerText {
+                    text: text_str,
+                    font_size,
+                    color,
+                    align,
+                };
+                self.ensure_pending_synced();
+                if let Some(existing) = self.pending_layers.iter_mut().find(|l| l.id == layer) {
+                    if let Some(tf) = transform {
+                        existing.parent = parent;
+                        existing.transform = (**tf).clone();
+                    }
+                    existing.asset = None;
+                    existing.text = Some(ltext);
+                } else {
+                    self.pending_layers.push(LayerState {
+                        id: layer,
+                        parent,
+                        asset: None,
+                        transform: transform
+                            .as_ref()
+                            .map(|tf| (**tf).clone())
+                            .unwrap_or_default(),
+                        shake_offset: [0.0, 0.0],
+                        text: Some(ltext),
+                    });
+                }
+                self.pending_dirty = true;
+            }
+            Op::ShakeStop { target } => {
+                let target = *target;
+                self.shakes.retain(|s| s.target != target);
+                match target {
+                    TweenTarget::Layer(lid) => {
+                        for l in self.layers.iter_mut().chain(self.pending_layers.iter_mut()) {
+                            if l.id == lid {
+                                l.shake_offset = [0.0, 0.0];
+                            }
+                        }
+                    }
+                    TweenTarget::DialogueBox => self.dialogue_shake = [0.0, 0.0],
+                    TweenTarget::Audio(_) => {}
+                }
+                if self.wait == WaitReason::Shake && self.shakes.is_empty() {
+                    self.wait = WaitReason::None;
+                }
+            }
+            Op::AudioPlayDyn {
+                channel,
+                bus,
+                gain,
+                looped,
+                fade_in_us,
+            } => {
+                let val = self.pop()?;
+                let asset_opt = match &val {
+                    Value::Int(id) if *id >= 0 => Some(AssetId(*id as u32)),
+                    Value::Str(s) => resolve_asset_path(&self.program.asset_lookup, s),
+                    _ => None,
+                };
+                if let Some(asset) = asset_opt {
+                    self.play_audio_internal(
+                        *channel,
+                        *bus,
+                        asset,
+                        *gain,
+                        *looped,
+                        *fade_in_us,
+                        None,
+                        None,
+                    );
+                }
+            }
+            Op::AudioGain {
+                channel,
+                gain,
+                duration_us,
+                wait,
+            } => {
+                let (channel, gain, duration_us, wait) = (*channel, *gain, *duration_us, *wait);
+                let target = TweenTarget::Audio(channel);
+                self.tweens
+                    .retain(|t| !(t.target == target && t.prop == TweenProp::Volume));
+                if let Some(chan) = self.audio.iter_mut().find(|c| c.channel == channel) {
+                    let current = chan.gain * chan.envelope;
+                    if duration_us == 0 {
+                        chan.gain = 1.0;
+                        chan.envelope = gain.clamp(0.0, 4.0);
+                        self.intents.push(VmIntent::SetAudioGain {
+                            channel,
+                            gain: chan.envelope,
+                        });
+                    } else {
+                        chan.gain = 1.0;
+                        chan.envelope = current;
+                        self.tweens.push(ActiveTween {
+                            target,
+                            prop: TweenProp::Volume,
+                            from: current,
+                            to: gain.clamp(0.0, 4.0),
+                            elapsed_us: 0,
+                            duration_us,
+                            easing: Easing::Linear,
+                        });
+                        if wait {
+                            self.wait = WaitReason::Tween;
+                        }
+                    }
+                }
+            }
+            Op::ChoiceList {
+                result_var,
+                index_var,
+                cancelable,
+                click_se,
+                timeout_us,
+            } => {
+                let id_list = self.pop()?;
+                let labels_val = self.pop()?;
+                let (result_var, index_var, cancelable, click_se, timeout_us) =
+                    (*result_var, *index_var, *cancelable, *click_se, *timeout_us);
+                if self.pending_dirty {
+                    self.commit_staged_if_dirty(Transition::Cut, 0, false);
+                }
+                let labels: Vec<String> = match labels_val {
+                    Value::List(v) => v
+                        .into_iter()
+                        .map(|x| x.to_display_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    other => other
+                        .to_display_string()
+                        .split("\r\n")
+                        .flat_map(|s| s.split('\n'))
+                        .map(str::to_owned)
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                };
+                if labels.is_empty() {
+                    if let Some(var) = result_var {
+                        if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                            *slot = Value::Str(String::new());
+                        }
+                    }
+                    if let Some(var) = index_var {
+                        if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                            *slot = Value::Int(-1);
+                        }
+                    }
+                    return Ok(());
+                }
+                let ids: Vec<Value> = match id_list {
+                    Value::List(v) => v,
+                    Value::Str(s) if !s.is_empty() => s
+                        .split("\r\n")
+                        .flat_map(|p| p.split('\n'))
+                        .filter(|p| !p.is_empty())
+                        .map(|p| {
+                            p.trim()
+                                .parse::<i64>()
+                                .map(Value::Int)
+                                .unwrap_or_else(|_| Value::Str(p.to_owned()))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let next_pc = self.pc;
+                let offered: Vec<OfferedChoice> = labels
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        let choice_index = ids.get(i).cloned().unwrap_or(Value::Int(i as i64));
+                        OfferedChoice {
+                            index: i as u16,
+                            label: label.clone(),
+                            image: None,
+                            hover_image: None,
+                            disabled_image: None,
+                            preview: None,
+                            rect: None,
+                            target_pc: next_pc,
+                            value: Some(Value::Str(label)),
+                            choice_index: Some(choice_index),
+                            disabled: false,
+                        }
+                    })
+                    .collect();
+                self.choice = Some(ChoiceState {
+                    items: offered,
+                    result_var,
+                    index_var,
+                    cancel_pc: cancelable.then_some(next_pc),
+                    timeout_us,
+                    elapsed_us: 0,
+                    default_idx: Some(0),
+                    background: None,
+                    menu_size: None,
+                    hover_se: None,
+                    click_se,
+                    fade_out_us: 0,
+                });
+                self.wait = WaitReason::Choice;
+                self.intents.push(VmIntent::Checkpoint);
+            }
+            Op::ChoiceMenu {
+                menu,
+                result_var,
+                index_var,
+                cancelable,
+                hover_se,
+                click_se,
+                fade_in_us: _,
+                fade_out_us,
+                timeout_us,
+            } => {
+                let disabled_val = self.pop()?;
+                let hidden_val = self.pop()?;
+                let (menu, result_var, index_var, cancelable, hover_se, click_se, fade_out_us, timeout_us) = (
+                    *menu,
+                    *result_var,
+                    *index_var,
+                    *cancelable,
+                    *hover_se,
+                    *click_se,
+                    *fade_out_us,
+                    *timeout_us,
+                );
+                if self.pending_dirty {
+                    self.commit_staged_if_dirty(Transition::Cut, 0, false);
+                }
+                let hidden_set = value_to_name_set(&hidden_val);
+                let disabled_set = value_to_name_set(&disabled_val);
+                let Some(tmpl) = self.program.menus.get(menu.0 as usize) else {
+                    return Ok(());
+                };
+                let next_pc = self.pc;
+                let mut offered = Vec::new();
+                for (orig_idx, item) in tmpl.items.iter().enumerate() {
+                    let name = self.program.str(item.name).to_owned();
+                    if hidden_set.contains(&name) {
+                        continue;
+                    }
+                    let disabled = disabled_set.contains(&name);
+                    let label = self.program.str(item.label).to_owned();
+                    offered.push(OfferedChoice {
+                        index: orig_idx as u16,
+                        label: if label.is_empty() { name.clone() } else { label },
+                        image: item.image,
+                        hover_image: item.hover_image,
+                        disabled_image: item.disabled_image,
+                        preview: item.preview_image.map(|img| (img, item.preview_pos)),
+                        rect: Some(item.rect),
+                        target_pc: next_pc,
+                        value: Some(Value::Str(name)),
+                        choice_index: Some(Value::Int(orig_idx as i64)),
+                        disabled,
+                    });
+                }
+                let any_enabled = offered.iter().any(|c| !c.disabled);
+                if offered.is_empty() || !any_enabled {
+                    if let Some(var) = result_var {
+                        if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                            *slot = Value::Str(String::new());
+                        }
+                    }
+                    if let Some(var) = index_var {
+                        if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                            *slot = Value::Int(-1);
+                        }
+                    }
+                    return Ok(());
+                }
+                self.choice = Some(ChoiceState {
+                    items: offered,
+                    result_var,
+                    index_var,
+                    cancel_pc: cancelable.then_some(next_pc),
+                    timeout_us,
+                    elapsed_us: 0,
+                    default_idx: Some(0),
+                    background: tmpl.background,
+                    menu_size: Some(tmpl.size),
+                    hover_se,
+                    click_se,
+                    fade_out_us,
+                });
+                self.wait = WaitReason::Choice;
+                self.intents.push(VmIntent::Checkpoint);
+            }
+            Op::TimelinePlay {
+                timeline,
+                layer,
+                scrap_on_end,
+                wait,
+                click_skippable,
+            } => {
+                let (timeline, layer, scrap_on_end, wait, click_skippable) =
+                    (*timeline, *layer, *scrap_on_end, *wait, *click_skippable);
+                if self.pending_dirty {
+                    self.commit_staged_if_dirty(Transition::Cut, 0, false);
+                }
+                self.timelines.retain(|tl| tl.layer != layer);
+                let mut active = ActiveTimeline {
+                    timeline,
+                    layer,
+                    elapsed_us: 0,
+                    scrap_on_end,
+                    triggered_sounds: Vec::new(),
+                };
+                self.trigger_timeline_sounds(&mut active, 0);
+                self.timelines.push(active);
+                if wait {
+                    self.wait = WaitReason::Timeline {
+                        layer,
+                        skippable: click_skippable,
+                    };
+                }
+            }
+            Op::WaitPlay {
+                layer,
+                click_skippable,
+            } => {
+                let (layer, click_skippable) = (*layer, *click_skippable);
+                if self.timelines.iter().any(|tl| tl.layer == layer) {
+                    self.wait = WaitReason::Timeline {
+                        layer,
+                        skippable: click_skippable,
+                    };
+                }
+            }
+            Op::OpenModal(kind) => {
+                let kind = *kind;
+                if self.pending_dirty {
+                    self.commit_staged_if_dirty(Transition::Cut, 0, false);
+                }
+                self.wait = WaitReason::Modal(kind);
+                self.intents.push(VmIntent::OpenModal(kind));
+            }
+            Op::SetDialogueStyle(idx) => {
+                self.dialogue_style = *idx;
+            }
+            Op::SetDialoguePortrait(asset) => {
+                self.dialogue_portrait = *asset;
+            }
+            Op::SetDialoguePortraitDyn => {
+                let val = self.pop()?;
+                self.dialogue_portrait = match &val {
+                    Value::Int(id) if *id >= 0 => Some(AssetId(*id as u32)),
+                    Value::Str(s) => resolve_asset_path(&self.program.asset_lookup, s),
+                    _ => None,
+                };
             }
         }
         Ok(())
@@ -1364,6 +1874,46 @@ impl Vm {
             }
         }
 
+        // 2b. Timelines (60Hz keyframed sequences)
+        if !self.timelines.is_empty() {
+            visual_changed = true;
+            let mut tl_idx = 0;
+            while tl_idx < self.timelines.len() {
+                let tl_id = self.timelines[tl_idx].timeline;
+                let (fps, duration_frames) = self
+                    .program
+                    .timelines
+                    .get(tl_id.0 as usize)
+                    .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
+                let total_us = ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
+                self.timelines[tl_idx].elapsed_us = if reduced_motion {
+                    total_us
+                } else {
+                    self.timelines[tl_idx].elapsed_us.saturating_add(delta_us)
+                };
+                let cur_frame =
+                    ((self.timelines[tl_idx].elapsed_us as f64 / 1_000_000.0) * fps as f64) as u32;
+                let mut tl_tmp = self.timelines[tl_idx].clone();
+                self.trigger_timeline_sounds(&mut tl_tmp, cur_frame);
+                self.timelines[tl_idx] = tl_tmp;
+                if self.timelines[tl_idx].elapsed_us >= total_us {
+                    let done = self.timelines.remove(tl_idx);
+                    if done.scrap_on_end {
+                        self.layers
+                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                        self.pending_layers
+                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                    }
+                    if matches!(self.wait, WaitReason::Timeline { layer, .. } if layer == done.layer)
+                    {
+                        self.wait = WaitReason::None;
+                    }
+                } else {
+                    tl_idx += 1;
+                }
+            }
+        }
+
         // 3. Stage transition
         if let Some(tr) = &mut self.transition {
             visual_changed = true;
@@ -1540,6 +2090,21 @@ impl Vm {
                 self.intents.push(VmIntent::StopVideo);
                 self.wait = WaitReason::None;
             }
+            WaitReason::Timeline {
+                layer,
+                skippable: true,
+            } => {
+                if let Some(pos) = self.timelines.iter().position(|t| t.layer == layer) {
+                    let done = self.timelines.remove(pos);
+                    if done.scrap_on_end {
+                        self.layers
+                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                        self.pending_layers
+                            .retain(|l| l.id != done.layer && l.parent != Some(done.layer));
+                    }
+                }
+                self.wait = WaitReason::None;
+            }
             _ => {}
         }
         std::mem::take(&mut self.intents)
@@ -1547,6 +2112,12 @@ impl Vm {
 
     pub fn notify_video_finished(&mut self) {
         if matches!(self.wait, WaitReason::Video { .. }) {
+            self.wait = WaitReason::None;
+        }
+    }
+
+    pub fn notify_modal_closed(&mut self) {
+        if matches!(self.wait, WaitReason::Modal(_)) {
             self.wait = WaitReason::None;
         }
     }
@@ -1570,9 +2141,21 @@ impl Vm {
             self.choice = Some(choice);
             return;
         };
+        if item.disabled {
+            self.choice = Some(choice);
+            return;
+        }
+        if let Some(se) = choice.click_se {
+            self.play_audio_internal(ChannelId(7), AudioBus::Sfx, se, 1.0, false, 0, None, None);
+        }
         if let (Some(var), Some(val)) = (choice.result_var, &item.value) {
             if let Some(slot) = self.vars.get_mut(var.0 as usize) {
                 *slot = val.clone();
+            }
+        }
+        if let (Some(var), Some(idx_val)) = (choice.index_var, &item.choice_index) {
+            if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                *slot = idx_val.clone();
             }
         }
         self.pc = item.target_pc;
@@ -1580,10 +2163,23 @@ impl Vm {
     }
 
     pub fn cancel_choice(&mut self) {
-        if let Some(cancel_pc) = self.choice.as_ref().and_then(|c| c.cancel_pc) {
-            self.choice = None;
-            self.pc = cancel_pc;
-            self.wait = WaitReason::None;
+        if let Some(choice) = self.choice.take() {
+            if let Some(cancel_pc) = choice.cancel_pc {
+                if let Some(var) = choice.result_var {
+                    if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                        *slot = Value::Str(String::new());
+                    }
+                }
+                if let Some(var) = choice.index_var {
+                    if let Some(slot) = self.vars.get_mut(var.0 as usize) {
+                        *slot = Value::Int(-1);
+                    }
+                }
+                self.pc = cancel_pc;
+                self.wait = WaitReason::None;
+            } else {
+                self.choice = Some(choice);
+            }
         }
     }
 
@@ -1609,6 +2205,15 @@ impl Vm {
             set.insert(ch.asset);
         }
         if let Some(c) = &self.choice {
+            if let Some(bg) = c.background {
+                set.insert(bg);
+            }
+            if let Some(se) = c.hover_se {
+                set.insert(se);
+            }
+            if let Some(se) = c.click_se {
+                set.insert(se);
+            }
             for item in &c.items {
                 if let Some(a) = item.image {
                     set.insert(a);
@@ -1616,6 +2221,38 @@ impl Vm {
                 if let Some(a) = item.hover_image {
                     set.insert(a);
                 }
+                if let Some(a) = item.disabled_image {
+                    set.insert(a);
+                }
+                if let Some((a, _)) = item.preview {
+                    set.insert(a);
+                }
+            }
+        }
+        for tl in &self.timelines {
+            if let Some(def) = self.program.timelines.get(tl.timeline.0 as usize) {
+                for clip in &def.clips {
+                    match &clip.kind {
+                        TimelineClipKind::Image { asset, .. }
+                        | TimelineClipKind::Sound { asset, .. } => {
+                            set.insert(*asset);
+                        }
+                        TimelineClipKind::Box { .. } => {}
+                    }
+                }
+            }
+        }
+        if let Some(p) = self.dialogue_portrait {
+            set.insert(p);
+        }
+        if let Some(style) = self
+            .program
+            .ui
+            .dialogue_styles
+            .get(self.dialogue_style as usize)
+        {
+            if let Some(bg) = style.dialogue_bg {
+                set.insert(bg);
             }
         }
         if let Some(bg) = self.program.ui.dialogue_bg {
@@ -1663,6 +2300,50 @@ impl Vm {
                 }
                 Op::Say { voice: Some(v), .. } => add(*v),
                 Op::AudioPlay { asset, .. } | Op::VideoPlay { asset, .. } => add(*asset),
+                Op::SetDialoguePortrait(Some(a)) => add(*a),
+                Op::TimelinePlay { timeline, .. } => {
+                    if let Some(def) = self.program.timelines.get(timeline.0 as usize) {
+                        for clip in &def.clips {
+                            match &clip.kind {
+                                TimelineClipKind::Image { asset, .. }
+                                | TimelineClipKind::Sound { asset, .. } => add(*asset),
+                                TimelineClipKind::Box { .. } => {}
+                            }
+                        }
+                    }
+                }
+                Op::ChoiceMenu {
+                    menu,
+                    hover_se,
+                    click_se,
+                    ..
+                } => {
+                    if let Some(se) = hover_se {
+                        add(*se);
+                    }
+                    if let Some(se) = click_se {
+                        add(*se);
+                    }
+                    if let Some(tmpl) = self.program.menus.get(menu.0 as usize) {
+                        if let Some(bg) = tmpl.background {
+                            add(bg);
+                        }
+                        for item in &tmpl.items {
+                            if let Some(a) = item.image {
+                                add(a);
+                            }
+                            if let Some(a) = item.hover_image {
+                                add(a);
+                            }
+                            if let Some(a) = item.disabled_image {
+                                add(a);
+                            }
+                            if let Some(a) = item.preview_image {
+                                add(a);
+                            }
+                        }
+                    }
+                }
                 Op::Jump(target) => {
                     pc = *target as usize;
                     continue;
@@ -1683,8 +2364,7 @@ impl Vm {
                             add(a);
                         }
                         // Peek first 4 ops of each choice target so selecting a branch is instant!
-                        let mut bpc = item.target_pc as usize;
-                        for _ in 0..4 {
+                        for bpc in (item.target_pc as usize..).take(4) {
                             let Some(bop) = self.program.ops.get(bpc) else {
                                 break;
                             };
@@ -1705,7 +2385,6 @@ impl Vm {
                                 }
                                 _ => {}
                             }
-                            bpc += 1;
                         }
                     }
                     break;
@@ -1760,7 +2439,7 @@ impl Vm {
             }
             TweenTarget::Audio(ch) => {
                 if let Some(chan) = self.audio.iter_mut().find(|c| c.channel == ch) {
-                    chan.envelope = value.clamp(0.0, 1.0);
+                    chan.envelope = value.clamp(0.0, 4.0);
                     let eff = chan.gain * chan.envelope;
                     self.intents.push(VmIntent::SetAudioGain {
                         channel: ch,
@@ -1769,6 +2448,240 @@ impl Vm {
                 }
             }
         }
+    }
+
+    fn trigger_timeline_sounds(&mut self, active: &mut ActiveTimeline, cur_frame: u32) {
+        let clips: Vec<(u32, AssetId, f32, AudioBus)> = self
+            .program
+            .timelines
+            .get(active.timeline.0 as usize)
+            .map(|def| {
+                def.clips
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, c)| match &c.kind {
+                        TimelineClipKind::Sound { asset, gain, bus }
+                            if cur_frame >= c.start_frame
+                                && !active.triggered_sounds.contains(&(idx as u32)) =>
+                        {
+                            Some((idx as u32, *asset, *gain, *bus))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (idx, asset, gain, bus) in clips {
+            active.triggered_sounds.push(idx);
+            let ch = ChannelId(16 + (idx % 16));
+            self.play_audio_internal(ch, bus, asset, gain, false, 0, None, None);
+        }
+    }
+
+    fn eval_builtin(&mut self, func: BuiltinFn, args: Vec<Value>) -> Value {
+        let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
+        match func {
+            BuiltinFn::ToInt => Value::Int(arg(0).as_i64().unwrap_or(0)),
+            BuiltinFn::ToStr => Value::Str(arg(0).to_display_string()),
+            BuiltinFn::CharLen => Value::Int(arg(0).to_display_string().chars().count() as i64),
+            BuiltinFn::StrRepeat => {
+                let s = arg(0).to_display_string();
+                let n = arg(1).as_i64().unwrap_or(0).clamp(0, 1024) as usize;
+                Value::Str(s.repeat(n))
+            }
+            BuiltinFn::AddDelimiter => {
+                let delim = arg(0).to_display_string();
+                let s = arg(1).to_display_string();
+                if s.is_empty() {
+                    Value::Str(String::new())
+                } else {
+                    Value::Str(format!("{s}{delim}"))
+                }
+            }
+            BuiltinFn::ListPush => {
+                let mut list = match arg(0) {
+                    Value::List(v) => v,
+                    Value::Null => Vec::new(),
+                    Value::Str(s) if s.is_empty() => Vec::new(),
+                    other => vec![other],
+                };
+                if list.len() < 4096 {
+                    list.push(arg(1));
+                }
+                Value::List(list)
+            }
+            BuiltinFn::ListLen => match arg(0) {
+                Value::List(v) => Value::Int(v.len() as i64),
+                Value::Null => Value::Int(0),
+                Value::Str(s) if s.is_empty() => Value::Int(0),
+                _ => Value::Int(1),
+            },
+            BuiltinFn::ListGet => {
+                let idx = arg(1).as_i64().unwrap_or(-1);
+                if idx < 0 {
+                    return Value::Str(String::new());
+                }
+                match arg(0) {
+                    Value::List(v) => v
+                        .get(idx as usize)
+                        .cloned()
+                        .unwrap_or_else(|| Value::Str(String::new())),
+                    other if idx == 0 => other,
+                    _ => Value::Str(String::new()),
+                }
+            }
+            BuiltinFn::ListSet => {
+                let idx = arg(1).as_i64().unwrap_or(-1);
+                let mut list = match arg(0) {
+                    Value::List(v) => v,
+                    Value::Null => Vec::new(),
+                    other => vec![other],
+                };
+                if idx >= 0 && (idx as usize) < 4096 {
+                    let i = idx as usize;
+                    if list.len() <= i {
+                        list.resize(i + 1, Value::Null);
+                    }
+                    list[i] = arg(2);
+                }
+                Value::List(list)
+            }
+            BuiltinFn::ListJoin => {
+                let delim = if args.len() >= 2 {
+                    arg(1).to_display_string()
+                } else {
+                    "\r\n".to_owned()
+                };
+                match arg(0) {
+                    Value::List(v) => Value::Str(
+                        v.iter()
+                            .map(Value::to_display_string)
+                            .collect::<Vec<_>>()
+                            .join(&delim),
+                    ),
+                    other => Value::Str(other.to_display_string()),
+                }
+            }
+            BuiltinFn::ListSplit => {
+                let src = arg(0).to_display_string();
+                let delim = if args.len() >= 2 {
+                    arg(1).to_display_string()
+                } else {
+                    "\r\n".to_owned()
+                };
+                if src.is_empty() {
+                    Value::List(Vec::new())
+                } else if delim.is_empty() {
+                    Value::List(vec![Value::Str(src)])
+                } else {
+                    Value::List(
+                        src.split(&delim)
+                            .map(|s| Value::Str(s.to_owned()))
+                            .collect(),
+                    )
+                }
+            }
+            BuiltinFn::ListCompact => match arg(0) {
+                Value::List(v) => Value::List(
+                    v.into_iter()
+                        .filter(|el| !el.to_display_string().is_empty())
+                        .collect(),
+                ),
+                other => other,
+            },
+            BuiltinFn::Min => {
+                let a = arg(0).as_i64().unwrap_or(0);
+                let b = arg(1).as_i64().unwrap_or(0);
+                Value::Int(a.min(b))
+            }
+            BuiltinFn::Max => {
+                let a = arg(0).as_i64().unwrap_or(0);
+                let b = arg(1).as_i64().unwrap_or(0);
+                Value::Int(a.max(b))
+            }
+            BuiltinFn::RandInt => {
+                let n = arg(0).as_i64().unwrap_or(1);
+                if n <= 1 {
+                    Value::Int(0)
+                } else {
+                    Value::Int((self.rng.next_u64() % (n as u64)) as i64)
+                }
+            }
+        }
+    }
+}
+
+fn value_to_name_set(val: &Value) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    match val {
+        Value::List(v) => {
+            for item in v {
+                let s = item.to_display_string();
+                for part in s.split("\r\n").flat_map(|p| p.split('\n')) {
+                    if !part.is_empty() {
+                        set.insert(part.to_owned());
+                    }
+                }
+            }
+        }
+        other => {
+            let s = other.to_display_string();
+            for part in s.split("\r\n").flat_map(|p| p.split('\n')) {
+                if !part.is_empty() {
+                    set.insert(part.to_owned());
+                }
+            }
+        }
+    }
+    set
+}
+
+fn resolve_asset_path(lookup: &BTreeMap<String, AssetId>, raw: &str) -> Option<AssetId> {
+    let mut norm = raw.replace('\\', "/");
+    while norm.starts_with("./") {
+        norm = norm[2..].to_owned();
+    }
+    while norm.starts_with('/') {
+        norm.remove(0);
+    }
+    let lower = norm.to_lowercase();
+    if let Some(&id) = lookup.get(&lower) {
+        return Some(id);
+    }
+    if let Some(dot) = lower.rfind('.') {
+        if let Some(&id) = lookup.get(&lower[..dot]) {
+            return Some(id);
+        }
+    }
+    for prefix in ["グラフィック/", "グラフィック/顔/", "サウンド/"] {
+        let cand = format!("{prefix}{lower}");
+        if let Some(&id) = lookup.get(&cand) {
+            return Some(id);
+        }
+        if let Some(dot) = cand.rfind('.') {
+            if let Some(&id) = lookup.get(&cand[..dot]) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn parse_solid_color(s: &str) -> Option<[f32; 4]> {
+    let hex = s.strip_prefix('$').or_else(|| s.strip_prefix('#'))?;
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+        Some([r, g, b, 1.0])
+    } else if hex.len() == 8 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+        let a = u8::from_str_radix(&hex[6..8], 16).ok()? as f32 / 255.0;
+        Some([r, g, b, a])
+    } else {
+        None
     }
 }
 
@@ -1806,6 +2719,25 @@ fn eval_binop(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
             lhs.to_display_string(),
             rhs.to_display_string()
         ))),
+        BinOp::BitAnd => Ok(Value::Int(
+            lhs.as_i64().unwrap_or(0) & rhs.as_i64().unwrap_or(0),
+        )),
+        BinOp::BitOr => Ok(Value::Int(
+            lhs.as_i64().unwrap_or(0) | rhs.as_i64().unwrap_or(0),
+        )),
+        BinOp::BitXor => Ok(Value::Int(
+            lhs.as_i64().unwrap_or(0) ^ rhs.as_i64().unwrap_or(0),
+        )),
+        BinOp::Shl => Ok(Value::Int(
+            lhs.as_i64()
+                .unwrap_or(0)
+                .wrapping_shl(rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32),
+        )),
+        BinOp::Shr => Ok(Value::Int(
+            lhs.as_i64()
+                .unwrap_or(0)
+                .wrapping_shr(rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32),
+        )),
         BinOp::And => Ok(Value::Bool(lhs.as_bool() && rhs.as_bool())),
         BinOp::Or => Ok(Value::Bool(lhs.as_bool() || rhs.as_bool())),
         BinOp::Eq => Ok(Value::Bool(values_eq(&lhs, &rhs))),
@@ -1888,6 +2820,12 @@ fn eval_binop(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
 fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+        (Value::Int(x), Value::Bool(y)) | (Value::Bool(y), Value::Int(x)) => *x == i64::from(*y),
+        (Value::Int(x), Value::Str(s)) | (Value::Str(s), Value::Int(x)) => {
+            s.trim().parse::<i64>().is_ok_and(|y| y == *x)
+        }
+        (Value::Null, Value::Str(s)) | (Value::Str(s), Value::Null) => s.is_empty(),
+        (Value::Null, Value::Int(0)) | (Value::Int(0), Value::Null) => true,
         _ => a == b,
     }
 }
@@ -1986,6 +2924,9 @@ mod tests {
             )]),
             ui: UiTheme::default(),
             assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
         })
     }
 
@@ -2042,5 +2983,193 @@ mod tests {
         restored.advance(false); // dismiss finished dialogue
         restored.step(1000).unwrap();
         assert_eq!(restored.outcome.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn vm_builtins_dynamic_assets_menus_timelines_and_modals() {
+        let mut lookup = BTreeMap::new();
+        lookup.insert("gfx/hero.png".into(), AssetId(10));
+        lookup.insert("sfx/click.wav".into(), AssetId(11));
+
+        let prog = Arc::new(NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.ext".into(),
+                title: "Ext".into(),
+                version: "1.0".into(),
+                stage_width: 1280,
+                stage_height: 720,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec![
+                "main".into(),          // 0
+                "list".into(),          // 1
+                "choice_val".into(),    // 2
+                "choice_idx".into(),    // 3
+                "gfx\\HERO.PNG".into(), // 4
+                "A".into(),             // 5
+                "B".into(),             // 6
+                "hidden".into(),        // 7
+                "Start".into(),         // 8
+                "Bonus".into(),         // 9
+                "done".into(),          // 10
+            ],
+            vars: vec![
+                VarMeta { name: StrId(1), default: Value::Null },
+                VarMeta { name: StrId(2), default: Value::Str(String::new()) },
+                VarMeta { name: StrId(3), default: Value::Int(-1) },
+            ],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 2,
+            }],
+            labels: vec![],
+            ops: vec![
+                // ListPush + ListCompact + ResolveAsset + LayerSetDyn
+                Op::LoadVar(VarId(0)),
+                Op::PushStr(StrId(5)),
+                Op::CallBuiltin { func: BuiltinFn::ListPush, argc: 2 },
+                Op::PushStr(StrId(6)),
+                Op::CallBuiltin { func: BuiltinFn::ListPush, argc: 2 },
+                Op::StoreVar(VarId(0)),
+                Op::PushStr(StrId(4)),
+                Op::ResolveAsset,
+                Op::LayerSetDyn {
+                    layer: LayerId(0),
+                    parent: None,
+                    transform: Box::new(Transform2D::default()),
+                },
+                Op::LayerSetText {
+                    layer: LayerId(1),
+                    parent: None,
+                    transform: Some(Box::new(Transform2D::default())),
+                    text: Some(StrId(5)),
+                    font_size: 24.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    align: TextAlign::Center,
+                },
+                // Play 30-frame 60Hz timeline with scrap_on_end + wait
+                Op::TimelinePlay {
+                    timeline: TimelineId(0),
+                    layer: LayerId(2),
+                    scrap_on_end: true,
+                    wait: true,
+                    click_skippable: false,
+                },
+                // ChoiceMenu filtering out "Bonus" via hidden_names
+                Op::PushStr(StrId(9)),
+                Op::PushNull,
+                Op::ChoiceMenu {
+                    menu: MenuId(0),
+                    result_var: Some(VarId(1)),
+                    index_var: Some(VarId(2)),
+                    cancelable: false,
+                    hover_se: None,
+                    click_se: Some(AssetId(11)),
+                    fade_in_us: 0,
+                    fade_out_us: 0,
+                    timeout_us: None,
+                },
+                // OpenModal(Gallery)
+                Op::OpenModal(ModalKind::Gallery),
+                Op::End { outcome: StrId(10) },
+            ],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: lookup,
+            timelines: vec![TimelineDef {
+                fps: 60.0,
+                size: [1280, 720],
+                duration_frames: 30,
+                clips: vec![TimelineClip {
+                    start_frame: 0,
+                    duration_frames: 30,
+                    z_order: 1,
+                    kind: TimelineClipKind::Image {
+                        asset: AssetId(10),
+                        pivot: [0.0, 0.0],
+                        pos_start: [0.0, 0.0],
+                        pos_end: [100.0, 0.0],
+                        pos_easing: [Easing::Linear, Easing::Linear],
+                        angle: [0.0, 0.0],
+                        angle_easing: Easing::Linear,
+                        scale_x: [1.0, 1.0],
+                        scale_y: [1.0, 1.0],
+                        scale_easing: [Easing::Linear, Easing::Linear],
+                        opacity: [0.0, 1.0],
+                        clip_start: None,
+                        clip_end: None,
+                    },
+                }],
+            }],
+            menus: vec![MenuTemplate {
+                size: [1280, 720],
+                background: None,
+                items: vec![
+                    MenuItemDef {
+                        name: StrId(8),
+                        label: StrId(8),
+                        rect: [100.0, 100.0, 200.0, 50.0],
+                        image: Some(AssetId(10)),
+                        hover_image: None,
+                        disabled_image: None,
+                        preview_image: None,
+                        preview_pos: [0.0, 0.0],
+                    },
+                    MenuItemDef {
+                        name: StrId(9),
+                        label: StrId(9),
+                        rect: [100.0, 170.0, 200.0, 50.0],
+                        image: Some(AssetId(10)),
+                        hover_image: None,
+                        disabled_image: None,
+                        preview_image: None,
+                        preview_pos: [0.0, 0.0],
+                    },
+                ],
+            }],
+        });
+
+        let mut vm = Vm::new(prog, None).unwrap();
+        vm.step(1000).unwrap();
+        assert_eq!(vm.layers.len(), 2);
+        assert_eq!(vm.layers[0].asset, Some(AssetId(10)));
+        assert_eq!(vm.layers[1].text.as_ref().unwrap().text, "A");
+        assert!(matches!(vm.wait, WaitReason::Timeline { layer: LayerId(2), .. }));
+
+        // Advance past 500ms timeline -> finishes & advances to ChoiceMenu
+        vm.tick(600_000, 1.0, false);
+        assert!(vm.timelines.is_empty());
+        assert_eq!(vm.wait, WaitReason::None);
+
+        vm.step(1000).unwrap();
+        assert_eq!(vm.wait, WaitReason::Choice);
+        // "Bonus" was hidden via stack arg, so only "Start" is offered!
+        let c = vm.choice.as_ref().unwrap();
+        assert_eq!(c.items.len(), 1);
+        assert_eq!(c.items[0].label, "Start");
+        let intents = vm.choose(0);
+        assert!(intents.iter().any(|i| matches!(i, VmIntent::PlayAudio { asset: AssetId(11), .. })));
+        assert_eq!(vm.vars[1], Value::Str("Start".into()));
+        assert_eq!(vm.vars[2], Value::Int(0));
+
+        // Next step hits OpenModal(Gallery)
+        let intents2 = vm.step(1000).unwrap();
+        assert!(intents2.contains(&VmIntent::OpenModal(ModalKind::Gallery)));
+        assert_eq!(vm.wait, WaitReason::Modal(ModalKind::Gallery));
+        vm.notify_modal_closed();
+        vm.step(1000).unwrap();
+        assert_eq!(vm.outcome.as_deref(), Some("done"));
     }
 }

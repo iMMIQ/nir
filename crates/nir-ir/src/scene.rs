@@ -1,4 +1,4 @@
-use crate::{AssetId, ChannelId, LayerId};
+use crate::{AssetId, AudioBus, ChannelId, LayerId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -235,4 +235,62 @@ impl ShakeSpec {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TextAlign {
+    #[default]
+    Left = 0,
+    Center = 1,
+    Right = 2,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TimelineClipKind {
+    Image {
+        asset: AssetId,
+        pivot: [f32; 2],
+        pos_start: [f32; 2],
+        pos_end: [f32; 2],
+        pos_easing: [Easing; 2],
+        angle: [f32; 2],
+        angle_easing: Easing,
+        scale_x: [f32; 2],
+        scale_y: [f32; 2],
+        scale_easing: [Easing; 2],
+        opacity: [f32; 2],
+        clip_start: Option<[f32; 4]>,
+        clip_end: Option<[f32; 4]>,
+    },
+    Box {
+        pos_start: [f32; 2],
+        pos_end: [f32; 2],
+        size_start: [f32; 2],
+        size_end: [f32; 2],
+        color: [f32; 4],
+        opacity: [f32; 2],
+    },
+    Sound {
+        asset: AssetId,
+        gain: f32,
+        bus: AudioBus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineClip {
+    pub start_frame: u32,
+    pub duration_frames: u32,
+    pub z_order: i32,
+    pub kind: TimelineClipKind,
+}
+
+/// Frame-accurate keyframed animation timeline (e.g. LiveCinema/LiveMotion or cut-in sequences).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineDef {
+    pub fps: f32,
+    pub size: [u32; 2],
+    pub duration_frames: u32,
+    pub clips: Vec<TimelineClip>,
 }

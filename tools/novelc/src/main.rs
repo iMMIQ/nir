@@ -87,6 +87,15 @@ enum Cmd {
         #[arg(long, value_enum)]
         build: Option<BuildTarget>,
         #[arg(long)]
+        no_optimize: bool,
+        #[arg(long)]
+        lossless: bool,
+        #[arg(long, default_value_t = 92)]
+        webp_quality: u8,
+        /// Also emit editable `.nirs` project files even when direct-to-IR is available
+        #[arg(long)]
+        emit_nirs: bool,
+        #[arg(long)]
         sdk: Option<PathBuf>,
     },
     /// Launch a live hot-reload Web preview server
@@ -155,16 +164,30 @@ fn main() -> Result<()> {
             strict,
             locale,
             build,
+            no_optimize,
+            lossless,
+            webp_quality,
+            emit_nirs,
             sdk,
-        } => cmd_convert(
-            &source,
-            &out,
-            &engine,
-            strict,
-            locale,
-            build,
-            sdk.as_deref(),
-        ),
+        } => {
+            let opt = OptimizeConfig {
+                enabled: !no_optimize,
+                lossless_images: lossless,
+                webp_quality,
+                ..Default::default()
+            };
+            cmd_convert(
+                &source,
+                &out,
+                &engine,
+                strict,
+                locale,
+                build,
+                &opt,
+                emit_nirs,
+                sdk.as_deref(),
+            )
+        }
         Cmd::Dev {
             project,
             host,
@@ -235,14 +258,13 @@ fn cmd_check(project: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build(
+fn package_built(
     project: &Path,
+    built: &nir_build::BuiltBundle,
     target: BuildTarget,
     out: Option<&Path>,
-    opt: &OptimizeConfig,
     sdk_override: Option<&Path>,
 ) -> Result<()> {
-    let built = nir_build::compile_project(project, opt)?;
     let s = &built.summary;
     println!(
         "Compiled `{}`: {} ops | {} assets ({} trimmed, {} pruned, saved {:.1} KiB) | {:.1} KiB (.nirpak)",
@@ -271,7 +293,7 @@ fn cmd_build(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| project.join("dist/web"));
             let sdk_dir = resolve_sdk_dir(sdk_override);
-            nir_build::package_web(&built, &sdk_dir, &dest)?;
+            nir_build::package_web(built, &sdk_dir, &dest)?;
             println!("Packaged Web bundle: {}", dest.display());
         }
         BuildTarget::Native => {
@@ -285,7 +307,7 @@ fn cmd_build(
                 "player-native"
             };
             let candidate = sdk_dir.join("native").join(bin_name);
-            nir_build::package_native(&built, &candidate, &dest, bin_name)?;
+            nir_build::package_native(built, &candidate, &dest, bin_name)?;
             println!("Packaged Native bundle: {}", dest.display());
         }
         BuildTarget::Android => {
@@ -300,13 +322,25 @@ fn cmd_build(
                     so_path.display()
                 );
             }
-            nir_build::package_android(project, &built, &so_path, &dest)?;
+            nir_build::package_android(project, built, &so_path, &dest)?;
             println!("Packaged signed Android APK: {}", dest.display());
         }
     }
     Ok(())
 }
 
+fn cmd_build(
+    project: &Path,
+    target: BuildTarget,
+    out: Option<&Path>,
+    opt: &OptimizeConfig,
+    sdk_override: Option<&Path>,
+) -> Result<()> {
+    let built = nir_build::compile_project(project, opt)?;
+    package_built(project, &built, target, out, sdk_override)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_convert(
     source: &Path,
     out: &Path,
@@ -314,6 +348,8 @@ fn cmd_convert(
     strict: bool,
     locale: Option<String>,
     build_target: Option<BuildTarget>,
+    opt: &OptimizeConfig,
+    emit_nirs: bool,
     sdk_override: Option<&Path>,
 ) -> Result<()> {
     let mut registry = ImporterRegistry::new();
@@ -325,6 +361,56 @@ fn cmd_convert(
         source_locale: locale,
         ..Default::default()
     };
+
+    if !emit_nirs {
+        if let Some((direct, report)) = registry
+            .import_direct_auto(source, Some(engine), &opts)
+            .with_context(|| format!("direct-converting `{}`", source.display()))?
+        {
+            fs::create_dir_all(out)?;
+            let report_json = serde_json::to_string_pretty(&report)?;
+            fs::write(out.join("conversion_report.json"), report_json)?;
+
+            let manifest = format!(
+                "[game]\nid = {:?}\ntitle = {:?}\nversion = {:?}\nlocale = {:?}\nstage = [{}, {}]\n",
+                direct.program.meta.game_id,
+                direct.program.meta.title,
+                direct.program.meta.version,
+                direct.program.meta.default_locale,
+                direct.program.meta.stage_width,
+                direct.program.meta.stage_height,
+            );
+            fs::write(out.join("game.toml"), manifest)?;
+
+            let sources: Vec<nir_build::DirectAssetSource> = direct
+                .raw_assets
+                .into_iter()
+                .map(|a| {
+                    let data = a.data;
+                    nir_build::DirectAssetSource {
+                        name: a.name,
+                        kind: a.kind,
+                        codec: a.codec,
+                        loader: std::sync::Arc::new(move || data.load()),
+                    }
+                })
+                .collect();
+            let cache_dir = out.join(".nir").join("cache");
+            let built = nir_build::build_direct_program(
+                direct.program,
+                sources,
+                &direct.keep_assets,
+                &cache_dir,
+                opt,
+            )?;
+
+            println!("{}", report.summary_text());
+            let target = build_target.unwrap_or(BuildTarget::Pak);
+            package_built(out, &built, target, None, sdk_override)?;
+            return Ok(());
+        }
+    }
+
     let (project, report) = registry
         .import_auto(source, Some(engine), &opts)
         .with_context(|| format!("converting `{}`", source.display()))?;
@@ -337,7 +423,7 @@ fn cmd_convert(
     println!("Emitted NIR v2 project: {}", out.display());
 
     if let Some(target) = build_target {
-        cmd_build(out, target, None, &OptimizeConfig::default(), sdk_override)?;
+        cmd_build(out, target, None, opt, sdk_override)?;
     }
     Ok(())
 }

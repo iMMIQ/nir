@@ -1,6 +1,6 @@
 use crate::{
-    AssetId, AudioLoopRegion, FuncId, FuncMeta, LabelMeta, NirError, Op, Result, SpriteTrim, StrId,
-    TextEntry, UiTheme, VarMeta,
+    AssetId, AudioLoopRegion, FuncId, FuncMeta, LabelMeta, MenuTemplate, NirError, Op, Result,
+    SpriteTrim, StrId, TextEntry, TimelineDef, UiTheme, VarMeta,
 };
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,15 @@ pub struct NirProgram {
     pub texts: BTreeMap<String, Vec<TextEntry>>,
     pub ui: UiTheme,
     pub assets: Vec<AssetMeta>,
+    /// Normalized lowercase relative path (`/`-separated) -> `AssetId` for dynamic runtime asset resolution.
+    #[serde(default)]
+    pub asset_lookup: BTreeMap<String, AssetId>,
+    /// Reusable frame-accurate timelines (LiveCinema/LiveMotion/cut-ins).
+    #[serde(default)]
+    pub timelines: Vec<TimelineDef>,
+    /// Reusable interactive image menus (e.g. `.lpm` templates).
+    #[serde(default)]
+    pub menus: Vec<MenuTemplate>,
 }
 
 impl NirProgram {
@@ -234,6 +243,9 @@ struct NirProgramRef<'a> {
     texts: &'a BTreeMap<String, Vec<TextEntry>>,
     ui: &'a UiTheme,
     assets: &'a [AssetMeta],
+    asset_lookup: &'a BTreeMap<String, AssetId>,
+    timelines: &'a [TimelineDef],
+    menus: &'a [MenuTemplate],
 }
 
 /// Encodes a `NirProgram` and raw media blobs into a single zero-copy `.nirpak` buffer
@@ -283,7 +295,7 @@ pub fn encode_nirpak_with_compression(
             continue;
         }
 
-        let pad = if offset % BLOB_ALIGN == 0 {
+        let pad = if offset.is_multiple_of(BLOB_ALIGN) {
             0
         } else {
             (BLOB_ALIGN - (offset % BLOB_ALIGN)) as usize
@@ -311,6 +323,9 @@ pub fn encode_nirpak_with_compression(
         texts: &program.texts,
         ui: &program.ui,
         assets: &patched_assets,
+        asset_lookup: &program.asset_lookup,
+        timelines: &program.timelines,
+        menus: &program.menus,
     };
 
     let (flags, prog_payload) = if compression == Compression::none() {
@@ -509,6 +524,9 @@ mod tests {
                 offset: 0,
                 size: 0,
             }],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
         };
 
         let blob = b"fake-webp-bytes-1234567890";
@@ -580,6 +598,9 @@ mod tests {
                     size: 0,
                 })
                 .collect(),
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
         };
         let blob_a = vec![0xABu8; 1000];
         let blob_c = vec![0xCDu8; 500];
