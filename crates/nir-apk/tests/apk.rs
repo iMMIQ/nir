@@ -271,7 +271,10 @@ fn aapt2_badging_reports_the_game() {
     );
     assert!(stdout.contains("versionCode='3'"), "versionCode");
     assert!(stdout.contains("versionName='1.0.3'"), "versionName");
-    assert!(stdout.contains("sdkVersion:'26'"), "min sdk");
+    assert!(
+        stdout.contains("sdkVersion:'26'") || stdout.contains("minSdkVersion:'26'"),
+        "min sdk"
+    );
     assert!(stdout.contains("targetSdkVersion:'29'"), "target sdk");
     assert!(
         stdout.contains("application-label:'星之梦 ～Planetium～'") || stdout.contains("星之梦"),
