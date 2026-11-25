@@ -16,6 +16,9 @@ jobs:
     env:
       LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
       _CL_: '/GL-'
+      ANDROID_NDK_HOME: ''
+      ANDROID_NDK_ROOT: ''
+      ANDROID_NDK: ''
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust

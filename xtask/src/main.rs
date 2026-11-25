@@ -156,6 +156,11 @@ fn main() -> Result<()> {
                 if ranlib.is_file() {
                     build.env("RANLIB_aarch64_linux_android", &ranlib);
                 }
+                if cfg!(windows)
+                    && std::env::var_os("CMAKE_GENERATOR_aarch64_linux_android").is_none()
+                {
+                    build.env("CMAKE_GENERATOR_aarch64_linux_android", "Ninja");
+                }
                 run(&mut build)?;
                 fs::create_dir_all("dist/sdk/android/lib/arm64-v8a")?;
                 fs::copy(
