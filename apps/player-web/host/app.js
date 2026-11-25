@@ -2059,9 +2059,13 @@ async function main() {
     recoverGpuRenderer();
   });
 
-  // --- Cinema Idle Chrome Auto-Fade & Desktop Pointer Cursor Feedback ---
+  // --- Cinema Idle Chrome Auto-Fade (Desktop + Mobile!) & Pointer Cursor Feedback ---
   let idleChromeTimer = 0;
+  let chromeIsIdle = false;
+  let mobileGestureHintShown = false;
+  let prevStoryReading = false;
   const setChromeIdle = (idle) => {
+    chromeIsIdle = idle;
     if (shelfBtn) shelfBtn.classList.toggle('chrome-idle', idle);
     if (fsBtn) fsBtn.classList.toggle('chrome-idle', idle);
     if (quickToolsEl && !engine.is_interface_hidden()) {
@@ -2069,16 +2073,18 @@ async function main() {
     }
     canvas.classList.toggle('cursor-idle', idle && !deviceProfile.isMobile);
   };
+  const scheduleChromeFade = () => {
+    clearTimeout(idleChromeTimer);
+    const delayMs = deviceProfile.isMobile ? 2800 : 3200;
+    idleChromeTimer = setTimeout(() => {
+      if (engine.is_story_reading() && !engine.has_hovered_hit()) {
+        setChromeIdle(true);
+      }
+    }, delayMs);
+  };
   const wakeChrome = () => {
     setChromeIdle(false);
-    clearTimeout(idleChromeTimer);
-    if (!deviceProfile.isMobile) {
-      idleChromeTimer = setTimeout(() => {
-        if (engine.is_story_reading() && !engine.has_hovered_hit()) {
-          setChromeIdle(true);
-        }
-      }, 3200);
-    }
+    scheduleChromeFade();
   };
   const syncPointerCursor = () => {
     if (!deviceProfile.isMobile) {
@@ -2086,6 +2092,55 @@ async function main() {
     }
   };
   wakeChrome();
+
+  // --- Mobile / Browser History Back Guard (`popstate`) ---
+  // Prevents OS edge-back swipe from abruptly exiting the game while inside Menu/Saves/Settings/History/CG!
+  let backGuardActive = false;
+  let lastExitWarnMs = 0;
+  try {
+    if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
+      history.pushState({ nirGuard: 1 }, '', location.href);
+      backGuardActive = true;
+      window.addEventListener('popstate', () => {
+        if (!backGuardActive) return;
+        if (engine.can_go_back()) {
+          try { history.pushState({ nirGuard: 1 }, '', location.href); } catch {}
+          engine.cancel_or_menu();
+          wakeChrome();
+          triggerHaptic(10);
+          scheduleFrame();
+          return;
+        }
+        const now = performance.now();
+        if (engine.is_story_reading() && now - lastExitWarnMs > 2500) {
+          lastExitWarnMs = now;
+          try {
+            history.pushState({ nirGuard: 1 }, '', location.href);
+            dispatchCmdJson(engine.emit_autosave());
+            dispatchCmdJson(engine.flush_pending_saves());
+          } catch {}
+          engine.show_toast(
+            shelfUrl ? '再返回一次将回到书架（已自动存档）' : '再返回一次将离开页面（已自动存档）',
+            2400,
+          );
+          wakeChrome();
+          triggerHaptic(12);
+          scheduleFrame();
+          return;
+        }
+        backGuardActive = false;
+        try {
+          dispatchCmdJson(engine.emit_autosave());
+          dispatchCmdJson(engine.flush_pending_saves());
+        } catch {}
+        if (shelfUrl) {
+          location.href = shelfUrl;
+        } else {
+          history.back();
+        }
+      });
+    }
+  } catch { /* ignore history API restrictions */ }
 
   // --- Unified Pointer + Multi-Touch Gesture Input ---
   const unlockAudio = () => audio.ensureContext();
@@ -2097,16 +2152,21 @@ async function main() {
     return [e.clientX - rect.left, e.clientY - rect.top];
   };
 
+  let primaryPointerDown = false;
   canvas.addEventListener('pointerdown', (e) => {
     unlockAudio();
-    wakeChrome();
     const [x, y] = localPos(e);
     if (e.pointerType === 'touch') {
+      // Only wake top-edge DOM chrome when tapping near top edge or outside quiet reading so CG stays clean!
+      if (y <= 76 || !engine.is_story_reading()) {
+        wakeChrome();
+      }
       try { canvas.setPointerCapture(e.pointerId); } catch {}
       engine.touch_start(e.pointerId, x, y);
       scheduleFrame();
       return;
     }
+    wakeChrome();
     if (e.button === 2) {
       engine.cancel_or_menu();
       syncPointerCursor();
@@ -2114,6 +2174,7 @@ async function main() {
       return;
     }
     if (e.button === 0 && e.isPrimary) {
+      primaryPointerDown = true;
       engine.pointer_down(x, y);
       syncPointerCursor();
       scheduleFrame();
@@ -2128,7 +2189,11 @@ async function main() {
       return;
     }
     wakeChrome();
-    engine.pointer_move(x, y);
+    if (primaryPointerDown) {
+      engine.pointer_drag(x, y);
+    } else {
+      engine.pointer_move(x, y);
+    }
     syncPointerCursor();
     if (engine.needs_frame()) scheduleFrame();
   });
@@ -2143,6 +2208,7 @@ async function main() {
       return;
     }
     if (e.button === 0 && e.isPrimary) {
+      primaryPointerDown = false;
       engine.pointer_up(x, y);
       syncPointerCursor();
       scheduleFrame();
@@ -2153,6 +2219,7 @@ async function main() {
     if (e.pointerType === 'touch') {
       engine.touch_cancel(e.pointerId);
     } else {
+      primaryPointerDown = false;
       engine.pointer_cancel();
     }
     scheduleFrame();
@@ -2883,11 +2950,36 @@ async function main() {
         }
       } catch { /* ignore */ }
     }
-    // Surface clean screenshot button prominently while UI is hidden to admire CGs
+    // Surface clean screenshot button prominently while UI is hidden to admire CGs,
+    // and automatically re-surface top chrome whenever leaving Story (Menu / Title / Saves / Settings)
+    const storyReadingNow = engine.is_story_reading();
+    if (deviceProfile.isMobile) {
+      if (!storyReadingNow && chromeIsIdle) {
+        setChromeIdle(false);
+      } else if (storyReadingNow && !prevStoryReading) {
+        scheduleChromeFade();
+      }
+    }
+    prevStoryReading = storyReadingNow;
     if (quickToolsEl) {
       const hiddenUi = engine.is_interface_hidden();
       if (copyBtn) copyBtn.hidden = hiddenUi;
       if (hiddenUi) quickToolsEl.classList.remove('chrome-idle');
+    }
+    // One-time subtle mobile gesture cheat-sheet toast on first entry into Story reading!
+    if (deviceProfile.isMobile && storyReadingNow && !mobileGestureHintShown) {
+      mobileGestureHintShown = true;
+      try {
+        if (localStorage.getItem('nir_mobile_gesture_hint_v1') !== '1') {
+          localStorage.setItem('nir_mobile_gesture_hint_v1', '1');
+          engine.show_toast('手势：上滑回看 · 下滑隐藏 · 右滑回退 · 长按快进 · 双指菜单', 4200);
+        }
+      } catch { /* ignore */ }
+    }
+    // Consume subtle touch button / slider / HoldSkip haptic pulse from Rust runtime
+    const uiHapticMs = engine.take_haptic_ms();
+    if (uiHapticMs > 0) {
+      triggerHaptic(uiHapticMs, 0.22);
     }
     // Gentle haptic pulse when story triggers a dramatic screen Shake
     if (engine.is_shaking() && ts - lastShakeHapticMs > 520) {

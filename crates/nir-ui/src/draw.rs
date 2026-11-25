@@ -216,6 +216,23 @@ impl TextRun {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliderKind {
+    TextSpeed,
+    FontScale,
+    AutoDelay,
+    DialogueOpacity,
+    MasterVolume,
+    AudioBus(nir_ir::AudioBus),
+}
+
+/// Interactive slider track registered by `nir-ui` so touch & pointer hosts support smooth dragging.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SliderTrack {
+    pub rect: [f32; 4],
+    pub kind: SliderKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HitRegion {
     pub id: u32,
@@ -238,6 +255,10 @@ pub struct DrawPacket {
     pub quads: Vec<Quad>,
     pub texts: Vec<TextRun>,
     pub hits: Vec<HitRegion>,
+    /// Interactive slider tracks for continuous touch/pointer scrubbing in Settings.
+    pub sliders: Vec<SliderTrack>,
+    /// Active modal overlay card bounds (tapping outside closes the overlay with one hand).
+    pub overlay_panel_rect: Option<[f32; 4]>,
     pub transition_from: Vec<Quad>,
     pub transition_to: Vec<Quad>,
     pub transition: Transition,
@@ -253,6 +274,15 @@ impl DrawPacket {
                 && x <= h.rect[0] + h.rect[2]
                 && y >= h.rect[1]
                 && y <= h.rect[1] + h.rect[3]
+        })
+    }
+
+    pub fn slider_at(&self, x: f32, y: f32) -> Option<SliderTrack> {
+        self.sliders.iter().rev().copied().find(|s| {
+            x >= s.rect[0]
+                && x <= s.rect[0] + s.rect[2]
+                && y >= s.rect[1]
+                && y <= s.rect[1] + s.rect[3]
         })
     }
 

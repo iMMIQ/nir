@@ -96,6 +96,10 @@ pub struct UiContext<'a> {
     pub history_scroll: usize,
     pub gallery_page: usize,
     pub viewing_cg: Option<(usize, usize)>,
+    /// CG lightbox zoom multiplier (`1.0..=3.0`).
+    pub cg_zoom: f32,
+    /// CG lightbox pan offset in logical pixels while zoomed in.
+    pub cg_pan: [f32; 2],
     pub settings_tab: u8,
     pub pending_confirm: Option<ConfirmKind>,
     pub host_has_shelf: bool,
@@ -1837,14 +1841,18 @@ fn project_story_hud(
             }
 
             // 5. Dialogue text — comfortable mobile size in Portrait Docked Reader,
-            //    or faithful stage-scaled typography in Landscape / Classic mode.
+            //    comfortable minimum floor on compact touch landscape, or faithful stage-scaled typography.
             let (fsize, lh) = if portrait_docked {
                 let sz = (17.5 * ctx.prefs.font_scale).clamp(14.0, 30.0);
                 (sz, (sz * 1.45).clamp(20.0, 46.0))
             } else {
-                let sz = (style_font_size * scale * ctx.prefs.font_scale).clamp(10.0, 72.0);
+                let mut sz = (style_font_size * scale * ctx.prefs.font_scale).clamp(10.0, 72.0);
+                if touch {
+                    let min_touch_sz = (14.5 * ctx.prefs.font_scale).clamp(13.0, 22.0);
+                    sz = sz.max(min_touch_sz);
+                }
                 let l = (style_line_height * scale * ctx.prefs.font_scale)
-                    .max(sz * 1.15)
+                    .max(sz * 1.18)
                     .min(sz * 1.85);
                 (sz, l)
             };
@@ -2017,10 +2025,10 @@ fn project_story_hud(
                 });
             }
 
-            // Optional inline voice-replay pill when the current line has voice (never crowds unvoiced lines!)
+            // Optional inline voice-replay pill when the current line has voice (touch-sized to avoid mis-taps!)
             if dlg.voice.is_some() && ctx.vm.choice.is_none() {
-                let vw = if touch { 56.0 } else { 48.0 };
-                let vh = if touch { 30.0 } else { 22.0 };
+                let vw = if touch { 72.0 } else { 48.0 };
+                let vh = if touch { 40.0 } else { 22.0 };
                 let vx = box_rect[0] + box_rect[2] - vw - 8.0;
                 let vy = box_rect[1] + 6.0;
                 b.button_styled(
@@ -2029,30 +2037,58 @@ fn project_story_hud(
                     UiAction::ReplayVoice,
                     true,
                     false,
-                    if touch { 0.88 } else { 0.65 },
+                    if touch { 0.90 } else { 0.65 },
                 );
             }
 
             // 6. Responsive non-overlapping quick-action toolbar strictly within safe area!
-            let buttons: [(&str, UiAction, bool); 7] = [
-                ("auto", UiAction::ToggleAuto, ctx.auto),
-                (
-                    "skip-compact",
-                    UiAction::ToggleSkip,
-                    ctx.skip || ctx.hold_skip,
-                ),
-                ("history-compact", UiAction::OpenHistory, false),
-                ("rollback", UiAction::Rollback, false),
-                (
-                    "save",
-                    UiAction::OpenSaves { save_mode: true },
-                    !ctx.replay_active,
-                ),
-                ("hide-interface", UiAction::ToggleHideUi, false),
-                ("menu", UiAction::OpenMenu, false),
-            ];
-            let n = buttons.len() as f32;
-            let min_btn_w = if touch { 44.0 } else { 34.0 };
+            //    Narrow touch phones (< 460px) condense to 5 wide thumb-friendly buttons incl. 1-tap Q.Save;
+            //    landscape phones, tablets & desktop keep the full 7-button strip.
+            let compact_touch_bar = touch && sw < 460.0;
+            let bar_h = if compact_touch_bar {
+                bar_h.max(44.0)
+            } else {
+                bar_h
+            };
+            let buttons_storage: Vec<(&str, UiAction, bool)> = if compact_touch_bar {
+                vec![
+                    ("rollback", UiAction::Rollback, false),
+                    ("auto", UiAction::ToggleAuto, ctx.auto),
+                    (
+                        "skip-compact",
+                        UiAction::ToggleSkip,
+                        ctx.skip || ctx.hold_skip,
+                    ),
+                    ("quick-save", UiAction::QuickSave, false),
+                    ("menu", UiAction::OpenMenu, false),
+                ]
+            } else {
+                vec![
+                    ("auto", UiAction::ToggleAuto, ctx.auto),
+                    (
+                        "skip-compact",
+                        UiAction::ToggleSkip,
+                        ctx.skip || ctx.hold_skip,
+                    ),
+                    ("history-compact", UiAction::OpenHistory, false),
+                    ("rollback", UiAction::Rollback, false),
+                    (
+                        "save",
+                        UiAction::OpenSaves { save_mode: true },
+                        !ctx.replay_active,
+                    ),
+                    ("hide-interface", UiAction::ToggleHideUi, false),
+                    ("menu", UiAction::OpenMenu, false),
+                ]
+            };
+            let n = buttons_storage.len() as f32;
+            let min_btn_w = if compact_touch_bar {
+                58.0
+            } else if touch {
+                44.0
+            } else {
+                34.0
+            };
             let min_comfortable_w = n * min_btn_w + (n - 1.0) * gap;
 
             let top_y = box_rect[1] - bar_h - margin;
@@ -2064,8 +2100,8 @@ fn project_story_hud(
 
             let (bar_min_l, bar_max_r, bar_y, bar_centered) = if portrait_docked {
                 (
-                    sx + 6.0,
-                    (sright - 6.0).max(sx + 126.0),
+                    sx + 8.0,
+                    (sright - 8.0).max(sx + 126.0),
                     sbottom - bar_h - 6.0,
                     true,
                 )
@@ -2079,7 +2115,9 @@ fn project_story_hud(
 
             let avail_w = (bar_max_r - bar_min_l).max(120.0);
             let max_btn_w = ((avail_w - gap * (n - 1.0)) / n).max(16.0);
-            let cap_btn_w = if touch {
+            let cap_btn_w = if compact_touch_bar {
+                86.0
+            } else if touch {
                 76.0
             } else {
                 (64.0 * ui_s).clamp(40.0, 74.0)
@@ -2098,9 +2136,11 @@ fn project_story_hud(
             } else {
                 0.56
             };
-            for (key, action, active) in buttons {
-                let enabled = !matches!(action, UiAction::OpenSaves { save_mode: true })
-                    || !ctx.replay_active;
+            for (key, action, active) in buttons_storage {
+                let enabled = !matches!(
+                    action,
+                    UiAction::OpenSaves { save_mode: true } | UiAction::QuickSave
+                ) || !ctx.replay_active;
                 b.button_styled(
                     [bx, bar_y, btn_w, bar_h],
                     messages.get(loc, key),
@@ -2303,6 +2343,7 @@ fn overlay_shell(
     ];
     b.soft_shadow([px, py, pw, ph], 14.0, anim);
     b.rounded_panel([px, py, pw, ph], surf, border, 14.0);
+    b.pkt.overlay_panel_rect = Some([px, py, pw, ph]);
     b.pkt.quads.push(Quad::gradient_h(
         [px + 16.0, py + 1.0, (pw - 32.0).max(20.0), 2.0],
         [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.90 * anim],
@@ -2379,6 +2420,18 @@ fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Mes
             UiAction::OpenGallery,
             true,
             false,
+        ));
+    }
+    if touch {
+        items.push((
+            format!(
+                "{}: {}",
+                messages.get(loc, "portrait-reader"),
+                messages.get(loc, if ctx.portrait_reader { "on" } else { "off" })
+            ),
+            UiAction::TogglePortraitReader,
+            true,
+            ctx.portrait_reader,
         ));
     }
     items.push((messages.get(loc, "settings"), UiAction::OpenSettings, true, false));
@@ -2715,91 +2768,123 @@ fn push_slider_row(
     row_h: f32,
     label: String,
     norm: f32,
+    kind: SliderKind,
     dec: UiAction,
     inc: UiAction,
-    mut make_step: impl FnMut(f32) -> UiAction,
 ) {
     let touch = b.is_touch();
     let btn_w = if touch { 42.0 } else { 34.0 };
-    let gap = 6.0;
-    let right_x = x + w;
-    let plus_x = right_x - btn_w;
-    let bar_w = if w >= 380.0 {
-        (w * 0.34).clamp(90.0, 220.0)
-    } else {
-        0.0
-    };
-    let minus_x = if bar_w > 0.0 {
-        plus_x - gap - bar_w - gap - btn_w
-    } else {
-        plus_x - gap - btn_w
-    };
-    let label_w = (minus_x - x - 8.0).max(60.0);
-    let label_size = (row_h * 0.42).clamp(13.0, 17.0);
+    let gap = 8.0;
+    let stacked = w < 420.0;
+    let clamped_norm = norm.clamp(0.0, 1.0);
 
-    b.push_text(TextRun {
-        text: label,
-        visible_bytes: None,
-        x,
-        y,
-        width: label_w,
-        height: row_h,
-        size: label_size,
-        line_height: label_size * 1.25,
-        color: b.theme.text,
-        emphasis: Vec::new(),
-        color_spans: Vec::new(),
-        ruby_spans: Vec::new(),
-        shadow: None,
-        outline: None,
-        scroll: 0.0,
-        clip: Some([x, y, label_w, row_h]),
-        font_assets: b.ui_fonts.clone(),
-        align: TextAlign::Left,
-        valign_center: true,
-        auto_fit: true,
-        inline_images: Vec::new(),
-        cache_key: 0,
-    });
-    b.button([minus_x, y, btn_w, row_h], "−".into(), dec, true, false);
-    if bar_w > 0.0 {
-        let bar_x = minus_x + btn_w + gap;
-        let track_h = 10.0;
-        let track_y = y + (row_h - track_h) * 0.5;
+    let (bar_x, bar_w, ctrl_y, ctrl_h, minus_x, plus_x) = if stacked {
+        let label_h = (row_h * 0.40).clamp(17.0, 24.0);
+        let label_size = (label_h * 0.72).clamp(12.5, 16.0);
+        b.push_text(TextRun {
+            text: label,
+            visible_bytes: None,
+            x,
+            y,
+            width: w,
+            height: label_h,
+            size: label_size,
+            line_height: label_h,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: None,
+            outline: None,
+            scroll: 0.0,
+            clip: Some([x, y, w, label_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Left,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+        let cy = y + label_h + 2.0;
+        let ch = (row_h - label_h - 2.0).max(28.0);
+        let mx = x;
+        let px = x + w - btn_w;
+        let bx = mx + btn_w + gap;
+        let bw = (px - gap - bx).max(60.0);
+        (bx, bw, cy, ch, mx, px)
+    } else {
+        let right_x = x + w;
+        let px = right_x - btn_w;
+        let bw = (w * 0.36).clamp(110.0, 240.0);
+        let mx = px - gap - bw - gap - btn_w;
+        let bx = mx + btn_w + gap;
+        let label_w = (mx - x - 8.0).max(60.0);
+        let label_size = (row_h * 0.42).clamp(13.0, 17.0);
+        b.push_text(TextRun {
+            text: label,
+            visible_bytes: None,
+            x,
+            y,
+            width: label_w,
+            height: row_h,
+            size: label_size,
+            line_height: label_size * 1.25,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: None,
+            outline: None,
+            scroll: 0.0,
+            clip: Some([x, y, label_w, row_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Left,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+        (bx, bw, y, row_h, mx, px)
+    };
+
+    b.button([minus_x, ctrl_y, btn_w, ctrl_h], "−".into(), dec, true, false);
+    // Continuous draggable slider track + glowing thumb pill
+    let track_h = if touch { 10.0 } else { 8.0 };
+    let track_y = ctrl_y + (ctrl_h - track_h) * 0.5;
+    b.pkt.quads.push(Quad::rounded(
+        [bar_x, track_y, bar_w, track_h],
+        [0.20, 0.25, 0.34, 0.88],
+        track_h * 0.5,
+    ));
+    let fill_w = (bar_w * clamped_norm).max(0.0);
+    if fill_w > 2.0 {
         b.pkt.quads.push(Quad::rounded(
-            [bar_x, track_y, bar_w, track_h],
-            [0.20, 0.25, 0.34, 0.85],
-            5.0,
+            [bar_x, track_y, fill_w, track_h],
+            b.theme.accent,
+            track_h * 0.5,
         ));
-        let fill_w = (bar_w * norm.clamp(0.0, 1.0)).max(0.0);
-        if fill_w > 2.0 {
-            b.pkt.quads.push(Quad::rounded(
-                [bar_x, track_y, fill_w, track_h],
-                b.theme.accent,
-                5.0,
-            ));
-        }
-        // 10 clickable segments across the bar for direct click/tap positioning!
-        let segs = 10usize;
-        let sw = bar_w / segs as f32;
-        for s in 0..segs {
-            let id = b.next_hit_id;
-            b.next_hit_id += 1;
-            let t = if s == 0 {
-                0.0
-            } else {
-                (s + 1) as f32 / segs as f32
-            };
-            b.pkt.hits.push(HitRegion {
-                id,
-                rect: [bar_x + s as f32 * sw, y, sw, row_h],
-                action: make_step(t),
-                label: String::new(),
-                enabled: true,
-            });
-        }
     }
-    b.button([plus_x, y, btn_w, row_h], "+".into(), inc, true, false);
+    let thumb_d = (if touch { 22.0_f32 } else { 18.0_f32 })
+        .min(ctrl_h - 4.0)
+        .max(14.0);
+    let thumb_cx = bar_x + fill_w.clamp(thumb_d * 0.45, (bar_w - thumb_d * 0.45).max(thumb_d * 0.45));
+    let thumb_rect = [
+        thumb_cx - thumb_d * 0.5,
+        ctrl_y + (ctrl_h - thumb_d) * 0.5,
+        thumb_d,
+        thumb_d,
+    ];
+    b.rounded_panel(
+        thumb_rect,
+        [0.95, 0.98, 1.0, 0.98],
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.95],
+        thumb_d * 0.5,
+    );
+    b.pkt.sliders.push(SliderTrack {
+        rect: [bar_x, ctrl_y, bar_w, ctrl_h],
+        kind,
+    });
+    b.button([plus_x, ctrl_y, btn_w, ctrl_h], "+".into(), inc, true, false);
 }
 
 fn push_toggle_row(
@@ -2875,15 +2960,27 @@ fn project_settings_overlay(
     let body_y = area[1] + tab_h + 10.0;
     let body_h = (area[3] - tab_h - 10.0).max(120.0);
     let locales = &ctx.vm.program().meta.locales;
-    let total_rows = match ctx.settings_tab {
-        0 => 6 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2),
-        1 => 4,
-        _ => 6,
+    let stacked_sliders = area[2] < 420.0;
+    let (slider_count, toggle_count) = match ctx.settings_tab {
+        0 => (
+            3usize,
+            3 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2),
+        ),
+        1 => (1, 3),
+        _ => (4, 2),
     };
-    let gap = (body_h * 0.02).clamp(5.0, 10.0);
-    let min_rh = if touch { 34.0 } else { 28.0 };
-    let max_rh = if touch { 48.0 } else { 44.0 };
-    let row_h = ((body_h - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(min_rh, max_rh);
+    let total_rows = slider_count + toggle_count;
+    let gap = (body_h * 0.018).clamp(5.0, 10.0);
+    let slider_weight = if stacked_sliders { 1.48_f32 } else { 1.0_f32 };
+    let total_weight = slider_count as f32 * slider_weight + toggle_count as f32;
+    let usable_h = (body_h - gap * total_rows.saturating_sub(1) as f32).max(100.0);
+    let unit_h = usable_h / total_weight.max(1.0);
+    let row_h = unit_h.clamp(if touch { 32.0 } else { 28.0 }, if touch { 46.0 } else { 44.0 });
+    let slider_h = if stacked_sliders {
+        (unit_h * slider_weight).clamp(48.0, 68.0)
+    } else {
+        row_h
+    };
     let mut y = body_y;
 
     if ctx.settings_tab == 0 {
@@ -2893,50 +2990,50 @@ fn project_settings_overlay(
             area[0],
             y,
             area[2],
-            row_h,
+            slider_h,
             format!("{}: {:.1}x", messages.get(loc, "text-speed"), ctx.prefs.text_speed),
             ((ctx.prefs.text_speed - 0.5) / 3.5).clamp(0.0, 1.0),
+            SliderKind::TextSpeed,
             UiAction::SetTextSpeed((ctx.prefs.text_speed - 0.5).clamp(0.5, 4.0)),
             UiAction::SetTextSpeed((ctx.prefs.text_speed + 0.5).clamp(0.5, 4.0)),
-            |t| UiAction::SetTextSpeed(((0.5 + t * 3.5) * 2.0).round() * 0.5),
         );
-        y += row_h + gap;
+        y += slider_h + gap;
 
         push_slider_row(
             b,
             area[0],
             y,
             area[2],
-            row_h,
+            slider_h,
             format!(
                 "{}: {}%",
                 messages.get(loc, "font-size"),
                 (ctx.prefs.font_scale * 100.0).round() as u32
             ),
             ((ctx.prefs.font_scale - 0.75) / 0.75).clamp(0.0, 1.0),
+            SliderKind::FontScale,
             UiAction::SetFontScale((ctx.prefs.font_scale - 0.1).clamp(0.75, 1.50)),
             UiAction::SetFontScale((ctx.prefs.font_scale + 0.1).clamp(0.75, 1.50)),
-            |t| UiAction::SetFontScale(0.75 + t * 0.75),
         );
-        y += row_h + gap;
+        y += slider_h + gap;
 
         push_slider_row(
             b,
             area[0],
             y,
             area[2],
-            row_h,
+            slider_h,
             format!(
                 "{}: {:.1}s",
                 messages.get(loc, "auto-wait"),
                 ctx.prefs.auto_delay_ms as f32 / 1000.0
             ),
             ((ctx.prefs.auto_delay_ms as f32 - 300.0) / 4700.0).clamp(0.0, 1.0),
+            SliderKind::AutoDelay,
             UiAction::SetAutoDelay(ctx.prefs.auto_delay_ms.saturating_sub(300).max(300)),
             UiAction::SetAutoDelay((ctx.prefs.auto_delay_ms + 300).min(5000)),
-            |t| UiAction::SetAutoDelay((300.0 + t * 4700.0).round() as u32),
         );
-        y += row_h + gap;
+        y += slider_h + gap;
 
         push_toggle_row(
             b,
@@ -3024,18 +3121,18 @@ fn project_settings_overlay(
             area[0],
             y,
             area[2],
-            row_h,
+            slider_h,
             format!(
                 "{}: {}%",
                 messages.get(loc, "dialogue-opacity"),
                 (ctx.prefs.dialogue_opacity * 100.0).round() as u32
             ),
             ((ctx.prefs.dialogue_opacity - 0.45) / 0.55).clamp(0.0, 1.0),
+            SliderKind::DialogueOpacity,
             UiAction::SetDialogueOpacity((ctx.prefs.dialogue_opacity - 0.08).clamp(0.45, 1.0)),
             UiAction::SetDialogueOpacity((ctx.prefs.dialogue_opacity + 0.08).clamp(0.45, 1.0)),
-            |t| UiAction::SetDialogueOpacity((0.45 + t * 0.55).clamp(0.45, 1.0)),
         );
-        y += row_h + gap;
+        y += slider_h + gap;
 
         push_toggle_row(
             b,
@@ -3084,18 +3181,18 @@ fn project_settings_overlay(
             area[0],
             y,
             area[2],
-            row_h,
+            slider_h,
             format!(
                 "{}: {}%",
                 messages.get(loc, "master-volume"),
                 (ctx.prefs.master_volume * 100.0).round() as u32
             ),
             ctx.prefs.master_volume,
+            SliderKind::MasterVolume,
             UiAction::SetMasterVolume((ctx.prefs.master_volume - 0.1).clamp(0.0, 1.0)),
             UiAction::SetMasterVolume((ctx.prefs.master_volume + 0.1).clamp(0.0, 1.0)),
-            UiAction::SetMasterVolume,
         );
-        y += row_h + gap;
+        y += slider_h + gap;
 
         let sliders: [(&str, AudioBus, f32); 3] = [
             ("music", AudioBus::Bgm, ctx.prefs.bgm_volume),
@@ -3108,9 +3205,10 @@ fn project_settings_overlay(
                 area[0],
                 y,
                 area[2],
-                row_h,
+                slider_h,
                 format!("{}: {}%", messages.get(loc, key), (val * 100.0).round() as u32),
                 val,
+                SliderKind::AudioBus(bus),
                 UiAction::SetVolume {
                     bus,
                     value: (val - 0.1).clamp(0.0, 1.0),
@@ -3119,9 +3217,8 @@ fn project_settings_overlay(
                     bus,
                     value: (val + 0.1).clamp(0.0, 1.0),
                 },
-                move |t| UiAction::SetVolume { bus, value: t },
             );
-            y += row_h + gap;
+            y += slider_h + gap;
         }
 
         push_toggle_row(
@@ -3551,31 +3648,77 @@ fn project_cg_viewer(
         (prog.meta.stage_width as f32, prog.meta.stage_height as f32),
         |m| (m.width.max(1) as f32, m.height.max(1) as f32),
     );
-    let scale = (sw / aw).min(img_area_h / ah);
+    let scale = (sw / aw).min(img_area_h / ah) * ctx.cg_zoom.clamp(1.0, 3.0);
     let dw = aw * scale;
     let dh = ah * scale;
-    let dx = sx + (sw - dw) * 0.5;
-    let dy = sy + (img_area_h - dh) * 0.5;
-    b.pkt.quads.push(Quad::image([dx, dy, dw, dh], asset));
+    let dx = sx + (sw - dw) * 0.5 + ctx.cg_pan[0];
+    let dy = sy + (img_area_h - dh) * 0.5 + ctx.cg_pan[1];
+    let mut cg_quad = Quad::image([dx, dy, dw, dh], asset);
+    cg_quad.clip = Some([0.0, 0.0, w, sy + img_area_h]);
+    b.pkt.quads.push(cg_quad);
 
-    // Tap image to advance variant or close
-    let img_hit_id = b.next_hit_id;
-    b.next_hit_id += 1;
-    let next_act = if idx + 1 < assets.len() {
-        UiAction::ViewCg {
-            item: item_idx as u32,
-            variant: (idx + 1) as u16,
-        }
-    } else {
-        UiAction::CloseCgViewer
-    };
-    b.pkt.hits.push(HitRegion {
-        id: img_hit_id,
-        rect: [0.0, 0.0, w, sy + img_area_h],
-        action: next_act,
-        label: String::new(),
-        enabled: true,
-    });
+    // Subtle zoom badge while magnified so touch users know double-tap resets!
+    if ctx.cg_zoom > 1.05 {
+        let zlabel = if loc.starts_with("zh") {
+            format!("{:.1}x · 双击复位", ctx.cg_zoom)
+        } else {
+            format!("{:.1}x · Double-tap reset", ctx.cg_zoom)
+        };
+        let zw = (estimate_display_units(&zlabel) * 12.5 + 22.0).clamp(100.0, 210.0);
+        let zh = 28.0;
+        let zrect = [sx + (sw - zw) * 0.5, sy + 10.0, zw, zh];
+        b.rounded_panel(
+            zrect,
+            [0.06, 0.09, 0.15, 0.84],
+            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.65],
+            14.0,
+        );
+        b.push_text(TextRun {
+            text: zlabel,
+            visible_bytes: None,
+            x: zrect[0] + 8.0,
+            y: zrect[1] + 1.0,
+            width: zw - 16.0,
+            height: zh - 2.0,
+            size: 12.5,
+            line_height: 16.0,
+            color: b.theme.text,
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: None,
+            outline: None,
+            scroll: 0.0,
+            clip: Some(zrect),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+
+    // Tap image to advance variant or close (only when unzoomed, so zoomed users can pan/double-tap freely!)
+    if ctx.cg_zoom <= 1.05 {
+        let img_hit_id = b.next_hit_id;
+        b.next_hit_id += 1;
+        let next_act = if idx + 1 < assets.len() {
+            UiAction::ViewCg {
+                item: item_idx as u32,
+                variant: (idx + 1) as u16,
+            }
+        } else {
+            UiAction::CloseCgViewer
+        };
+        b.pkt.hits.push(HitRegion {
+            id: img_hit_id,
+            rect: [0.0, 0.0, w, sy + img_area_h],
+            action: next_act,
+            label: String::new(),
+            enabled: true,
+        });
+    }
 
     let by = sy + sh - bar_h - 6.0;
     let bw = 96.0_f32.min((sw - 36.0) / 3.0);
@@ -3896,6 +4039,8 @@ mod tests {
                 history_scroll: 0,
                 gallery_page: 0,
                 viewing_cg: None,
+                cg_zoom: 1.0,
+                cg_pan: [0.0, 0.0],
                 settings_tab: 0,
                 pending_confirm: None,
                 host_has_shelf: false,
@@ -4048,6 +4193,8 @@ mod tests {
             history_scroll: 0,
             gallery_page: 0,
             viewing_cg: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
             settings_tab: 0,
             pending_confirm: None,
             host_has_shelf: false,
@@ -4107,6 +4254,8 @@ mod tests {
             history_scroll: 0,
             gallery_page: 0,
             viewing_cg: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
             settings_tab: 0,
             pending_confirm: None,
             host_has_shelf: false,
@@ -4147,18 +4296,28 @@ mod tests {
             "dialogue should sit below stage in portrait reader"
         );
 
-        // All 7 touch toolbar buttons >= 40px tall and strictly inside safe insets!
-        assert_eq!(pkt.hits.len(), 7);
+        // Narrow portrait touch phones condense toolbar to 5 wide thumb-friendly buttons (>= 44px tall, >= 60px wide, incl. QuickSave)!
+        assert_eq!(pkt.hits.len(), 5);
+        assert!(pkt.hits.iter().any(|h| h.action == UiAction::QuickSave));
         for h in &pkt.hits {
             assert!(
-                h.rect[3] >= 40.0,
-                "touch button {} too short: {}",
+                h.rect[2] >= 60.0 && h.rect[3] >= 42.0,
+                "touch button {} too small: {:?}",
                 h.label,
-                h.rect[3]
+                h.rect
             );
             assert!(h.rect[1] >= insets.top - 0.5);
             assert!(h.rect[1] + h.rect[3] <= 844.0 - insets.bottom + 0.5);
         }
+
+        // Narrow portrait Settings keeps draggable slider tracks visible even at 390px width!
+        let settings_ctx = UiContext {
+            screen: Screen::Settings,
+            ..ctx
+        };
+        let set_pkt = project(&settings_ctx, 390.0, 844.0, &msgs);
+        assert_eq!(set_pkt.sliders.len(), 3, "narrow portrait Settings tab 0 must render all 3 draggable sliders");
+        assert!(set_pkt.overlay_panel_rect.is_some(), "modal overlay must expose panel bounds for backdrop tap dismiss");
 
         // Landscape phone (844x390) with horizontal notches (47px left/right, 21px bottom)
         let land_insets = SafeInsets {
@@ -4192,6 +4351,8 @@ mod tests {
             history_scroll: 0,
             gallery_page: 0,
             viewing_cg: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
             settings_tab: 0,
             pending_confirm: None,
             host_has_shelf: false,
@@ -4285,6 +4446,8 @@ mod tests {
             history_scroll: 0,
             gallery_page: 0,
             viewing_cg: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
             settings_tab: 0,
             pending_confirm: None,
             host_has_shelf: true,

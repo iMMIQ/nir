@@ -552,6 +552,11 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
+        pub fn pointer_drag(&mut self, logical_x: f32, logical_y: f32) {
+            self.runtime.pointer_drag(logical_x, logical_y);
+        }
+
+        #[wasm_bindgen]
         pub fn pointer_up(&mut self, logical_x: f32, logical_y: f32) {
             self.runtime.pointer_up(logical_x, logical_y);
         }
@@ -627,6 +632,16 @@ mod wasm_host {
         #[wasm_bindgen]
         pub fn is_shaking(&self) -> bool {
             self.runtime.is_shaking()
+        }
+
+        #[wasm_bindgen]
+        pub fn can_go_back(&self) -> bool {
+            self.runtime.can_go_back()
+        }
+
+        #[wasm_bindgen]
+        pub fn take_haptic_ms(&mut self) -> u16 {
+            self.runtime.take_haptic_ms()
         }
 
         #[wasm_bindgen]

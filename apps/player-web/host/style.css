@@ -178,6 +178,32 @@ html, body {
   border-color: #88c9ff;
   color: #fff;
 }
+@media (pointer: coarse) {
+  #shelf-btn {
+    min-height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+    border-radius: 12px;
+  }
+  #fs-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+  }
+  #quick-tools {
+    gap: 8px;
+  }
+  #quick-tools.shifted-left {
+    right: calc(env(safe-area-inset-right, 0px) + 60px);
+  }
+  .tool-pill {
+    min-width: 44px;
+    height: 44px;
+    padding: 0 11px;
+    font-size: 16px;
+    border-radius: 12px;
+  }
+}
 #shelf-btn[hidden] {
   display: none;
 }

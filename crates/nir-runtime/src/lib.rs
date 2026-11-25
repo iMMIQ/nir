@@ -10,7 +10,8 @@ pub mod gesture;
 use gesture::{TouchAction, TouchGestureEngine};
 use nir_ir::*;
 use nir_ui::{
-    ConfirmKind, DrawPacket, InputMode, Messages, SafeInsets, Screen, SlotSummary, UiContext,
+    ConfirmKind, DrawPacket, InputMode, Messages, SafeInsets, Screen, SliderKind, SliderTrack,
+    SlotSummary, UiContext,
 };
 use nir_vm::{ProfileData, RollbackCheckpoint, SaveSnapshot, Vm, VmIntent, WaitReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -115,6 +116,10 @@ pub struct Runtime {
     hovered_hit: Option<u32>,
     pressed_hit: Option<u32>,
     pressed_started_on_hit: bool,
+    active_slider: Option<SliderTrack>,
+    cg_zoom: f32,
+    cg_pan: [f32; 2],
+    haptic_pulse_ms: u16,
     hud_toolbar_hovered: bool,
     pub safe_insets: SafeInsets,
     pub input_mode: InputMode,
@@ -200,6 +205,10 @@ impl Runtime {
             hovered_hit: None,
             pressed_hit: None,
             pressed_started_on_hit: false,
+            active_slider: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
+            haptic_pulse_ms: 0,
             hud_toolbar_hovered: false,
             safe_insets: SafeInsets::default(),
             input_mode: InputMode::Pointer,
@@ -295,6 +304,66 @@ impl Runtime {
 
     pub fn is_shaking(&self) -> bool {
         !self.vm.shakes.is_empty()
+    }
+
+    /// Returns whether a back/cancel gesture has an in-app layer to dismiss (modal, CG viewer, confirm, hidden UI).
+    pub fn can_go_back(&self) -> bool {
+        self.pending_confirm.is_some()
+            || self.viewing_cg.is_some()
+            || (self.interface_hidden && self.screen == Screen::Story)
+            || !matches!(self.screen, Screen::Story | Screen::Title)
+    }
+
+    /// Consumes any queued subtle haptic feedback pulse duration in milliseconds (0 = none).
+    pub fn take_haptic_ms(&mut self) -> u16 {
+        std::mem::take(&mut self.haptic_pulse_ms)
+    }
+
+    fn queue_haptic(&mut self, ms: u16) {
+        if self.input_mode == InputMode::Touch {
+            self.haptic_pulse_ms = self.haptic_pulse_ms.max(ms);
+        }
+    }
+
+    pub fn cg_zoom(&self) -> f32 {
+        self.cg_zoom
+    }
+
+    pub fn cg_pan(&self) -> [f32; 2] {
+        self.cg_pan
+    }
+
+    fn reset_cg_view(&mut self) {
+        self.cg_zoom = 1.0;
+        self.cg_pan = [0.0, 0.0];
+    }
+
+    fn clamp_cg_pan(&mut self) {
+        if self.cg_zoom <= 1.01 {
+            self.cg_zoom = 1.0;
+            self.cg_pan = [0.0, 0.0];
+            return;
+        }
+        let max_x = (self.last_packet.width * (self.cg_zoom - 1.0) * 0.55).max(24.0);
+        let max_y = (self.last_packet.height * (self.cg_zoom - 1.0) * 0.55).max(24.0);
+        self.cg_pan[0] = self.cg_pan[0].clamp(-max_x, max_x);
+        self.cg_pan[1] = self.cg_pan[1].clamp(-max_y, max_y);
+    }
+
+    fn apply_slider_position(&mut self, track: SliderTrack, x: f32) {
+        let t = ((x - track.rect[0]) / track.rect[2].max(1.0)).clamp(0.0, 1.0);
+        let action = match track.kind {
+            SliderKind::TextSpeed => UiAction::SetTextSpeed(((0.5 + t * 3.5) * 2.0).round() * 0.5),
+            SliderKind::FontScale => UiAction::SetFontScale(((0.75 + t * 0.75) * 20.0).round() / 20.0),
+            SliderKind::AutoDelay => UiAction::SetAutoDelay((((300.0 + t * 4700.0) / 100.0).round() * 100.0) as u32),
+            SliderKind::DialogueOpacity => UiAction::SetDialogueOpacity(((0.45 + t * 0.55) * 20.0).round() / 20.0),
+            SliderKind::MasterVolume => UiAction::SetMasterVolume((t * 20.0).round() / 20.0),
+            SliderKind::AudioBus(bus) => UiAction::SetVolume {
+                bus,
+                value: (t * 20.0).round() / 20.0,
+            },
+        };
+        self.dispatch(action);
     }
 
     pub fn current_screen_name(&self) -> &'static str {
@@ -667,6 +736,7 @@ impl Runtime {
             }
             self.pressed_hit = None;
             self.pressed_started_on_hit = false;
+            self.active_slider = None;
             for bus in [AudioBus::Bgm, AudioBus::Voice, AudioBus::Sfx] {
                 self.commands
                     .push(HostCommand::PauseAudioBus { bus, paused: true });
@@ -772,14 +842,29 @@ impl Runtime {
         }
     }
 
-    /// Highlights a pressed control without triggering until release (`pointer_up`),
-    /// preventing accidental taps when dragging away.
+    /// Highlights a pressed control (or captures a slider track for smooth scrubbing)
+    /// without triggering buttons until release (`pointer_up`).
     pub fn pointer_down(&mut self, x: f32, y: f32) {
+        if let Some(track) = self.last_packet.slider_at(x, y) {
+            self.active_slider = Some(track);
+            self.pressed_hit = None;
+            self.pressed_started_on_hit = true;
+            self.apply_slider_position(track, x);
+            self.queue_haptic(8);
+            return;
+        }
         let hit = self.last_packet.hit_test(x, y).map(|h| h.id);
         self.pressed_hit = hit;
         self.pressed_started_on_hit = hit.is_some();
         if hit.is_some() {
             self.dirty = true;
+        }
+    }
+
+    /// Updates an active pointer-dragged slider track (desktop mouse scrubbing).
+    pub fn pointer_drag(&mut self, x: f32, _y: f32) {
+        if let Some(track) = self.active_slider {
+            self.apply_slider_position(track, x);
         }
     }
 
@@ -789,10 +874,17 @@ impl Runtime {
             self.dirty = true;
         }
         self.pressed_started_on_hit = false;
+        self.active_slider = None;
     }
 
     /// Releases a primary pointer / tap at viewport coordinates `(x, y)`.
     pub fn pointer_up(&mut self, x: f32, y: f32) {
+        if let Some(track) = self.active_slider.take() {
+            self.pressed_hit = None;
+            self.pressed_started_on_hit = false;
+            self.apply_slider_position(track, x);
+            return;
+        }
         let started_id = self.pressed_hit.take();
         let started_on_hit = self.pressed_started_on_hit;
         self.pressed_started_on_hit = false;
@@ -823,19 +915,46 @@ impl Runtime {
                     if has_preview && self.hovered_hit != Some(hit.id) {
                         self.hovered_hit = Some(hit.id);
                         self.play_choice_hover_se();
+                        self.queue_haptic(8);
                         self.dirty = true;
                         return;
                     }
                 }
             }
             let action = hit.action.clone();
+            // While zoomed into a CG, ignore the full-image tap-to-advance hitbox (bottom bar buttons still work!)
+            if self.viewing_cg.is_some()
+                && self.cg_zoom > 1.05
+                && hit.label.is_empty()
+                && matches!(action, UiAction::ViewCg { .. } | UiAction::CloseCgViewer)
+            {
+                return;
+            }
             self.hovered_hit = None;
+            self.queue_haptic(8);
             self.dispatch(action);
             return;
         }
         // Dragged off a pressed button -> cancel cleanly without advancing story!
         if started_on_hit {
             return;
+        }
+        // One-handed ergonomic overlay dismissal: tapping the dimmed backdrop outside the modal card closes it!
+        if self.viewing_cg.is_none()
+            && self.pending_confirm.is_none()
+            && !matches!(self.screen, Screen::Story | Screen::Title | Screen::Ended)
+        {
+            if let Some(panel) = self.last_packet.overlay_panel_rect {
+                let inside = x >= panel[0]
+                    && x <= panel[0] + panel[2]
+                    && y >= panel[1]
+                    && y <= panel[1] + panel[3];
+                if !inside {
+                    self.queue_haptic(8);
+                    self.dispatch(UiAction::CloseOverlay);
+                    return;
+                }
+            }
         }
         if self.screen == Screen::Story && self.vm.choice.is_none() {
             self.dispatch(UiAction::Advance);
@@ -846,6 +965,7 @@ impl Runtime {
     pub fn pointer_click(&mut self, x: f32, y: f32) {
         self.pressed_hit = None;
         self.pressed_started_on_hit = false;
+        self.active_slider = None;
         self.pointer_up(x, y);
     }
 
@@ -858,18 +978,40 @@ impl Runtime {
     }
 
     pub fn touch_move(&mut self, id: u64, x: f32, y: f32) {
-        if let Some(act) = self.gestures.touch_move(id, x, y, self.screen) {
+        let slider_active = self.active_slider.is_some();
+        let viewing_cg = self.viewing_cg.is_some();
+        let cg_zoomed = self.cg_zoom > 1.02;
+        if let Some(act) = self.gestures.touch_move(
+            id,
+            x,
+            y,
+            self.screen,
+            slider_active,
+            viewing_cg,
+            cg_zoomed,
+        ) {
             self.apply_touch_action(act);
         }
     }
 
     pub fn touch_end(&mut self, id: u64, x: f32, y: f32) {
         let allow_story_swipes = self.vm.choice.is_none() && !self.pressed_started_on_hit;
-        if let Some(act) = self
-            .gestures
-            .touch_end(id, x, y, self.screen, allow_story_swipes)
-        {
+        let viewing_cg = self.viewing_cg.is_some();
+        let cg_zoomed = self.cg_zoom > 1.02;
+        let was_slider = self.active_slider.is_some();
+        if let Some(act) = self.gestures.touch_end(
+            id,
+            x,
+            y,
+            self.screen,
+            allow_story_swipes,
+            viewing_cg,
+            cg_zoomed,
+        ) {
             self.apply_touch_action(act);
+        } else if was_slider {
+            self.active_slider = None;
+            self.pressed_started_on_hit = false;
         }
     }
 
@@ -886,17 +1028,76 @@ impl Runtime {
             TouchAction::CancelPress => self.pointer_cancel(),
             TouchAction::CancelOrMenu => {
                 self.pointer_cancel();
+                self.queue_haptic(10);
                 self.cancel_or_menu();
             }
             TouchAction::HoldSkip(held) => {
                 if held {
                     self.pointer_cancel();
+                    self.queue_haptic(14);
                 }
                 self.dispatch(UiAction::HoldSkip(held));
             }
             TouchAction::Dispatch(ui_act) => {
                 self.pointer_cancel();
+                self.queue_haptic(8);
                 self.dispatch(ui_act);
+            }
+            TouchAction::SliderDrag(x, _y) => {
+                if let Some(track) = self.active_slider {
+                    self.apply_slider_position(track, x);
+                }
+            }
+            TouchAction::CgSwipe(delta) => {
+                self.pointer_cancel();
+                if let Some((item_idx, var_idx)) = self.viewing_cg {
+                    let next_v = if delta < 0 {
+                        var_idx.saturating_sub(1)
+                    } else {
+                        var_idx + 1
+                    };
+                    self.queue_haptic(8);
+                    self.dispatch(UiAction::ViewCg {
+                        item: item_idx as u32,
+                        variant: next_v as u16,
+                    });
+                }
+            }
+            TouchAction::CgPinchZoom { factor, .. } => {
+                self.pointer_cancel();
+                if self.viewing_cg.is_some() {
+                    let prev = self.cg_zoom;
+                    self.cg_zoom = (self.cg_zoom * factor).clamp(1.0, 3.0);
+                    if (self.cg_zoom - prev).abs() > 0.002 {
+                        self.clamp_cg_pan();
+                        self.dirty = true;
+                    }
+                }
+            }
+            TouchAction::CgPan { dx, dy } => {
+                self.pointer_cancel();
+                if self.viewing_cg.is_some() && self.cg_zoom > 1.02 {
+                    self.cg_pan[0] += dx;
+                    self.cg_pan[1] += dy;
+                    self.clamp_cg_pan();
+                    self.dirty = true;
+                }
+            }
+            TouchAction::CgDoubleTap(pos) => {
+                self.pointer_cancel();
+                if self.viewing_cg.is_some() {
+                    if self.cg_zoom > 1.05 {
+                        self.reset_cg_view();
+                    } else {
+                        self.cg_zoom = 2.0;
+                        let cx = self.last_packet.width * 0.5;
+                        let cy = self.last_packet.height * 0.5;
+                        self.cg_pan = [-(pos[0] - cx) * 0.65, -(pos[1] - cy) * 0.65];
+                        self.clamp_cg_pan();
+                    }
+                    self.queue_haptic(10);
+                    self.dirty = true;
+                }
             }
         }
     }
@@ -908,6 +1109,7 @@ impl Runtime {
             return;
         }
         if self.viewing_cg.take().is_some() {
+            self.reset_cg_view();
             self.dirty = true;
             return;
         }
@@ -1232,12 +1434,16 @@ impl Runtime {
                         if let Some(id) = asset {
                             self.request_asset(id, true);
                         }
+                        if self.viewing_cg != Some((item as usize, v)) {
+                            self.reset_cg_view();
+                        }
                         self.viewing_cg = Some((item as usize, v));
                     }
                 }
             }
             UiAction::CloseCgViewer => {
                 self.viewing_cg = None;
+                self.reset_cg_view();
             }
             UiAction::SettingsTab(tab) => {
                 self.settings_tab = tab.min(2);
@@ -1676,6 +1882,8 @@ impl Runtime {
             history_scroll: self.history_scroll,
             gallery_page: self.gallery_page,
             viewing_cg: self.viewing_cg,
+            cg_zoom: self.cg_zoom,
+            cg_pan: self.cg_pan,
             settings_tab: self.settings_tab,
             pending_confirm: self.pending_confirm,
             host_has_shelf: self.host_has_shelf,
@@ -2357,5 +2565,105 @@ mod tests {
         assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "二行目");
         rt.dispatch(UiAction::ToggleBilingual);
         assert!(rt.prefs.bilingual);
+    }
+
+    #[test]
+    fn mobile_ergonomics_slider_drag_backdrop_dismiss_edge_guard_and_cg_zoom_work() {
+        let mut prog_owned = (*test_prog()).clone();
+        prog_owned.assets.push(AssetMeta {
+            id: AssetId(0),
+            name: StrId(0),
+            kind: AssetKind::Image,
+            codec: MediaCodec::Png,
+            width: 800,
+            height: 600,
+            trim: None,
+            duration_us: 0,
+            sample_rate: 0,
+            channels: 0,
+            loop_region: None,
+            offset: 0,
+            size: 16,
+            delta: None,
+        });
+        prog_owned.ui.gallery.push(GalleryItem {
+            id: StrId(0),
+            title: StrId(0),
+            unlock_flag: None,
+            thumb: Some(AssetId(0)),
+            cg_assets: vec![AssetId(0), AssetId(0)],
+            replay_func: None,
+        });
+        let mut rt = Runtime::new(
+            Arc::new(prog_owned),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
+        rt.set_input_mode(InputMode::Touch);
+        rt.dispatch(UiAction::NewGame);
+        rt.dispatch(UiAction::Advance); // reveal line 1
+        rt.dispatch(UiAction::Advance); // advance to line 2
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第二句");
+        assert!(rt.prepare_frame(390.0, 844.0).is_some());
+
+        // 1. Left-edge (< 24px) right swipe is guarded for OS back navigation and must NOT rollback!
+        rt.touch_start(10, 8.0, 260.0);
+        rt.touch_move(10, 90.0, 262.0);
+        rt.touch_end(10, 120.0, 262.0);
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "第二句");
+
+        // 2. Settings on narrow 390px phone exposes draggable sliders & backdrop tap closes overlay!
+        rt.dispatch(UiAction::OpenSettings);
+        assert!(rt.can_go_back());
+        assert!(rt.prepare_frame(390.0, 844.0).is_some());
+        let first_slider = rt.last_packet().sliders[0];
+        let sx_right = first_slider.rect[0] + first_slider.rect[2] * 0.95;
+        let sy_mid = first_slider.rect[1] + first_slider.rect[3] * 0.5;
+        rt.touch_start(11, first_slider.rect[0] + 4.0, sy_mid);
+        rt.touch_move(11, sx_right, sy_mid);
+        rt.touch_end(11, sx_right, sy_mid);
+        assert!(rt.prefs.text_speed >= 3.5, "slider drag should raise text_speed, got {}", rt.prefs.text_speed);
+        assert!(rt.take_haptic_ms() > 0, "touch slider should emit subtle haptic");
+
+        // Tapping dimmed backdrop outside modal panel dismisses Settings one-handedly!
+        rt.touch_start(12, 3.0, 3.0);
+        rt.touch_end(12, 3.0, 3.0);
+        assert_eq!(rt.screen, Screen::Story);
+
+        // 3. CG Viewer supports pinch zoom, pan, double-tap reset, and unzoomed swipe variant switch!
+        rt.dispatch(UiAction::OpenGallery);
+        rt.dispatch(UiAction::ViewCg { item: 0, variant: 0 });
+        assert!(rt.can_go_back());
+        assert!(rt.prepare_frame(390.0, 844.0).is_some());
+
+        // Pinch zoom in
+        rt.touch_start(20, 150.0, 360.0);
+        rt.touch_start(21, 240.0, 360.0);
+        rt.touch_move(21, 310.0, 360.0);
+        rt.touch_end(20, 150.0, 360.0);
+        rt.touch_end(21, 310.0, 360.0);
+        assert!(rt.cg_zoom() > 1.2, "pinch should zoom in CG, got {}", rt.cg_zoom());
+
+        // Pan while zoomed
+        rt.touch_start(22, 200.0, 360.0);
+        rt.touch_move(22, 230.0, 380.0);
+        rt.touch_end(22, 230.0, 380.0);
+        assert!(rt.cg_pan()[0].abs() > 1.0);
+
+        // Double-tap resets zoom cleanly back to 1.0x
+        rt.touch_start(23, 200.0, 360.0);
+        rt.touch_end(23, 200.0, 360.0);
+        rt.tick(80_000);
+        rt.touch_start(24, 202.0, 361.0);
+        rt.touch_end(24, 202.0, 361.0);
+        assert!((rt.cg_zoom() - 1.0).abs() < 0.01);
+
+        // Swipe left switches CG variant 0 -> 1
+        rt.touch_start(25, 280.0, 360.0);
+        rt.touch_move(25, 160.0, 362.0);
+        rt.touch_end(25, 140.0, 362.0);
+        assert_eq!(rt.viewing_cg, Some((0, 1)));
     }
 }
