@@ -1,10 +1,30 @@
 {
+  "id": "./",
   "name": "NIR Player",
   "short_name": "NIR",
+  "description": "High-performance WebGPU/WebGL2 Visual Novel Player with Offline OPFS & Cloud Sync",
   "start_url": "./",
-  "display": "fullscreen",
-  "display_override": ["fullscreen", "standalone"],
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["fullscreen", "standalone", "minimal-ui"],
   "orientation": "any",
   "background_color": "#0d1118",
-  "theme_color": "#0d1118"
+  "theme_color": "#0d1118",
+  "icons": [
+    {
+      "src": "./icon.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "file_handlers": [
+    {
+      "action": "./play.html?local=1",
+      "accept": {
+        "application/vnd.nir.pak": [".nirpak"],
+        "application/octet-stream": [".nirpak"]
+      }
+    }
+  ]
 }

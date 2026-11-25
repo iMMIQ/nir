@@ -11,6 +11,9 @@ const videoPlayBtn = document.getElementById('video-play-btn');
 const videoSkipBtn = document.getElementById('video-skip-btn');
 const fsBtn = document.getElementById('fs-btn');
 const shelfBtn = document.getElementById('shelf-btn');
+const quickToolsEl = document.getElementById('quick-tools');
+const copyBtn = document.getElementById('copy-btn');
+const shotBtn = document.getElementById('shot-btn');
 const syncPill = document.getElementById('sync-pill');
 const safeProbeEl = document.getElementById('safe-area-probe');
 const loaderEl = document.getElementById('loader');
@@ -83,11 +86,246 @@ function readViewportMetrics() {
   return { width, height, dpr, insets: { top, right, bottom, left } };
 }
 
-// --- Streaming / Zero-Copy `.nirpak` Source (keeps media out of WASM linear memory!) ---
+// --- OPFS (Origin Private File System) & Local File Zero-Copy `.nirpak` Helpers ---
+async function openOpfsPakFile(slug) {
+  if (!slug || !navigator.storage?.getDirectory) return null;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle('nir-paks');
+    const fh = await dir.getFileHandle(`${slug}.nirpak`);
+    const file = await fh.getFile();
+    return file && file.size >= 32 ? file : null;
+  } catch {
+    return null;
+  }
+}
+
+async function consumeLocalPendingPakFile() {
+  // 1. Check PWA File Handling API (`window.launchQueue`)
+  if (window.launchQueue && typeof window.launchQueue.setConsumer === 'function') {
+    const launched = await new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, 180);
+      try {
+        window.launchQueue.setConsumer(async (params) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try {
+            const handle = params?.files?.[0];
+            resolve(handle ? await handle.getFile() : null);
+          } catch {
+            resolve(null);
+          }
+        });
+      } catch {
+        clearTimeout(timer);
+        resolve(null);
+      }
+    });
+    if (launched && launched.size >= 32) return launched;
+  }
+  // 2. Check IndexedDB handoff from Shelf ("Play Local Without Uploading")
+  try {
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('nir_local_play_v1', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('kv');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    const file = await new Promise((resolve) => {
+      const tx = db.transaction('kv', 'readonly');
+      const req = tx.objectStore('kv').get('pending_file');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+    db.close();
+    if (file && typeof file.slice === 'function' && file.size >= 32) return file;
+  } catch { /* ignore */ }
+  return null;
+}
+
+// --- Off-Main-Thread Image Decode & LiveMaker Delta Compositor Worker (Transferable ImageBitmap!) ---
+class ImageDecodeWorkerPool {
+  constructor(maxBases = 8) {
+    this.worker = null;
+    this.nextReqId = 1;
+    this.pending = new Map();
+    this.workerBaseIds = new Set();
+    this.maxBases = maxBases;
+    this.disabled = false;
+    this._init();
+  }
+
+  _init() {
+    if (
+      typeof Worker === 'undefined' ||
+      typeof OffscreenCanvas === 'undefined' ||
+      typeof createImageBitmap !== 'function'
+    ) {
+      this.disabled = true;
+      return;
+    }
+    const src = `
+      const baseCache = new Map();
+      let maxBases = ${Number(this.maxBases) || 8};
+      function putBase(id, bmp) {
+        const old = baseCache.get(id);
+        if (old) { try { old.close(); } catch {} baseCache.delete(id); }
+        baseCache.set(id, bmp);
+        while (baseCache.size > maxBases) {
+          const oldest = baseCache.keys().next().value;
+          const ob = baseCache.get(oldest);
+          baseCache.delete(oldest);
+          try { ob.close(); } catch {}
+        }
+      }
+      function getBase(id) {
+        const hit = baseCache.get(id);
+        if (!hit) return null;
+        baseCache.delete(id);
+        baseCache.set(id, hit);
+        return hit;
+      }
+      async function compositeDelta(baseBmp, patchBmp, delta) {
+        const w = baseBmp.width, h = baseBmp.height;
+        const cvs = new OffscreenCanvas(w, h);
+        const ctx = cvs.getContext('2d');
+        ctx.globalCompositeOperation = 'copy';
+        ctx.drawImage(baseBmp, 0, 0);
+        const mask = delta.tile_mask;
+        if (!mask || mask.length === 0) {
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.drawImage(patchBmp, delta.x, delta.y);
+        } else {
+          const TILE = 16;
+          const pw = patchBmp.width, ph = patchBmp.height;
+          const txCount = Math.ceil(pw / TILE), tyCount = Math.ceil(ph / TILE);
+          ctx.globalCompositeOperation = 'source-over';
+          for (let pty = 0; pty < tyCount; pty++) {
+            for (let ptx = 0; ptx < txCount; ptx++) {
+              const bit = pty * txCount + ptx;
+              if (((mask[bit >> 3] || 0) & (1 << (bit & 7))) === 0) continue;
+              const sx = ptx * TILE, sy = pty * TILE;
+              const sw = Math.min(TILE, pw - sx), sh = Math.min(TILE, ph - sy);
+              ctx.clearRect(delta.x + sx, delta.y + sy, sw, sh);
+              ctx.drawImage(patchBmp, sx, sy, sw, sh, delta.x + sx, delta.y + sy, sw, sh);
+            }
+          }
+        }
+        return createImageBitmap(cvs, { premultiplyAlpha: 'premultiply' });
+      }
+      self.onmessage = async (ev) => {
+        const m = ev.data;
+        if (m.op === 'clear_bases') {
+          for (const b of baseCache.values()) { try { b.close(); } catch {} }
+          baseCache.clear();
+          return;
+        }
+        try {
+          if (m.op === 'decode') {
+            const bmp = await createImageBitmap(new Blob([m.bytes], { type: m.mime }), { premultiplyAlpha: 'premultiply' });
+            self.postMessage({ reqId: m.reqId, bitmap: bmp }, [bmp]);
+          } else if (m.op === 'delta') {
+            let baseBmp = getBase(m.baseId);
+            if (!baseBmp) {
+              if (!m.baseBytes) throw new Error('missing baseBytes');
+              baseBmp = await createImageBitmap(new Blob([m.baseBytes], { type: m.baseMime }), { premultiplyAlpha: 'none' });
+              putBase(m.baseId, baseBmp);
+            }
+            const patchBmp = await createImageBitmap(new Blob([m.patchBytes], { type: m.patchMime }), { premultiplyAlpha: 'none' });
+            try {
+              const out = await compositeDelta(baseBmp, patchBmp, m.delta);
+              self.postMessage({ reqId: m.reqId, bitmap: out, cachedBases: Array.from(baseCache.keys()) }, [out]);
+            } finally {
+              patchBmp.close();
+            }
+          }
+        } catch (err) {
+          self.postMessage({ reqId: m.reqId, error: String(err?.message ?? err) });
+        }
+      };
+    `;
+    try {
+      const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      this.worker = new Worker(url);
+      URL.revokeObjectURL(url);
+      this.worker.onmessage = (ev) => {
+        const { reqId, bitmap, error, cachedBases } = ev.data || {};
+        if (Array.isArray(cachedBases)) {
+          this.workerBaseIds = new Set(cachedBases);
+        }
+        const entry = this.pending.get(reqId);
+        if (!entry) {
+          if (bitmap) try { bitmap.close(); } catch {}
+          return;
+        }
+        this.pending.delete(reqId);
+        if (error) entry.reject(new Error(error));
+        else entry.resolve(bitmap);
+      };
+      this.worker.onerror = () => {
+        this.disabled = true;
+        for (const p of this.pending.values()) p.reject(new Error('worker error'));
+        this.pending.clear();
+        try { this.worker?.terminate(); } catch {}
+        this.worker = null;
+      };
+    } catch {
+      this.disabled = true;
+      this.worker = null;
+    }
+  }
+
+  get available() {
+    return !this.disabled && this.worker !== null;
+  }
+
+  hasCachedBase(baseId) {
+    return this.workerBaseIds.has(baseId);
+  }
+
+  clearBases() {
+    this.workerBaseIds.clear();
+    if (this.worker) {
+      try { this.worker.postMessage({ op: 'clear_bases' }); } catch {}
+    }
+  }
+
+  decode(bytes, mime) {
+    const reqId = this.nextReqId++;
+    const copy = bytes.slice().buffer;
+    return new Promise((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject });
+      this.worker.postMessage({ op: 'decode', reqId, bytes: copy, mime }, [copy]);
+    });
+  }
+
+  decodeDelta(baseId, baseBytesOrNull, baseMime, patchBytes, patchMime, delta) {
+    const reqId = this.nextReqId++;
+    const patchBuf = patchBytes.slice().buffer;
+    const transfers = [patchBuf];
+    let baseBuf = null;
+    if (baseBytesOrNull) {
+      baseBuf = baseBytesOrNull.slice().buffer;
+      transfers.push(baseBuf);
+    }
+    return new Promise((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject });
+      this.worker.postMessage(
+        { op: 'delta', reqId, baseId, baseBytes: baseBuf, baseMime, patchBytes: patchBuf, patchMime, delta },
+        transfers,
+      );
+    });
+  }
+}
+
+// --- Streaming / OPFS / Local File Zero-Copy `.nirpak` Source (keeps media out of WASM linear memory!) ---
 class PakSource {
-  constructor(url, rangeCacheLimit) {
+  constructor(url, rangeCacheLimit, localFile = null) {
     this.url = url;
-    this.mode = 'memory'; // 'range' | 'memory'
+    this.localFile = localFile;
+    this.mode = localFile ? 'file' : 'memory'; // 'file' | 'range' | 'memory'
     this.fullBytes = null;
     this.mediaBase = 0;
     this.rangeCache = new Map(); // key -> Uint8Array
@@ -97,6 +335,16 @@ class PakSource {
   }
 
   async open() {
+    if (this.localFile) {
+      if (this.localFile.size < 32) throw new Error('truncated local nirpak header');
+      const hdr = new Uint8Array(await this.localFile.slice(0, 32).arrayBuffer());
+      const dv = new DataView(hdr.buffer, hdr.byteOffset, 32);
+      const progLen = Number(dv.getBigUint64(16, true));
+      this.mediaBase = 32 + progLen;
+      this.mode = 'file';
+      setProgress(65, 'Reading local story index…');
+      return new Uint8Array(await this.localFile.slice(0, this.mediaBase).arrayBuffer());
+    }
     // Probe 32-byte `.nirpak` header via HTTP Range first for instant startup!
     try {
       const probe = await fetch(this.url, {
@@ -188,6 +436,9 @@ class PakSource {
     if (size === 0) return new Uint8Array(0);
     const start = this.mediaBase + offset;
     const end = start + size;
+    if (this.mode === 'file' && this.localFile) {
+      return new Uint8Array(await this.localFile.slice(start, end).arrayBuffer());
+    }
     if (this.mode === 'memory' && this.fullBytes) {
       // Zero-copy subarray view directly over JS-owned `.nirpak`!
       return this.fullBytes.subarray(start, end);
@@ -1313,12 +1564,28 @@ async function main() {
   const shelfUrl = cfg.shelfUrl || null;
   const translationsApi = cfg.translationsApi || null;
   const wantResume = qs.get('resume') === '1' || qs.get('resume') === 'true';
+  const wantLocal = qs.get('local') === '1';
 
-  let pak = new PakSource(pakUrl, deviceProfile.rangeCacheLimit);
+  // Prefer OPFS offline `.nirpak` or local dragged/launched `.nirpak` for zero-RAM instant slicing!
+  const slugMatch = /\/games\/([^/?#]+)\/game\.nirpak/.exec(pakUrl);
+  const pakSlug = cfg.slug || (slugMatch ? decodeURIComponent(slugMatch[1]) : null);
+  let localPakFile = null;
+  if (wantLocal) {
+    localPakFile = await consumeLocalPendingPakFile();
+  } else if (pakSlug) {
+    localPakFile = await openOpfsPakFile(pakSlug);
+  }
+  if (navigator.storage?.persist) {
+    navigator.storage.persist().catch(() => {});
+  }
+
+  let pak = new PakSource(pakUrl, deviceProfile.rangeCacheLimit, localPakFile);
   const store = new SaveStore(
-    gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2',
-    saveApi,
-    userPrefsApi,
+    localPakFile
+      ? `nir_saves_v2:local:${localPakFile.name}`
+      : (gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2'),
+    localPakFile ? null : saveApi,
+    localPakFile ? null : userPrefsApi,
     showSyncPill,
   );
 
@@ -1375,7 +1642,14 @@ async function main() {
   // Coordinate DOM corner chrome clearance with Canvas HUD capsules so they never collide!
   const syncChromePads = () => {
     const leftPad = shelfBtn && !shelfBtn.hidden ? Math.ceil(shelfBtn.offsetWidth || 78) + 12 : 0;
-    const rightPad = fsBtn && !fsBtn.hidden ? Math.ceil(fsBtn.offsetWidth || 40) + 12 : 0;
+    const fsVis = Boolean(fsBtn && !fsBtn.hidden);
+    if (quickToolsEl) {
+      quickToolsEl.classList.toggle('shifted-left', fsVis);
+    }
+    const qtVis = Boolean(quickToolsEl && !quickToolsEl.hidden);
+    const rightPad =
+      (fsVis ? Math.ceil(fsBtn.offsetWidth || 40) + 12 : 0) +
+      (qtVis ? Math.ceil(quickToolsEl.offsetWidth || 84) + 12 : 0);
     engine.set_host_top_chrome_pads(leftPad, rightPad);
   };
 
@@ -1611,6 +1885,8 @@ async function main() {
     }
   };
 
+  const decodeWorker = new ImageDecodeWorkerPool(deviceProfile.maxBaseBitmaps);
+
   const dispatchImageDecode = (cmd, isPrefetch) => {
     if (inflightImages.has(cmd.id) || contextLost) return;
     inflightImages.add(cmd.id);
@@ -1623,6 +1899,22 @@ async function main() {
         if (!contextLost) engine.upload_ktx2_bytes(cmd.id, bytes);
         scheduleFrame();
       });
+    } else if (cmd.delta && decodeWorker.available) {
+      const d = cmd.delta;
+      const needBase = !decodeWorker.hasCachedBase(d.base_id);
+      task = Promise.all([
+        needBase ? pak.getAssetBytes(d.base_offset, d.base_size) : Promise.resolve(null),
+        pak.getAssetBytes(cmd.offset, cmd.size),
+      ])
+        .then(([baseBytes, patchBytes]) =>
+          decodeWorker.decodeDelta(d.base_id, baseBytes, d.base_mime, patchBytes, cmd.mime, d),
+        )
+        .then((bmp) => {
+          inflightImages.delete(cmd.id);
+          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
+          bmp.close();
+          scheduleFrame();
+        });
     } else if (cmd.delta) {
       const d = cmd.delta;
       task = Promise.all([
@@ -1641,6 +1933,15 @@ async function main() {
           } finally {
             patchBmp.close();
           }
+        });
+    } else if (decodeWorker.available) {
+      task = pak.getAssetBytes(cmd.offset, cmd.size)
+        .then((bytes) => decodeWorker.decode(bytes, cmd.mime))
+        .then((bmp) => {
+          inflightImages.delete(cmd.id);
+          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
+          bmp.close();
+          scheduleFrame();
         });
     } else {
       task = pak.getAssetBytes(cmd.offset, cmd.size)
@@ -1763,6 +2064,9 @@ async function main() {
   const setChromeIdle = (idle) => {
     if (shelfBtn) shelfBtn.classList.toggle('chrome-idle', idle);
     if (fsBtn) fsBtn.classList.toggle('chrome-idle', idle);
+    if (quickToolsEl && !engine.is_interface_hidden()) {
+      quickToolsEl.classList.toggle('chrome-idle', idle);
+    }
     canvas.classList.toggle('cursor-idle', idle && !deviceProfile.isMobile);
   };
   const wakeChrome = () => {
@@ -1878,6 +2182,9 @@ async function main() {
       else if (e.code === 'F9') { e.preventDefault(); engine.dispatch_action_json('"QuickLoad"'); handled = true; }
       else if (e.code === 'KeyV' || e.code === 'KeyR') { engine.dispatch_action_json('"ReplayVoice"'); handled = true; }
       else if (e.code === 'KeyB') { engine.dispatch_action_json('"ToggleBilingual"'); handled = true; }
+      else if (e.code === 'KeyC' && e.shiftKey) { toggleAutoCopyHook(); handled = true; }
+      else if (e.code === 'KeyC' && !e.ctrlKey && !e.metaKey) { copyCurrentDialogue(true); handled = true; }
+      else if (e.code === 'KeyP') { captureAndSaveScreenshot(); handled = true; }
     }
     if (handled) scheduleFrame();
   });
@@ -1912,6 +2219,7 @@ async function main() {
     // Free transient mobile decode caches when backgrounded to minimize Jetsam kills!
     if (deviceProfile.isMobile) {
       clearBaseBitmapCache();
+      decodeWorker.clearBases();
       if (deviceProfile.lowMem) {
         pak.trimCache(8 * 1024 * 1024);
       }
@@ -2030,6 +2338,301 @@ async function main() {
   for (const [key, dataUrl] of store.thumbnails.entries()) {
     uploadThumbDataUrl(key, dataUrl);
   }
+  // --- Multi-Tab Sync (BroadcastChannel) + Concurrent Play Guard (Web Locks API) ---
+  const syncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('nir-sync') : null;
+  const broadcastSaveSync = (kind, snapshotJson, thumb) => {
+    if (!syncChannel) return;
+    try {
+      const snap = JSON.parse(snapshotJson || '{}');
+      syncChannel.postMessage({
+        type: 'save-updated',
+        kind,
+        gameId: engine.game_id(),
+        slug: pakSlug,
+        summary: snap.summary || '',
+        savedAt: snap.saved_at_unix || Math.floor(Date.now() / 1000),
+        thumb: thumb || null,
+      });
+    } catch { /* ignore */ }
+  };
+  if (navigator.locks && typeof navigator.locks.request === 'function') {
+    const lockName = `nir-game-session:${engine.game_id() || pakUrl}`;
+    navigator.locks.request(lockName, { ifAvailable: true }, (lock) => {
+      if (!lock) {
+        engine.show_toast('检测到另一标签页正在运行本作，请注意避免存档覆盖', 4200);
+        scheduleFrame();
+        return;
+      }
+      // Hold exclusive lock for the lifetime of this tab
+      return new Promise(() => {});
+    }).catch(() => {});
+  }
+
+  // --- Subtle Haptic Feedback (Vibration API + Gamepad Dual-Rumble) ---
+  let activeGamepadIndex = -1;
+  let lastShakeHapticMs = 0;
+  const triggerHaptic = (ms = 14, strong = 0.25) => {
+    try {
+      if (deviceProfile.isMobile && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(ms);
+      }
+      if (activeGamepadIndex >= 0 && navigator.getGamepads) {
+        const gp = navigator.getGamepads()[activeGamepadIndex];
+        const act = gp?.vibrationActuator;
+        if (act && typeof act.playEffect === 'function') {
+          act.playEffect('dual-rumble', {
+            startDelay: 0,
+            duration: Math.max(40, ms * 3),
+            weakMagnitude: strong,
+            strongMagnitude: strong * 0.6,
+          }).catch(() => {});
+        }
+      }
+    } catch { /* ignore */ }
+  };
+
+  // --- Texthooker Clipboard Copy & Auto-Copy Hook (great for Japanese visual novel learners!) ---
+  let autoCopyHook = false;
+  let lastDialogueKey = '';
+  let lastDialogueObj = null;
+
+  const copyCurrentDialogue = async (explicitToast = false) => {
+    const raw = engine.current_dialogue_json();
+    if (!raw) {
+      if (explicitToast) showSyncPill('当前无台词可复制');
+      return;
+    }
+    try {
+      const d = JSON.parse(raw);
+      const line = (d.text || '').trim();
+      if (!line) return;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(line);
+        if (explicitToast) showSyncPill('📋 已复制台词');
+      }
+    } catch {
+      if (explicitToast) showSyncPill('复制需要页面处于焦点状态', true);
+    }
+  };
+
+  const toggleAutoCopyHook = () => {
+    autoCopyHook = !autoCopyHook;
+    if (copyBtn) {
+      copyBtn.classList.toggle('active', autoCopyHook);
+      copyBtn.textContent = autoCopyHook ? '🔗' : '📋';
+    }
+    showSyncPill(autoCopyHook ? '🔗 已开启台词自动复制 (Texthooker)' : '已关闭台词自动复制');
+    if (autoCopyHook) copyCurrentDialogue(false);
+  };
+
+  // --- Clean Borderless Full-Res PNG Screenshot + Web Share API ---
+  const captureAndSaveScreenshot = () => {
+    if (!canvas || canvas.width === 0 || canvas.height === 0) return;
+    try {
+      const sr = engine.stage_rect_phys();
+      let sx = 0, sy = 0, sw = canvas.width, sh = canvas.height;
+      if (sr && sr.length === 4 && sr[2] > 16 && sr[3] > 16) {
+        sx = Math.max(0, Math.round(sr[0]));
+        sy = Math.max(0, Math.round(sr[1]));
+        sw = Math.min(canvas.width - sx, Math.round(sr[2]));
+        sh = Math.min(canvas.height - sy, Math.round(sr[3]));
+      }
+      const out = document.createElement('canvas');
+      out.width = Math.max(1, sw);
+      out.height = Math.max(1, sh);
+      out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, out.width, out.height);
+      const safeName = (engine.title() || 'nir-cg').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
+      const fname = `${safeName}-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.png`;
+      out.toBlob(async (blob) => {
+        if (!blob) return;
+        const file = new File([blob], fname, { type: 'image/png' });
+        if (deviceProfile.isMobile && navigator.canShare && navigator.canShare({ files: [file] })) {
+          try {
+            await navigator.share({ files: [file], title: engine.title() });
+            return;
+          } catch { /* fall back to direct download */ }
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        showSyncPill('📷 已保存无黑边截图');
+      }, 'image/png');
+    } catch {
+      showSyncPill('截图保存失败', true);
+    }
+  };
+
+  if (quickToolsEl) {
+    quickToolsEl.hidden = false;
+    syncChromePads();
+  }
+  if (copyBtn) {
+    let copyHoldTimer = 0;
+    let copyLongPressed = false;
+    copyBtn.addEventListener('click', () => {
+      if (copyLongPressed) { copyLongPressed = false; return; }
+      copyCurrentDialogue(true);
+    });
+    copyBtn.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      toggleAutoCopyHook();
+    });
+    copyBtn.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch') return;
+      copyLongPressed = false;
+      clearTimeout(copyHoldTimer);
+      copyHoldTimer = setTimeout(() => {
+        copyLongPressed = true;
+        triggerHaptic(14);
+        toggleAutoCopyHook();
+      }, 480);
+    });
+    copyBtn.addEventListener('pointerup', () => clearTimeout(copyHoldTimer));
+    copyBtn.addEventListener('pointercancel', () => clearTimeout(copyHoldTimer));
+  }
+  if (shotBtn) {
+    shotBtn.addEventListener('click', () => {
+      triggerHaptic(10);
+      captureAndSaveScreenshot();
+    });
+  }
+
+  // --- Media Session API (Lock-Screen Metadata + Bluetooth / Media Key Controls) ---
+  const coverArtwork = cfg.coverUrl
+    ? [{ src: new URL(cfg.coverUrl, location.href).href, sizes: '640x360', type: 'image/jpeg' }]
+    : [];
+  const syncMediaSession = (dlg) => {
+    if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
+    try {
+      const title = engine.title() || cfg.gameTitle || 'NIR Player';
+      const artist = (dlg?.speaker || '').trim() || 'NIR Visual Novel';
+      const album = (dlg?.text || '').trim().slice(0, 64);
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title,
+        artist,
+        album,
+        artwork: coverArtwork,
+      });
+    } catch { /* ignore */ }
+  };
+  if ('mediaSession' in navigator) {
+    const safeBind = (action, fn) => {
+      try { navigator.mediaSession.setActionHandler(action, fn); } catch {}
+    };
+    safeBind('play', () => { audio.ensureContext(); engine.dispatch_action_json('"ToggleAuto"'); scheduleFrame(); });
+    safeBind('pause', () => { engine.dispatch_action_json('"ToggleAuto"'); scheduleFrame(); });
+    safeBind('nexttrack', () => { engine.dispatch_action_json('"Advance"'); scheduleFrame(); });
+    safeBind('previoustrack', () => { engine.dispatch_action_json('"Rollback"'); scheduleFrame(); });
+    syncMediaSession(null);
+  }
+
+  // --- Gamepad API Controller (Xbox / PlayStation / Switch / Steam Deck / 8BitDo Micro) ---
+  // Zero overhead when no gamepad is connected!
+  let gamepadRaf = 0;
+  const gpPrev = new Map(); // btnIndex -> pressed
+  let gpHoldSkip = false;
+  let gpLastAxisMs = 0;
+  const pollGamepads = () => {
+    gamepadRaf = 0;
+    if (activeGamepadIndex < 0 || !navigator.getGamepads || document.visibilityState === 'hidden') return;
+    const gp = navigator.getGamepads()[activeGamepadIndex];
+    if (!gp || !gp.connected) {
+      activeGamepadIndex = -1;
+      if (gpHoldSkip) {
+        gpHoldSkip = false;
+        engine.dispatch_action_json(JSON.stringify({ HoldSkip: false }));
+        scheduleFrame();
+      }
+      return;
+    }
+    const pressed = (idx) => Boolean(gp.buttons?.[idx]?.pressed);
+    const edge = (idx) => {
+      const cur = pressed(idx);
+      const prev = gpPrev.get(idx) || false;
+      gpPrev.set(idx, cur);
+      return cur && !prev;
+    };
+    let acted = false;
+    if (edge(0) || edge(5)) { engine.dispatch_action_json('"Advance"'); acted = true; } // A / R1
+    if (edge(1)) { engine.cancel_or_menu(); acted = true; } // B
+    if (edge(2)) { engine.dispatch_action_json('"OpenHistory"'); acted = true; } // X
+    if (edge(3)) { engine.dispatch_action_json('"ToggleHideUi"'); acted = true; } // Y
+    if (edge(4) || edge(12)) { engine.scroll_wheel(-120); acted = true; } // L1 / D-Pad Up
+    if (edge(13)) { engine.scroll_wheel(120); acted = true; } // D-Pad Down
+    if (edge(9)) { engine.dispatch_action_json('"ToggleAuto"'); acted = true; } // Start
+    if (edge(8)) { engine.dispatch_action_json('"QuickSave"'); acted = true; } // Select
+    // Left stick vertical scroll (throttled)
+    const ay = gp.axes?.[1] || 0;
+    const nowMs = performance.now();
+    if (Math.abs(ay) > 0.65 && nowMs - gpLastAxisMs > 240) {
+      gpLastAxisMs = nowMs;
+      engine.scroll_wheel(ay < 0 ? -120 : 120);
+      acted = true;
+    }
+    // R2 trigger hold-skip
+    const r2 = (gp.buttons?.[7]?.value || 0) > 0.45 || pressed(7);
+    if (r2 !== gpHoldSkip) {
+      gpHoldSkip = r2;
+      engine.dispatch_action_json(JSON.stringify({ HoldSkip: r2 }));
+      acted = true;
+    }
+    if (acted) {
+      unlockAudio();
+      scheduleFrame();
+    }
+    gamepadRaf = requestAnimationFrame(pollGamepads);
+  };
+  window.addEventListener('gamepadconnected', (e) => {
+    activeGamepadIndex = e.gamepad.index;
+    gpPrev.clear();
+    engine.show_toast(`🎮 已连接手柄：${(e.gamepad.id || 'Gamepad').slice(0, 28)}`, 2400);
+    scheduleFrame();
+    if (!gamepadRaf) gamepadRaf = requestAnimationFrame(pollGamepads);
+  });
+  window.addEventListener('gamepaddisconnected', (e) => {
+    if (e.gamepad.index === activeGamepadIndex) {
+      activeGamepadIndex = -1;
+      if (gpHoldSkip) {
+        gpHoldSkip = false;
+        engine.dispatch_action_json(JSON.stringify({ HoldSkip: false }));
+        scheduleFrame();
+      }
+      engine.show_toast('手柄已断开', 1800);
+      scheduleFrame();
+    }
+  });
+
+  // --- Drag & Drop a local `.nirpak` directly onto the player for zero-upload instant play! ---
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer?.types?.includes('Files')) e.preventDefault();
+  });
+  window.addEventListener('drop', async (e) => {
+    const file = e.dataTransfer?.files?.[0];
+    if (!file || !file.name.toLowerCase().endsWith('.nirpak')) return;
+    e.preventDefault();
+    try {
+      const nextPak = new PakSource(pakUrl, deviceProfile.rangeCacheLimit, file);
+      const freshHeader = await nextPak.open();
+      pak = nextPak;
+      engine.hot_reload(freshHeader);
+      inflightImages.clear();
+      prefetchQueue.length = 0;
+      clearBaseBitmapCache();
+      decodeWorker.clearBases();
+      audio.clearCache();
+      await loadAllFonts();
+      document.title = engine.title();
+      engine.show_toast(`⚡ 已本地直开：${engine.title()}`, 2600);
+      scheduleFrame();
+    } catch (err) {
+      engine.show_toast(`无法读取本地 .nirpak：${err?.message ?? err}`, 3500);
+      scheduleFrame();
+    }
+  });
+
   // Load external translation patches (if hosted by Shelf)
   if (translationsApi) {
     fetch(translationsApi, { cache: 'no-store' })
@@ -2150,6 +2753,8 @@ async function main() {
         const thumb = latestCapturedThumb || captureStageThumb();
         store.saveSlot(cmd.slot, cmd.snapshot_json, thumb);
         if (thumb) uploadThumbDataUrl(cmd.slot, thumb);
+        broadcastSaveSync('slot', cmd.snapshot_json, thumb);
+        triggerHaptic(12);
         break;
       }
       case 'request_load_slot':
@@ -2167,6 +2772,7 @@ async function main() {
         const thumb = latestCapturedThumb || captureStageThumb();
         store.saveNamed('autosave', cmd.snapshot_json, thumb, { keepalive: true });
         if (thumb) uploadThumbDataUrl('auto', thumb);
+        broadcastSaveSync('autosave', cmd.snapshot_json, thumb);
         break;
       }
       case 'request_load_auto':
@@ -2181,6 +2787,8 @@ async function main() {
         const thumb = latestCapturedThumb || captureStageThumb();
         store.saveNamed('quicksave', cmd.snapshot_json, thumb);
         if (thumb) uploadThumbDataUrl('quick', thumb);
+        broadcastSaveSync('quicksave', cmd.snapshot_json, thumb);
+        triggerHaptic(14);
         break;
       }
       case 'request_load_quick':
@@ -2262,6 +2870,29 @@ async function main() {
         handleCommand(cmd);
       }
       latestCapturedThumb = null;
+    }
+    // Sync live dialogue changes to Media Session lock-screen metadata & optional Texthooker clipboard!
+    const dlgJson = engine.current_dialogue_json();
+    if (dlgJson && dlgJson !== lastDialogueKey) {
+      lastDialogueKey = dlgJson;
+      try {
+        lastDialogueObj = JSON.parse(dlgJson);
+        syncMediaSession(lastDialogueObj);
+        if (autoCopyHook && lastDialogueObj?.text && document.hasFocus()) {
+          navigator.clipboard?.writeText(lastDialogueObj.text.trim()).catch(() => {});
+        }
+      } catch { /* ignore */ }
+    }
+    // Surface clean screenshot button prominently while UI is hidden to admire CGs
+    if (quickToolsEl) {
+      const hiddenUi = engine.is_interface_hidden();
+      if (copyBtn) copyBtn.hidden = hiddenUi;
+      if (hiddenUi) quickToolsEl.classList.remove('chrome-idle');
+    }
+    // Gentle haptic pulse when story triggers a dramatic screen Shake
+    if (engine.is_shaking() && ts - lastShakeHapticMs > 520) {
+      lastShakeHapticMs = ts;
+      triggerHaptic(18, 0.42);
     }
     // Lazy-load 6.1 MiB Pan-CJK fallback font ONLY if a bundled font actually encounters a missing glyph!
     if (!fallbackFontStarted && engine.has_missing_glyphs()) {

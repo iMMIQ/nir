@@ -619,6 +619,34 @@ mod wasm_host {
             self.runtime.is_story_reading()
         }
 
+        #[wasm_bindgen]
+        pub fn is_interface_hidden(&self) -> bool {
+            self.runtime.is_interface_hidden()
+        }
+
+        #[wasm_bindgen]
+        pub fn is_shaking(&self) -> bool {
+            self.runtime.is_shaking()
+        }
+
+        #[wasm_bindgen]
+        pub fn current_screen_name(&self) -> String {
+            self.runtime.current_screen_name().to_owned()
+        }
+
+        #[wasm_bindgen]
+        pub fn current_dialogue_json(&self) -> String {
+            match self.runtime.current_dialogue_info() {
+                Some((id, speaker, text)) => serde_json::json!({
+                    "id": id,
+                    "speaker": speaker,
+                    "text": text,
+                })
+                .to_string(),
+                None => String::new(),
+            }
+        }
+
         /// Returns the active stage viewport in physical canvas pixels `[x, y, w, h]`
         /// for clean, letterbox-free save thumbnail capture.
         #[wasm_bindgen]

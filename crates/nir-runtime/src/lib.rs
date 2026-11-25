@@ -289,6 +289,32 @@ impl Runtime {
             && self.pending_confirm.is_none()
     }
 
+    pub fn is_interface_hidden(&self) -> bool {
+        self.screen == Screen::Story && self.interface_hidden
+    }
+
+    pub fn is_shaking(&self) -> bool {
+        !self.vm.shakes.is_empty()
+    }
+
+    pub fn current_screen_name(&self) -> &'static str {
+        match self.screen {
+            Screen::Title => "title",
+            Screen::Story => "story",
+            Screen::Menu => "menu",
+            Screen::Saves { .. } => "saves",
+            Screen::Settings => "settings",
+            Screen::History => "history",
+            Screen::Gallery => "gallery",
+            Screen::Ended => "ended",
+        }
+    }
+
+    pub fn current_dialogue_info(&self) -> Option<(u32, &str, &str)> {
+        let d = self.vm.dialogue.as_ref()?;
+        Some((d.text_id.0, d.speaker.as_str(), d.full_text.as_str()))
+    }
+
     pub fn stage_rect(&self) -> [f32; 4] {
         self.last_packet.stage_rect
     }
