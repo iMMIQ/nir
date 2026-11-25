@@ -67,6 +67,7 @@ struct Vertex {
     pos: [f32; 2],
     uv: [f32; 2],
     color: [f32; 4],
+    rect_params: [f32; 4],
 }
 
 struct GpuTexture {
@@ -710,7 +711,7 @@ impl Renderer {
         let vlayout = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4],
         }];
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -783,21 +784,25 @@ impl Renderer {
                 pos: [-1.0, 1.0],
                 uv: [0.0, 0.0],
                 color: [1.0; 4],
+                rect_params: [0.0; 4],
             },
             Vertex {
                 pos: [1.0, 1.0],
                 uv: [1.0, 0.0],
                 color: [1.0; 4],
+                rect_params: [0.0; 4],
             },
             Vertex {
                 pos: [-1.0, -1.0],
                 uv: [0.0, 1.0],
                 color: [1.0; 4],
+                rect_params: [0.0; 4],
             },
             Vertex {
                 pos: [1.0, -1.0],
                 uv: [1.0, 1.0],
                 color: [1.0; 4],
+                rect_params: [0.0; 4],
             },
         ];
         let mip_vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1637,11 +1642,17 @@ impl Renderer {
                     .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
                 let [u0, v0, u1, v1] = q.uv;
                 let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
+                let rect_params = if q.corner_radius > 0.0 {
+                    [w.max(1.0), h.max(1.0), q.corner_radius, 0.0]
+                } else {
+                    [0.0; 4]
+                };
                 for idx in 0..4 {
                     verts.push(Vertex {
                         pos: [corners[idx][0] * inv_w - 1.0, 1.0 - corners[idx][1] * inv_h],
                         uv: uvs[idx],
                         color,
+                        rect_params,
                     });
                 }
             }

@@ -42,6 +42,24 @@ impl TextEntry {
         }
     }
 
+    /// Flattens static text spans into a plain string (used for bilingual overlay & search).
+    pub fn to_plain_text(&self) -> String {
+        let mut out = String::new();
+        for span in &self.spans {
+            match span {
+                RichSpan::Text(s) | RichSpan::Emphasis(s) | RichSpan::Color { text: s, .. } => {
+                    out.push_str(s);
+                }
+                RichSpan::Ruby { base, .. } => out.push_str(base),
+                RichSpan::Pause { .. }
+                | RichSpan::InlineImage { .. }
+                | RichSpan::Var(_)
+                | RichSpan::Speed(_) => {}
+            }
+        }
+        out
+    }
+
     /// Collects all static characters for fast compiler font subsetting.
     pub fn collect_chars(&self, out: &mut std::collections::BTreeSet<char>) {
         for span in &self.spans {

@@ -164,6 +164,9 @@ pub struct Preferences {
     /// Comfortable docked bottom dialogue layout on narrow portrait screens (phones).
     #[serde(default = "default_true")]
     pub portrait_reader: bool,
+    /// Show secondary/original text alongside translated text when multiple locales exist.
+    #[serde(default)]
+    pub bilingual: bool,
     /// Per-character voice volume override (0.0 = muted, 1.0 = full).
     pub character_volumes: BTreeMap<String, f32>,
 }
@@ -190,6 +193,7 @@ impl Default for Preferences {
             reduced_motion: false,
             fullscreen: false,
             portrait_reader: true,
+            bilingual: false,
             character_volumes: BTreeMap::new(),
         }
     }

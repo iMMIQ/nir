@@ -10,10 +10,24 @@ const videoOverlayEl = document.getElementById('video-overlay');
 const videoPlayBtn = document.getElementById('video-play-btn');
 const videoSkipBtn = document.getElementById('video-skip-btn');
 const fsBtn = document.getElementById('fs-btn');
+const shelfBtn = document.getElementById('shelf-btn');
+const syncPill = document.getElementById('sync-pill');
 const safeProbeEl = document.getElementById('safe-area-probe');
 const loaderEl = document.getElementById('loader');
 const loaderText = document.getElementById('loader-text');
 const loaderFill = document.getElementById('loader-fill');
+
+let syncPillTimer = 0;
+const showSyncPill = (msg, isError = false) => {
+  if (!syncPill) return;
+  syncPill.textContent = msg;
+  syncPill.style.color = isError ? '#ff9ea3' : '#9fd0fb';
+  syncPill.hidden = false;
+  clearTimeout(syncPillTimer);
+  syncPillTimer = setTimeout(() => {
+    syncPill.hidden = true;
+  }, isError ? 3200 : 1600);
+};
 
 const setProgress = (pct, msg) => {
   if (loaderFill) loaderFill.style.width = `${Math.round(pct)}%`;
@@ -285,11 +299,17 @@ class PakSource {
 
 // --- Lightweight IndexedDB persistence with optional same-origin Cloud Sync ---
 class SaveStore {
-  constructor(dbName, saveApi = null) {
+  constructor(dbName, saveApi = null, userPrefsApi = null, onSyncStatus = null) {
     this.dbName = dbName;
     this.saveApi = saveApi ? saveApi.replace(/\/+$/, '') : null;
+    this.userPrefsApi = userPrefsApi ? userPrefsApi.replace(/\/+$/, '') : null;
+    this.onSyncStatus = onSyncStatus || null;
     this.db = null;
     this.slotIndex = {};
+    this.deletedSlots = {}; // slot -> deleted_at_unix
+    this.autosaveSummary = null;
+    this.quicksaveSummary = null;
+    this.thumbnails = new Map(); // 'auto' | 'quick' | slotNumber -> dataUrl
   }
   async open() {
     this.db = await new Promise((resolve, reject) => {
@@ -306,12 +326,45 @@ class SaveStore {
       headers: { 'Content-Type': 'application/json' },
       body: val,
       keepalive,
-    }).catch(() => {});
+    })
+      .then((res) => {
+        if (this.onSyncStatus && (key === 'autosave' || key === 'quicksave' || key.startsWith('slot_'))) {
+          this.onSyncStatus(res.ok ? '☁ 云存档已同步' : '云存档同步失败（已本地保存）', !res.ok);
+        }
+      })
+      .catch(() => {
+        if (this.onSyncStatus && (key === 'autosave' || key === 'quicksave' || key.startsWith('slot_'))) {
+          this.onSyncStatus('离线模式 · 存档已本地暂存', false);
+        }
+      });
   }
   _remoteDel(key) {
     if (!this.saveApi) return;
     fetch(`${this.saveApi}/${encodeURIComponent(key)}`, {
       method: 'DELETE',
+    }).catch(() => {});
+  }
+  saveGlobalPrefs(prefs) {
+    if (!this.userPrefsApi || !prefs) return;
+    const shared = {
+      master_volume: prefs.master_volume,
+      bgm_volume: prefs.bgm_volume,
+      voice_volume: prefs.voice_volume,
+      sfx_volume: prefs.sfx_volume,
+      text_speed: prefs.text_speed,
+      font_scale: prefs.font_scale,
+      auto_delay_ms: prefs.auto_delay_ms,
+      auto_wait_voice: prefs.auto_wait_voice,
+      continue_voice_on_advance: prefs.continue_voice_on_advance,
+      skip_unread: prefs.skip_unread,
+      portrait_reader: prefs.portrait_reader,
+      reduced_motion: prefs.reduced_motion,
+      bilingual: prefs.bilingual,
+    };
+    fetch(this.userPrefsApi, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(shared),
     }).catch(() => {});
   }
   async get(key) {
@@ -343,28 +396,74 @@ class SaveStore {
       tx.onerror = () => resolve();
     });
   }
-  async saveSlot(slot, snapshotJson) {
-    await this.set(`slot_${slot}`, snapshotJson);
+  _injectThumb(snapshotJson, thumbDataUrl) {
+    if (!thumbDataUrl) return snapshotJson;
     try {
       const snap = JSON.parse(snapshotJson);
+      snap.thumbnail = thumbDataUrl;
+      return JSON.stringify(snap);
+    } catch {
+      return snapshotJson;
+    }
+  }
+  async saveSlot(slot, snapshotJson, thumbDataUrl = null) {
+    const payload = this._injectThumb(snapshotJson, thumbDataUrl);
+    await this.set(`slot_${slot}`, payload);
+    delete this.deletedSlots[slot];
+    if (thumbDataUrl) this.thumbnails.set(slot, thumbDataUrl);
+    try {
+      const snap = JSON.parse(payload);
       this.slotIndex[slot] = {
         slot,
         exists: true,
         saved_at_unix: snap.saved_at_unix ?? 0,
         summary: snap.summary ?? '',
+        has_thumb: Boolean(snap.thumbnail),
       };
       await this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
+      await this.set('deleted_slots', JSON.stringify(this.deletedSlots), { remote: false });
+    } catch { /* ignore */ }
+  }
+  async saveNamed(kind, snapshotJson, thumbDataUrl = null, { keepalive = false } = {}) {
+    const payload = this._injectThumb(snapshotJson, thumbDataUrl);
+    await this.set(kind, payload, { remote: true, keepalive });
+    const thumbKey = kind === 'autosave' ? 'auto' : 'quick';
+    if (thumbDataUrl) this.thumbnails.set(thumbKey, thumbDataUrl);
+    try {
+      const snap = JSON.parse(payload);
+      const summary = {
+        slot: kind === 'autosave' ? 0xffffffff : 0xfffffffe,
+        exists: true,
+        saved_at_unix: snap.saved_at_unix ?? 0,
+        summary: snap.summary ?? '',
+        has_thumb: Boolean(snap.thumbnail),
+      };
+      if (kind === 'autosave') this.autosaveSummary = summary;
+      else this.quicksaveSummary = summary;
     } catch { /* ignore */ }
   }
   async deleteSlot(slot) {
     await this.del(`slot_${slot}`);
     delete this.slotIndex[slot];
+    this.thumbnails.delete(slot);
+    this.deletedSlots[slot] = Math.floor(Date.now() / 1000);
     await this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
+    await this.set('deleted_slots', JSON.stringify(this.deletedSlots), { remote: false });
   }
   async _fetchRemoteBundle() {
     if (!this.saveApi) return null;
     try {
       const res = await fetch(`${this.saveApi}/bundle`, { cache: 'no-store' });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+  async _fetchGlobalPrefs() {
+    if (!this.userPrefsApi) return null;
+    try {
+      const res = await fetch(this.userPrefsApi, { cache: 'no-store' });
       if (!res.ok) return null;
       return await res.json();
     } catch {
@@ -384,8 +483,8 @@ class SaveStore {
       if (Array.isArray(a.flags) || Array.isArray(b.flags)) {
         merged.flags = Array.from(new Set([...(b.flags || []), ...(a.flags || [])]));
       }
-      if (a.vars || b.vars) {
-        merged.vars = { ...(b.vars || {}), ...(a.vars || {}) };
+      if (a.values || b.values) {
+        merged.values = { ...(b.values || {}), ...(a.values || {}) };
       }
       return JSON.stringify(merged);
     } catch {
@@ -394,24 +493,60 @@ class SaveStore {
   }
   async loadInitialState(slotCount = 24) {
     const remotePromise = this._fetchRemoteBundle();
+    const globalPrefsPromise = this._fetchGlobalPrefs();
     let prefsRaw = null;
     let profileRaw = null;
     let indexRaw = null;
+    let deletedRaw = null;
+    let autoRaw = null;
+    let quickRaw = null;
     if (this.db) {
-      ({ prefsRaw, profileRaw, indexRaw } = await new Promise((resolve) => {
+      ({ prefsRaw, profileRaw, indexRaw, deletedRaw, autoRaw, quickRaw } = await new Promise((resolve) => {
         const tx = this.db.transaction('kv', 'readonly');
         const os = tx.objectStore('kv');
         const rPrefs = os.get('prefs');
         const rProfile = os.get('profile');
         const rIdx = os.get('slots_index');
+        const rDel = os.get('deleted_slots');
+        const rAuto = os.get('autosave');
+        const rQuick = os.get('quicksave');
         tx.oncomplete = () => resolve({
           prefsRaw: rPrefs.result ?? null,
           profileRaw: rProfile.result ?? null,
           indexRaw: rIdx.result ?? null,
+          deletedRaw: rDel.result ?? null,
+          autoRaw: rAuto.result ?? null,
+          quickRaw: rQuick.result ?? null,
         });
-        tx.onerror = () => resolve({ prefsRaw: null, profileRaw: null, indexRaw: null });
+        tx.onerror = () => resolve({
+          prefsRaw: null, profileRaw: null, indexRaw: null, deletedRaw: null, autoRaw: null, quickRaw: null,
+        });
       }));
     }
+
+    if (deletedRaw) {
+      try { this.deletedSlots = JSON.parse(deletedRaw) || {}; } catch { this.deletedSlots = {}; }
+    }
+    const parseNamed = (raw, key, virtualSlot) => {
+      if (!raw) return null;
+      try {
+        const snap = JSON.parse(raw);
+        if (typeof snap.thumbnail === 'string' && snap.thumbnail.startsWith('data:image/')) {
+          this.thumbnails.set(key, snap.thumbnail);
+        }
+        return {
+          slot: virtualSlot,
+          exists: true,
+          saved_at_unix: Number(snap.saved_at_unix ?? 0),
+          summary: snap.summary ?? '',
+          has_thumb: Boolean(snap.thumbnail),
+        };
+      } catch {
+        return null;
+      }
+    };
+    this.autosaveSummary = parseNamed(autoRaw, 'auto', 0xffffffff);
+    this.quicksaveSummary = parseNamed(quickRaw, 'quick', 0xfffffffe);
 
     if (indexRaw) {
       try {
@@ -419,47 +554,70 @@ class SaveStore {
       } catch {
         this.slotIndex = {};
       }
-    } else if (this.db) {
+    }
+    // Load local slot thumbnails lazily from IDB for slots that exist
+    if (this.db) {
       const legacy = await new Promise((resolve) => {
         const tx = this.db.transaction('kv', 'readonly');
         const os = tx.objectStore('kv');
         const reqs = [];
         for (let slot = 0; slot < slotCount; slot++) {
-          reqs.push({ slot, req: os.get(`slot_${slot}`) });
+          if (!indexRaw || this.slotIndex[slot]?.exists) {
+            reqs.push({ slot, req: os.get(`slot_${slot}`) });
+          }
         }
         tx.oncomplete = () => resolve(reqs.map(({ slot, req }) => ({ slot, raw: req.result ?? null })));
         tx.onerror = () => resolve([]);
       });
-      this.slotIndex = {};
       for (const { slot, raw } of legacy) {
         if (raw) {
           try {
             const snap = JSON.parse(raw);
+            if (typeof snap.thumbnail === 'string' && snap.thumbnail.startsWith('data:image/')) {
+              this.thumbnails.set(slot, snap.thumbnail);
+            }
             this.slotIndex[slot] = {
               slot,
               exists: true,
               saved_at_unix: snap.saved_at_unix ?? 0,
               summary: snap.summary ?? '',
+              has_thumb: Boolean(snap.thumbnail),
             };
           } catch { /* ignore */ }
         }
       }
-      if (Object.keys(this.slotIndex).length > 0) {
+      if (!indexRaw && Object.keys(this.slotIndex).length > 0) {
         this.set('slots_index', JSON.stringify(this.slotIndex), { remote: false });
       }
     }
 
-    const remote = await remotePromise;
+    const [remote, globalPrefs] = await Promise.all([remotePromise, globalPrefsPromise]);
     if (remote && typeof remote === 'object') {
-      if (!prefsRaw && typeof remote.prefs === 'string') {
-        prefsRaw = remote.prefs;
-        await this.set('prefs', prefsRaw, { remote: false });
+      if (typeof remote.prefs === 'string') {
+        if (!prefsRaw) {
+          prefsRaw = remote.prefs;
+          await this.set('prefs', prefsRaw, { remote: false });
+        }
       }
       if (typeof remote.profile === 'string') {
         const mergedProfile = SaveStore._mergeProfile(profileRaw, remote.profile);
         if (mergedProfile && mergedProfile !== profileRaw) {
           profileRaw = mergedProfile;
           await this.set('profile', profileRaw, { remote: false });
+        }
+      }
+      if (typeof remote.autosave === 'string') {
+        const rAuto = parseNamed(remote.autosave, 'auto', 0xffffffff);
+        if (rAuto && (!this.autosaveSummary || rAuto.saved_at_unix > this.autosaveSummary.saved_at_unix)) {
+          await this.set('autosave', remote.autosave, { remote: false });
+          this.autosaveSummary = rAuto;
+        }
+      }
+      if (typeof remote.quicksave === 'string') {
+        const rQuick = parseNamed(remote.quicksave, 'quick', 0xfffffffe);
+        if (rQuick && (!this.quicksaveSummary || rQuick.saved_at_unix > this.quicksaveSummary.saved_at_unix)) {
+          await this.set('quicksave', remote.quicksave, { remote: false });
+          this.quicksaveSummary = rQuick;
         }
       }
       if (remote.slots && typeof remote.slots === 'object') {
@@ -471,14 +629,20 @@ class SaveStore {
           try {
             const rSnap = JSON.parse(raw);
             const rTs = Number(rSnap.saved_at_unix ?? 0);
+            const delTs = Number(this.deletedSlots[slot] ?? 0);
+            if (delTs > rTs) continue; // Respect newer local deletion tombstone
             const lTs = Number(this.slotIndex[slot]?.saved_at_unix ?? -1);
             if (!this.slotIndex[slot]?.exists || rTs > lTs) {
               await this.set(`slot_${slot}`, raw, { remote: false });
+              if (typeof rSnap.thumbnail === 'string' && rSnap.thumbnail.startsWith('data:image/')) {
+                this.thumbnails.set(slot, rSnap.thumbnail);
+              }
               this.slotIndex[slot] = {
                 slot,
                 exists: true,
                 saved_at_unix: rTs,
                 summary: rSnap.summary ?? '',
+                has_thumb: Boolean(rSnap.thumbnail),
               };
               idxChanged = true;
             }
@@ -490,14 +654,21 @@ class SaveStore {
       }
     }
 
+    // Inherit user-level global preferences if this game has never saved custom prefs yet!
+    if (!prefsRaw && globalPrefs && typeof globalPrefs === 'object' && Object.keys(globalPrefs).length > 0) {
+      prefsRaw = JSON.stringify(globalPrefs);
+    }
+
     const slots = [];
     for (let slot = 0; slot < slotCount; slot++) {
-      slots.push(this.slotIndex[slot] ?? { slot, exists: false, saved_at_unix: 0, summary: '' });
+      slots.push(this.slotIndex[slot] ?? { slot, exists: false, saved_at_unix: 0, summary: '', has_thumb: false });
     }
     return {
       prefsJson: prefsRaw ?? '{}',
       profileJson: profileRaw ?? '{}',
       slots,
+      autosave: this.autosaveSummary,
+      quicksave: this.quicksaveSummary,
     };
   }
 }
@@ -1087,7 +1258,10 @@ function registerServiceWorker(cfg) {
   if (cfg.disableSw || !('serviceWorker' in navigator)) return;
   const secure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
   if (!secure) return;
-  navigator.serviceWorker.register(new URL('./sw.js', import.meta.url).href).catch(() => {});
+  const swUrl = cfg.swUrl
+    ? new URL(cfg.swUrl, location.href).href
+    : new URL('./sw.js', import.meta.url).href;
+  navigator.serviceWorker.register(swUrl).catch(() => {});
 }
 
 async function fetchWithCacheApi(url) {
@@ -1127,15 +1301,24 @@ async function main() {
   const wasmBinUrl = cfg.wasmUrl ? new URL(cfg.wasmUrl, location.href).href : null;
   const gameKey = cfg.gameId || qs.get('game') || null;
   const saveApi = cfg.saveApi || qs.get('save_api') || null;
+  const userPrefsApi = cfg.userPrefsApi || null;
+  const shelfUrl = cfg.shelfUrl || null;
+  const translationsApi = cfg.translationsApi || null;
+  const wantResume = qs.get('resume') === '1' || qs.get('resume') === 'true';
 
   let pak = new PakSource(pakUrl, deviceProfile.rangeCacheLimit);
-  const store = new SaveStore(gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2', saveApi);
+  const store = new SaveStore(
+    gameKey ? `nir_saves_v2:${gameKey}` : 'nir_saves_v2',
+    saveApi,
+    userPrefsApi,
+    showSyncPill,
+  );
 
   const [{ default: initWasm, WebEngine }, headerBytes, initialSaves] = await Promise.all([
     import(/* @vite-ignore */ wasmJsUrl),
     pak.open(),
     store.open().then(() => store.loadInitialState(24)).catch(() => ({
-      prefsJson: '{}', profileJson: '{}', slots: [],
+      prefsJson: '{}', profileJson: '{}', slots: [], autosave: null, quicksave: null,
     })),
   ]);
   if (wasmBinUrl) {
@@ -1171,6 +1354,26 @@ async function main() {
   );
   if (deviceProfile.isMobile) {
     engine.set_input_mode(true);
+  }
+  engine.set_host_has_shelf(Boolean(shelfUrl));
+  engine.set_tz_offset_mins(-new Date().getTimezoneOffset());
+  if (initialSaves.autosave) {
+    engine.set_autosave_summary_json(JSON.stringify(initialSaves.autosave));
+  }
+  if (initialSaves.quicksave) {
+    engine.set_quicksave_summary_json(JSON.stringify(initialSaves.quicksave));
+  }
+
+  // Optional back-to-shelf button when launched from NIR Shelf
+  if (shelfBtn && shelfUrl) {
+    shelfBtn.hidden = false;
+    shelfBtn.addEventListener('click', () => {
+      try {
+        dispatchCmdJson(engine.emit_autosave());
+        dispatchCmdJson(engine.flush_pending_saves());
+      } catch { /* ignore */ }
+      location.href = shelfUrl;
+    });
   }
 
   const fallbackFontUrls = (() => {
@@ -1606,8 +1809,7 @@ async function main() {
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
-    const act = e.deltaY < 0 ? 'Rollback' : 'Advance';
-    engine.dispatch_action_json(JSON.stringify(act));
+    engine.scroll_wheel(e.deltaY);
     scheduleFrame();
   }, { passive: false });
 
@@ -1624,6 +1826,10 @@ async function main() {
       else if (e.code === 'KeyS') { engine.dispatch_action_json('"ToggleSkip"'); handled = true; }
       else if (e.code === 'KeyH') { engine.dispatch_action_json('"ToggleHideUi"'); handled = true; }
       else if (e.code === 'PageUp') { engine.dispatch_action_json('"Rollback"'); handled = true; }
+      else if (e.code === 'F5') { e.preventDefault(); engine.dispatch_action_json('"QuickSave"'); handled = true; }
+      else if (e.code === 'F9') { e.preventDefault(); engine.dispatch_action_json('"QuickLoad"'); handled = true; }
+      else if (e.code === 'KeyV' || e.code === 'KeyR') { engine.dispatch_action_json('"ReplayVoice"'); handled = true; }
+      else if (e.code === 'KeyB') { engine.dispatch_action_json('"ToggleBilingual"'); handled = true; }
     }
     if (handled) scheduleFrame();
   });
@@ -1715,6 +1921,63 @@ async function main() {
     if (videoSkipBtn) videoSkipBtn.onclick = null;
   };
 
+  // Lightweight 160x90 WebP thumbnail capture right after rendering a frame
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = 160;
+  thumbCanvas.height = 90;
+  const thumbCtx = thumbCanvas.getContext('2d');
+  const captureStageThumb = () => {
+    if (!thumbCtx || !canvas || canvas.width === 0 || canvas.height === 0) return null;
+    try {
+      thumbCtx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+      let url = thumbCanvas.toDataURL('image/webp', 0.65);
+      if (!url || !url.startsWith('data:image/webp')) {
+        url = thumbCanvas.toDataURL('image/jpeg', 0.7);
+      }
+      return url && url.length < 32768 ? url : null;
+    } catch {
+      return null;
+    }
+  };
+  const uploadThumbDataUrl = (target, dataUrl) => {
+    if (!dataUrl || contextLost) return;
+    fetch(dataUrl)
+      .then((r) => r.blob())
+      .then((b) => createImageBitmap(b, { premultiplyAlpha: 'premultiply' }))
+      .then((bmp) => {
+        if (!contextLost) {
+          if (target === 'auto') engine.upload_autosave_thumb_bitmap(bmp);
+          else if (target === 'quick') engine.upload_quicksave_thumb_bitmap(bmp);
+          else engine.upload_slot_thumb_bitmap(target, bmp);
+        }
+        bmp.close();
+        scheduleFrame();
+      })
+      .catch(() => {});
+  };
+  // Upload any previously stored save thumbnails lazily
+  for (const [key, dataUrl] of store.thumbnails.entries()) {
+    uploadThumbDataUrl(key, dataUrl);
+  }
+  // Load external translation patches (if hosted by Shelf)
+  if (translationsApi) {
+    fetch(translationsApi, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data || !data.patches || typeof data.patches !== 'object') return;
+        let loadedAny = false;
+        for (const [loc, patch] of Object.entries(data.patches)) {
+          try {
+            const count = engine.load_translation_patch(loc, JSON.stringify(patch));
+            if (count > 0) loadedAny = true;
+          } catch { /* ignore invalid patch */ }
+        }
+        if (loadedAny) scheduleFrame();
+      })
+      .catch(() => {});
+  }
+
+  let latestCapturedThumb = null;
   const handleCommand = (cmd) => {
     switch (cmd.op) {
       case 'decode_image':
@@ -1812,9 +2075,12 @@ async function main() {
           videoEl.hidden = true;
         }
         break;
-      case 'save_slot':
-        store.saveSlot(cmd.slot, cmd.snapshot_json);
+      case 'save_slot': {
+        const thumb = latestCapturedThumb || captureStageThumb();
+        store.saveSlot(cmd.slot, cmd.snapshot_json, thumb);
+        if (thumb) uploadThumbDataUrl(cmd.slot, thumb);
         break;
+      }
       case 'request_load_slot':
         store.get(`slot_${cmd.slot}`).then((json) => {
           if (json) {
@@ -1826,15 +2092,53 @@ async function main() {
       case 'delete_slot':
         store.deleteSlot(cmd.slot);
         break;
+      case 'save_auto': {
+        const thumb = latestCapturedThumb || captureStageThumb();
+        store.saveNamed('autosave', cmd.snapshot_json, thumb, { keepalive: true });
+        if (thumb) uploadThumbDataUrl('auto', thumb);
+        break;
+      }
+      case 'request_load_auto':
+        store.get('autosave').then((json) => {
+          if (json) {
+            engine.apply_loaded_snapshot_json(json);
+            scheduleFrame();
+          }
+        });
+        break;
+      case 'save_quick': {
+        const thumb = latestCapturedThumb || captureStageThumb();
+        store.saveNamed('quicksave', cmd.snapshot_json, thumb);
+        if (thumb) uploadThumbDataUrl('quick', thumb);
+        break;
+      }
+      case 'request_load_quick':
+        store.get('quicksave').then((json) => {
+          if (json) {
+            engine.apply_loaded_snapshot_json(json);
+            scheduleFrame();
+          }
+        });
+        break;
       case 'save_profile':
         store.set('profile', cmd.profile_json, { keepalive: true });
         break;
       case 'save_preferences':
         audio.applyPreferences(cmd.prefs);
         store.set('prefs', JSON.stringify(cmd.prefs));
+        store.saveGlobalPrefs(cmd.prefs);
+        break;
+      case 'return_to_shelf':
+        if (shelfUrl) {
+          location.href = shelfUrl;
+        }
         break;
     }
   };
+
+  if (wantResume) {
+    engine.try_resume_latest();
+  }
 
   setProgress(100, 'Ready');
   loaderEl?.classList.add('hidden');
@@ -1861,6 +2165,8 @@ async function main() {
     const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
     if (cmdsJson) {
       const cmds = JSON.parse(cmdsJson);
+      const hasSaveCmd = cmds.some((c) => c.op === 'save_slot' || c.op === 'save_auto' || c.op === 'save_quick');
+      latestCapturedThumb = hasSaveCmd ? captureStageThumb() : null;
       const ranges = [];
       for (const cmd of cmds) {
         if (cmd.op === 'decode_image' || cmd.op === 'preload_audio' || cmd.op === 'play_audio') {
@@ -1874,6 +2180,7 @@ async function main() {
       for (const cmd of cmds) {
         handleCommand(cmd);
       }
+      latestCapturedThumb = null;
     }
     // Lazy-load 6.1 MiB Pan-CJK fallback font ONLY if a bundled font actually encounters a missing glyph!
     if (!fallbackFontStarted && engine.has_missing_glyphs()) {

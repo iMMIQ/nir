@@ -21,6 +21,8 @@ pub struct Quad {
     pub blend: BlendMode,
     pub clip: Option<[f32; 4]>,
     pub special: SpecialQuad,
+    /// Optional SDF corner radius in logical pixels (0 = sharp rectangle).
+    pub corner_radius: f32,
 }
 
 impl Quad {
@@ -34,6 +36,14 @@ impl Quad {
             blend: BlendMode::Normal,
             clip: None,
             special: SpecialQuad::None,
+            corner_radius: 0.0,
+        }
+    }
+
+    pub fn rounded(rect: [f32; 4], color: [f32; 4], corner_radius: f32) -> Self {
+        Self {
+            corner_radius,
+            ..Self::solid(rect, color)
         }
     }
 
@@ -47,6 +57,14 @@ impl Quad {
             blend: BlendMode::Normal,
             clip: None,
             special: SpecialQuad::None,
+            corner_radius: 0.0,
+        }
+    }
+
+    pub fn rounded_image(rect: [f32; 4], asset: AssetId, corner_radius: f32) -> Self {
+        Self {
+            corner_radius,
+            ..Self::image(rect, asset)
         }
     }
 }

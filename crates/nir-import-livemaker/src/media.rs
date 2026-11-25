@@ -70,11 +70,20 @@ pub(super) fn gal_size(data: &[u8]) -> Result<(u32, u32)> {
             },
         )?;
         let root = doc.root_element();
+        let frame_count: usize = root
+            .attribute("Count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let frames_actual = root
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "Frame")
+            .count();
         ensure!(
             root.tag_name().name() == "Frames"
                 && root.attribute("Version") == Some("200")
-                && root.attribute("Count") == Some("1"),
-            "E_IMPORT_GAL_FRAMES: expected static GaleX200"
+                && frame_count >= 1
+                && frames_actual == frame_count,
+            "E_IMPORT_GAL_FRAMES: expected valid GaleX200"
         );
         ensure!(
             root.attribute("Randomized") == Some("0"),
@@ -536,9 +545,10 @@ fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
             .parse()
             .with_context(|| format!("E_IMPORT_GAL_XML: invalid {name}"))
     };
+    let frame_count = number(root, "Count")?;
     ensure!(
-        number(root, "Version")? == 200 && number(root, "Count")? == 1,
-        "E_IMPORT_GAL_FRAMES: expected static GaleX200"
+        number(root, "Version")? == 200 && frame_count >= 1,
+        "E_IMPORT_GAL_FRAMES: expected valid GaleX200"
     );
     ensure!(
         number(root, "Randomized")? == 0,
@@ -561,7 +571,8 @@ fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
     );
     let frames: Vec<_> = root.children().filter(|n| n.is_element()).collect();
     ensure!(
-        frames.len() == 1 && frames[0].tag_name().name() == "Frame",
+        frames.len() == frame_count as usize
+            && frames.iter().all(|f| f.tag_name().name() == "Frame"),
         "E_IMPORT_GAL_XML: frames"
     );
     let directories: Vec<_> = frames[0].children().filter(|n| n.is_element()).collect();
@@ -662,6 +673,19 @@ fn galx_container(data: &[u8]) -> Result<Vec<u8>> {
             "E_IMPORT_GAL_ALPHA: unexpected disabled alpha payload"
         );
         blob(&mut out, alpha_data);
+    }
+    // For multi-frame GaleX200 animations, validate and skip remaining frames' layer blobs cleanly!
+    for extra_frame in &frames[1..] {
+        let extra_dirs: Vec<_> = extra_frame.children().filter(|n| n.is_element()).collect();
+        ensure!(
+            extra_dirs.len() == 1 && extra_dirs[0].tag_name().name() == "Layers",
+            "E_IMPORT_GAL_XML: layers"
+        );
+        let extra_count = number(extra_dirs[0], "Count")? as usize;
+        for _ in 0..extra_count {
+            let _ = input.blob()?;
+            let _ = input.blob()?;
+        }
     }
     ensure!(
         input.at == data.len(),

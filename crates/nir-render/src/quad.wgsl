@@ -2,12 +2,14 @@ struct VertexIn {
     @location(0) pos: vec2f,
     @location(1) uv: vec2f,
     @location(2) color: vec4f,
+    @location(3) rect_params: vec4f,
 }
 
 struct VertexOut {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) @interpolate(flat) color: vec4f,
+    @location(2) @interpolate(flat) rect_params: vec4f,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
@@ -19,12 +21,24 @@ fn vs(v: VertexIn) -> VertexOut {
     o.pos = vec4f(v.pos, 0.0, 1.0);
     o.uv = v.uv;
     o.color = v.color;
+    o.rect_params = v.rect_params;
     return o;
 }
 
 @fragment
 fn fs(v: VertexOut) -> @location(0) vec4f {
-    return textureSample(image, image_sampler, v.uv) * v.color;
+    var col = textureSample(image, image_sampler, v.uv) * v.color;
+    let r = v.rect_params.z;
+    if r > 0.0 {
+        let size = v.rect_params.xy;
+        let cr = min(r, min(size.x, size.y) * 0.5);
+        let half = size * 0.5;
+        let p = abs(v.uv * size - half) - (half - vec2f(cr));
+        let d = length(max(p, vec2f(0.0))) + min(max(p.x, p.y), 0.0) - cr;
+        let cov = 1.0 - smoothstep(-0.75, 0.75, d);
+        col = col * cov;
+    }
+    return col;
 }
 
 @group(1) @binding(0) var target_image: texture_2d<f32>;

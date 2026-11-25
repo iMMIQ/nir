@@ -382,6 +382,8 @@ fn run_with_event_loop(
     let audio = AudioHost::new(&prefs);
     let mut runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
         .map_err(|e| anyhow::anyhow!("initializing runtime: {e}"))?;
+    runtime.set_autosave_summary(storage.named_summary("autosave", u32::MAX));
+    runtime.set_quicksave_summary(storage.named_summary("quicksave", u32::MAX - 1));
     if cfg!(target_os = "android") {
         runtime.set_input_mode(nir_ui::InputMode::Touch);
     }
@@ -687,6 +689,20 @@ impl NativeApp {
                 HostCommand::DeleteSlot(slot) => {
                     let _ = self.storage.delete_slot(slot);
                 }
+                HostCommand::SaveAuto { snapshot } => {
+                    let _ = self.storage.save_named("autosave", &snapshot);
+                }
+                HostCommand::RequestLoadAuto => match self.storage.load_named("autosave") {
+                    Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
+                    Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
+                },
+                HostCommand::SaveQuick { snapshot } => {
+                    let _ = self.storage.save_named("quicksave", &snapshot);
+                }
+                HostCommand::RequestLoadQuick => match self.storage.load_named("quicksave") {
+                    Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
+                    Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
+                },
                 HostCommand::SaveProfile(profile) => {
                     let _ = self.storage.save_profile(&profile);
                 }
@@ -694,7 +710,7 @@ impl NativeApp {
                     self.audio.apply_preferences(&prefs);
                     let _ = self.storage.save_preferences(&prefs);
                 }
-                HostCommand::Quit => {
+                HostCommand::ReturnToShelf | HostCommand::Quit => {
                     self.should_quit = true;
                 }
             }
@@ -913,18 +929,9 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 30.0,
                 };
-                if dy > 0.2 {
-                    if self.runtime.screen == nir_ui::Screen::History {
-                        self.runtime.dispatch(UiAction::ScrollHistory(-2));
-                    } else {
-                        self.runtime.dispatch(UiAction::Rollback);
-                    }
-                } else if dy < -0.2 {
-                    if self.runtime.screen == nir_ui::Screen::History {
-                        self.runtime.dispatch(UiAction::ScrollHistory(2));
-                    } else {
-                        self.runtime.dispatch(UiAction::Advance);
-                    }
+                if dy.abs() > 0.2 {
+                    // winit +y = scroll up (matches browser -deltaY)
+                    self.runtime.scroll_wheel(-dy);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -956,6 +963,18 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                         }
                         KeyCode::PageUp if pressed => {
                             self.runtime.dispatch(UiAction::Rollback);
+                        }
+                        KeyCode::F5 if pressed && !event.repeat => {
+                            self.runtime.dispatch(UiAction::QuickSave);
+                        }
+                        KeyCode::F9 if pressed && !event.repeat => {
+                            self.runtime.dispatch(UiAction::QuickLoad);
+                        }
+                        KeyCode::KeyV | KeyCode::KeyR if pressed && !event.repeat => {
+                            self.runtime.dispatch(UiAction::ReplayVoice);
+                        }
+                        KeyCode::KeyB if pressed && !event.repeat => {
+                            self.runtime.dispatch(UiAction::ToggleBilingual);
                         }
                         KeyCode::F11 if pressed && !event.repeat => {
                             if let Some(win) = &self.window {

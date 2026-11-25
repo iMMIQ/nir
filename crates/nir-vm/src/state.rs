@@ -346,6 +346,9 @@ pub struct SaveSnapshot {
     pub locale: String,
     pub rng_word_pos: u128,
     pub outcome: Option<String>,
+    /// Optional small base64 data URL (e.g. 160×90 WebP ~3 KB) captured by the host at save time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
 }
 
 pub const SAVE_FORMAT_VERSION: u32 = 2;

@@ -13,6 +13,11 @@ pub use text_engine::TextEngine;
 use nir_ir::*;
 use nir_vm::{ActiveTimeline, LayerState, Vm};
 
+/// Reserved virtual `AssetId` range for host-uploaded save-slot thumbnails (`SAVE_THUMB_ASSET_BASE + slot`).
+pub const SAVE_THUMB_ASSET_BASE: u32 = 0xFFFF_0000;
+pub const AUTOSAVE_THUMB_ASSET_ID: AssetId = AssetId(SAVE_THUMB_ASSET_BASE + 1000);
+pub const QUICKSAVE_THUMB_ASSET_ID: AssetId = AssetId(SAVE_THUMB_ASSET_BASE + 1001);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Title,
@@ -25,12 +30,20 @@ pub enum Screen {
     Ended,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    OverwriteSlot(u32),
+    DeleteSlot(u32),
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SlotSummary {
     pub slot: u32,
     pub exists: bool,
     pub summary: String,
     pub saved_at_unix: u64,
+    #[serde(default)]
+    pub has_thumb: bool,
 }
 
 /// Safe-area insets in logical pixels (notch, Dynamic Island, status bar, Home Indicator).
@@ -77,14 +90,47 @@ pub struct UiContext<'a> {
     pub interface_hidden: bool,
     pub replay_active: bool,
     pub slots: &'a [SlotSummary],
+    pub autosave: Option<&'a SlotSummary>,
+    pub quicksave: Option<&'a SlotSummary>,
     pub saves_page: usize,
     pub history_scroll: usize,
+    pub gallery_page: usize,
+    pub viewing_cg: Option<(usize, usize)>,
+    pub settings_tab: u8,
+    pub pending_confirm: Option<ConfirmKind>,
+    pub host_has_shelf: bool,
+    pub loading_visible: bool,
+    pub tz_offset_mins: i32,
     pub hovered_hit: Option<u32>,
     pub pressed_hit: Option<u32>,
     pub safe_insets: SafeInsets,
     pub input_mode: InputMode,
     pub portrait_reader: bool,
     pub toast: Option<&'a str>,
+}
+
+/// Pure-Rust civil date/time formatter (`YYYY-MM-DD HH:MM`) using Howard Hinnant's algorithm.
+pub fn format_unix_hm(unix_secs: u64, tz_offset_mins: i32) -> String {
+    if unix_secs == 0 {
+        return String::new();
+    }
+    let shifted = (unix_secs as i64).saturating_add(tz_offset_mins as i64 * 60);
+    let days = shifted.div_euclid(86_400);
+    let secs_of_day = shifted.rem_euclid(86_400) as u32;
+    let hour = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}")
 }
 
 /// Computes letterboxed stage viewport `(x, y, w, h, scale)` inside `(view_w, view_h)`.
@@ -260,6 +306,7 @@ pub fn project_layers(
             blend: layer.transform.blend,
             clip,
             special: SpecialQuad::None,
+            corner_radius: 0.0,
         });
     };
 
@@ -528,6 +575,7 @@ fn project_timelines(
                         blend: BlendMode::Normal,
                         clip: None,
                         special: SpecialQuad::None,
+                        corner_radius: 0.0,
                     });
                 }
                 TimelineClipKind::Box {
@@ -587,6 +635,24 @@ impl<'a> Builder<'a> {
         self.pkt.texts.push(run);
     }
 
+    fn rounded_panel(&mut self, rect: [f32; 4], fill: [f32; 4], border: [f32; 4], radius: f32) {
+        let r = radius.min(rect[2].min(rect[3]) * 0.45);
+        if border[3] > 0.01 {
+            self.pkt.quads.push(Quad::rounded(rect, border, r));
+            let inner = [
+                rect[0] + 1.0,
+                rect[1] + 1.0,
+                (rect[2] - 2.0).max(1.0),
+                (rect[3] - 2.0).max(1.0),
+            ];
+            self.pkt
+                .quads
+                .push(Quad::rounded(inner, fill, (r - 1.0).max(0.0)));
+        } else {
+            self.pkt.quads.push(Quad::rounded(rect, fill, r));
+        }
+    }
+
     fn button(
         &mut self,
         rect: [f32; 4],
@@ -600,7 +666,7 @@ impl<'a> Builder<'a> {
         let is_pressed = enabled && self.pressed == Some(id);
         let is_hover = enabled && !self.is_touch() && self.hovered == Some(id);
         let bg = if !enabled {
-            [0.14, 0.16, 0.20, 0.55]
+            [0.13, 0.16, 0.21, 0.52]
         } else if is_pressed {
             [
                 (self.theme.accent[0] * 1.05).min(1.0),
@@ -610,38 +676,40 @@ impl<'a> Builder<'a> {
             ]
         } else if is_hover {
             [
-                self.theme.accent[0] * 0.85,
-                self.theme.accent[1] * 0.85,
-                self.theme.accent[2] * 0.85,
-                0.92,
+                self.theme.accent[0] * 0.88,
+                self.theme.accent[1] * 0.88,
+                self.theme.accent[2] * 0.88,
+                0.94,
             ]
         } else if primary {
             [
-                self.theme.accent[0] * 0.38,
-                self.theme.accent[1] * 0.38,
-                self.theme.accent[2] * 0.38,
-                0.90,
+                self.theme.accent[0] * 0.40,
+                self.theme.accent[1] * 0.40,
+                self.theme.accent[2] * 0.40,
+                0.92,
             ]
         } else {
             self.theme.panel
         };
-        self.pkt.quads.push(Quad::solid(rect, bg));
-        // Subtle border (brighter when hovered or pressed)
-        let border = if is_pressed || is_hover {
+        let border = if !enabled {
+            [0.32, 0.40, 0.52, 0.24]
+        } else if is_pressed || is_hover {
             self.theme.accent
+        } else if primary {
+            [
+                self.theme.accent[0],
+                self.theme.accent[1],
+                self.theme.accent[2],
+                0.78,
+            ]
         } else {
             self.theme.panel_border
         };
-        self.pkt
-            .quads
-            .push(Quad::solid([rect[0], rect[1], rect[2], 1.5], border));
-        self.pkt.quads.push(Quad::solid(
-            [rect[0], rect[1] + rect[3] - 1.5, rect[2], 1.5],
-            border,
-        ));
+        let radius = (rect[3] * 0.22).clamp(5.0, 10.0);
+        self.rounded_panel(rect, bg, border, radius);
 
-        let size = (rect[3] * 0.44).clamp(11.0, 22.0);
-        let pad_x = (rect[2] * 0.09).clamp(3.0, 14.0);
+        let size = (rect[3] * 0.44).clamp(11.0, 21.0);
+        let pad_x = (rect[2] * 0.08).clamp(4.0, 14.0);
         let text_color = if !enabled {
             self.theme.muted
         } else if is_pressed || is_hover {
@@ -746,6 +814,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
                 blend: BlendMode::Normal,
                 clip: None,
                 special: SpecialQuad::StageTransition,
+                corner_radius: 0.0,
             });
         } else {
             let stage_quads = project_layers_and_timelines(
@@ -786,6 +855,50 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         }
     }
 
+    // Optional fullscreen CG lightbox (on top of Gallery)
+    if let Some((item_idx, var_idx)) = ctx.viewing_cg {
+        project_cg_viewer(&mut b, ctx, messages, loc, item_idx, var_idx);
+    }
+
+    // Confirmation dialog (overwrite / delete save)
+    if let Some(confirm) = ctx.pending_confirm {
+        project_confirm_modal(&mut b, messages, loc, confirm);
+    }
+
+    // Subtle non-blocking loading indicator when urgent scene images take >150ms
+    if ctx.loading_visible && ctx.screen == Screen::Story {
+        let lw = 148.0_f32.min((safe[2] - 24.0).max(110.0));
+        let lh = 30.0;
+        let lrect = [safe[0] + 10.0, safe[1] + 10.0, lw, lh];
+        b.rounded_panel(
+            lrect,
+            [0.06, 0.09, 0.14, 0.86],
+            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.5],
+            8.0,
+        );
+        b.push_text(TextRun {
+            text: messages.get(loc, "loading-assets"),
+            visible_bytes: None,
+            x: lrect[0] + 8.0,
+            y: lrect[1] + 1.0,
+            width: lw - 16.0,
+            height: lh - 2.0,
+            size: 13.0,
+            line_height: 17.0,
+            color: b.theme.muted,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some(lrect),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+
     // Lightweight Toast notification (strictly inside safe area!)
     if let Some(msg) = ctx.toast {
         let tw = (safe[2] * 0.65)
@@ -793,13 +906,12 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             .min((safe[2] - 20.0).max(160.0));
         let th = 40.0;
         let rect = [safe[0] + (safe[2] - tw) * 0.5, safe[1] + 12.0, tw, th];
-        b.pkt
-            .quads
-            .push(Quad::solid(rect, [0.08, 0.11, 0.16, 0.94]));
-        b.pkt.quads.push(Quad::solid(
-            [rect[0], rect[1] + th - 2.0, tw, 2.0],
-            b.theme.accent,
-        ));
+        b.rounded_panel(
+            rect,
+            [0.08, 0.11, 0.16, 0.94],
+            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
+            10.0,
+        );
         b.push_text(TextRun {
             text: msg.to_owned(),
             visible_bytes: None,
@@ -877,44 +989,29 @@ fn project_title(
         cache_key: 0,
     });
 
-    let has_save = ctx.slots.iter().any(|s| s.exists);
+    let has_any_save = ctx.autosave.is_some_and(|s| s.exists)
+        || ctx.quicksave.is_some_and(|s| s.exists)
+        || ctx.slots.iter().any(|s| s.exists);
     let has_gallery = !prog.ui.gallery.is_empty();
-    let btn_count = if has_gallery { 4usize } else { 3usize };
 
-    let bw = (sw * if b.is_touch() { 0.56 } else { 0.28 })
-        .clamp(196.0, 340.0)
-        .min((sw * 0.84).max(160.0));
-    let bx = sx + sw * 0.08;
-    let start_y = (title_y + title_h + 16.0).max(sy + sh * 0.40);
-    let avail_h = (sy + sh - start_y - 16.0).max(120.0);
-    let gap = (avail_h * 0.05).clamp(8.0, 14.0);
-    let min_bh = if b.is_touch() { 42.0 } else { 32.0 };
-    let max_bh = if b.is_touch() { 54.0 } else { 48.0 };
-    let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(min_bh, max_bh);
-    let total_h = bh * btn_count as f32 + gap * (btn_count - 1) as f32;
-    let mut by = start_y.min((sy + sh - total_h - 12.0).max(sy + 12.0));
-
-    b.button(
-        [bx, by, bw, bh],
+    let mut btns: Vec<(String, UiAction, bool, bool)> = Vec::with_capacity(6);
+    if has_any_save {
+        btns.push((messages.get(loc, "continue"), UiAction::Continue, true, true));
+    }
+    btns.push((
         messages.get(loc, "new-game"),
         UiAction::NewGame,
         true,
-        true,
-    );
-    by += bh + gap;
-
-    b.button(
-        [bx, by, bw, bh],
+        !has_any_save,
+    ));
+    btns.push((
         messages.get(loc, "load"),
         UiAction::OpenSaves { save_mode: false },
-        has_save,
+        has_any_save,
         false,
-    );
-    by += bh + gap;
-
+    ));
     if has_gallery {
-        b.button(
-            [bx, by, bw, bh],
+        btns.push((
             if loc.starts_with("zh") {
                 "鉴赏 / 回想".into()
             } else {
@@ -923,17 +1020,41 @@ fn project_title(
             UiAction::OpenGallery,
             true,
             false,
-        );
-        by += bh + gap;
+        ));
     }
-
-    b.button(
-        [bx, by, bw, bh],
+    btns.push((
         messages.get(loc, "settings"),
         UiAction::OpenSettings,
         true,
         false,
-    );
+    ));
+    if ctx.host_has_shelf {
+        btns.push((
+            messages.get(loc, "return-shelf"),
+            UiAction::ReturnShelf,
+            true,
+            false,
+        ));
+    }
+
+    let btn_count = btns.len();
+    let bw = (sw * if b.is_touch() { 0.56 } else { 0.28 })
+        .clamp(196.0, 340.0)
+        .min((sw * 0.84).max(160.0));
+    let bx = sx + sw * 0.08;
+    let start_y = (title_y + title_h + 14.0).max(sy + sh * 0.36);
+    let avail_h = (sy + sh - start_y - 16.0).max(120.0);
+    let gap = (avail_h * 0.04).clamp(7.0, 12.0);
+    let min_bh = if b.is_touch() { 40.0 } else { 32.0 };
+    let max_bh = if b.is_touch() { 50.0 } else { 46.0 };
+    let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(min_bh, max_bh);
+    let total_h = bh * btn_count as f32 + gap * (btn_count - 1) as f32;
+    let mut by = start_y.min((sy + sh - total_h - 12.0).max(sy + 12.0));
+
+    for (label, action, enabled, primary) in btns {
+        b.button([bx, by, bw, bh], label, action, enabled, primary);
+        by += bh + gap;
+    }
 }
 
 fn project_ui_node(
@@ -1080,19 +1201,17 @@ fn project_story_hud(
         let pill_h = if touch { 28.0 } else { 24.0 };
         let pill_w = (estimate_display_units(&mode_label) * 13.0 + 24.0).clamp(72.0, 160.0);
         let pill_rect = [sright - pill_w - 8.0, sy + 8.0, pill_w, pill_h];
-        b.pkt.quads.push(Quad::solid(
+        b.rounded_panel(
             pill_rect,
             [
                 b.theme.accent[0] * 0.28,
                 b.theme.accent[1] * 0.28,
                 b.theme.accent[2] * 0.28,
-                0.86,
+                0.88,
             ],
-        ));
-        b.pkt.quads.push(Quad::solid(
-            [pill_rect[0], pill_rect[1] + pill_h - 2.0, pill_w, 2.0],
-            b.theme.accent,
-        ));
+            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
+            pill_h * 0.45,
+        );
         b.push_text(TextRun {
             text: mode_label,
             visible_bytes: None,
@@ -1204,24 +1323,16 @@ fn project_story_hud(
                 } else {
                     let mut panel = b.theme.panel;
                     panel[3] *= alpha;
-                    b.pkt.quads.push(Quad::solid(box_rect, panel));
                     let mut border = b.theme.panel_border;
                     border[3] *= alpha;
-                    b.pkt.quads.push(Quad::solid(
-                        [box_rect[0], box_rect[1], box_rect[2], 2.0],
-                        border,
-                    ));
+                    b.rounded_panel(box_rect, panel, border, 10.0);
                 }
             } else {
                 let mut panel = b.theme.panel;
                 panel[3] = (panel[3].max(0.92)) * alpha;
-                b.pkt.quads.push(Quad::solid(box_rect, panel));
                 let mut border = b.theme.accent;
-                border[3] *= 0.72 * alpha;
-                b.pkt.quads.push(Quad::solid(
-                    [box_rect[0], box_rect[1], box_rect[2], 2.0],
-                    border,
-                ));
+                border[3] *= 0.65 * alpha;
+                b.rounded_panel(box_rect, panel, border, 12.0);
             }
 
             // 2. Dialogue-bound face portrait decoration (fitted inside box_rect when auto-placed,
@@ -1437,20 +1548,9 @@ fn project_story_hud(
                         let tab_x =
                             box_rect[0].clamp(sx + 4.0, (sright - tab_w - 4.0).max(sx + 4.0));
                         let tab_rect = [tab_x, tab_y, tab_w, tab_h];
-                        b.pkt
-                            .quads
-                            .push(Quad::solid(tab_rect, [0.06, 0.08, 0.13, 0.88 * alpha]));
                         let mut accent_bar = sc;
-                        accent_bar[3] *= 0.85;
-                        b.pkt.quads.push(Quad::solid(
-                            [
-                                tab_rect[0],
-                                tab_rect[1] + tab_rect[3] - 2.0,
-                                tab_rect[2],
-                                2.0,
-                            ],
-                            accent_bar,
-                        ));
+                        accent_bar[3] *= 0.78;
+                        b.rounded_panel(tab_rect, [0.06, 0.08, 0.13, 0.90 * alpha], accent_bar, 7.0);
                         b.push_text(TextRun {
                             text: dlg.speaker.clone(),
                             visible_bytes: None,
@@ -1530,6 +1630,35 @@ fn project_story_hud(
                 .collect();
             let mut tc = style_text_color;
             tc[3] *= alpha;
+
+            // Optional bilingual secondary line when multiple locales exist
+            let secondary_text: Option<String> = if ctx.prefs.bilingual && prog.meta.locales.len() >= 2 {
+                let sec_loc = if ctx.prefs.text_locale != prog.meta.default_locale {
+                    Some(prog.meta.default_locale.as_str())
+                } else {
+                    prog.meta
+                        .locales
+                        .iter()
+                        .find(|l| l.as_str() != ctx.prefs.text_locale.as_str())
+                        .map(String::as_str)
+                };
+                sec_loc.and_then(|sl| {
+                    let entry = prog.text(sl, dlg.text_id)?;
+                    let s = entry.to_plain_text();
+                    (!s.is_empty() && s != dlg.full_text).then_some(s)
+                })
+            } else {
+                None
+            };
+
+            let (primary_h, sec_rect) = if secondary_text.is_some() && text_rect[3] >= 56.0 {
+                let ph = text_rect[3] * 0.56;
+                let sh = (text_rect[3] - ph - 4.0).max(18.0);
+                (ph, Some([text_rect[0], text_rect[1] + ph + 4.0, text_rect[2], sh]))
+            } else {
+                (text_rect[3], None)
+            };
+
             b.push_text(TextRun {
                 text: dlg.full_text.clone(),
                 visible_bytes: if dlg.finished {
@@ -1540,14 +1669,14 @@ fn project_story_hud(
                 x: text_rect[0],
                 y: text_rect[1],
                 width: text_rect[2],
-                height: text_rect[3],
+                height: primary_h,
                 size: fsize,
                 line_height: lh,
                 color: tc,
                 emphasis,
                 shadow: scaled_shadow,
                 scroll: 0.0,
-                clip: Some(text_rect),
+                clip: Some([text_rect[0], text_rect[1], text_rect[2], primary_h]),
                 font_assets: b.text_fonts.clone(),
                 align: TextAlign::Left,
                 valign_center: false,
@@ -1555,6 +1684,78 @@ fn project_story_hud(
                 inline_images,
                 cache_key: 0,
             });
+
+            if let (Some(stext), Some(sr)) = (secondary_text, sec_rect) {
+                let sec_sz = (fsize * 0.82).clamp(10.0, 26.0);
+                let mut sc = b.theme.muted;
+                sc[3] *= alpha * 0.92;
+                b.push_text(TextRun {
+                    text: stext,
+                    visible_bytes: None,
+                    x: sr[0],
+                    y: sr[1],
+                    width: sr[2],
+                    height: sr[3],
+                    size: sec_sz,
+                    line_height: sec_sz * 1.32,
+                    color: sc,
+                    emphasis: Vec::new(),
+                    shadow: scaled_shadow,
+                    scroll: 0.0,
+                    clip: Some(sr),
+                    font_assets: b.text_fonts.clone(),
+                    align: TextAlign::Left,
+                    valign_center: false,
+                    auto_fit: true,
+                    inline_images: Vec::new(),
+                    cache_key: 0,
+                });
+            }
+
+            // Crisp click-to-continue indicator at bottom-right when dialogue line is completely revealed
+            if dlg.finished && ctx.vm.choice.is_none() && !ctx.auto && !ctx.skip && !ctx.hold_skip {
+                let ind_sz = (fsize * 0.72).clamp(11.0, 18.0);
+                let ix = box_rect[0] + box_rect[2] - ind_sz - 10.0;
+                let iy = box_rect[1] + box_rect[3] - ind_sz - 6.0;
+                let mut ic = b.theme.accent;
+                ic[3] *= alpha * 0.92;
+                b.push_text(TextRun {
+                    text: "▼".into(),
+                    visible_bytes: None,
+                    x: ix,
+                    y: iy,
+                    width: ind_sz + 4.0,
+                    height: ind_sz + 4.0,
+                    size: ind_sz,
+                    line_height: ind_sz + 2.0,
+                    color: ic,
+                    emphasis: Vec::new(),
+                    shadow: scaled_shadow,
+                    scroll: 0.0,
+                    clip: Some(box_rect),
+                    font_assets: b.ui_fonts.clone(),
+                    align: TextAlign::Center,
+                    valign_center: true,
+                    auto_fit: false,
+                    inline_images: Vec::new(),
+                    cache_key: 0,
+                });
+            }
+
+            // Optional inline voice-replay pill when the current line has voice (never crowds unvoiced lines!)
+            if dlg.voice.is_some() && ctx.vm.choice.is_none() {
+                let vw = if touch { 56.0 } else { 48.0 };
+                let vh = if touch { 30.0 } else { 22.0 };
+                let vx = box_rect[0] + box_rect[2] - vw - 8.0;
+                let vy = box_rect[1] + 6.0;
+                b.button(
+                    [vx, vy, vw, vh],
+                    messages.get(loc, "replay-voice"),
+                    UiAction::ReplayVoice,
+                    true,
+                    false,
+                );
+            }
 
             // 6. Responsive non-overlapping quick-action toolbar strictly within safe area!
             let buttons: [(&str, UiAction, bool); 7] = [
@@ -1787,12 +1988,17 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
     } else {
         (hdr_h * 0.72).clamp(28.0, 38.0)
     };
-    b.pkt
-        .quads
-        .push(Quad::solid([px, py, pw, ph], b.theme.surface));
-    b.pkt
-        .quads
-        .push(Quad::solid([px, py, pw, 2.0], b.theme.accent));
+    b.rounded_panel(
+        [px, py, pw, ph],
+        b.theme.surface,
+        [b.theme.panel_border[0], b.theme.panel_border[1], b.theme.panel_border[2], 0.65],
+        12.0,
+    );
+    b.pkt.quads.push(Quad::rounded(
+        [px + 12.0, py + 1.0, (pw - 24.0).max(20.0), 2.5],
+        b.theme.accent,
+        1.5,
+    ));
     let title_size = (hdr_h * 0.46).clamp(16.0, 26.0);
     b.push_text(TextRun {
         text: title,
@@ -1838,52 +2044,166 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
 fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
     let area = overlay_shell(b, messages.get(loc, "menu"), messages, loc);
     let touch = b.is_touch();
-    let items: [(&str, UiAction, bool, bool); 6] = [
-        ("close", UiAction::CloseOverlay, true, true),
-        (
-            "save",
-            UiAction::OpenSaves { save_mode: true },
-            !ctx.replay_active,
-            false,
-        ),
-        (
-            "load",
-            UiAction::OpenSaves { save_mode: false },
-            !ctx.replay_active,
-            false,
-        ),
-        ("history", UiAction::OpenHistory, true, false),
-        ("settings", UiAction::OpenSettings, true, false),
-        (
-            if ctx.replay_active { "back" } else { "exit" },
-            if ctx.replay_active {
-                UiAction::ExitReplay
-            } else {
-                UiAction::ReturnTitle
-            },
+    let has_quick = ctx.quicksave.is_some_and(|s| s.exists);
+    let has_voice = ctx.vm.dialogue.as_ref().is_some_and(|d| d.voice.is_some());
+    let has_gallery = !ctx.vm.program().ui.gallery.is_empty();
+
+    let mut items: Vec<(String, UiAction, bool, bool)> = vec![
+        (messages.get(loc, "close"), UiAction::CloseOverlay, true, true),
+        (messages.get(loc, "quick-save"), UiAction::QuickSave, !ctx.replay_active, false),
+        (messages.get(loc, "quick-load"), UiAction::QuickLoad, !ctx.replay_active && has_quick, false),
+        (messages.get(loc, "save"), UiAction::OpenSaves { save_mode: true }, !ctx.replay_active, false),
+        (messages.get(loc, "load"), UiAction::OpenSaves { save_mode: false }, !ctx.replay_active, false),
+        (messages.get(loc, "history"), UiAction::OpenHistory, true, false),
+    ];
+    if has_voice {
+        items.push((messages.get(loc, "replay-voice"), UiAction::ReplayVoice, true, false));
+    }
+    if has_gallery {
+        items.push((
+            if loc.starts_with("zh") { "鉴赏 / 回想".into() } else { "Gallery".into() },
+            UiAction::OpenGallery,
             true,
             false,
-        ),
-    ];
-    let bw = area[2].min(380.0);
-    let bx = area[0] + (area[2] - bw) * 0.5;
-    let n = items.len() as f32;
-    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
-    let min_bh = if touch { 38.0 } else { 28.0 };
-    let max_bh = if touch { 52.0 } else { 46.0 };
-    let bh = ((area[3] - gap * (n - 1.0)) / n).clamp(min_bh, max_bh);
-    let total_h = bh * n + gap * (n - 1.0);
-    let mut by = area[1] + ((area[3] - total_h) * 0.5).max(0.0);
-    for (key, action, enabled, primary) in items {
-        b.button(
-            [bx, by, bw, bh],
-            messages.get(loc, key),
-            action,
-            enabled,
-            primary,
-        );
-        by += bh + gap;
+        ));
     }
+    items.push((messages.get(loc, "settings"), UiAction::OpenSettings, true, false));
+    items.push((
+        messages.get(loc, if ctx.replay_active { "back" } else { "exit" }),
+        if ctx.replay_active {
+            UiAction::ExitReplay
+        } else {
+            UiAction::ReturnTitle
+        },
+        true,
+        false,
+    ));
+    if ctx.host_has_shelf {
+        items.push((messages.get(loc, "return-shelf"), UiAction::ReturnShelf, true, false));
+    }
+
+    let cols = if area[2] >= 440.0 { 2usize } else { 1usize };
+    let rows = items.len().div_ceil(cols).max(1);
+    let gap = (area[3] * 0.025).clamp(6.0, 12.0);
+    let bw = ((area[2] - gap * (cols - 1) as f32) / cols as f32).min(320.0);
+    let total_w = bw * cols as f32 + gap * (cols - 1) as f32;
+    let start_x = area[0] + ((area[2] - total_w) * 0.5).max(0.0);
+    let min_bh = if touch { 38.0 } else { 30.0 };
+    let max_bh = if touch { 50.0 } else { 44.0 };
+    let bh = ((area[3] - gap * (rows - 1) as f32) / rows as f32).clamp(min_bh, max_bh);
+    let total_h = bh * rows as f32 + gap * (rows - 1) as f32;
+    let start_y = area[1] + ((area[3] - total_h) * 0.5).max(0.0);
+
+    for (idx, (label, action, enabled, primary)) in items.into_iter().enumerate() {
+        let col = idx % cols;
+        let row = idx / cols;
+        let x = start_x + col as f32 * (bw + gap);
+        let y = start_y + row as f32 * (bh + gap);
+        b.button([x, y, bw, bh], label, action, enabled, primary);
+    }
+}
+
+fn draw_slot_card(
+    b: &mut Builder<'_>,
+    rect: [f32; 4],
+    badge: String,
+    timestamp: String,
+    summary: String,
+    thumb_asset: Option<AssetId>,
+    action: UiAction,
+    enabled: bool,
+    primary: bool,
+) {
+    let id = b.next_hit_id;
+    b.next_hit_id += 1;
+    let is_pressed = enabled && b.pressed == Some(id);
+    let is_hover = enabled && !b.is_touch() && b.hovered == Some(id);
+    let bg = if !enabled {
+        [0.12, 0.15, 0.20, 0.50]
+    } else if is_pressed {
+        [b.theme.accent[0] * 0.65, b.theme.accent[1] * 0.65, b.theme.accent[2] * 0.65, 0.94]
+    } else if is_hover {
+        [b.theme.accent[0] * 0.32, b.theme.accent[1] * 0.32, b.theme.accent[2] * 0.32, 0.92]
+    } else if primary {
+        [b.theme.accent[0] * 0.22, b.theme.accent[1] * 0.22, b.theme.accent[2] * 0.22, 0.90]
+    } else {
+        b.theme.panel
+    };
+    let border = if is_pressed || is_hover || primary {
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85]
+    } else {
+        b.theme.panel_border
+    };
+    b.rounded_panel(rect, bg, border, 8.0);
+
+    let pad = 6.0;
+    let mut tx = rect[0] + pad + 2.0;
+    if let Some(asset) = thumb_asset {
+        let th = (rect[3] - pad * 2.0).max(24.0);
+        let tw = (th * 16.0 / 9.0).min(rect[2] * 0.36);
+        b.pkt
+            .quads
+            .push(Quad::rounded_image([rect[0] + pad, rect[1] + pad, tw, th], asset, 5.0));
+        tx = rect[0] + pad + tw + 8.0;
+    }
+    let tw = (rect[0] + rect[2] - tx - pad).max(40.0);
+    let top_h = (rect[3] * 0.40).clamp(15.0, 22.0);
+    let top_line = if timestamp.is_empty() {
+        badge.clone()
+    } else {
+        format!("{badge}  ·  {timestamp}")
+    };
+    b.push_text(TextRun {
+        text: top_line,
+        visible_bytes: None,
+        x: tx,
+        y: rect[1] + 4.0,
+        width: tw,
+        height: top_h,
+        size: (top_h * 0.68).clamp(11.0, 14.0),
+        line_height: top_h,
+        color: if enabled { b.theme.accent } else { b.theme.muted },
+        emphasis: Vec::new(),
+        shadow: None,
+        scroll: 0.0,
+        clip: Some([tx, rect[1] + 2.0, tw, top_h + 2.0]),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    let sum_y = rect[1] + top_h + 4.0;
+    let sum_h = (rect[3] - top_h - 8.0).max(16.0);
+    b.push_text(TextRun {
+        text: summary.clone(),
+        visible_bytes: None,
+        x: tx,
+        y: sum_y,
+        width: tw,
+        height: sum_h,
+        size: (sum_h * 0.60).clamp(12.0, 16.0),
+        line_height: (sum_h * 0.72).clamp(14.0, 20.0),
+        color: if enabled { b.theme.text } else { b.theme.muted },
+        emphasis: Vec::new(),
+        shadow: None,
+        scroll: 0.0,
+        clip: Some([tx, sum_y, tw, sum_h]),
+        font_assets: b.text_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    b.pkt.hits.push(HitRegion {
+        id,
+        rect,
+        action,
+        label: format!("{badge} {summary}"),
+        enabled,
+    });
 }
 
 fn project_saves_overlay(
@@ -1894,15 +2214,60 @@ fn project_saves_overlay(
     save_mode: bool,
 ) {
     let title = messages.get(loc, if save_mode { "save" } else { "load" });
-    let area = overlay_shell(b, title, messages, loc);
+    let mut area = overlay_shell(b, title, messages, loc);
     let touch = b.is_touch();
+    let gap = (area[3] * 0.022).clamp(6.0, 10.0);
+
+    // On Load screen, surface Auto-Save & Quick-Save right at the top for 1-tap resume!
+    if !save_mode {
+        let has_auto = ctx.autosave.is_some_and(|s| s.exists);
+        let has_quick = ctx.quicksave.is_some_and(|s| s.exists);
+        if has_auto || has_quick {
+            let special_h = (if touch { 54.0_f32 } else { 52.0_f32 }).min(area[3] * 0.22);
+            let mut specials: Vec<(&SlotSummary, String, UiAction, AssetId)> = Vec::new();
+            if let Some(a) = ctx.autosave.filter(|s| s.exists) {
+                specials.push((
+                    a,
+                    messages.get(loc, "auto-save"),
+                    UiAction::LoadAutoSave,
+                    AUTOSAVE_THUMB_ASSET_ID,
+                ));
+            }
+            if let Some(q) = ctx.quicksave.filter(|s| s.exists) {
+                specials.push((
+                    q,
+                    messages.get(loc, "quick-save"),
+                    UiAction::QuickLoad,
+                    QUICKSAVE_THUMB_ASSET_ID,
+                ));
+            }
+            let sw = (area[2] - gap * (specials.len() - 1) as f32) / specials.len() as f32;
+            for (i, (slot, badge, action, thumb_id)) in specials.into_iter().enumerate() {
+                let sx = area[0] + i as f32 * (sw + gap);
+                let ts = format_unix_hm(slot.saved_at_unix, ctx.tz_offset_mins);
+                draw_slot_card(
+                    b,
+                    [sx, area[1], sw, special_h],
+                    badge,
+                    ts,
+                    slot.summary.clone(),
+                    slot.has_thumb.then_some(thumb_id),
+                    action,
+                    true,
+                    true,
+                );
+            }
+            area[1] += special_h + gap + 2.0;
+            area[3] = (area[3] - special_h - gap - 2.0).max(80.0);
+        }
+    }
+
     let cols = if area[2] >= 560.0 { 2 } else { 1 };
-    let gap = (area[3] * 0.022).clamp(6.0, 12.0);
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
     let cell_h = if touch {
-        (area[3] * 0.135).clamp(44.0, 62.0)
+        (area[3] * 0.16).clamp(52.0, 68.0)
     } else {
-        (area[3] * 0.14).clamp(40.0, 64.0)
+        (area[3] * 0.165).clamp(48.0, 68.0)
     };
     let nav_h = if touch { 42.0 } else { 34.0 };
     let total_slots = ctx.slots.len();
@@ -1921,7 +2286,7 @@ fn project_saves_overlay(
     let start = page * per_page;
     let end = (start + per_page).min(total_slots);
 
-    let del_w = if touch { 48.0 } else { 40.0 };
+    let del_w = if touch { 46.0 } else { 38.0 };
     let del_gap = 6.0;
 
     for (local_idx, slot) in ctx.slots[start..end].iter().enumerate() {
@@ -1929,10 +2294,16 @@ fn project_saves_overlay(
         let row = local_idx / cols;
         let x = area[0] + col as f32 * (cell_w + gap);
         let y = area[1] + row as f32 * (cell_h + gap);
-        let label = if slot.exists {
-            format!("#{:02}  {}", slot.slot + 1, slot.summary)
+        let badge = format!("#{:02}", slot.slot + 1);
+        let ts = if slot.exists {
+            format_unix_hm(slot.saved_at_unix, ctx.tz_offset_mins)
         } else {
-            format!("#{:02}  {}", slot.slot + 1, messages.get(loc, "empty-slot"))
+            String::new()
+        };
+        let summary = if slot.exists {
+            slot.summary.clone()
+        } else {
+            messages.get(loc, "empty-slot")
         };
         let action = if save_mode {
             UiAction::SaveSlot(slot.slot)
@@ -1946,7 +2317,19 @@ fn project_saves_overlay(
         } else {
             cell_w
         };
-        b.button([x, y, main_w, cell_h], label, action, enabled, false);
+        let thumb_asset =
+            (slot.exists && slot.has_thumb).then_some(AssetId(SAVE_THUMB_ASSET_BASE + slot.slot));
+        draw_slot_card(
+            b,
+            [x, y, main_w, cell_h],
+            badge,
+            ts,
+            summary,
+            thumb_asset,
+            action,
+            enabled,
+            false,
+        );
         if show_delete {
             b.button(
                 [x + main_w + del_gap, y, del_w, cell_h],
@@ -2001,6 +2384,144 @@ fn project_saves_overlay(
     }
 }
 
+fn push_slider_row(
+    b: &mut Builder<'_>,
+    x: f32,
+    y: f32,
+    w: f32,
+    row_h: f32,
+    label: String,
+    norm: f32,
+    dec: UiAction,
+    inc: UiAction,
+    mut make_step: impl FnMut(f32) -> UiAction,
+) {
+    let touch = b.is_touch();
+    let btn_w = if touch { 42.0 } else { 34.0 };
+    let gap = 6.0;
+    let right_x = x + w;
+    let plus_x = right_x - btn_w;
+    let bar_w = if w >= 380.0 {
+        (w * 0.34).clamp(90.0, 220.0)
+    } else {
+        0.0
+    };
+    let minus_x = if bar_w > 0.0 {
+        plus_x - gap - bar_w - gap - btn_w
+    } else {
+        plus_x - gap - btn_w
+    };
+    let label_w = (minus_x - x - 8.0).max(60.0);
+    let label_size = (row_h * 0.42).clamp(13.0, 17.0);
+
+    b.push_text(TextRun {
+        text: label,
+        visible_bytes: None,
+        x,
+        y,
+        width: label_w,
+        height: row_h,
+        size: label_size,
+        line_height: label_size * 1.25,
+        color: b.theme.text,
+        emphasis: Vec::new(),
+        shadow: None,
+        scroll: 0.0,
+        clip: Some([x, y, label_w, row_h]),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    b.button([minus_x, y, btn_w, row_h], "−".into(), dec, true, false);
+    if bar_w > 0.0 {
+        let bar_x = minus_x + btn_w + gap;
+        let track_h = 10.0;
+        let track_y = y + (row_h - track_h) * 0.5;
+        b.pkt.quads.push(Quad::rounded(
+            [bar_x, track_y, bar_w, track_h],
+            [0.20, 0.25, 0.34, 0.85],
+            5.0,
+        ));
+        let fill_w = (bar_w * norm.clamp(0.0, 1.0)).max(0.0);
+        if fill_w > 2.0 {
+            b.pkt.quads.push(Quad::rounded(
+                [bar_x, track_y, fill_w, track_h],
+                b.theme.accent,
+                5.0,
+            ));
+        }
+        // 10 clickable segments across the bar for direct click/tap positioning!
+        let segs = 10usize;
+        let sw = bar_w / segs as f32;
+        for s in 0..segs {
+            let id = b.next_hit_id;
+            b.next_hit_id += 1;
+            let t = if s == 0 {
+                0.0
+            } else {
+                (s + 1) as f32 / segs as f32
+            };
+            b.pkt.hits.push(HitRegion {
+                id,
+                rect: [bar_x + s as f32 * sw, y, sw, row_h],
+                action: make_step(t),
+                label: String::new(),
+                enabled: true,
+            });
+        }
+    }
+    b.button([plus_x, y, btn_w, row_h], "+".into(), inc, true, false);
+}
+
+fn push_toggle_row(
+    b: &mut Builder<'_>,
+    x: f32,
+    y: f32,
+    w: f32,
+    row_h: f32,
+    label: String,
+    active: bool,
+    action: UiAction,
+    messages: &Messages,
+    loc: &str,
+) {
+    let toggle_w = (w * 0.26).clamp(84.0, 124.0);
+    let toggle_x = x + w - toggle_w;
+    let label_w = (toggle_x - x - 8.0).max(60.0);
+    let label_size = (row_h * 0.42).clamp(13.0, 17.0);
+    b.push_text(TextRun {
+        text: label,
+        visible_bytes: None,
+        x,
+        y,
+        width: label_w,
+        height: row_h,
+        size: label_size,
+        line_height: label_size * 1.25,
+        color: b.theme.text,
+        emphasis: Vec::new(),
+        shadow: None,
+        scroll: 0.0,
+        clip: Some([x, y, label_w, row_h]),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    b.button(
+        [toggle_x, y, toggle_w, row_h],
+        messages.get(loc, if active { "on" } else { "off" }),
+        action,
+        true,
+        active,
+    );
+}
+
 fn project_settings_overlay(
     b: &mut Builder<'_>,
     ctx: &UiContext<'_>,
@@ -2009,155 +2530,242 @@ fn project_settings_overlay(
 ) {
     let area = overlay_shell(b, messages.get(loc, "settings"), messages, loc);
     let touch = b.is_touch();
-    let has_locales = !ctx.vm.program().meta.locales.is_empty();
-    let total_rows = 6 + usize::from(has_locales);
-    let gap = (area[3] * 0.02).clamp(5.0, 10.0);
-    let min_rh = if touch { 36.0 } else { 28.0 };
-    let max_rh = if touch { 48.0 } else { 44.0 };
-    let row_h =
-        ((area[3] - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(min_rh, max_rh);
-    let btn_w = (area[2] * 0.16).clamp(if touch { 48.0 } else { 40.0 }, 64.0);
-    let btn_gap = 8.0;
-    let right_x = area[0] + area[2];
-    let plus_x = right_x - btn_w;
-    let minus_x = (plus_x - btn_gap - btn_w).max(area[0] + 80.0);
-    let label_w = (minus_x - area[0] - 8.0).max(64.0);
-    let label_size = (row_h * 0.42).clamp(13.0, 18.0);
-    let mut y = area[1];
+    let tab_h = if touch { 40.0 } else { 34.0 };
+    let tab_gap = 8.0;
+    let tab_w = ((area[2] - tab_gap) * 0.5).min(200.0);
+    b.button(
+        [area[0], area[1], tab_w, tab_h],
+        messages.get(loc, "tab-reading"),
+        UiAction::SettingsTab(0),
+        true,
+        ctx.settings_tab == 0,
+    );
+    b.button(
+        [area[0] + tab_w + tab_gap, area[1], tab_w, tab_h],
+        messages.get(loc, "tab-audio"),
+        UiAction::SettingsTab(1),
+        true,
+        ctx.settings_tab == 1,
+    );
 
-    let mut push_setting_row = |b: &mut Builder<'_>, text: String, dec: UiAction, inc: UiAction| {
-        b.push_text(TextRun {
-            text,
-            visible_bytes: None,
-            x: area[0],
-            y,
-            width: label_w,
-            height: row_h,
-            size: label_size,
-            line_height: label_size * 1.25,
-            color: b.theme.text,
-            emphasis: Vec::new(),
-            shadow: None,
-            scroll: 0.0,
-            clip: Some([area[0], y, label_w, row_h]),
-            font_assets: b.ui_fonts.clone(),
-            align: TextAlign::Left,
-            valign_center: true,
-            auto_fit: true,
-            inline_images: Vec::new(),
-            cache_key: 0,
-        });
-        b.button([minus_x, y, btn_w, row_h], "−".into(), dec, true, false);
-        b.button([plus_x, y, btn_w, row_h], "+".into(), inc, true, false);
-        y += row_h + gap;
+    let body_y = area[1] + tab_h + 10.0;
+    let body_h = (area[3] - tab_h - 10.0).max(120.0);
+    let locales = &ctx.vm.program().meta.locales;
+    let total_rows = if ctx.settings_tab == 0 {
+        6 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2)
+    } else {
+        6
     };
+    let gap = (body_h * 0.02).clamp(5.0, 9.0);
+    let min_rh = if touch { 34.0 } else { 28.0 };
+    let max_rh = if touch { 46.0 } else { 42.0 };
+    let row_h = ((body_h - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(min_rh, max_rh);
+    let mut y = body_y;
 
-    let sliders: [(&str, AudioBus, f32); 3] = [
-        ("music", AudioBus::Bgm, ctx.prefs.bgm_volume),
-        ("voice", AudioBus::Voice, ctx.prefs.voice_volume),
-        ("sfx", AudioBus::Sfx, ctx.prefs.sfx_volume),
-    ];
-    for (key, bus, val) in sliders {
-        push_setting_row(
+    if ctx.settings_tab == 0 {
+        // Tab 0: Reading & Language
+        push_slider_row(
             b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            format!("{}: {:.1}x", messages.get(loc, "text-speed"), ctx.prefs.text_speed),
+            ((ctx.prefs.text_speed - 0.5) / 3.5).clamp(0.0, 1.0),
+            UiAction::SetTextSpeed((ctx.prefs.text_speed - 0.5).clamp(0.5, 4.0)),
+            UiAction::SetTextSpeed((ctx.prefs.text_speed + 0.5).clamp(0.5, 4.0)),
+            |t| UiAction::SetTextSpeed(((0.5 + t * 3.5) * 2.0).round() * 0.5),
+        );
+        y += row_h + gap;
+
+        push_slider_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
             format!(
                 "{}: {}%",
-                messages.get(loc, key),
-                (val * 100.0).round() as u32
+                messages.get(loc, "font-size"),
+                (ctx.prefs.font_scale * 100.0).round() as u32
             ),
-            UiAction::SetVolume {
-                bus,
-                value: (val - 0.1).clamp(0.0, 1.0),
-            },
-            UiAction::SetVolume {
-                bus,
-                value: (val + 0.1).clamp(0.0, 1.0),
-            },
-        );
-    }
-
-    // Text speed
-    push_setting_row(
-        b,
-        format!(
-            "{}: {:.1}x",
-            messages.get(loc, "text-speed"),
-            ctx.prefs.text_speed
-        ),
-        UiAction::SetTextSpeed((ctx.prefs.text_speed - 0.5).clamp(0.5, 4.0)),
-        UiAction::SetTextSpeed((ctx.prefs.text_speed + 0.5).clamp(0.5, 4.0)),
-    );
-
-    // Font scale (`字号`)
-    push_setting_row(
-        b,
-        format!(
-            "{}: {}%",
-            messages.get(loc, "font-size"),
-            (ctx.prefs.font_scale * 100.0).round() as u32
-        ),
-        UiAction::SetFontScale((ctx.prefs.font_scale - 0.1).clamp(0.75, 1.50)),
-        UiAction::SetFontScale((ctx.prefs.font_scale + 0.1).clamp(0.75, 1.50)),
-    );
-
-    // Portrait docked reader toggle (`竖屏舒适阅读`)
-    if y + row_h <= area[1] + area[3] + 2.0 {
-        let toggle_w = (btn_w * 2.0 + btn_gap).min(136.0);
-        let toggle_x = right_x - toggle_w;
-        let tlabel_w = (toggle_x - area[0] - 8.0).max(64.0);
-        b.push_text(TextRun {
-            text: messages.get(loc, "portrait-reader"),
-            visible_bytes: None,
-            x: area[0],
-            y,
-            width: tlabel_w,
-            height: row_h,
-            size: label_size,
-            line_height: label_size * 1.25,
-            color: b.theme.text,
-            emphasis: Vec::new(),
-            shadow: None,
-            scroll: 0.0,
-            clip: Some([area[0], y, tlabel_w, row_h]),
-            font_assets: b.ui_fonts.clone(),
-            align: TextAlign::Left,
-            valign_center: true,
-            auto_fit: true,
-            inline_images: Vec::new(),
-            cache_key: 0,
-        });
-        b.button(
-            [toggle_x, y, toggle_w, row_h],
-            messages.get(loc, if ctx.portrait_reader { "on" } else { "off" }),
-            UiAction::TogglePortraitReader,
-            true,
-            ctx.portrait_reader,
+            ((ctx.prefs.font_scale - 0.75) / 0.75).clamp(0.0, 1.0),
+            UiAction::SetFontScale((ctx.prefs.font_scale - 0.1).clamp(0.75, 1.50)),
+            UiAction::SetFontScale((ctx.prefs.font_scale + 0.1).clamp(0.75, 1.50)),
+            |t| UiAction::SetFontScale(0.75 + t * 0.75),
         );
         y += row_h + gap;
-    }
 
-    // Language switchers (fit cleanly inside area width)
-    let locales = &ctx.vm.program().meta.locales;
-    if !locales.is_empty() && y + row_h <= area[1] + area[3] + 2.0 {
-        let lgap = 8.0;
-        let lw = ((area[2] - lgap * (locales.len().saturating_sub(1)) as f32)
-            / locales.len() as f32)
-            .clamp(56.0, 110.0);
-        let mut lx = area[0];
-        for locale in locales {
-            if lx + lw > right_x + 1.0 {
-                break;
-            }
-            let active = locale == &ctx.prefs.text_locale;
-            b.button(
-                [lx, y, lw, row_h],
-                locale.clone(),
-                UiAction::SetLocale(locale.clone()),
-                true,
-                active,
+        push_slider_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            format!(
+                "{}: {:.1}s",
+                messages.get(loc, "auto-wait"),
+                ctx.prefs.auto_delay_ms as f32 / 1000.0
+            ),
+            ((ctx.prefs.auto_delay_ms as f32 - 300.0) / 4700.0).clamp(0.0, 1.0),
+            UiAction::SetAutoDelay(ctx.prefs.auto_delay_ms.saturating_sub(300).max(300)),
+            UiAction::SetAutoDelay((ctx.prefs.auto_delay_ms + 300).min(5000)),
+            |t| UiAction::SetAutoDelay((300.0 + t * 4700.0).round() as u32),
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "skip-unread"),
+            ctx.prefs.skip_unread,
+            UiAction::ToggleSkipUnread,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "portrait-reader"),
+            ctx.portrait_reader,
+            UiAction::TogglePortraitReader,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "motion"),
+            ctx.prefs.reduced_motion,
+            UiAction::ToggleReducedMotion,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        if locales.len() >= 2 && y + row_h <= body_y + body_h + 2.0 {
+            push_toggle_row(
+                b,
+                area[0],
+                y,
+                area[2],
+                row_h,
+                messages.get(loc, "bilingual"),
+                ctx.prefs.bilingual,
+                UiAction::ToggleBilingual,
+                messages,
+                loc,
             );
-            lx += lw + lgap;
+            y += row_h + gap;
         }
+
+        if !locales.is_empty() && y + row_h <= body_y + body_h + 2.0 {
+            let lgap = 8.0;
+            let lw = ((area[2] - lgap * (locales.len().saturating_sub(1)) as f32)
+                / locales.len() as f32)
+                .clamp(56.0, 120.0);
+            let mut lx = area[0];
+            for locale in locales {
+                if lx + lw > area[0] + area[2] + 1.0 {
+                    break;
+                }
+                let active = locale == &ctx.prefs.text_locale;
+                b.button(
+                    [lx, y, lw, row_h],
+                    locale.clone(),
+                    UiAction::SetLocale(locale.clone()),
+                    true,
+                    active,
+                );
+                lx += lw + lgap;
+            }
+        }
+    } else {
+        // Tab 1: Audio & Voice
+        push_slider_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            format!(
+                "{}: {}%",
+                messages.get(loc, "master-volume"),
+                (ctx.prefs.master_volume * 100.0).round() as u32
+            ),
+            ctx.prefs.master_volume,
+            UiAction::SetMasterVolume((ctx.prefs.master_volume - 0.1).clamp(0.0, 1.0)),
+            UiAction::SetMasterVolume((ctx.prefs.master_volume + 0.1).clamp(0.0, 1.0)),
+            UiAction::SetMasterVolume,
+        );
+        y += row_h + gap;
+
+        let sliders: [(&str, AudioBus, f32); 3] = [
+            ("music", AudioBus::Bgm, ctx.prefs.bgm_volume),
+            ("voice", AudioBus::Voice, ctx.prefs.voice_volume),
+            ("sfx", AudioBus::Sfx, ctx.prefs.sfx_volume),
+        ];
+        for (key, bus, val) in sliders {
+            push_slider_row(
+                b,
+                area[0],
+                y,
+                area[2],
+                row_h,
+                format!("{}: {}%", messages.get(loc, key), (val * 100.0).round() as u32),
+                val,
+                UiAction::SetVolume {
+                    bus,
+                    value: (val - 0.1).clamp(0.0, 1.0),
+                },
+                UiAction::SetVolume {
+                    bus,
+                    value: (val + 0.1).clamp(0.0, 1.0),
+                },
+                move |t| UiAction::SetVolume { bus, value: t },
+            );
+            y += row_h + gap;
+        }
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "auto-wait-voice"),
+            ctx.prefs.auto_wait_voice,
+            UiAction::ToggleAutoWaitVoice,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "voice-continue"),
+            ctx.prefs.continue_voice_on_advance,
+            UiAction::ToggleContinueVoiceOnAdvance,
+            messages,
+            loc,
+        );
     }
 }
 
@@ -2170,34 +2778,50 @@ fn project_history_overlay(
     let area = overlay_shell(b, messages.get(loc, "history"), messages, loc);
     let touch = b.is_touch();
     let nav_h = if touch { 44.0 } else { 36.0 };
-    let row_h = (area[3] * 0.16).clamp(48.0, 68.0);
+    let row_h = (area[3] * 0.165).clamp(50.0, 72.0);
     let visible_rows = ((area[3] - nav_h - 10.0) / row_h).max(1.0) as usize;
     let total = ctx.vm.history.len();
     let end = total.saturating_sub(ctx.history_scroll);
     let start = end.saturating_sub(visible_rows);
 
     let mut y = area[1];
-    let fsize = (row_h * 0.28).clamp(14.0, 18.0);
-    for entry in ctx.vm.history.range(start..end) {
+    let fsize = (row_h * 0.27).clamp(14.0, 18.0);
+    let voice_btn_w = if touch { 68.0 } else { 58.0 };
+    let voice_btn_h = if touch { 36.0 } else { 28.0 };
+    for (idx, entry) in ctx.vm.history.range(start..end).enumerate() {
+        let card_rect = [area[0], y, area[2], row_h - 5.0];
+        let tint = if idx % 2 == 0 {
+            [0.11, 0.15, 0.22, 0.52]
+        } else {
+            [0.09, 0.12, 0.18, 0.36]
+        };
+        b.pkt.quads.push(Quad::rounded(card_rect, tint, 7.0));
+
         let text = if entry.speaker.is_empty() {
             entry.text.clone()
         } else {
             format!("【{}】 {}", entry.speaker, entry.text)
         };
+        let has_v = entry.voice.is_some();
+        let text_w = if has_v {
+            (area[2] - voice_btn_w - 22.0).max(60.0)
+        } else {
+            (area[2] - 16.0).max(60.0)
+        };
         b.push_text(TextRun {
             text,
             visible_bytes: None,
-            x: area[0] + 6.0,
-            y,
-            width: (area[2] - 12.0).max(40.0),
-            height: row_h - 6.0,
+            x: area[0] + 8.0,
+            y: y + 4.0,
+            width: text_w,
+            height: row_h - 12.0,
             size: fsize,
             line_height: fsize * 1.38,
             color: b.theme.text,
             emphasis: Vec::new(),
             shadow: None,
             scroll: 0.0,
-            clip: Some([area[0], y, area[2], row_h - 4.0]),
+            clip: Some([area[0] + 6.0, y + 2.0, text_w + 2.0, row_h - 8.0]),
             font_assets: b.text_fonts.clone(),
             align: TextAlign::Left,
             valign_center: false,
@@ -2205,6 +2829,17 @@ fn project_history_overlay(
             inline_images: Vec::new(),
             cache_key: 0,
         });
+        if let Some(voice_asset) = entry.voice {
+            let vx = area[0] + area[2] - voice_btn_w - 6.0;
+            let vy = y + ((row_h - 5.0) - voice_btn_h) * 0.5;
+            b.button(
+                [vx, vy, voice_btn_w, voice_btn_h],
+                format!("▶ {}", messages.get(loc, "replay-voice")),
+                UiAction::ReplayHistoryVoice(voice_asset),
+                true,
+                false,
+            );
+        }
         y += row_h;
     }
 
@@ -2268,19 +2903,34 @@ fn project_gallery_overlay(
         messages,
         loc,
     );
+    let touch = b.is_touch();
     let cols = (area[2] / 190.0).floor().clamp(2.0, 4.0) as usize;
     let gap = 12.0;
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = (cell_w * 0.62).clamp(72.0, 120.0);
+    let cell_h = (cell_w * 0.62).clamp(72.0, 128.0);
+    let nav_h = if touch { 42.0 } else { 34.0 };
+    let total = prog.ui.gallery.len();
+    let rows_full = (((area[3] + gap) / (cell_h + gap)).floor() as usize).max(1);
+    let need_pages = total > rows_full * cols;
+    let list_h = if need_pages {
+        (area[3] - nav_h - gap).max(cell_h)
+    } else {
+        area[3]
+    };
+    let rows_per_page = (((list_h + gap) / (cell_h + gap)).floor() as usize).max(1);
+    let per_page = (rows_per_page * cols).max(1);
+    let total_pages = total.div_ceil(per_page).max(1);
+    let page = ctx.gallery_page.min(total_pages - 1);
+    let start = page * per_page;
+    let end = (start + per_page).min(total);
 
-    for (idx, item) in prog.ui.gallery.iter().enumerate() {
-        let col = idx % cols;
-        let row = idx / cols;
+    for (local_idx, item) in prog.ui.gallery[start..end].iter().enumerate() {
+        let abs_idx = start + local_idx;
+        let col = local_idx % cols;
+        let row = local_idx / cols;
         let x = area[0] + col as f32 * (cell_w + gap);
         let y = area[1] + row as f32 * (cell_h + gap);
-        if y + cell_h > area[1] + area[3] + 1.0 {
-            break;
-        }
+        let rect = [x, y, cell_w, cell_h];
         let unlocked = item
             .unlock_flag
             .is_none_or(|f| ctx.vm.profile.flags.contains(prog.str(f)));
@@ -2289,25 +2939,311 @@ fn project_gallery_overlay(
         } else {
             "???".into()
         };
-        if let Some(func) = item.replay_func {
-            b.button(
-                [x, y, cell_w, cell_h],
-                label,
-                UiAction::StartReplay(func),
-                unlocked,
-                false,
-            );
+        let action = if let Some(func) = item.replay_func {
+            Some(UiAction::StartReplay(func))
+        } else if !item.cg_assets.is_empty() || item.thumb.is_some() {
+            Some(UiAction::ViewCg {
+                item: abs_idx as u32,
+                variant: 0,
+            })
         } else {
-            b.pkt
-                .quads
-                .push(Quad::solid([x, y, cell_w, cell_h], b.theme.panel));
+            None
+        };
+        if let Some(act) = action {
+            let id = b.next_hit_id;
+            b.next_hit_id += 1;
+            let is_hover = unlocked && !b.is_touch() && b.hovered == Some(id);
+            let border = if is_hover {
+                b.theme.accent
+            } else {
+                b.theme.panel_border
+            };
+            b.rounded_panel(rect, b.theme.panel, border, 8.0);
             if unlocked {
-                if let Some(thumb) = item.thumb {
-                    b.pkt.quads.push(Quad::image([x, y, cell_w, cell_h], thumb));
+                if let Some(thumb) = item.thumb.or_else(|| item.cg_assets.first().copied()) {
+                    b.pkt.quads.push(Quad::rounded_image(
+                        [x + 2.0, y + 2.0, (cell_w - 4.0).max(8.0), (cell_h - 4.0).max(8.0)],
+                        thumb,
+                        6.0,
+                    ));
                 }
             }
+            let cap_h = 24.0;
+            b.pkt.quads.push(Quad::rounded(
+                [x + 2.0, y + cell_h - cap_h - 2.0, (cell_w - 4.0).max(8.0), cap_h],
+                [0.05, 0.08, 0.13, 0.80],
+                5.0,
+            ));
+            b.push_text(TextRun {
+                text: label.clone(),
+                visible_bytes: None,
+                x: x + 6.0,
+                y: y + cell_h - cap_h - 1.0,
+                width: (cell_w - 12.0).max(16.0),
+                height: cap_h - 2.0,
+                size: 13.0,
+                line_height: 16.0,
+                color: if unlocked { b.theme.text } else { b.theme.muted },
+                emphasis: Vec::new(),
+                shadow: None,
+                scroll: 0.0,
+                clip: Some(rect),
+                font_assets: b.ui_fonts.clone(),
+                align: TextAlign::Center,
+                valign_center: true,
+                auto_fit: true,
+                inline_images: Vec::new(),
+                cache_key: 0,
+            });
+            b.pkt.hits.push(HitRegion {
+                id,
+                rect,
+                action: act,
+                label,
+                enabled: unlocked,
+            });
         }
     }
+
+    if total_pages > 1 {
+        let by = area[1] + area[3] - nav_h;
+        let nav_w = ((area[2] - 80.0) * 0.5).clamp(76.0, 128.0);
+        b.button(
+            [area[0], by, nav_w, nav_h],
+            messages.get(loc, "scroll-back"),
+            UiAction::GalleryPage(-1),
+            page > 0,
+            false,
+        );
+        b.button(
+            [area[0] + area[2] - nav_w, by, nav_w, nav_h],
+            messages.get(loc, "scroll-forward"),
+            UiAction::GalleryPage(1),
+            page + 1 < total_pages,
+            false,
+        );
+        let mid_x = area[0] + nav_w + 6.0;
+        let mid_w = (area[2] - nav_w * 2.0 - 12.0).max(40.0);
+        b.push_text(TextRun {
+            text: format!("{} / {}", page + 1, total_pages),
+            visible_bytes: None,
+            x: mid_x,
+            y: by,
+            width: mid_w,
+            height: nav_h,
+            size: 14.0,
+            line_height: 18.0,
+            color: b.theme.muted,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: Some([mid_x, by, mid_w, nav_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+}
+
+fn project_cg_viewer(
+    b: &mut Builder<'_>,
+    ctx: &UiContext<'_>,
+    messages: &Messages,
+    loc: &str,
+    item_idx: usize,
+    var_idx: usize,
+) {
+    let prog = ctx.vm.program();
+    let Some(item) = prog.ui.gallery.get(item_idx) else {
+        return;
+    };
+    let assets: Vec<AssetId> = if !item.cg_assets.is_empty() {
+        item.cg_assets.clone()
+    } else if let Some(t) = item.thumb {
+        vec![t]
+    } else {
+        return;
+    };
+    let idx = var_idx.min(assets.len() - 1);
+    let asset = assets[idx];
+    let w = b.pkt.width;
+    let h = b.pkt.height;
+    let [sx, sy, sw, sh] = b.safe;
+    b.pkt
+        .quads
+        .push(Quad::solid([0.0, 0.0, w, h], [0.02, 0.03, 0.06, 0.96]));
+
+    let bar_h = if b.is_touch() { 44.0 } else { 36.0 };
+    let img_area_h = (sh - bar_h - 18.0).max(100.0);
+    let (aw, ah) = prog.asset(asset).map_or(
+        (prog.meta.stage_width as f32, prog.meta.stage_height as f32),
+        |m| (m.width.max(1) as f32, m.height.max(1) as f32),
+    );
+    let scale = (sw / aw).min(img_area_h / ah);
+    let dw = aw * scale;
+    let dh = ah * scale;
+    let dx = sx + (sw - dw) * 0.5;
+    let dy = sy + (img_area_h - dh) * 0.5;
+    b.pkt.quads.push(Quad::image([dx, dy, dw, dh], asset));
+
+    // Tap image to advance variant or close
+    let img_hit_id = b.next_hit_id;
+    b.next_hit_id += 1;
+    let next_act = if idx + 1 < assets.len() {
+        UiAction::ViewCg {
+            item: item_idx as u32,
+            variant: (idx + 1) as u16,
+        }
+    } else {
+        UiAction::CloseCgViewer
+    };
+    b.pkt.hits.push(HitRegion {
+        id: img_hit_id,
+        rect: [0.0, 0.0, w, sy + img_area_h],
+        action: next_act,
+        label: String::new(),
+        enabled: true,
+    });
+
+    let by = sy + sh - bar_h - 6.0;
+    let bw = 96.0_f32.min((sw - 36.0) / 3.0);
+    if assets.len() > 1 {
+        b.button(
+            [sx + 8.0, by, bw, bar_h],
+            messages.get(loc, "cg-prev"),
+            UiAction::ViewCg {
+                item: item_idx as u32,
+                variant: idx.saturating_sub(1) as u16,
+            },
+            idx > 0,
+            false,
+        );
+        b.button(
+            [sx + bw + 16.0, by, bw, bar_h],
+            messages.get(loc, "cg-next"),
+            UiAction::ViewCg {
+                item: item_idx as u32,
+                variant: (idx + 1).min(assets.len() - 1) as u16,
+            },
+            idx + 1 < assets.len(),
+            false,
+        );
+        b.push_text(TextRun {
+            text: format!("{} / {}", idx + 1, assets.len()),
+            visible_bytes: None,
+            x: sx + bw * 2.0 + 24.0,
+            y: by,
+            width: (sw - bw * 3.0 - 40.0).max(40.0),
+            height: bar_h,
+            size: 14.0,
+            line_height: 18.0,
+            color: b.theme.muted,
+            emphasis: Vec::new(),
+            shadow: None,
+            scroll: 0.0,
+            clip: None,
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+    b.button(
+        [sx + sw - bw - 8.0, by, bw, bar_h],
+        messages.get(loc, "back"),
+        UiAction::CloseCgViewer,
+        true,
+        true,
+    );
+}
+
+fn project_confirm_modal(
+    b: &mut Builder<'_>,
+    messages: &Messages,
+    loc: &str,
+    confirm: ConfirmKind,
+) {
+    let w = b.pkt.width;
+    let h = b.pkt.height;
+    let [sx, sy, sw, sh] = b.safe;
+    b.pkt
+        .quads
+        .push(Quad::solid([0.0, 0.0, w, h], [0.02, 0.03, 0.07, 0.72]));
+    // Backdrop hit absorbs accidental clicks behind modal
+    let bg_id = b.next_hit_id;
+    b.next_hit_id += 1;
+    b.pkt.hits.push(HitRegion {
+        id: bg_id,
+        rect: [0.0, 0.0, w, h],
+        action: UiAction::CancelPending,
+        label: String::new(),
+        enabled: true,
+    });
+
+    let cw = (sw * 0.78).clamp(260.0, 420.0).min((sw - 24.0).max(220.0));
+    let ch = 152.0;
+    let cx = sx + (sw - cw) * 0.5;
+    let cy = sy + (sh - ch) * 0.5;
+    b.rounded_panel(
+        [cx, cy, cw, ch],
+        b.theme.surface,
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
+        12.0,
+    );
+    let (msg, ok_label) = match confirm {
+        ConfirmKind::OverwriteSlot(slot) => (
+            format!("{} #{:02}?", messages.get(loc, "overwrite-slot"), slot + 1),
+            messages.get(loc, "confirm-overwrite"),
+        ),
+        ConfirmKind::DeleteSlot(slot) => (
+            format!("{} #{:02}?", messages.get(loc, "delete-slot"), slot + 1),
+            messages.get(loc, "confirm-delete"),
+        ),
+    };
+    b.push_text(TextRun {
+        text: msg,
+        visible_bytes: None,
+        x: cx + 18.0,
+        y: cy + 20.0,
+        width: cw - 36.0,
+        height: 52.0,
+        size: 17.0,
+        line_height: 24.0,
+        color: b.theme.text,
+        emphasis: Vec::new(),
+        shadow: None,
+        scroll: 0.0,
+        clip: Some([cx + 14.0, cy + 14.0, cw - 28.0, 62.0]),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Center,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    let btn_gap = 12.0;
+    let bw = (cw - 36.0 - btn_gap) * 0.5;
+    let bh = if b.is_touch() { 44.0 } else { 38.0 };
+    let by = cy + ch - bh - 18.0;
+    b.button(
+        [cx + 18.0, by, bw, bh],
+        messages.get(loc, "cancel"),
+        UiAction::CancelPending,
+        true,
+        false,
+    );
+    b.button(
+        [cx + 18.0 + bw + btn_gap, by, bw, bh],
+        ok_label,
+        UiAction::ConfirmPending,
+        true,
+        true,
+    );
 }
 
 fn project_ended_overlay(b: &mut Builder<'_>, messages: &Messages, loc: &str) {
@@ -2471,8 +3407,17 @@ mod tests {
                 interface_hidden: false,
                 replay_active: false,
                 slots: &[],
+                autosave: None,
+                quicksave: None,
                 saves_page: 0,
                 history_scroll: 0,
+                gallery_page: 0,
+                viewing_cg: None,
+                settings_tab: 0,
+                pending_confirm: None,
+                host_has_shelf: false,
+                loading_visible: false,
+                tz_offset_mins: 0,
                 hovered_hit: None,
                 pressed_hit: None,
                 safe_insets: SafeInsets::default(),
@@ -2607,8 +3552,17 @@ mod tests {
             interface_hidden: false,
             replay_active: false,
             slots: &[],
+            autosave: None,
+            quicksave: None,
             saves_page: 0,
             history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: false,
+            loading_visible: false,
+            tz_offset_mins: 0,
             hovered_hit: None,
             pressed_hit: None,
             safe_insets: SafeInsets::default(),
@@ -2650,8 +3604,17 @@ mod tests {
             interface_hidden: false,
             replay_active: false,
             slots: &[],
+            autosave: None,
+            quicksave: None,
             saves_page: 0,
             history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: false,
+            loading_visible: false,
+            tz_offset_mins: 0,
             hovered_hit: None,
             pressed_hit: None,
             safe_insets: insets,
@@ -2706,6 +3669,7 @@ mod tests {
                 exists: i < 4,
                 summary: format!("Line {i}"),
                 saved_at_unix: 1000 + i as u64,
+                has_thumb: false,
             })
             .collect();
         let saves_ctx = UiContext {
@@ -2718,8 +3682,17 @@ mod tests {
             interface_hidden: false,
             replay_active: false,
             slots: &slots,
+            autosave: None,
+            quicksave: None,
             saves_page: 1,
             history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: false,
+            loading_visible: false,
+            tz_offset_mins: 0,
             hovered_hit: None,
             pressed_hit: None,
             safe_insets: land_insets,

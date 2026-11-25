@@ -401,6 +401,40 @@ impl Vm {
             locale: self.locale.clone(),
             rng_word_pos: self.rng.get_word_pos(),
             outcome: self.outcome.clone(),
+            thumbnail: None,
+        }
+    }
+
+    /// Replaces the program Arc (e.g. after dynamically loading an external translation locale)
+    /// without resetting VM state, and refreshes the currently displayed dialogue line if any.
+    pub fn apply_translation_program(&mut self, program: Arc<NirProgram>, locale: String) {
+        self.program = program;
+        self.locale = locale;
+        if let Some(dlg) = &mut self.dialogue {
+            if let Some(entry) = self.program.text(&self.locale, dlg.text_id) {
+                let full_text = entry.to_plain_text();
+                if !full_text.is_empty() {
+                    use unicode_segmentation::UnicodeSegmentation;
+                    let len = full_text.len();
+                    dlg.total_graphemes = full_text.graphemes(true).count();
+                    dlg.full_text = full_text;
+                    dlg.spans = vec![ResolvedSpan {
+                        byte_start: 0,
+                        byte_end: len,
+                        emphasis: false,
+                        color: None,
+                        ruby: None,
+                        speed: 1.0,
+                        inline_image: None,
+                    }];
+                    if dlg.finished {
+                        dlg.visible_graphemes = dlg.total_graphemes;
+                    } else {
+                        dlg.visible_graphemes = dlg.visible_graphemes.min(dlg.total_graphemes);
+                    }
+                    dlg.recompute_visible_bytes();
+                }
+            }
         }
     }
 

@@ -90,12 +90,21 @@ pub enum JsHostCommand {
     DeleteSlot {
         slot: u32,
     },
+    SaveAuto {
+        snapshot_json: String,
+    },
+    RequestLoadAuto,
+    SaveQuick {
+        snapshot_json: String,
+    },
+    RequestLoadQuick,
     SaveProfile {
         profile_json: String,
     },
     SavePreferences {
         prefs: Preferences,
     },
+    ReturnToShelf,
 }
 
 pub fn codec_mime(codec: MediaCodec) -> &'static str {
@@ -238,10 +247,19 @@ fn convert_host_command(
         }),
         HostCommand::RequestLoadSlot(slot) => Some(JsHostCommand::RequestLoadSlot { slot }),
         HostCommand::DeleteSlot(slot) => Some(JsHostCommand::DeleteSlot { slot }),
+        HostCommand::SaveAuto { snapshot } => Some(JsHostCommand::SaveAuto {
+            snapshot_json: serde_json::to_string(&snapshot).unwrap_or_default(),
+        }),
+        HostCommand::RequestLoadAuto => Some(JsHostCommand::RequestLoadAuto),
+        HostCommand::SaveQuick { snapshot } => Some(JsHostCommand::SaveQuick {
+            snapshot_json: serde_json::to_string(&snapshot).unwrap_or_default(),
+        }),
+        HostCommand::RequestLoadQuick => Some(JsHostCommand::RequestLoadQuick),
         HostCommand::SaveProfile(profile) => Some(JsHostCommand::SaveProfile {
             profile_json: serde_json::to_string(&profile).unwrap_or_default(),
         }),
         HostCommand::SavePreferences(prefs) => Some(JsHostCommand::SavePreferences { prefs }),
+        HostCommand::ReturnToShelf => Some(JsHostCommand::ReturnToShelf),
         HostCommand::Quit => None,
     }
 }
@@ -574,6 +592,93 @@ mod wasm_host {
         #[wasm_bindgen]
         pub fn cancel_or_menu(&mut self) {
             self.runtime.cancel_or_menu();
+        }
+
+        #[wasm_bindgen]
+        pub fn scroll_wheel(&mut self, delta_y: f32) {
+            self.runtime.scroll_wheel(delta_y);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_host_has_shelf(&mut self, has_shelf: bool) {
+            self.runtime.set_host_has_shelf(has_shelf);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_tz_offset_mins(&mut self, offset_mins: i32) {
+            self.runtime.set_tz_offset_mins(offset_mins);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_autosave_summary_json(&mut self, json: &str) {
+            let s: Option<SlotSummary> = serde_json::from_str(json).ok();
+            self.runtime.set_autosave_summary(s);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_quicksave_summary_json(&mut self, json: &str) {
+            let s: Option<SlotSummary> = serde_json::from_str(json).ok();
+            self.runtime.set_quicksave_summary(s);
+        }
+
+        #[wasm_bindgen]
+        pub fn upload_slot_thumb_bitmap(
+            &mut self,
+            slot: u32,
+            bitmap: &ImageBitmap,
+        ) -> Result<(), JsValue> {
+            let id = AssetId(nir_ui::SAVE_THUMB_ASSET_BASE + slot);
+            self.renderer
+                .upload_image_bitmap(id, bitmap)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.runtime.mark_slot_has_thumb(slot, true);
+            self.runtime.mark_asset_loaded(id);
+            Ok(())
+        }
+
+        #[wasm_bindgen]
+        pub fn upload_autosave_thumb_bitmap(&mut self, bitmap: &ImageBitmap) -> Result<(), JsValue> {
+            let id = nir_ui::AUTOSAVE_THUMB_ASSET_ID;
+            self.renderer
+                .upload_image_bitmap(id, bitmap)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.runtime.mark_autosave_has_thumb(true);
+            self.runtime.mark_asset_loaded(id);
+            Ok(())
+        }
+
+        #[wasm_bindgen]
+        pub fn upload_quicksave_thumb_bitmap(&mut self, bitmap: &ImageBitmap) -> Result<(), JsValue> {
+            let id = nir_ui::QUICKSAVE_THUMB_ASSET_ID;
+            self.renderer
+                .upload_image_bitmap(id, bitmap)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.runtime.mark_quicksave_has_thumb(true);
+            self.runtime.mark_asset_loaded(id);
+            Ok(())
+        }
+
+        #[wasm_bindgen]
+        pub fn try_resume_latest(&mut self) -> bool {
+            self.runtime.try_resume_latest()
+        }
+
+        #[wasm_bindgen]
+        pub fn emit_autosave(&mut self) -> String {
+            self.runtime.emit_autosave();
+            self.drain_js_commands()
+        }
+
+        #[wasm_bindgen]
+        pub fn load_translation_patch(
+            &mut self,
+            locale: &str,
+            patch_json: &str,
+        ) -> Result<u32, JsValue> {
+            self.runtime
+                .load_translation_patch(locale, patch_json)
+                .map(|n| n as u32)
+                .map_err(|e| JsValue::from_str(&e))
         }
 
         #[wasm_bindgen]

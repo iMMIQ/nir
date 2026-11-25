@@ -96,6 +96,7 @@ impl LocalStorage {
             exists: true,
             saved_at_unix: snap.saved_at_unix,
             summary: snap.summary.clone(),
+            has_thumb: false,
         };
         let index_bytes = {
             let mut map = self.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -124,6 +125,30 @@ impl LocalStorage {
         self.enqueue_write(self.index_path(), index_bytes)
     }
 
+    pub fn save_named(&self, name: &str, snap: &SaveSnapshot) -> Result<()> {
+        let data = serde_json::to_vec(snap)?;
+        self.enqueue_write(self.dir.join(format!("{name}.json")), data)
+    }
+
+    pub fn load_named(&self, name: &str) -> Result<SaveSnapshot> {
+        self.flush();
+        let path = self.dir.join(format!("{name}.json"));
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("reading named save `{}`", path.display()))?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub fn named_summary(&self, name: &str, virtual_slot: u32) -> Option<SlotSummary> {
+        let snap = self.load_named(name).ok()?;
+        Some(SlotSummary {
+            slot: virtual_slot,
+            exists: true,
+            saved_at_unix: snap.saved_at_unix,
+            summary: snap.summary,
+            has_thumb: false,
+        })
+    }
+
     /// Reads lightweight `slots_index.json` in a single I/O operation (O(1) cold start!).
     /// Falls back once to scanning existing `slot_XX.json` files if index is absent.
     pub fn list_slot_summaries(&self, slot_count: u32) -> Vec<SlotSummary> {
@@ -143,6 +168,7 @@ impl LocalStorage {
                                 exists: true,
                                 saved_at_unix: snap.saved_at_unix,
                                 summary: snap.summary,
+                                has_thumb: false,
                             },
                         );
                     }
@@ -300,6 +326,7 @@ mod tests {
             locale: "en".into(),
             rng_word_pos: 0,
             outcome: None,
+            thumbnail: None,
         };
         st.save_slot(2, &snap).unwrap();
         st.flush();

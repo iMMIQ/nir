@@ -9,7 +9,9 @@ pub mod gesture;
 
 use gesture::{TouchAction, TouchGestureEngine};
 use nir_ir::*;
-use nir_ui::{DrawPacket, InputMode, Messages, SafeInsets, Screen, SlotSummary, UiContext};
+use nir_ui::{
+    ConfirmKind, DrawPacket, InputMode, Messages, SafeInsets, Screen, SlotSummary, UiContext,
+};
 use nir_vm::{ProfileData, RollbackCheckpoint, SaveSnapshot, Vm, VmIntent, WaitReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -17,6 +19,9 @@ use std::sync::Arc;
 const MAX_ROLLBACK_CHECKPOINTS: usize = 32;
 const SKIP_INTERVAL_US: u64 = 55_000;
 const PROFILE_FLUSH_INTERVAL_US: u64 = 5_000_000;
+const VOICE_REPLAY_CHANNEL: ChannelId = ChannelId(7);
+const AUTOSAVE_LINE_INTERVAL: u32 = 8;
+const LOADING_INDICATOR_DELAY_US: u64 = 150_000;
 
 /// Typed commands sent from `Runtime` to the platform host (Native / Web / Mobile).
 #[derive(Debug, Clone, PartialEq)]
@@ -61,8 +66,17 @@ pub enum HostCommand {
     },
     RequestLoadSlot(u32),
     DeleteSlot(u32),
+    SaveAuto {
+        snapshot: Box<SaveSnapshot>,
+    },
+    RequestLoadAuto,
+    SaveQuick {
+        snapshot: Box<SaveSnapshot>,
+    },
+    RequestLoadQuick,
     SaveProfile(ProfileData),
     SavePreferences(Preferences),
+    ReturnToShelf,
     Quit,
 }
 
@@ -80,11 +94,21 @@ pub struct Runtime {
     pub interface_hidden: bool,
     auto_elapsed_us: u64,
     skip_elapsed_us: u64,
-    voice_playing: bool,
+    active_voice_channels: BTreeSet<ChannelId>,
     checkpoints: VecDeque<RollbackCheckpoint>,
     pub slots: Vec<SlotSummary>,
+    pub autosave: Option<SlotSummary>,
+    pub quicksave: Option<SlotSummary>,
+    lines_since_autosave: u32,
     saves_page: usize,
     history_scroll: usize,
+    gallery_page: usize,
+    viewing_cg: Option<(usize, usize)>,
+    settings_tab: u8,
+    pending_confirm: Option<ConfirmKind>,
+    pub host_has_shelf: bool,
+    pub tz_offset_mins: i32,
+    urgent_loading_us: u64,
     hovered_hit: Option<u32>,
     pressed_hit: Option<u32>,
     pressed_started_on_hit: bool,
@@ -147,11 +171,21 @@ impl Runtime {
             interface_hidden: false,
             auto_elapsed_us: 0,
             skip_elapsed_us: 0,
-            voice_playing: false,
+            active_voice_channels: BTreeSet::new(),
             checkpoints: VecDeque::new(),
             slots: norm_slots,
+            autosave: None,
+            quicksave: None,
+            lines_since_autosave: 0,
             saves_page: 0,
             history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: false,
+            tz_offset_mins: 0,
+            urgent_loading_us: 0,
             hovered_hit: None,
             pressed_hit: None,
             pressed_started_on_hit: false,
@@ -237,10 +271,215 @@ impl Runtime {
     }
 
     pub fn notify_audio_ended(&mut self, channel: ChannelId) {
-        if channel == ChannelId(1) {
-            self.voice_playing = false;
-        }
+        self.active_voice_channels.remove(&channel);
         self.vm.notify_audio_ended(channel);
+    }
+
+    pub fn set_host_has_shelf(&mut self, has_shelf: bool) {
+        if self.host_has_shelf != has_shelf {
+            self.host_has_shelf = has_shelf;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_tz_offset_mins(&mut self, offset_mins: i32) {
+        self.tz_offset_mins = offset_mins.clamp(-720, 840);
+    }
+
+    pub fn set_autosave_summary(&mut self, summary: Option<SlotSummary>) {
+        self.autosave = summary;
+        self.dirty = true;
+    }
+
+    pub fn set_quicksave_summary(&mut self, summary: Option<SlotSummary>) {
+        self.quicksave = summary;
+        self.dirty = true;
+    }
+
+    pub fn mark_slot_has_thumb(&mut self, slot: u32, has_thumb: bool) {
+        if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
+            entry.has_thumb = has_thumb;
+            self.dirty = true;
+        }
+    }
+
+    pub fn mark_autosave_has_thumb(&mut self, has_thumb: bool) {
+        if let Some(a) = &mut self.autosave {
+            a.has_thumb = has_thumb;
+            self.dirty = true;
+        }
+    }
+
+    pub fn mark_quicksave_has_thumb(&mut self, has_thumb: bool) {
+        if let Some(q) = &mut self.quicksave {
+            q.has_thumb = has_thumb;
+            self.dirty = true;
+        }
+    }
+
+    /// Emits an automatic breakpoint save when actively reading Story (never during replay or title).
+    pub fn emit_autosave(&mut self) {
+        if self.screen != Screen::Story
+            || self.frozen_vm.is_some()
+            || self.vm.outcome.is_some()
+            || (self.vm.dialogue.is_none() && self.vm.choice.is_none())
+        {
+            return;
+        }
+        self.lines_since_autosave = 0;
+        let snap = self.vm.snapshot(self.unix_clock);
+        self.autosave = Some(SlotSummary {
+            slot: u32::MAX,
+            exists: true,
+            summary: snap.summary.clone(),
+            saved_at_unix: snap.saved_at_unix,
+            has_thumb: self.autosave.as_ref().is_some_and(|a| a.has_thumb),
+        });
+        self.commands.push(HostCommand::SaveAuto {
+            snapshot: Box::new(snap),
+        });
+    }
+
+    /// Loads whichever saved state (AutoSave, QuickSave, or manual slots) is most recent.
+    pub fn try_resume_latest(&mut self) -> bool {
+        enum Latest {
+            Auto(u64),
+            Quick(u64),
+            Slot(u32, u64),
+        }
+        let mut best: Option<Latest> = None;
+        let ts_of = |l: &Latest| match *l {
+            Latest::Auto(t) | Latest::Quick(t) | Latest::Slot(_, t) => t,
+        };
+        if let Some(a) = &self.autosave {
+            if a.exists {
+                best = Some(Latest::Auto(a.saved_at_unix));
+            }
+        }
+        if let Some(q) = &self.quicksave {
+            if q.exists && best.as_ref().is_none_or(|b| q.saved_at_unix >= ts_of(b)) {
+                best = Some(Latest::Quick(q.saved_at_unix));
+            }
+        }
+        for s in &self.slots {
+            if s.exists && best.as_ref().is_none_or(|b| s.saved_at_unix > ts_of(b)) {
+                best = Some(Latest::Slot(s.slot, s.saved_at_unix));
+            }
+        }
+        match best {
+            Some(Latest::Auto(_)) => {
+                self.commands.push(HostCommand::RequestLoadAuto);
+                true
+            }
+            Some(Latest::Quick(_)) => {
+                self.commands.push(HostCommand::RequestLoadQuick);
+                true
+            }
+            Some(Latest::Slot(slot, _)) => {
+                self.commands.push(HostCommand::RequestLoadSlot(slot));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Unified mouse wheel routing across Story, History, Saves, Gallery, and CG Viewer.
+    pub fn scroll_wheel(&mut self, delta_y: f32) {
+        if delta_y.abs() < 0.01 {
+            return;
+        }
+        let up = delta_y < 0.0;
+        if let Some((item_idx, var_idx)) = self.viewing_cg {
+            let next_v = if up {
+                var_idx.saturating_sub(1)
+            } else {
+                var_idx + 1
+            };
+            self.dispatch(UiAction::ViewCg {
+                item: item_idx as u32,
+                variant: next_v as u16,
+            });
+            return;
+        }
+        match self.screen {
+            Screen::History => self.dispatch(UiAction::ScrollHistory(if up { 2 } else { -2 })),
+            Screen::Saves { .. } => self.dispatch(UiAction::SavesPage(if up { -1 } else { 1 })),
+            Screen::Gallery => self.dispatch(UiAction::GalleryPage(if up { -1 } else { 1 })),
+            Screen::Story => self.dispatch(if up {
+                UiAction::Rollback
+            } else {
+                UiAction::Advance
+            }),
+            _ => {}
+        }
+    }
+
+    /// Dynamically injects an external JSON translation table (`{"texts":{"0":"..."}}` or `{"0":"..."}`)
+    /// into the loaded `NirProgram` as `locale` without modifying `.nirpak`!
+    pub fn load_translation_patch(
+        &mut self,
+        locale: &str,
+        patch_json: &str,
+    ) -> std::result::Result<usize, String> {
+        let locale = locale.trim();
+        if locale.is_empty() {
+            return Err("empty locale".into());
+        }
+        let val: serde_json::Value =
+            serde_json::from_str(patch_json).map_err(|e| format!("invalid patch json: {e}"))?;
+        let map = val
+            .get("texts")
+            .and_then(|v| v.as_object())
+            .or_else(|| val.as_object())
+            .ok_or_else(|| "expected JSON object mapping text_id -> string".to_owned())?;
+
+        let mut next_prog = (*self.program).clone();
+        let base_table = next_prog
+            .texts
+            .get(&next_prog.meta.default_locale)
+            .cloned()
+            .unwrap_or_default();
+        let mut table = next_prog
+            .texts
+            .get(locale)
+            .cloned()
+            .unwrap_or(base_table);
+        let mut applied = 0usize;
+        for (k, v) in map {
+            let Ok(idx) = k.parse::<usize>() else {
+                continue;
+            };
+            let Some(text) = v.as_str() else {
+                continue;
+            };
+            if idx < table.len() {
+                table[idx] = TextEntry::plain(text);
+                applied += 1;
+            }
+        }
+        if applied == 0 {
+            return Ok(0);
+        }
+        next_prog.texts.insert(locale.to_owned(), table);
+        if !next_prog.meta.locales.iter().any(|l| l == locale) {
+            next_prog.meta.locales.push(locale.to_owned());
+        }
+        let arc = Arc::new(next_prog);
+        self.program = Arc::clone(&arc);
+        self.prefs.text_locale = locale.to_owned();
+        self.vm.apply_translation_program(arc, locale.to_owned());
+        self.dirty = true;
+        Ok(applied)
+    }
+
+    fn has_urgent_image_loading(&self) -> bool {
+        self.requested_assets.iter().any(|(&id, &urgent)| {
+            urgent
+                && self
+                    .program
+                    .asset(id)
+                    .is_some_and(|a| a.kind == AssetKind::Image)
+        })
     }
 
     pub fn notify_video_finished(&mut self) {
@@ -322,6 +561,7 @@ impl Runtime {
         }
         self.paused_by_host = paused;
         if paused {
+            self.emit_autosave();
             self.flush_pending_saves();
             if self.hold_skip {
                 self.hold_skip = false;
@@ -371,6 +611,9 @@ impl Runtime {
             return false;
         }
         if self.toast.is_some() || self.gestures.needs_clock() {
+            return true;
+        }
+        if self.has_urgent_image_loading() && self.urgent_loading_us < LOADING_INDICATOR_DELAY_US {
             return true;
         }
         if self.screen != Screen::Story {
@@ -540,6 +783,14 @@ impl Runtime {
 
     /// Handles secondary click / right-click / Android Back / Escape.
     pub fn cancel_or_menu(&mut self) {
+        if self.pending_confirm.take().is_some() {
+            self.dirty = true;
+            return;
+        }
+        if self.viewing_cg.take().is_some() {
+            self.dirty = true;
+            return;
+        }
         if self.interface_hidden && self.screen == Screen::Story {
             self.interface_hidden = false;
             self.dirty = true;
@@ -585,15 +836,7 @@ impl Runtime {
                 }
             }
             UiAction::Continue => {
-                if let Some(latest) = self
-                    .slots
-                    .iter()
-                    .filter(|s| s.exists)
-                    .max_by_key(|s| s.saved_at_unix)
-                    .map(|s| s.slot)
-                {
-                    self.commands.push(HostCommand::RequestLoadSlot(latest));
-                }
+                self.try_resume_latest();
             }
             UiAction::Advance => {
                 if self.screen != Screen::Story {
@@ -604,10 +847,17 @@ impl Runtime {
                     return;
                 }
                 self.auto_elapsed_us = 0;
+                let was_finished = self.vm.dialogue.as_ref().is_some_and(|d| d.finished);
                 let stop_voice = !self.prefs.continue_voice_on_advance;
                 let intents = self.vm.advance(stop_voice);
                 self.handle_intents(intents);
                 self.step_vm();
+                if was_finished {
+                    self.lines_since_autosave = self.lines_since_autosave.saturating_add(1);
+                    if self.lines_since_autosave >= AUTOSAVE_LINE_INTERVAL {
+                        self.emit_autosave();
+                    }
+                }
             }
             UiAction::Choose(idx) => {
                 if self.screen != Screen::Story {
@@ -617,6 +867,7 @@ impl Runtime {
                 let intents = self.vm.choose(idx as usize);
                 self.handle_intents(intents);
                 self.step_vm();
+                self.emit_autosave();
             }
             UiAction::CancelChoice => {
                 if self.screen == Screen::Story {
@@ -719,37 +970,156 @@ impl Runtime {
                 self.screen = Screen::History;
             }
             UiAction::OpenGallery => {
-                self.return_screen = self.screen;
+                if matches!(self.screen, Screen::Title | Screen::Story | Screen::Menu) {
+                    self.return_screen = self.screen;
+                }
+                self.gallery_page = 0;
+                self.viewing_cg = None;
                 self.screen = Screen::Gallery;
             }
             UiAction::SaveSlot(slot) => {
                 if self.frozen_vm.is_some() {
                     return;
                 }
-                self.flush_pending_saves();
-                let snap = self.vm.snapshot(self.unix_clock);
-                if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
-                    entry.exists = true;
-                    entry.summary = snap.summary.clone();
-                    entry.saved_at_unix = snap.saved_at_unix;
+                if self.slots.iter().any(|s| s.slot == slot && s.exists) {
+                    self.pending_confirm = Some(ConfirmKind::OverwriteSlot(slot));
+                    return;
                 }
-                self.commands.push(HostCommand::SaveSlot {
-                    slot,
-                    snapshot: Box::new(snap),
-                });
-                let msg = self.messages.get(&self.prefs.ui_locale, "saved");
-                self.show_toast(msg, 1800);
+                self.commit_save_slot(slot);
             }
             UiAction::LoadSlot(slot) => {
+                self.pending_confirm = None;
                 self.commands.push(HostCommand::RequestLoadSlot(slot));
             }
             UiAction::DeleteSlot(slot) => {
-                if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
-                    entry.exists = false;
-                    entry.summary.clear();
-                    entry.saved_at_unix = 0;
+                if self.slots.iter().any(|s| s.slot == slot && s.exists) {
+                    self.pending_confirm = Some(ConfirmKind::DeleteSlot(slot));
                 }
-                self.commands.push(HostCommand::DeleteSlot(slot));
+            }
+            UiAction::ConfirmPending => {
+                if let Some(kind) = self.pending_confirm.take() {
+                    match kind {
+                        ConfirmKind::OverwriteSlot(slot) => self.commit_save_slot(slot),
+                        ConfirmKind::DeleteSlot(slot) => self.commit_delete_slot(slot),
+                    }
+                }
+            }
+            UiAction::CancelPending => {
+                self.pending_confirm = None;
+            }
+            UiAction::QuickSave => {
+                if self.frozen_vm.is_some() || (self.screen != Screen::Story && self.screen != Screen::Menu) {
+                    return;
+                }
+                self.flush_pending_saves();
+                let snap = self.vm.snapshot(self.unix_clock);
+                self.quicksave = Some(SlotSummary {
+                    slot: u32::MAX - 1,
+                    exists: true,
+                    summary: snap.summary.clone(),
+                    saved_at_unix: snap.saved_at_unix,
+                    has_thumb: self.quicksave.as_ref().is_some_and(|q| q.has_thumb),
+                });
+                self.commands.push(HostCommand::SaveQuick {
+                    snapshot: Box::new(snap),
+                });
+                let msg = self.messages.get(&self.prefs.ui_locale, "quick-saved");
+                self.show_toast(msg, 1800);
+            }
+            UiAction::QuickLoad => {
+                if self.frozen_vm.is_some() {
+                    return;
+                }
+                if self.quicksave.as_ref().is_some_and(|q| q.exists) {
+                    self.commands.push(HostCommand::RequestLoadQuick);
+                } else {
+                    let msg = self.messages.get(&self.prefs.ui_locale, "no-quick-save");
+                    self.show_toast(msg, 1800);
+                }
+            }
+            UiAction::LoadAutoSave => {
+                if self.frozen_vm.is_some() {
+                    return;
+                }
+                if self.autosave.as_ref().is_some_and(|a| a.exists) {
+                    self.commands.push(HostCommand::RequestLoadAuto);
+                }
+            }
+            UiAction::ReplayVoice => {
+                if let Some(asset) = self.vm.dialogue.as_ref().and_then(|d| d.voice) {
+                    self.play_preview_voice(asset);
+                } else {
+                    let msg = self.messages.get(&self.prefs.ui_locale, "voice-unavailable");
+                    self.show_toast(msg, 1500);
+                }
+            }
+            UiAction::ReplayHistoryVoice(asset) => {
+                self.play_preview_voice(asset);
+            }
+            UiAction::SetMasterVolume(v) => {
+                self.prefs.master_volume = v.clamp(0.0, 1.0);
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleAutoWaitVoice => {
+                self.prefs.auto_wait_voice = !self.prefs.auto_wait_voice;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleContinueVoiceOnAdvance => {
+                self.prefs.continue_voice_on_advance = !self.prefs.continue_voice_on_advance;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleBilingual => {
+                self.prefs.bilingual = !self.prefs.bilingual;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::GalleryPage(delta) => {
+                let max_page = self.program.ui.gallery.len().saturating_sub(1);
+                if delta > 0 {
+                    self.gallery_page = self.gallery_page.saturating_add(delta as usize).min(max_page);
+                } else {
+                    self.gallery_page = self
+                        .gallery_page
+                        .saturating_sub(delta.unsigned_abs() as usize);
+                }
+            }
+            UiAction::ViewCg { item, variant } => {
+                if let Some(gi) = self.program.ui.gallery.get(item as usize) {
+                    let count = if !gi.cg_assets.is_empty() {
+                        gi.cg_assets.len()
+                    } else if gi.thumb.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+                    if count > 0 {
+                        let v = (variant as usize).min(count - 1);
+                        let asset = gi
+                            .cg_assets
+                            .get(v)
+                            .copied()
+                            .or(gi.thumb);
+                        if let Some(id) = asset {
+                            self.request_asset(id, true);
+                        }
+                        self.viewing_cg = Some((item as usize, v));
+                    }
+                }
+            }
+            UiAction::CloseCgViewer => {
+                self.viewing_cg = None;
+            }
+            UiAction::SettingsTab(tab) => {
+                self.settings_tab = tab.min(1);
+            }
+            UiAction::ReturnShelf => {
+                self.emit_autosave();
+                self.flush_pending_saves();
+                self.stop_all_audio();
+                self.commands.push(HostCommand::ReturnToShelf);
             }
             UiAction::StartReplay(func) => {
                 if self.frozen_vm.is_some() {
@@ -779,9 +1149,12 @@ impl Runtime {
                 }
             }
             UiAction::ReturnTitle => {
+                self.emit_autosave();
                 self.flush_pending_saves();
                 self.stop_all_audio();
                 self.frozen_vm = None;
+                self.pending_confirm = None;
+                self.viewing_cg = None;
                 self.auto = false;
                 self.skip = false;
                 self.interface_hidden = false;
@@ -871,10 +1244,59 @@ impl Runtime {
                     .push(HostCommand::SavePreferences(self.prefs.clone()));
             }
             UiAction::Quit => {
+                self.emit_autosave();
                 self.flush_pending_saves();
                 self.commands.push(HostCommand::Quit);
             }
         }
+    }
+
+    fn commit_save_slot(&mut self, slot: u32) {
+        self.flush_pending_saves();
+        let snap = self.vm.snapshot(self.unix_clock);
+        if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
+            entry.exists = true;
+            entry.summary = snap.summary.clone();
+            entry.saved_at_unix = snap.saved_at_unix;
+        }
+        self.commands.push(HostCommand::SaveSlot {
+            slot,
+            snapshot: Box::new(snap),
+        });
+        let msg = self.messages.get(&self.prefs.ui_locale, "saved");
+        self.show_toast(msg, 1800);
+    }
+
+    fn commit_delete_slot(&mut self, slot: u32) {
+        if let Some(entry) = self.slots.iter_mut().find(|s| s.slot == slot) {
+            entry.exists = false;
+            entry.summary.clear();
+            entry.saved_at_unix = 0;
+            entry.has_thumb = false;
+        }
+        self.commands.push(HostCommand::DeleteSlot(slot));
+    }
+
+    fn play_preview_voice(&mut self, asset: AssetId) {
+        self.request_asset(asset, true);
+        self.commands.push(HostCommand::PauseAudioBus {
+            bus: AudioBus::Voice,
+            paused: false,
+        });
+        self.commands.push(HostCommand::StopAudio {
+            channel: VOICE_REPLAY_CHANNEL,
+            fade_out_us: 0,
+        });
+        self.commands.push(HostCommand::PlayAudio {
+            channel: VOICE_REPLAY_CHANNEL,
+            bus: AudioBus::Voice,
+            asset,
+            gain: 1.0,
+            looped: false,
+            fade_in_us: 0,
+            loop_region: None,
+            character: None,
+        });
     }
 
     /// Applies a loaded save snapshot returned by the host storage layer.
@@ -939,6 +1361,20 @@ impl Runtime {
             }
         }
 
+        if self.has_urgent_image_loading() {
+            let was_vis = self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US;
+            self.urgent_loading_us = self.urgent_loading_us.saturating_add(delta_us);
+            if !was_vis && self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US {
+                self.dirty = true;
+            }
+        } else if self.urgent_loading_us > 0 {
+            let was_vis = self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US;
+            self.urgent_loading_us = 0;
+            if was_vis {
+                self.dirty = true;
+            }
+        }
+
         // Long-press HoldSkip detection (only on Story blank area without active choices).
         let can_long_press = self.screen == Screen::Story
             && !self.interface_hidden
@@ -988,7 +1424,7 @@ impl Runtime {
             }
         } else if self.auto && self.vm.wait == WaitReason::Dialogue {
             let dlg_done = self.vm.dialogue.as_ref().is_some_and(|d| d.finished);
-            let voice_ready = !self.prefs.auto_wait_voice || !self.voice_playing;
+            let voice_ready = !self.prefs.auto_wait_voice || self.active_voice_channels.is_empty();
             if dlg_done && voice_ready {
                 self.auto_elapsed_us = self.auto_elapsed_us.saturating_add(delta_us);
                 let target_us = self.prefs.auto_delay_ms as u64 * 1000;
@@ -1021,8 +1457,17 @@ impl Runtime {
             interface_hidden: self.interface_hidden,
             replay_active: self.frozen_vm.is_some(),
             slots: &self.slots,
+            autosave: self.autosave.as_ref(),
+            quicksave: self.quicksave.as_ref(),
             saves_page: self.saves_page,
             history_scroll: self.history_scroll,
+            gallery_page: self.gallery_page,
+            viewing_cg: self.viewing_cg,
+            settings_tab: self.settings_tab,
+            pending_confirm: self.pending_confirm,
+            host_has_shelf: self.host_has_shelf,
+            loading_visible: self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US,
+            tz_offset_mins: self.tz_offset_mins,
             hovered_hit: self.hovered_hit,
             pressed_hit: self.pressed_hit,
             safe_insets: self.safe_insets,
@@ -1076,8 +1521,8 @@ impl Runtime {
                     loop_region,
                     character,
                 } => {
-                    if channel == ChannelId(1) && bus == AudioBus::Voice {
-                        self.voice_playing = true;
+                    if bus == AudioBus::Voice {
+                        self.active_voice_channels.insert(channel);
                     }
                     let eff = gain * self.channel_character_gain(bus, character.as_deref());
                     self.request_asset(asset, true);
@@ -1096,9 +1541,7 @@ impl Runtime {
                     channel,
                     fade_out_us,
                 } => {
-                    if channel == ChannelId(1) {
-                        self.voice_playing = false;
-                    }
+                    self.active_voice_channels.remove(&channel);
                     self.commands.push(HostCommand::StopAudio {
                         channel,
                         fade_out_us,
@@ -1163,7 +1606,11 @@ impl Runtime {
     }
 
     fn stop_all_audio(&mut self) {
-        self.voice_playing = false;
+        self.active_voice_channels.clear();
+        self.commands.push(HostCommand::StopAudio {
+            channel: VOICE_REPLAY_CHANNEL,
+            fade_out_us: 0,
+        });
         let channels: Vec<ChannelId> = self.vm.audio.iter().map(|c| c.channel).collect();
         for ch in channels {
             self.commands.push(HostCommand::StopAudio {
@@ -1595,11 +2042,14 @@ mod tests {
         rt.touch_end(9, 180.0, 200.0);
         assert!(!rt.hold_skip);
 
-        // 6. Host background pause pauses all 3 audio buses & clocks; resume restores cleanly
+        // 6. Host background pause pauses all 3 audio buses & clocks + emits SaveAuto; resume restores cleanly
         rt.take_commands();
         rt.set_host_paused(true);
         assert!(!rt.needs_clock());
         let paused_cmds = rt.take_commands();
+        assert!(paused_cmds
+            .iter()
+            .any(|c| matches!(c, HostCommand::SaveAuto { .. })));
         assert_eq!(
             paused_cmds
                 .iter()
@@ -1616,5 +2066,76 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn autosave_quicksave_confirm_wheel_voice_and_translation_patch_work() {
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
+        rt.set_unix_time(1_760_000_100);
+        rt.set_host_has_shelf(true);
+        rt.dispatch(UiAction::NewGame);
+        rt.take_commands();
+
+        // 1. Save into empty slot 0 commits immediately; overwriting occupied slot 0 asks for confirm!
+        rt.dispatch(UiAction::SaveSlot(0));
+        let cmds = rt.take_commands();
+        assert!(cmds.iter().any(|c| matches!(c, HostCommand::SaveSlot { slot: 0, .. })));
+        rt.dispatch(UiAction::SaveSlot(0));
+        assert!(rt.take_commands().is_empty(), "overwrite should wait for confirm");
+        rt.dispatch(UiAction::ConfirmPending);
+        assert!(rt
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, HostCommand::SaveSlot { slot: 0, .. })));
+
+        // 2. Delete slot 0 also asks for confirm
+        rt.dispatch(UiAction::DeleteSlot(0));
+        assert!(rt.take_commands().is_empty(), "delete should wait for confirm");
+        rt.dispatch(UiAction::CancelPending);
+        assert!(rt.slots[0].exists);
+
+        // 3. QuickSave & AutoSave + try_resume_latest picks newest timestamp
+        rt.set_unix_time(1_760_000_200);
+        rt.dispatch(UiAction::QuickSave);
+        assert!(rt
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, HostCommand::SaveQuick { .. })));
+        rt.set_unix_time(1_760_000_300);
+        rt.emit_autosave();
+        assert!(rt
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, HostCommand::SaveAuto { .. })));
+        assert!(rt.try_resume_latest());
+        assert!(rt
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, HostCommand::RequestLoadAuto)));
+
+        // 4. History wheel routing scrolls history instead of rolling back Story!
+        rt.dispatch(UiAction::Advance);
+        rt.dispatch(UiAction::Advance);
+        rt.dispatch(UiAction::OpenHistory);
+        rt.scroll_wheel(-100.0);
+        assert_eq!(rt.screen, Screen::History);
+        assert!(rt.history_scroll > 0);
+        rt.dispatch(UiAction::CloseOverlay);
+
+        // 5. External translation patch adds a new locale without rebuilding .nirpak!
+        let applied = rt
+            .load_translation_patch("ja", r#"{"texts":{"0":"最初の一行","1":"二行目"}}"#)
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert!(rt.program().meta.locales.contains(&"ja".to_owned()));
+        assert_eq!(rt.vm().dialogue.as_ref().unwrap().full_text, "二行目");
+        rt.dispatch(UiAction::ToggleBilingual);
+        assert!(rt.prefs.bilingual);
     }
 }
