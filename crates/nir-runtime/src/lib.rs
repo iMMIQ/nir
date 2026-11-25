@@ -22,6 +22,9 @@ const PROFILE_FLUSH_INTERVAL_US: u64 = 5_000_000;
 const VOICE_REPLAY_CHANNEL: ChannelId = ChannelId(7);
 const AUTOSAVE_LINE_INTERVAL: u32 = 8;
 const LOADING_INDICATOR_DELAY_US: u64 = 150_000;
+const OVERLAY_ANIM_US: u64 = 165_000;
+const TOAST_FADE_US: u64 = 160_000;
+const DIALOGUE_FADE_US: u64 = 85_000;
 
 /// Typed commands sent from `Runtime` to the platform host (Native / Web / Mobile).
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +115,18 @@ pub struct Runtime {
     hovered_hit: Option<u32>,
     pressed_hit: Option<u32>,
     pressed_started_on_hit: bool,
+    hud_toolbar_hovered: bool,
     pub safe_insets: SafeInsets,
     pub input_mode: InputMode,
     gestures: TouchGestureEngine,
     toast: Option<(String, u64)>,
+    toast_elapsed_us: u64,
+    overlay_anim_us: u64,
+    dialogue_fade_us: u64,
+    last_dialogue_key: Option<(TextId, usize)>,
+    ui_time_us: u64,
+    host_top_left_pad: f32,
+    host_top_right_pad: f32,
     loaded_assets: BTreeSet<AssetId>,
     /// Tracks in-flight asset requests and whether they have already been promoted to `urgent`.
     requested_assets: BTreeMap<AssetId, bool>,
@@ -189,10 +200,18 @@ impl Runtime {
             hovered_hit: None,
             pressed_hit: None,
             pressed_started_on_hit: false,
+            hud_toolbar_hovered: false,
             safe_insets: SafeInsets::default(),
             input_mode: InputMode::Pointer,
             gestures: TouchGestureEngine::default(),
             toast: None,
+            toast_elapsed_us: 0,
+            overlay_anim_us: OVERLAY_ANIM_US,
+            dialogue_fade_us: DIALOGUE_FADE_US,
+            last_dialogue_key: None,
+            ui_time_us: 0,
+            host_top_left_pad: 0.0,
+            host_top_right_pad: 0.0,
             loaded_assets: BTreeSet::new(),
             requested_assets: BTreeMap::new(),
             commands: Vec::new(),
@@ -242,7 +261,58 @@ impl Runtime {
 
     pub fn show_toast(&mut self, message: impl Into<String>, duration_ms: u64) {
         self.toast = Some((message.into(), duration_ms.saturating_mul(1000)));
+        self.toast_elapsed_us = if self.prefs.reduced_motion {
+            TOAST_FADE_US
+        } else {
+            0
+        };
         self.dirty = true;
+    }
+
+    pub fn set_host_top_chrome_pads(&mut self, left: f32, right: f32) {
+        let l = left.clamp(0.0, 220.0);
+        let r = right.clamp(0.0, 220.0);
+        if (self.host_top_left_pad - l).abs() > 0.5 || (self.host_top_right_pad - r).abs() > 0.5 {
+            self.host_top_left_pad = l;
+            self.host_top_right_pad = r;
+            self.dirty = true;
+        }
+    }
+
+    pub fn has_hovered_hit(&self) -> bool {
+        self.hovered_hit.is_some()
+    }
+
+    pub fn is_story_reading(&self) -> bool {
+        self.screen == Screen::Story
+            && self.viewing_cg.is_none()
+            && self.pending_confirm.is_none()
+    }
+
+    pub fn stage_rect(&self) -> [f32; 4] {
+        self.last_packet.stage_rect
+    }
+
+    fn restart_overlay_anim(&mut self) {
+        self.overlay_anim_us = if self.prefs.reduced_motion {
+            OVERLAY_ANIM_US
+        } else {
+            0
+        };
+    }
+
+    fn is_waiting_dialogue_click(&self) -> bool {
+        self.screen == Screen::Story
+            && !self.interface_hidden
+            && self.vm.choice.is_none()
+            && !self.auto
+            && !self.skip
+            && !self.hold_skip
+            && self
+                .vm
+                .dialogue
+                .as_ref()
+                .is_some_and(|d| d.finished || d.paused_for_click)
     }
 
     pub fn mark_asset_loaded(&mut self, id: AssetId) {
@@ -613,6 +683,17 @@ impl Runtime {
         if self.toast.is_some() || self.gestures.needs_clock() {
             return true;
         }
+        if !self.prefs.reduced_motion {
+            if self.overlay_anim_us < OVERLAY_ANIM_US {
+                return true;
+            }
+            if self.screen == Screen::Story && self.dialogue_fade_us < DIALOGUE_FADE_US {
+                return true;
+            }
+            if self.is_waiting_dialogue_click() {
+                return true;
+            }
+        }
         if self.has_urgent_image_loading() && self.urgent_loading_us < LOADING_INDICATOR_DELAY_US {
             return true;
         }
@@ -627,8 +708,21 @@ impl Runtime {
         let hit = self.last_packet.hit_test(x, y);
         let next = hit.map(|h| h.id);
         let is_choice_hit = hit.is_some_and(|h| matches!(h.action, UiAction::Choose(_)));
-        if next != self.hovered_hit {
+        let is_toolbar_hit = hit.is_some_and(|h| {
+            matches!(
+                h.action,
+                UiAction::ToggleAuto
+                    | UiAction::ToggleSkip
+                    | UiAction::OpenHistory
+                    | UiAction::Rollback
+                    | UiAction::OpenSaves { save_mode: true }
+                    | UiAction::ToggleHideUi
+                    | UiAction::OpenMenu
+            )
+        });
+        if next != self.hovered_hit || is_toolbar_hit != self.hud_toolbar_hovered {
             self.hovered_hit = next;
+            self.hud_toolbar_hovered = is_toolbar_hit;
             if is_choice_hit {
                 self.play_choice_hover_se();
             }
@@ -920,6 +1014,7 @@ impl Runtime {
                     self.skip = false;
                     self.return_screen = Screen::Story;
                     self.screen = Screen::Menu;
+                    self.restart_overlay_anim();
                     self.commands.push(HostCommand::PauseAudioBus {
                         bus: AudioBus::Voice,
                         paused: true,
@@ -955,12 +1050,14 @@ impl Runtime {
                 }
                 self.saves_page = 0;
                 self.screen = Screen::Saves { save_mode };
+                self.restart_overlay_anim();
             }
             UiAction::OpenSettings => {
                 if matches!(self.screen, Screen::Title | Screen::Story | Screen::Menu) {
                     self.return_screen = self.screen;
                 }
                 self.screen = Screen::Settings;
+                self.restart_overlay_anim();
             }
             UiAction::OpenHistory => {
                 if matches!(self.screen, Screen::Story | Screen::Menu) {
@@ -968,6 +1065,7 @@ impl Runtime {
                 }
                 self.history_scroll = 0;
                 self.screen = Screen::History;
+                self.restart_overlay_anim();
             }
             UiAction::OpenGallery => {
                 if matches!(self.screen, Screen::Title | Screen::Story | Screen::Menu) {
@@ -976,6 +1074,7 @@ impl Runtime {
                 self.gallery_page = 0;
                 self.viewing_cg = None;
                 self.screen = Screen::Gallery;
+                self.restart_overlay_anim();
             }
             UiAction::SaveSlot(slot) => {
                 if self.frozen_vm.is_some() {
@@ -983,6 +1082,7 @@ impl Runtime {
                 }
                 if self.slots.iter().any(|s| s.slot == slot && s.exists) {
                     self.pending_confirm = Some(ConfirmKind::OverwriteSlot(slot));
+                    self.restart_overlay_anim();
                     return;
                 }
                 self.commit_save_slot(slot);
@@ -994,6 +1094,7 @@ impl Runtime {
             UiAction::DeleteSlot(slot) => {
                 if self.slots.iter().any(|s| s.slot == slot && s.exists) {
                     self.pending_confirm = Some(ConfirmKind::DeleteSlot(slot));
+                    self.restart_overlay_anim();
                 }
             }
             UiAction::ConfirmPending => {
@@ -1113,7 +1214,27 @@ impl Runtime {
                 self.viewing_cg = None;
             }
             UiAction::SettingsTab(tab) => {
-                self.settings_tab = tab.min(1);
+                self.settings_tab = tab.min(2);
+            }
+            UiAction::SetDialogueOpacity(v) => {
+                self.prefs.dialogue_opacity = v.clamp(0.45, 1.0);
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleAmbientBackdrop => {
+                self.prefs.ambient_backdrop = !self.prefs.ambient_backdrop;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleImageSharpening => {
+                self.prefs.image_sharpening = !self.prefs.image_sharpening;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+            }
+            UiAction::ToggleTextOutline => {
+                self.prefs.text_outline = !self.prefs.text_outline;
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
             }
             UiAction::ReturnShelf => {
                 self.emit_autosave();
@@ -1353,11 +1474,58 @@ impl Runtime {
         }
 
         if let Some((_, rem)) = &mut self.toast {
+            self.toast_elapsed_us = self.toast_elapsed_us.saturating_add(delta_us);
             if delta_us >= *rem {
                 self.toast = None;
+                self.toast_elapsed_us = 0;
                 self.dirty = true;
             } else {
                 *rem -= delta_us;
+                if !self.prefs.reduced_motion
+                    && (self.toast_elapsed_us <= TOAST_FADE_US + delta_us || *rem <= TOAST_FADE_US)
+                {
+                    self.dirty = true;
+                }
+            }
+        }
+
+        if !self.prefs.reduced_motion && self.overlay_anim_us < OVERLAY_ANIM_US {
+            self.overlay_anim_us = self
+                .overlay_anim_us
+                .saturating_add(delta_us)
+                .min(OVERLAY_ANIM_US);
+            self.dirty = true;
+        }
+
+        if !self.prefs.reduced_motion && self.screen == Screen::Story {
+            let cur_dlg = self.vm.dialogue.as_ref().map(|d| (d.text_id, d.full_text.len(), d.finished));
+            let cur_key = cur_dlg.map(|(id, len, _)| (id, len));
+            if cur_key != self.last_dialogue_key {
+                let had_prev = self.last_dialogue_key.is_some();
+                self.last_dialogue_key = cur_key;
+                // Only apply subtle line-swap fade when instantly displaying a subsequent line
+                // (typewriter lines already reveal smoothly and keep sub-grapheme dirty-gating intact!).
+                if had_prev && cur_dlg.is_some_and(|(_, _, fin)| fin) && !self.skip && !self.hold_skip
+                {
+                    self.dialogue_fade_us = 0;
+                    self.dirty = true;
+                } else {
+                    self.dialogue_fade_us = DIALOGUE_FADE_US;
+                }
+            }
+            if self.dialogue_fade_us < DIALOGUE_FADE_US {
+                self.dialogue_fade_us = self
+                    .dialogue_fade_us
+                    .saturating_add(delta_us)
+                    .min(DIALOGUE_FADE_US);
+                self.dirty = true;
+            }
+            if self.is_waiting_dialogue_click() {
+                let prev_step = self.ui_time_us / 33_000;
+                self.ui_time_us = self.ui_time_us.wrapping_add(delta_us);
+                if self.ui_time_us / 33_000 != prev_step {
+                    self.dirty = true;
+                }
             }
         }
 
@@ -1447,6 +1615,25 @@ impl Runtime {
         if !self.dirty && !size_changed {
             return None;
         }
+        let overlay_anim = if self.prefs.reduced_motion {
+            1.0
+        } else {
+            (self.overlay_anim_us as f32 / OVERLAY_ANIM_US as f32).clamp(0.0, 1.0)
+        };
+        let toast_anim = if self.prefs.reduced_motion {
+            1.0
+        } else if let Some((_, rem)) = &self.toast {
+            let enter = (self.toast_elapsed_us as f32 / TOAST_FADE_US as f32).clamp(0.0, 1.0);
+            let exit = (*rem as f32 / TOAST_FADE_US as f32).clamp(0.0, 1.0);
+            enter.min(exit)
+        } else {
+            1.0
+        };
+        let dialogue_fade = if self.prefs.reduced_motion || self.skip || self.hold_skip {
+            1.0
+        } else {
+            (self.dialogue_fade_us as f32 / DIALOGUE_FADE_US as f32).clamp(0.0, 1.0)
+        };
         let ctx = UiContext {
             vm: &self.vm,
             screen: self.screen,
@@ -1474,6 +1661,13 @@ impl Runtime {
             input_mode: self.input_mode,
             portrait_reader: self.prefs.portrait_reader,
             toast: self.toast.as_ref().map(|(m, _)| m.as_str()),
+            overlay_anim,
+            toast_anim,
+            dialogue_fade,
+            ui_time_s: (self.ui_time_us as f64 / 1_000_000.0) as f32,
+            hud_toolbar_hovered: self.hud_toolbar_hovered,
+            host_top_left_pad: self.host_top_left_pad,
+            host_top_right_pad: self.host_top_right_pad,
         };
         let next = nir_ui::project(&ctx, width, height, &self.messages);
         let assets_updated = self.last_rendered_asset_epoch != self.asset_epoch;

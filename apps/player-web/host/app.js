@@ -360,6 +360,10 @@ class SaveStore {
       portrait_reader: prefs.portrait_reader,
       reduced_motion: prefs.reduced_motion,
       bilingual: prefs.bilingual,
+      dialogue_opacity: prefs.dialogue_opacity,
+      ambient_backdrop: prefs.ambient_backdrop,
+      image_sharpening: prefs.image_sharpening,
+      text_outline: prefs.text_outline,
     };
     fetch(this.userPrefsApi, {
       method: 'PUT',
@@ -1286,11 +1290,15 @@ async function fetchWithCacheApi(url) {
 }
 
 async function main() {
-  setProgress(5, 'Initializing NIR Engine…');
+  const cfg = globalThis.__NIR_CONFIG__ || {};
+  if (loaderEl && cfg.coverUrl) {
+    loaderEl.style.setProperty('--loader-cover', `url("${cfg.coverUrl}")`);
+    loaderEl.classList.add('has-cover');
+  }
+  setProgress(5, cfg.gameTitle ? `正在载入 ${cfg.gameTitle}…` : 'Initializing NIR Engine…');
   if (typeof globalThis.WebAssembly === 'undefined') {
     throw new ReferenceError('WebAssembly is not defined');
   }
-  const cfg = globalThis.__NIR_CONFIG__ || {};
   registerServiceWorker(cfg);
 
   const qs = new URLSearchParams(location.search);
@@ -1364,6 +1372,13 @@ async function main() {
     engine.set_quicksave_summary_json(JSON.stringify(initialSaves.quicksave));
   }
 
+  // Coordinate DOM corner chrome clearance with Canvas HUD capsules so they never collide!
+  const syncChromePads = () => {
+    const leftPad = shelfBtn && !shelfBtn.hidden ? Math.ceil(shelfBtn.offsetWidth || 78) + 12 : 0;
+    const rightPad = fsBtn && !fsBtn.hidden ? Math.ceil(fsBtn.offsetWidth || 40) + 12 : 0;
+    engine.set_host_top_chrome_pads(leftPad, rightPad);
+  };
+
   // Optional back-to-shelf button when launched from NIR Shelf
   if (shelfBtn && shelfUrl) {
     shelfBtn.hidden = false;
@@ -1375,6 +1390,7 @@ async function main() {
       location.href = shelfUrl;
     });
   }
+  syncChromePads();
 
   const fallbackFontUrls = (() => {
     const out = [];
@@ -1491,6 +1507,7 @@ async function main() {
     );
     const inFs = Boolean(document.fullscreenElement);
     fsBtn.hidden = !canFs || inFs;
+    syncChromePads();
   };
   if (fsBtn) {
     fsBtn.addEventListener('click', async () => {
@@ -1741,6 +1758,31 @@ async function main() {
     recoverGpuRenderer();
   });
 
+  // --- Cinema Idle Chrome Auto-Fade & Desktop Pointer Cursor Feedback ---
+  let idleChromeTimer = 0;
+  const setChromeIdle = (idle) => {
+    if (shelfBtn) shelfBtn.classList.toggle('chrome-idle', idle);
+    if (fsBtn) fsBtn.classList.toggle('chrome-idle', idle);
+    canvas.classList.toggle('cursor-idle', idle && !deviceProfile.isMobile);
+  };
+  const wakeChrome = () => {
+    setChromeIdle(false);
+    clearTimeout(idleChromeTimer);
+    if (!deviceProfile.isMobile) {
+      idleChromeTimer = setTimeout(() => {
+        if (engine.is_story_reading() && !engine.has_hovered_hit()) {
+          setChromeIdle(true);
+        }
+      }, 3200);
+    }
+  };
+  const syncPointerCursor = () => {
+    if (!deviceProfile.isMobile) {
+      canvas.classList.toggle('pointer-hover', engine.has_hovered_hit());
+    }
+  };
+  wakeChrome();
+
   // --- Unified Pointer + Multi-Touch Gesture Input ---
   const unlockAudio = () => audio.ensureContext();
   window.addEventListener('touchend', unlockAudio, { passive: true });
@@ -1753,6 +1795,7 @@ async function main() {
 
   canvas.addEventListener('pointerdown', (e) => {
     unlockAudio();
+    wakeChrome();
     const [x, y] = localPos(e);
     if (e.pointerType === 'touch') {
       try { canvas.setPointerCapture(e.pointerId); } catch {}
@@ -1762,11 +1805,13 @@ async function main() {
     }
     if (e.button === 2) {
       engine.cancel_or_menu();
+      syncPointerCursor();
       scheduleFrame();
       return;
     }
     if (e.button === 0 && e.isPrimary) {
       engine.pointer_down(x, y);
+      syncPointerCursor();
       scheduleFrame();
     }
   });
@@ -1778,7 +1823,9 @@ async function main() {
       if (engine.needs_frame()) scheduleFrame();
       return;
     }
+    wakeChrome();
     engine.pointer_move(x, y);
+    syncPointerCursor();
     if (engine.needs_frame()) scheduleFrame();
   });
 
@@ -1793,6 +1840,7 @@ async function main() {
     }
     if (e.button === 0 && e.isPrimary) {
       engine.pointer_up(x, y);
+      syncPointerCursor();
       scheduleFrame();
     }
   });
@@ -1921,18 +1969,41 @@ async function main() {
     if (videoSkipBtn) videoSkipBtn.onclick = null;
   };
 
-  // Lightweight 160x90 WebP thumbnail capture right after rendering a frame
+  // Clean 160x90 WebP thumbnail capture cropped strictly to `stage_rect` (zero letterbox bars!)
+  // and cached during Story reading so manual saves inside the Saves overlay never capture the menu UI!
   const thumbCanvas = document.createElement('canvas');
   thumbCanvas.width = 160;
   thumbCanvas.height = 90;
   const thumbCtx = thumbCanvas.getContext('2d');
+  let cleanStoryThumb = null;
+  let lastThumbCaptureMs = 0;
   const captureStageThumb = () => {
     if (!thumbCtx || !canvas || canvas.width === 0 || canvas.height === 0) return null;
     try {
-      thumbCtx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
-      let url = thumbCanvas.toDataURL('image/webp', 0.65);
+      const sr = engine.stage_rect_phys();
+      let sx = 0, sy = 0, sw = canvas.width, sh = canvas.height;
+      if (sr && sr.length === 4 && sr[2] > 16 && sr[3] > 16) {
+        sx = Math.max(0, Math.min(canvas.width - 1, sr[0]));
+        sy = Math.max(0, Math.min(canvas.height - 1, sr[1]));
+        sw = Math.max(1, Math.min(canvas.width - sx, sr[2]));
+        sh = Math.max(1, Math.min(canvas.height - sy, sr[3]));
+      }
+      // Center-crop stage to 16:9 aspect ratio for crisp, borderless save thumbnails
+      const targetAr = thumbCanvas.width / thumbCanvas.height;
+      const srcAr = sw / sh;
+      if (srcAr > targetAr) {
+        const cropW = sh * targetAr;
+        sx += (sw - cropW) * 0.5;
+        sw = cropW;
+      } else if (srcAr < targetAr) {
+        const cropH = sw / targetAr;
+        sy += (sh - cropH) * 0.35; // Slight upper bias keeps character faces nicely framed!
+        sh = cropH;
+      }
+      thumbCtx.drawImage(canvas, sx, sy, sw, sh, 0, 0, thumbCanvas.width, thumbCanvas.height);
+      let url = thumbCanvas.toDataURL('image/webp', 0.72);
       if (!url || !url.startsWith('data:image/webp')) {
-        url = thumbCanvas.toDataURL('image/jpeg', 0.7);
+        url = thumbCanvas.toDataURL('image/jpeg', 0.75);
       }
       return url && url.length < 32768 ? url : null;
     } catch {
@@ -2163,10 +2234,20 @@ async function main() {
     const dt = ts - lastTs;
     lastTs = ts;
     const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
+    // Keep a fresh, clean (menu-free, borderless) stage thumbnail while actively reading Story!
+    if (engine.is_story_reading() && ts - lastThumbCaptureMs > 650) {
+      const snap = captureStageThumb();
+      if (snap) {
+        cleanStoryThumb = snap;
+        lastThumbCaptureMs = ts;
+      }
+    }
     if (cmdsJson) {
       const cmds = JSON.parse(cmdsJson);
       const hasSaveCmd = cmds.some((c) => c.op === 'save_slot' || c.op === 'save_auto' || c.op === 'save_quick');
-      latestCapturedThumb = hasSaveCmd ? captureStageThumb() : null;
+      latestCapturedThumb = hasSaveCmd
+        ? (engine.is_story_reading() ? (captureStageThumb() || cleanStoryThumb) : (cleanStoryThumb || captureStageThumb()))
+        : null;
       const ranges = [];
       for (const cmd of cmds) {
         if (cmd.op === 'decode_image' || cmd.op === 'preload_audio' || cmd.op === 'play_audio') {

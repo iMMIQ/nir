@@ -167,12 +167,28 @@ pub struct Preferences {
     /// Show secondary/original text alongside translated text when multiple locales exist.
     #[serde(default)]
     pub bilingual: bool,
+    /// Opacity multiplier for the dialogue box surface (0.45..=1.0).
+    #[serde(default = "default_dialogue_opacity")]
+    pub dialogue_opacity: f32,
+    /// Soft blurred stage backdrop filling letterbox margins and modal overlays.
+    #[serde(default = "default_true")]
+    pub ambient_backdrop: bool,
+    /// Subtle contrast-adaptive edge sharpening when upscaling classic lower-res CGs.
+    #[serde(default = "default_true")]
+    pub image_sharpening: bool,
+    /// Crisp 4-way soft text outline for legibility over bright/detailed CGs.
+    #[serde(default = "default_true")]
+    pub text_outline: bool,
     /// Per-character voice volume override (0.0 = muted, 1.0 = full).
     pub character_volumes: BTreeMap<String, f32>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_dialogue_opacity() -> f32 {
+    0.90
 }
 
 impl Default for Preferences {
@@ -194,6 +210,10 @@ impl Default for Preferences {
             fullscreen: false,
             portrait_reader: true,
             bilingual: false,
+            dialogue_opacity: default_dialogue_opacity(),
+            ambient_backdrop: true,
+            image_sharpening: true,
+            text_outline: true,
             character_volumes: BTreeMap::new(),
         }
     }
@@ -211,6 +231,7 @@ impl Preferences {
         self.text_speed = clamp(self.text_speed, 0.0, 8.0, 1.0);
         self.auto_delay_ms = self.auto_delay_ms.min(15_000);
         self.font_scale = clamp(self.font_scale, 0.75, 1.75, 1.0);
+        self.dialogue_opacity = clamp(self.dialogue_opacity, 0.45, 1.0, default_dialogue_opacity());
         self.master_volume = clamp(self.master_volume, 0.0, 1.0, 1.0);
         self.bgm_volume = clamp(self.bgm_volume, 0.0, 1.0, 0.7);
         self.voice_volume = clamp(self.voice_volume, 0.0, 1.0, 0.9);

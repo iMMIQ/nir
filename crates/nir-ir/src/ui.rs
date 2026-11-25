@@ -205,4 +205,9 @@ pub enum UiAction {
     CloseCgViewer,
     SettingsTab(u8),
     ReturnShelf,
+    // Visual experience actions (appended to preserve postcard enum discriminants!)
+    SetDialogueOpacity(f32),
+    ToggleAmbientBackdrop,
+    ToggleImageSharpening,
+    ToggleTextOutline,
 }

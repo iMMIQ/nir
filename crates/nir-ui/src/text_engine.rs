@@ -236,23 +236,47 @@ impl TextEngine {
         if !rich {
             b.set_text(fonts, &r.text, attrs, cosmic_text::Shaping::Advanced);
         } else {
-            let mut spans = Vec::new();
-            let mut pos = 0;
+            // Merge emphasis ranges (warm gold) and explicit per-span colors into non-overlapping slices.
+            let mut styled: Vec<(usize, usize, cosmic_text::Color)> =
+                Vec::with_capacity(r.emphasis.len() + r.color_spans.len());
             for &(start, end) in &r.emphasis {
-                if start >= pos
+                if start < end
                     && end <= r.text.len()
                     && r.text.is_char_boundary(start)
                     && r.text.is_char_boundary(end)
                 {
-                    if start > pos {
-                        spans.push((&r.text[pos..start], attrs.clone()));
-                    }
-                    spans.push((
-                        &r.text[start..end],
-                        attrs.clone().color(cosmic_text::Color::rgb(240, 212, 138)),
-                    ));
-                    pos = end;
+                    styled.push((start, end, cosmic_text::Color::rgb(244, 214, 136)));
                 }
+            }
+            for &(start, end, rgba) in &r.color_spans {
+                if start < end
+                    && end <= r.text.len()
+                    && r.text.is_char_boundary(start)
+                    && r.text.is_char_boundary(end)
+                {
+                    let c = cosmic_text::Color::rgba(
+                        (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        ((rgba[3] * r.color[3]).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    );
+                    styled.push((start, end, c));
+                }
+            }
+            styled.sort_by_key(|&(s, e, _)| (s, e));
+
+            let mut spans = Vec::new();
+            let mut pos = 0;
+            for (start, end, col) in styled {
+                let s = start.max(pos);
+                if s >= end {
+                    continue;
+                }
+                if s > pos {
+                    spans.push((&r.text[pos..s], attrs.clone()));
+                }
+                spans.push((&r.text[s..end], attrs.clone().color(col)));
+                pos = end;
             }
             if pos < r.text.len() {
                 spans.push((&r.text[pos..], attrs.clone()));
@@ -301,7 +325,7 @@ impl TextEngine {
             TextAlign::Center => Some(cosmic_text::Align::Center),
             TextAlign::Right => Some(cosmic_text::Align::Right),
         };
-        let rich = with_emphasis && !r.emphasis.is_empty();
+        let rich = with_emphasis && r.has_rich_colors();
 
         let mut cur_size = r.size.max(6.0);
         let mut cur_lh = r.line_height.max(cur_size * 1.05);
@@ -387,12 +411,12 @@ impl TextEngine {
         self.shapes = self.shapes.saturating_add(1);
     }
 
-    /// Shapes all runs (and any distinct emphasis-stripped shadow buffers) with zero `TextRun` cloning!
+    /// Shapes all runs (and any distinct color-stripped shadow/outline buffers) with zero `TextRun` cloning!
     pub fn layout_texts(&mut self, runs: &[TextRun]) {
-        const TARGET_ENTRIES: usize = 192;
+        const TARGET_ENTRIES: usize = 256;
         for r in runs {
             self.shape_entry(r, r.cache_key, true);
-            if r.shadow.is_some() && !r.emphasis.is_empty() {
+            if (r.shadow.is_some() || r.outline.is_some()) && r.has_rich_colors() {
                 let sk = r.shadow_cache_key();
                 self.shape_entry(r, sk, false);
             }
@@ -402,7 +426,7 @@ impl TextEngine {
             let mut protected: HashSet<u64> = HashSet::with_capacity(runs.len() * 2);
             for r in runs {
                 protected.insert(r.cache_key);
-                if r.shadow.is_some() && !r.emphasis.is_empty() {
+                if (r.shadow.is_some() || r.outline.is_some()) && r.has_rich_colors() {
                     protected.insert(r.shadow_cache_key());
                 }
             }
@@ -448,7 +472,10 @@ mod tests {
             line_height: 36.0,
             color: [1.0, 1.0, 1.0, 1.0],
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some([0.0, 0.0, 240.0, 76.0]),
             font_assets: Vec::new(),

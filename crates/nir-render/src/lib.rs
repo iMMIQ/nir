@@ -68,6 +68,7 @@ struct Vertex {
     uv: [f32; 2],
     color: [f32; 4],
     rect_params: [f32; 4],
+    border_color: [f32; 4],
 }
 
 struct GpuTexture {
@@ -88,6 +89,7 @@ pub struct Renderer {
     pipelines: [wgpu::RenderPipeline; 4],
     mix_pipeline: wgpu::RenderPipeline,
     mip_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: wgpu::RenderPipeline,
     mip_vertices: wgpu::Buffer,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -102,6 +104,8 @@ pub struct Renderer {
     scratch: Option<(GpuTexture, GpuTexture, u32, u32)>,
     scratch_from_sig: Option<u64>,
     scratch_to_sig: Option<u64>,
+    blur_pair: Option<(GpuTexture, GpuTexture, u32, u32)>,
+    blur_stage_sig: Option<u64>,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     scratch_verts: Vec<Vertex>,
@@ -711,7 +715,7 @@ impl Renderer {
         let vlayout = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
         }];
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -779,30 +783,60 @@ impl Renderer {
             cache: None,
         });
 
+        let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("kawase_blur"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &vlayout,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_blur"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let mip_quad = [
             Vertex {
                 pos: [-1.0, 1.0],
                 uv: [0.0, 0.0],
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
+                border_color: [0.0; 4],
             },
             Vertex {
                 pos: [1.0, 1.0],
                 uv: [1.0, 0.0],
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
+                border_color: [0.0; 4],
             },
             Vertex {
                 pos: [-1.0, -1.0],
                 uv: [0.0, 1.0],
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
+                border_color: [0.0; 4],
             },
             Vertex {
                 pos: [1.0, -1.0],
                 uv: [1.0, 1.0],
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
+                border_color: [0.0; 4],
             },
         ];
         let mip_vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -886,6 +920,7 @@ impl Renderer {
             pipelines,
             mix_pipeline,
             mip_pipeline,
+            blur_pipeline,
             mip_vertices,
             layout,
             sampler,
@@ -900,6 +935,8 @@ impl Renderer {
             scratch: None,
             scratch_from_sig: None,
             scratch_to_sig: None,
+            blur_pair: None,
+            blur_stage_sig: None,
             vertices,
             indices,
             scratch_verts: Vec::with_capacity(initial_quads * 4),
@@ -967,6 +1004,8 @@ impl Renderer {
         self.scratch = None;
         self.scratch_from_sig = None;
         self.scratch_to_sig = None;
+        self.blur_pair = None;
+        self.blur_stage_sig = None;
         self.texture_epoch = self.texture_epoch.wrapping_add(1);
         removed
     }
@@ -1533,8 +1572,95 @@ impl Renderer {
             self.scratch_to_sig = None;
         }
 
-        // 1. Prepare text glyphs via glyphon (zero TextRun cloning, cached line_offsets!)
+        // 1. Prepare text glyphs via glyphon (zero TextRun cloning, cached line_offsets, ruby & crisp outlines!)
         self.text.layout_texts(&p.texts);
+
+        // Compute positioned ruby annotations directly from shaped base glyph boxes!
+        let mut ruby_runs: Vec<TextRun> = Vec::new();
+        for r in &p.texts {
+            if r.ruby_spans.is_empty() {
+                continue;
+            }
+            let Some(entry) = self.text.buffers.get(&r.cache_key) else {
+                continue;
+            };
+            let y_draw = if r.valign_center && entry.content_height > 0.0 {
+                r.y + ((r.height - entry.content_height) * 0.5).max(0.0)
+            } else {
+                r.y
+            };
+            let ruby_sz = (entry.effective_size * 0.44).clamp(8.0, 15.0);
+            let offsets = &entry.line_offsets;
+            for (b_start, b_end, ruby_text) in &r.ruby_spans {
+                if ruby_text.is_empty() {
+                    continue;
+                }
+                if let Some(vis) = r.visible_bytes {
+                    if *b_start >= vis {
+                        continue;
+                    }
+                }
+                let mut min_x = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut line_y = None;
+                for run in entry.buffer.layout_runs() {
+                    let base = *offsets.get(run.line_i).unwrap_or(&0);
+                    for g in run.glyphs {
+                        let gs = base + g.start;
+                        let ge = base + g.end;
+                        if ge > *b_start && gs < *b_end {
+                            if line_y.is_none() {
+                                line_y = Some(y_draw + run.line_top - r.scroll);
+                            }
+                            min_x = min_x.min(r.x + g.x);
+                            max_x = max_x.max(r.x + g.x + g.w);
+                        }
+                    }
+                    if line_y.is_some() {
+                        break;
+                    }
+                }
+                if let Some(ly) = line_y {
+                    if max_x > min_x {
+                        let span_w = max_x - min_x;
+                        let ruby_w = (ruby_text.chars().count().max(1) as f32 * ruby_sz * 1.15)
+                            .max(span_w + 8.0);
+                        let rx = min_x + (span_w - ruby_w) * 0.5;
+                        let ry = ly - ruby_sz * 0.92;
+                        let mut rr = TextRun {
+                            text: ruby_text.clone(),
+                            visible_bytes: None,
+                            x: rx,
+                            y: ry,
+                            width: ruby_w,
+                            height: ruby_sz * 1.35,
+                            size: ruby_sz,
+                            line_height: ruby_sz * 1.18,
+                            color: r.color,
+                            emphasis: Vec::new(),
+                            color_spans: Vec::new(),
+                            ruby_spans: Vec::new(),
+                            shadow: r.shadow,
+                            outline: r.outline,
+                            scroll: 0.0,
+                            clip: r.clip.map(|[cx, cy, cw, ch]| [cx, cy - ruby_sz, cw, ch + ruby_sz]),
+                            font_assets: r.font_assets.clone(),
+                            align: nir_ir::TextAlign::Center,
+                            valign_center: false,
+                            auto_fit: false,
+                            inline_images: Vec::new(),
+                            cache_key: 0,
+                        };
+                        rr.compute_key();
+                        ruby_runs.push(rr);
+                    }
+                }
+            }
+        }
+        if !ruby_runs.is_empty() {
+            self.text.layout_texts(&ruby_runs);
+        }
+
         let cur_vp = [self.config.width, self.config.height];
         if cur_vp != self.last_viewport {
             self.viewport.update(
@@ -1546,10 +1672,10 @@ impl Renderer {
             );
             self.last_viewport = cur_vp;
         }
-        let mut areas = Vec::with_capacity(p.texts.len() * 2);
-        for r in &p.texts {
+        let mut areas = Vec::with_capacity((p.texts.len() + ruby_runs.len()) * 5);
+        for r in p.texts.iter().chain(ruby_runs.iter()) {
+            let sk = r.shadow_cache_key();
             if let Some(s) = r.shadow {
-                let sk = r.shadow_cache_key();
                 if let Some(entry) = self.text.buffers.get(&sk) {
                     let scol = [s.color[0], s.color[1], s.color[2], s.color[3] * r.color[3]];
                     Self::push_text_areas(
@@ -1561,6 +1687,25 @@ impl Renderer {
                         scol,
                         dpr,
                     );
+                }
+            }
+            if let Some(ocol) = r.outline {
+                if ocol[3] > 0.01 {
+                    if let Some(entry) = self.text.buffers.get(&sk) {
+                        let off = (entry.effective_size * 0.044).clamp(0.8, 1.35);
+                        let oc = [ocol[0], ocol[1], ocol[2], ocol[3] * r.color[3]];
+                        for (dx, dy) in [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off)] {
+                            Self::push_text_areas(
+                                &mut areas,
+                                entry,
+                                r,
+                                r.x + dx,
+                                r.y + dy,
+                                oc,
+                                dpr,
+                            );
+                        }
+                    }
                 }
             }
             if let Some(entry) = self.text.buffers.get(&r.cache_key) {
@@ -1618,49 +1763,72 @@ impl Renderer {
             }
         }
 
-        // 2. Build indexed vertices (4 vertices per quad instead of 6!)
+        // 2. Build indexed vertices (4 vertices per quad; supports smooth gradients, SDF borders & CAS sharpening!)
         let mut verts = std::mem::take(&mut self.scratch_verts);
         verts.clear();
-        let append = |verts: &mut Vec<Vertex>, quads: &[Quad], vw: f32, vh: f32| {
+        let premul = |c: [f32; 4]| -> [f32; 4] {
+            let a = c[3];
+            [
+                linear(c[0]) * a,
+                linear(c[1]) * a,
+                linear(c[2]) * a,
+                a,
+            ]
+        };
+        let append_in = |verts: &mut Vec<Vertex>, quads: &[Quad], ox: f32, oy: f32, vw: f32, vh: f32| {
             let inv_w = 2.0 / vw.max(1.0);
             let inv_h = 2.0 / vh.max(1.0);
             for q in quads {
                 let [x, y, w, h] = q.rect;
-                let color = if q.special == SpecialQuad::StageTransition {
-                    p.transition.shader_params(p.transition_progress)
+                let (c0, c1) = if q.special == SpecialQuad::StageTransition {
+                    let sp = p.transition.shader_params(p.transition_progress);
+                    (sp, sp)
                 } else {
-                    let a = q.color[3];
-                    [
-                        linear(q.color[0]) * a,
-                        linear(q.color[1]) * a,
-                        linear(q.color[2]) * a,
-                        a,
-                    ]
+                    let start = premul(q.color);
+                    let end = q.color_end.map_or(start, premul);
+                    (start, end)
+                };
+                let vcols = if q.gradient_horizontal {
+                    [c0, c1, c0, c1]
+                } else {
+                    [c0, c0, c1, c1]
                 };
                 let corners = q
                     .corners
                     .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
                 let [u0, v0, u1, v1] = q.uv;
                 let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
-                let rect_params = if q.corner_radius > 0.0 {
-                    [w.max(1.0), h.max(1.0), q.corner_radius, 0.0]
+                let rect_params = if q.corner_radius > 0.0 || q.border_width > 0.0 {
+                    [w.max(1.0), h.max(1.0), q.corner_radius, q.border_width]
+                } else {
+                    [w.max(1.0), h.max(1.0), 0.0, 0.0]
+                };
+                let border_color = if q.border_width > 0.0 && q.border_color[3] > 0.0 {
+                    premul(q.border_color)
+                } else if q.sharpen > 0.01 && q.asset.is_some() && q.special == SpecialQuad::None {
+                    // Sentinel border_color.a < -0.5 enables CAS-lite edge sharpening in quad.wgsl!
+                    [q.sharpen.clamp(0.0, 1.0), 0.0, 0.0, -1.0]
                 } else {
                     [0.0; 4]
                 };
                 for idx in 0..4 {
                     verts.push(Vertex {
-                        pos: [corners[idx][0] * inv_w - 1.0, 1.0 - corners[idx][1] * inv_h],
+                        pos: [
+                            (corners[idx][0] - ox) * inv_w - 1.0,
+                            1.0 - (corners[idx][1] - oy) * inv_h,
+                        ],
                         uv: uvs[idx],
-                        color,
+                        color: vcols[idx],
                         rect_params,
+                        border_color,
                     });
                 }
             }
         };
-        append(&mut verts, &p.quads, p.width, p.height);
+        append_in(&mut verts, &p.quads, 0.0, 0.0, p.width, p.height);
         let inline_quad_start = verts.len() / 4;
         if !inline_quads.is_empty() {
-            append(&mut verts, &inline_quads, p.width, p.height);
+            append_in(&mut verts, &inline_quads, 0.0, 0.0, p.width, p.height);
         }
 
         // Determine whether transition offscreen passes need re-rendering (skip static source/target!)
@@ -1686,15 +1854,76 @@ impl Renderer {
                 if self.scratch_from_sig != Some(from_sig) {
                     render_from = true;
                     tr_from_quad_start = verts.len() / 4;
-                    append(&mut verts, &p.transition_from, sw as f32, sh as f32);
+                    append_in(&mut verts, &p.transition_from, 0.0, 0.0, sw as f32, sh as f32);
                     self.scratch_from_sig = Some(from_sig);
                 }
                 if self.scratch_to_sig != Some(to_sig) {
                     render_to = true;
                     tr_to_quad_start = verts.len() / 4;
-                    append(&mut verts, &p.transition_to, sw as f32, sh as f32);
+                    append_in(&mut verts, &p.transition_to, 0.0, 0.0, sw as f32, sh as f32);
                     self.scratch_to_sig = Some(to_sig);
                 }
+            }
+        }
+
+        // Optional 1/8-res 2-Pass Kawase Blur of the pure stage for AmbientBackdrop & FrostedBackdrop!
+        // Cached by stage quad signature so static scenes pay 0 blur passes!
+        let mut run_blur = false;
+        let mut blur_stage_quad_start = verts.len() / 4;
+        let mut blur_pass1_quad = 0usize;
+        let mut blur_pass2_quad = 0usize;
+        let [s0, s1] = p.stage_quad_range;
+        let stage_slice = if s0 < s1 && s1 <= p.quads.len() {
+            &p.quads[s0..s1]
+        } else {
+            &[][..]
+        };
+        if p.needs_blur && !stage_slice.is_empty() && p.stage_rect[2] > 2.0 && p.stage_rect[3] > 2.0
+        {
+            let bw = (p.stage_size[0].max(160) / 6).clamp(112, 224);
+            let bh = (p.stage_size[1].max(90) / 6).clamp(64, 150);
+            let need_alloc = !self
+                .blur_pair
+                .as_ref()
+                .is_some_and(|(_, _, w, h)| *w == bw && *h == bh);
+            if need_alloc {
+                self.blur_pair = Some((self.offscreen(bw, bh), self.offscreen(bw, bh), bw, bh));
+                self.blur_stage_sig = None;
+            }
+            let mut bsig = hash_transition_quads(stage_slice, bw, bh, self.texture_epoch);
+            if has_transition {
+                let qprog = (p.transition_progress * 10.0).round() as u64;
+                bsig ^= qprog.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            }
+            if self.blur_stage_sig != Some(bsig) {
+                run_blur = true;
+                blur_stage_quad_start = verts.len() / 4;
+                let [srx, sry, srw, srh] = p.stage_rect;
+                append_in(&mut verts, stage_slice, srx, sry, srw, srh);
+
+                // Fullscreen quad for Kawase pass 1 (radius 1.45 texels) & pass 2 (radius 2.65 texels)
+                let push_fs_blur = |verts: &mut Vec<Vertex>, radius: f32| -> usize {
+                    let qidx = verts.len() / 4;
+                    let rp = [radius, radius, 0.0, 0.0];
+                    for (pos, uv) in [
+                        ([-1.0, 1.0], [0.0, 0.0]),
+                        ([1.0, 1.0], [1.0, 0.0]),
+                        ([-1.0, -1.0], [0.0, 1.0]),
+                        ([1.0, -1.0], [1.0, 1.0]),
+                    ] {
+                        verts.push(Vertex {
+                            pos,
+                            uv,
+                            color: [1.0; 4],
+                            rect_params: rp,
+                            border_color: [0.0; 4],
+                        });
+                    }
+                    qidx
+                };
+                blur_pass1_quad = push_fs_blur(&mut verts, 1.45);
+                blur_pass2_quad = push_fs_blur(&mut verts, 2.65);
+                self.blur_stage_sig = Some(bsig);
             }
         }
 
@@ -1794,11 +2023,76 @@ impl Renderer {
                         &mut pass,
                         quads,
                         qstart,
+                        [0.0, 0.0],
                         *sw as f32,
                         *sh as f32,
                         [*sw, *sh],
                         p,
                     );
+                }
+            }
+        }
+
+        // 4b. Optional 1/8-res 2-Pass Kawase Blur of pure stage (cached across static frames!)
+        if run_blur {
+            if let Some((blur_a, blur_b, bw, bh)) = &self.blur_pair {
+                // Step 0: Downsample pure stage quads into `blur_a`
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("blur_stage_capture"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &blur_a.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.015,
+                                    g: 0.020,
+                                    b: 0.032,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    self.paint_quads(
+                        &mut pass,
+                        stage_slice,
+                        blur_stage_quad_start,
+                        [p.stage_rect[0], p.stage_rect[1]],
+                        p.stage_rect[2],
+                        p.stage_rect[3],
+                        [*bw, *bh],
+                        p,
+                    );
+                }
+                // Step 1: Kawase blur pass 1 (blur_a -> blur_b)
+                for (src_tex, dst_tex, qidx) in [
+                    (blur_a, blur_b, blur_pass1_quad),
+                    (blur_b, blur_a, blur_pass2_quad),
+                ] {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("kawase_blur_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &dst_tex.view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.blur_pipeline);
+                    pass.set_bind_group(0, &src_tex.bind, &[]);
+                    pass.set_vertex_buffer(0, self.vertices.slice(..));
+                    pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    let is = (qidx * 6) as u32;
+                    pass.draw_indexed(is..(is + 6), 0, 0..1);
                 }
             }
         }
@@ -1811,7 +2105,12 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.008,
+                            g: 0.011,
+                            b: 0.018,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1820,12 +2119,13 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             let phys = [self.config.width, self.config.height];
-            self.paint_quads(&mut pass, &p.quads, 0, p.width, p.height, phys, p);
+            self.paint_quads(&mut pass, &p.quads, 0, [0.0, 0.0], p.width, p.height, phys, p);
             if !inline_quads.is_empty() {
                 self.paint_quads(
                     &mut pass,
                     &inline_quads,
                     inline_quad_start,
+                    [0.0, 0.0],
                     p.width,
                     p.height,
                     phys,
@@ -1853,6 +2153,7 @@ impl Renderer {
         pass: &mut wgpu::RenderPass<'_>,
         quads: &[Quad],
         quad_offset: usize,
+        origin: [f32; 2],
         vw: f32,
         vh: f32,
         physical: [u32; 2],
@@ -1880,11 +2181,11 @@ impl Renderer {
         };
 
         for (i, q) in quads.iter().enumerate() {
-            let clip = q.clip.unwrap_or([0.0, 0.0, vw, vh]);
-            let x = (clip[0] * sx).max(0.0) as u32;
-            let y = (clip[1] * sy).max(0.0) as u32;
-            let r = ((clip[0] + clip[2]) * sx).clamp(0.0, physical[0] as f32) as u32;
-            let b = ((clip[1] + clip[3]) * sy).clamp(0.0, physical[1] as f32) as u32;
+            let clip = q.clip.unwrap_or([origin[0], origin[1], vw, vh]);
+            let x = ((clip[0] - origin[0]) * sx).max(0.0) as u32;
+            let y = ((clip[1] - origin[1]) * sy).max(0.0) as u32;
+            let r = (((clip[0] - origin[0]) + clip[2]) * sx).clamp(0.0, physical[0] as f32) as u32;
+            let b = (((clip[1] - origin[1]) + clip[3]) * sy).clamp(0.0, physical[1] as f32) as u32;
             if r <= x || b <= y {
                 flush(pass, &mut batch);
                 continue;
@@ -1912,6 +2213,27 @@ impl Renderer {
                         .and_then(|id| self.textures.get(&id))
                         .unwrap_or(&self.white_tex);
                     pass.set_bind_group(2, &mask.bind, &[]);
+                    pass.draw_indexed(is..ie, 0, 0..1);
+                }
+                continue;
+            }
+
+            if matches!(
+                q.special,
+                SpecialQuad::AmbientBackdrop | SpecialQuad::FrostedBackdrop
+            ) {
+                flush(pass, &mut batch);
+                if let Some((blur_a, _, _, _)) = &self.blur_pair {
+                    let pl_id = q.blend as u8;
+                    if cur_pipeline != Some(pl_id) {
+                        pass.set_pipeline(&self.pipelines[q.blend as usize]);
+                        cur_pipeline = Some(pl_id);
+                    }
+                    if cur_scissor != Some(scissor) {
+                        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                        cur_scissor = Some(scissor);
+                    }
+                    pass.set_bind_group(0, &blur_a.bind, &[]);
                     pass.draw_indexed(is..ie, 0, 0..1);
                 }
                 continue;
@@ -2106,5 +2428,147 @@ mod tests {
         let rgba = decode_ktx2_to_rgba_premultiplied(&parsed).unwrap();
         assert_eq!(rgba.len(), 4 * 4 * 4);
         assert!(rgba[0] > 240 && rgba[1] < 10 && rgba[2] < 10 && rgba[3] == 255);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn quad_wgsl_compiles_cleanly_on_wgpu_validator() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        fn poll_sync<F: Future>(fut: F) -> F::Output {
+            let mut fut = pin!(fut);
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            loop {
+                if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        if wgpu::Instance::enabled_backend_features().is_empty() {
+            return;
+        }
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = poll_sync(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|_| {
+            poll_sync(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        });
+        let Ok(adapter) = adapter else {
+            return;
+        };
+        let Ok((device, _queue)) = poll_sync(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("wgsl_validate"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                .using_resolution(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        })) else {
+            return;
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("nir_quad_validate"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
+        });
+        let vlayout = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
+        }];
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        for entry in ["fs", "fs_blur"] {
+            let _ = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &vlayout,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+        }
+        let mix_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout, &layout, &layout],
+            push_constant_ranges: &[],
+        });
+        let _ = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fs_mix"),
+            layout: Some(&mix_pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &vlayout,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_mix"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
     }
 }

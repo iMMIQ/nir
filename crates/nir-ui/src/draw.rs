@@ -7,6 +7,10 @@ pub enum SpecialQuad {
     #[default]
     None,
     StageTransition,
+    /// Blurred, dimmed stage backdrop filling letterbox margins & portrait gaps.
+    AmbientBackdrop,
+    /// Blurred stage backdrop behind modal overlays (frosted glass depth).
+    FrostedBackdrop,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,12 +21,22 @@ pub struct Quad {
     /// Optional 4 transformed corners `[TL, TR, BL, BR]` for rotated / affine layers.
     pub corners: Option<[[f32; 2]; 4]>,
     pub color: [f32; 4],
+    /// Optional secondary gradient color (bottom edge when `gradient_horizontal == false`,
+    /// right edge when `gradient_horizontal == true`). Zero extra shader branches!
+    pub color_end: Option<[f32; 4]>,
+    pub gradient_horizontal: bool,
     pub asset: Option<AssetId>,
     pub blend: BlendMode,
     pub clip: Option<[f32; 4]>,
     pub special: SpecialQuad,
     /// Optional SDF corner radius in logical pixels (0 = sharp rectangle).
     pub corner_radius: f32,
+    /// Optional single-pass SDF border width in logical pixels (0 = no border).
+    pub border_width: f32,
+    /// Single-pass SDF border RGBA (straight sRGB, ignored when `border_width <= 0`).
+    pub border_color: [f32; 4],
+    /// Optional CAS-lite edge sharpening strength (`0.0..=1.0`) for upscaled classic CGs.
+    pub sharpen: f32,
 }
 
 impl Quad {
@@ -32,11 +46,32 @@ impl Quad {
             uv: [0.0, 0.0, 1.0, 1.0],
             corners: None,
             color,
+            color_end: None,
+            gradient_horizontal: false,
             asset: None,
             blend: BlendMode::Normal,
             clip: None,
             special: SpecialQuad::None,
             corner_radius: 0.0,
+            border_width: 0.0,
+            border_color: [0.0; 4],
+            sharpen: 0.0,
+        }
+    }
+
+    pub fn gradient_v(rect: [f32; 4], top: [f32; 4], bottom: [f32; 4]) -> Self {
+        Self {
+            color_end: Some(bottom),
+            gradient_horizontal: false,
+            ..Self::solid(rect, top)
+        }
+    }
+
+    pub fn gradient_h(rect: [f32; 4], left: [f32; 4], right: [f32; 4]) -> Self {
+        Self {
+            color_end: Some(right),
+            gradient_horizontal: true,
+            ..Self::solid(rect, left)
         }
     }
 
@@ -47,17 +82,27 @@ impl Quad {
         }
     }
 
+    pub fn panel(
+        rect: [f32; 4],
+        fill_top: [f32; 4],
+        fill_bottom: Option<[f32; 4]>,
+        border: [f32; 4],
+        border_width: f32,
+        corner_radius: f32,
+    ) -> Self {
+        Self {
+            color_end: fill_bottom,
+            corner_radius,
+            border_width: if border[3] > 0.01 { border_width } else { 0.0 },
+            border_color: border,
+            ..Self::solid(rect, fill_top)
+        }
+    }
+
     pub fn image(rect: [f32; 4], asset: AssetId) -> Self {
         Self {
-            rect,
-            uv: [0.0, 0.0, 1.0, 1.0],
-            corners: None,
-            color: [1.0, 1.0, 1.0, 1.0],
             asset: Some(asset),
-            blend: BlendMode::Normal,
-            clip: None,
-            special: SpecialQuad::None,
-            corner_radius: 0.0,
+            ..Self::solid(rect, [1.0, 1.0, 1.0, 1.0])
         }
     }
 
@@ -81,7 +126,13 @@ pub struct TextRun {
     pub line_height: f32,
     pub color: [f32; 4],
     pub emphasis: Vec<(usize, usize)>,
+    /// Rich per-span colors `(byte_start, byte_end, rgba)` from script markup.
+    pub color_spans: Vec<(usize, usize, [f32; 4])>,
+    /// Ruby phonetic annotations `(byte_start, byte_end, ruby_text)` rendered above base glyphs.
+    pub ruby_spans: Vec<(usize, usize, String)>,
     pub shadow: Option<TextShadow>,
+    /// Optional 4-way soft outline RGBA for crisp legibility over bright/detailed CGs.
+    pub outline: Option<[f32; 4]>,
     pub scroll: f32,
     pub clip: Option<[f32; 4]>,
     pub font_assets: Vec<AssetId>,
@@ -105,16 +156,23 @@ impl TextRun {
         self.size.to_bits().hash(&mut h);
         self.line_height.to_bits().hash(&mut h);
         self.emphasis.hash(&mut h);
+        for &(s, e, c) in &self.color_spans {
+            s.hash(&mut h);
+            e.hash(&mut h);
+            for ch in c {
+                ch.to_bits().hash(&mut h);
+            }
+        }
         self.font_assets.hash(&mut h);
         (self.align as u8).hash(&mut h);
         self.auto_fit.hash(&mut h);
         self.cache_key = h.finish();
     }
 
-    /// Cache key for the shadow pass: reuses `self.cache_key` directly when `emphasis` is empty
-    /// (zero extra shaping!), or hashes without `emphasis` so shadow text stays shadow-colored.
+    /// Cache key for shadow/outline passes: reuses `self.cache_key` directly when no rich span colors
+    /// exist (zero extra shaping!), or hashes monochrome so shadow/outline stays uniformly dark.
     pub fn shadow_cache_key(&self) -> u64 {
-        if self.emphasis.is_empty() {
+        if self.emphasis.is_empty() && self.color_spans.is_empty() {
             return self.cache_key;
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -133,10 +191,15 @@ impl TextRun {
         h.finish()
     }
 
+    pub fn has_rich_colors(&self) -> bool {
+        !self.emphasis.is_empty() || !self.color_spans.is_empty()
+    }
+
     pub fn shadow_run(&self) -> Option<Self> {
         let s = self.shadow?;
         let mut r = self.clone();
         r.shadow = None;
+        r.outline = None;
         r.x += s.offset[0];
         r.y += s.offset[1];
         r.color = [
@@ -146,6 +209,8 @@ impl TextRun {
             s.color[3] * self.color[3],
         ];
         r.emphasis.clear();
+        r.color_spans.clear();
+        r.ruby_spans.clear();
         r.compute_key();
         Some(r)
     }
@@ -166,6 +231,10 @@ pub struct DrawPacket {
     pub height: f32,
     pub stage_size: [u32; 2],
     pub stage_rect: [f32; 4],
+    /// Index slice `[start, end)` inside `quads` containing the pure stage scene (for GPU blur).
+    pub stage_quad_range: [usize; 2],
+    /// True when any `AmbientBackdrop` or `FrostedBackdrop` quad requires the blurred stage texture.
+    pub needs_blur: bool,
     pub quads: Vec<Quad>,
     pub texts: Vec<TextRun>,
     pub hits: Vec<HitRegion>,
@@ -190,6 +259,8 @@ impl DrawPacket {
     pub fn visual_eq(&self, other: &Self) -> bool {
         self.width == other.width
             && self.height == other.height
+            && self.stage_rect == other.stage_rect
+            && self.needs_blur == other.needs_blur
             && self.quads == other.quads
             && self.texts == other.texts
             && self.transition == other.transition

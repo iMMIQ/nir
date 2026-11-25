@@ -107,6 +107,20 @@ pub struct UiContext<'a> {
     pub input_mode: InputMode,
     pub portrait_reader: bool,
     pub toast: Option<&'a str>,
+    /// Smooth 0..1 modal overlay reveal animation progress (`1.0` when static or `reduced_motion`).
+    pub overlay_anim: f32,
+    /// Smooth 0..1 toast slide/fade progress (`1.0` when static or `reduced_motion`).
+    pub toast_anim: f32,
+    /// Smooth 0..1 dialogue line transition alpha (`1.0` when static or `reduced_motion`).
+    pub dialogue_fade: f32,
+    /// Monotonic UI animation clock in seconds (used only for subtle breathing indicator when waiting).
+    pub ui_time_s: f32,
+    /// True when desktop pointer hovers the quick-action toolbar (brightens ghost pill bar).
+    pub hud_toolbar_hovered: bool,
+    /// Extra top-left logical px clearance reserved for host chrome (e.g. Web `#shelf-btn`).
+    pub host_top_left_pad: f32,
+    /// Extra top-right logical px clearance reserved for host chrome (e.g. Web `#fs-btn`).
+    pub host_top_right_pad: f32,
 }
 
 /// Pure-Rust civil date/time formatter (`YYYY-MM-DD HH:MM`) using Howard Hinnant's algorithm.
@@ -305,8 +319,7 @@ pub fn project_layers(
             asset: layer.asset,
             blend: layer.transform.blend,
             clip,
-            special: SpecialQuad::None,
-            corner_radius: 0.0,
+            ..Quad::solid(rect, color)
         });
     };
 
@@ -390,7 +403,10 @@ fn project_layer_texts(
             line_height: size * 1.25,
             color,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: b.theme.text_shadow,
+            outline: None,
             scroll: 0.0,
             clip: None,
             font_assets: b.text_fonts.clone(),
@@ -566,16 +582,14 @@ fn project_timelines(
                     } else {
                         None
                     };
+                    let col = [1.0, 1.0, 1.0, op.clamp(0.0, 1.0)];
                     out.push(Quad {
                         rect,
                         uv: [0.0, 0.0, 1.0, 1.0],
                         corners,
-                        color: [1.0, 1.0, 1.0, op.clamp(0.0, 1.0)],
+                        color: col,
                         asset: Some(*asset),
-                        blend: BlendMode::Normal,
-                        clip: None,
-                        special: SpecialQuad::None,
-                        corner_radius: 0.0,
+                        ..Quad::solid(rect, col)
                     });
                 }
                 TimelineClipKind::Box {
@@ -613,6 +627,34 @@ fn project_timelines(
     out
 }
 
+fn cover_uv(src_w: f32, src_h: f32, dst_w: f32, dst_h: f32) -> [f32; 4] {
+    let src_ar = src_w.max(1.0) / src_h.max(1.0);
+    let dst_ar = dst_w.max(1.0) / dst_h.max(1.0);
+    if dst_ar > src_ar {
+        let vis_v = (src_ar / dst_ar).clamp(0.15, 1.0);
+        let pad = (1.0 - vis_v) * 0.5;
+        [0.0, pad, 1.0, 1.0 - pad]
+    } else {
+        let vis_u = (dst_ar / src_ar).clamp(0.15, 1.0);
+        let pad = (1.0 - vis_u) * 0.5;
+        [pad, 0.0, 1.0 - pad, 1.0]
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+fn shade_color(c: [f32; 4], mult: f32) -> [f32; 4] {
+    [
+        (c[0] * mult).clamp(0.0, 1.0),
+        (c[1] * mult).clamp(0.0, 1.0),
+        (c[2] * mult).clamp(0.0, 1.0),
+        c[3],
+    ]
+}
+
 struct Builder<'a> {
     pkt: DrawPacket,
     theme: &'a UiTheme,
@@ -635,22 +677,38 @@ impl<'a> Builder<'a> {
         self.pkt.texts.push(run);
     }
 
+    /// Single-pass DPI-adaptive SDF rounded panel with subtle top-lit vertical gradient & crisp stroke.
     fn rounded_panel(&mut self, rect: [f32; 4], fill: [f32; 4], border: [f32; 4], radius: f32) {
-        let r = radius.min(rect[2].min(rect[3]) * 0.45);
-        if border[3] > 0.01 {
-            self.pkt.quads.push(Quad::rounded(rect, border, r));
-            let inner = [
-                rect[0] + 1.0,
-                rect[1] + 1.0,
-                (rect[2] - 2.0).max(1.0),
-                (rect[3] - 2.0).max(1.0),
-            ];
-            self.pkt
-                .quads
-                .push(Quad::rounded(inner, fill, (r - 1.0).max(0.0)));
-        } else {
-            self.pkt.quads.push(Quad::rounded(rect, fill, r));
+        let r = radius.min(rect[2].min(rect[3]) * 0.48);
+        let top = shade_color(fill, 1.10);
+        let bot = shade_color(fill, 0.90);
+        self.pkt.quads.push(Quad::panel(
+            rect,
+            top,
+            Some(bot),
+            border,
+            if border[3] > 0.01 { 1.0 } else { 0.0 },
+            r,
+        ));
+    }
+
+    /// Soft grounded drop-shadow behind elevated cards & modal dialogs.
+    fn soft_shadow(&mut self, rect: [f32; 4], radius: f32, alpha: f32) {
+        if alpha <= 0.01 {
+            return;
         }
+        let spread = 6.0;
+        let srect = [
+            rect[0] - spread * 0.5,
+            rect[1] + 4.0,
+            rect[2] + spread,
+            rect[3] + spread * 0.6,
+        ];
+        self.pkt.quads.push(Quad::rounded(
+            srect,
+            [0.01, 0.02, 0.04, (0.36 * alpha).clamp(0.0, 0.6)],
+            (radius + 3.0).min(srect[2].min(srect[3]) * 0.45),
+        ));
     }
 
     fn button(
@@ -661,62 +719,88 @@ impl<'a> Builder<'a> {
         enabled: bool,
         primary: bool,
     ) {
+        self.button_styled(rect, label, action, enabled, primary, 1.0);
+    }
+
+    /// Styled rounded button supporting subtle ghost-mode opacity (`opacity_mult < 1.0`) for Story HUD.
+    fn button_styled(
+        &mut self,
+        rect: [f32; 4],
+        label: String,
+        action: UiAction,
+        enabled: bool,
+        primary: bool,
+        opacity_mult: f32,
+    ) {
         let id = self.next_hit_id;
         self.next_hit_id += 1;
         let is_pressed = enabled && self.pressed == Some(id);
         let is_hover = enabled && !self.is_touch() && self.hovered == Some(id);
-        let bg = if !enabled {
-            [0.13, 0.16, 0.21, 0.52]
+        let eff_alpha = if is_hover || is_pressed || primary {
+            1.0
+        } else {
+            opacity_mult.clamp(0.25, 1.0)
+        };
+        let mut bg = if !enabled {
+            [0.12, 0.15, 0.20, 0.44]
         } else if is_pressed {
             [
-                (self.theme.accent[0] * 1.05).min(1.0),
-                (self.theme.accent[1] * 1.05).min(1.0),
-                (self.theme.accent[2] * 1.05).min(1.0),
+                (self.theme.accent[0] * 1.06).min(1.0),
+                (self.theme.accent[1] * 1.06).min(1.0),
+                (self.theme.accent[2] * 1.06).min(1.0),
                 0.96,
             ]
         } else if is_hover {
             [
-                self.theme.accent[0] * 0.88,
-                self.theme.accent[1] * 0.88,
-                self.theme.accent[2] * 0.88,
+                self.theme.accent[0] * 0.90,
+                self.theme.accent[1] * 0.90,
+                self.theme.accent[2] * 0.90,
                 0.94,
             ]
         } else if primary {
             [
-                self.theme.accent[0] * 0.40,
-                self.theme.accent[1] * 0.40,
-                self.theme.accent[2] * 0.40,
+                self.theme.accent[0] * 0.46,
+                self.theme.accent[1] * 0.46,
+                self.theme.accent[2] * 0.46,
                 0.92,
             ]
         } else {
             self.theme.panel
         };
-        let border = if !enabled {
-            [0.32, 0.40, 0.52, 0.24]
+        bg[3] *= eff_alpha;
+        let mut border = if !enabled {
+            [0.32, 0.40, 0.52, 0.22]
         } else if is_pressed || is_hover {
-            self.theme.accent
+            [
+                (self.theme.accent[0] * 1.15).min(1.0),
+                (self.theme.accent[1] * 1.15).min(1.0),
+                (self.theme.accent[2] * 1.15).min(1.0),
+                0.95,
+            ]
         } else if primary {
             [
                 self.theme.accent[0],
                 self.theme.accent[1],
                 self.theme.accent[2],
-                0.78,
+                0.84,
             ]
         } else {
             self.theme.panel_border
         };
-        let radius = (rect[3] * 0.22).clamp(5.0, 10.0);
+        border[3] *= eff_alpha;
+        let radius = (rect[3] * 0.24).clamp(6.0, 11.0);
         self.rounded_panel(rect, bg, border, radius);
 
         let size = (rect[3] * 0.44).clamp(11.0, 21.0);
         let pad_x = (rect[2] * 0.08).clamp(4.0, 14.0);
-        let text_color = if !enabled {
+        let mut text_color = if !enabled {
             self.theme.muted
         } else if is_pressed || is_hover {
-            [0.05, 0.07, 0.10, 1.0]
+            [0.04, 0.06, 0.09, 1.0]
         } else {
             self.theme.text
         };
+        text_color[3] *= eff_alpha.max(0.62);
         self.push_text(TextRun {
             text: label.clone(),
             visible_bytes: None,
@@ -728,7 +812,10 @@ impl<'a> Builder<'a> {
             line_height: size * 1.22,
             color: text_color,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some(rect),
             font_assets: self.ui_fonts.clone(),
@@ -748,7 +835,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Projects the full engine frame (stage + transitions + HUD + overlays + toast).
+/// Projects the full engine frame (ambient backdrop + stage + transitions + HUD + frosted overlays + toast).
 pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages) -> DrawPacket {
     let prog = ctx.vm.program();
     let sw = prog.meta.stage_width as f32;
@@ -781,7 +868,39 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         next_hit_id: 1,
     };
 
+    // Determine whether letterbox margins / portrait bottom area need an Ambient Backdrop
+    let has_margins = (stage_rect[0] > 2.0)
+        || (stage_rect[1] > 2.0)
+        || (stage_rect[0] + stage_rect[2] < width - 2.0)
+        || (stage_rect[1] + stage_rect[3] < height - 2.0);
+    let has_stage_art = if ctx.screen == Screen::Title {
+        prog.ui
+            .title_screen
+            .as_ref()
+            .and_then(|s| s.background)
+            .or(prog.meta.title_bg)
+            .is_some()
+    } else {
+        ctx.vm.transition.is_some() || !ctx.vm.layers.is_empty()
+    };
+    let use_ambient = ctx.prefs.ambient_backdrop && has_margins && has_stage_art;
+    if use_ambient {
+        let mut amb = Quad::solid([0.0, 0.0, width, height], [0.26, 0.29, 0.36, 1.0]);
+        amb.uv = cover_uv(stage_rect[2], stage_rect[3], width, height);
+        amb.special = SpecialQuad::AmbientBackdrop;
+        b.pkt.quads.push(amb);
+        b.pkt.needs_blur = true;
+    }
+
+    // Subtle CAS-lite edge sharpening ONLY when classic low-res CGs are meaningfully upscaled!
+    let sharpen_amt = if ctx.prefs.image_sharpening && scale > 1.22 {
+        ((scale - 1.15) * 0.48).clamp(0.18, 0.56)
+    } else {
+        0.0
+    };
+
     // 1. Background / Stage rendering
+    let stage_start = b.pkt.quads.len();
     if ctx.screen == Screen::Title {
         if let Some(bg) = prog
             .ui
@@ -790,11 +909,16 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             .and_then(|s| s.background)
             .or(prog.meta.title_bg)
         {
-            b.pkt.quads.push(Quad::image(stage_rect, bg));
+            let mut q = Quad::image(stage_rect, bg);
+            q.sharpen = sharpen_amt;
+            b.pkt.quads.push(q);
+            b.pkt.stage_quad_range = [stage_start, b.pkt.quads.len()];
         } else {
-            b.pkt
-                .quads
-                .push(Quad::solid([0.0, 0.0, width, height], prog.ui.surface));
+            b.pkt.quads.push(Quad::gradient_v(
+                [0.0, 0.0, width, height],
+                [0.09, 0.12, 0.19, 1.0],
+                [0.04, 0.06, 0.10, 1.0],
+            ));
         }
         project_title(&mut b, ctx, messages, loc, stage_rect, scale);
     } else {
@@ -807,25 +931,39 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             b.pkt.transition_progress = tr.progress();
             b.pkt.quads.push(Quad {
                 rect: stage_rect,
-                uv: [0.0, 0.0, 1.0, 1.0],
-                corners: None,
-                color: [1.0, 1.0, 1.0, 1.0],
-                asset: None,
-                blend: BlendMode::Normal,
-                clip: None,
                 special: SpecialQuad::StageTransition,
-                corner_radius: 0.0,
+                ..Quad::solid(stage_rect, [1.0, 1.0, 1.0, 1.0])
             });
+            b.pkt.stage_quad_range = [stage_start, b.pkt.quads.len()];
         } else {
-            let stage_quads = project_layers_and_timelines(
+            let mut stage_quads = project_layers_and_timelines(
                 prog,
                 &ctx.vm.layers,
                 &ctx.vm.timelines,
                 stage_rect,
                 scale,
             );
+            if sharpen_amt > 0.0 {
+                for q in &mut stage_quads {
+                    if q.asset.is_some() {
+                        q.sharpen = sharpen_amt;
+                    }
+                }
+            }
             b.pkt.quads.extend(stage_quads);
+            b.pkt.stage_quad_range = [stage_start, b.pkt.quads.len()];
             project_layer_texts(&mut b, &ctx.vm.layers, stage_rect, scale);
+        }
+
+        // Soft feathered bottom transition in Portrait Docked Reader so artwork flows into the reader panel!
+        if portrait_docked {
+            let feather_h = 26.0_f32.min(stage_rect[3] * 0.14);
+            let fy = stage_rect[1] + stage_rect[3] - feather_h;
+            b.pkt.quads.push(Quad::gradient_v(
+                [stage_rect[0], fy, stage_rect[2], feather_h + 1.0],
+                [0.05, 0.07, 0.11, 0.0],
+                [0.05, 0.07, 0.11, 0.72],
+            ));
         }
 
         // Story HUD (unless hidden)
@@ -851,7 +989,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             Screen::Settings => project_settings_overlay(&mut b, ctx, messages, loc),
             Screen::History => project_history_overlay(&mut b, ctx, messages, loc),
             Screen::Gallery => project_gallery_overlay(&mut b, ctx, messages, loc),
-            Screen::Ended => project_ended_overlay(&mut b, messages, loc),
+            Screen::Ended => project_ended_overlay(&mut b, ctx, messages, loc),
         }
     }
 
@@ -862,19 +1000,24 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
 
     // Confirmation dialog (overwrite / delete save)
     if let Some(confirm) = ctx.pending_confirm {
-        project_confirm_modal(&mut b, messages, loc, confirm);
+        project_confirm_modal(&mut b, ctx, messages, loc, confirm);
     }
 
-    // Subtle non-blocking loading indicator when urgent scene images take >150ms
+    // Subtle non-blocking loading indicator when urgent scene images take >150ms (clears host top-left chrome!)
     if ctx.loading_visible && ctx.screen == Screen::Story {
         let lw = 148.0_f32.min((safe[2] - 24.0).max(110.0));
         let lh = 30.0;
-        let lrect = [safe[0] + 10.0, safe[1] + 10.0, lw, lh];
+        let lrect = [
+            safe[0] + 10.0 + ctx.host_top_left_pad,
+            safe[1] + 10.0,
+            lw,
+            lh,
+        ];
         b.rounded_panel(
             lrect,
-            [0.06, 0.09, 0.14, 0.86],
-            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.5],
-            8.0,
+            [0.06, 0.09, 0.14, 0.88],
+            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.55],
+            9.0,
         );
         b.push_text(TextRun {
             text: messages.get(loc, "loading-assets"),
@@ -887,7 +1030,10 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             line_height: 17.0,
             color: b.theme.muted,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some(lrect),
             font_assets: b.ui_fonts.clone(),
@@ -899,19 +1045,34 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         });
     }
 
-    // Lightweight Toast notification (strictly inside safe area!)
+    // Lightweight animated Toast notification (strictly inside safe area!)
     if let Some(msg) = ctx.toast {
+        let t_ease = ease_out_cubic(ctx.toast_anim);
         let tw = (safe[2] * 0.65)
             .clamp(200.0, 520.0)
             .min((safe[2] - 20.0).max(160.0));
         let th = 40.0;
-        let rect = [safe[0] + (safe[2] - tw) * 0.5, safe[1] + 12.0, tw, th];
+        let slide_y = (1.0 - t_ease) * -14.0;
+        let rect = [
+            safe[0] + (safe[2] - tw) * 0.5,
+            safe[1] + 12.0 + slide_y,
+            tw,
+            th,
+        ];
+        b.soft_shadow(rect, 11.0, t_ease);
         b.rounded_panel(
             rect,
-            [0.08, 0.11, 0.16, 0.94],
-            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
-            10.0,
+            [0.08, 0.11, 0.17, 0.94 * t_ease],
+            [
+                b.theme.accent[0],
+                b.theme.accent[1],
+                b.theme.accent[2],
+                0.85 * t_ease,
+            ],
+            11.0,
         );
+        let mut tc = b.theme.text;
+        tc[3] *= t_ease;
         b.push_text(TextRun {
             text: msg.to_owned(),
             visible_bytes: None,
@@ -921,9 +1082,12 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             height: th - 4.0,
             size: 15.0,
             line_height: 20.0,
-            color: b.theme.text,
+            color: tc,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some(rect),
             font_assets: b.ui_fonts.clone(),
@@ -954,19 +1118,27 @@ fn project_title(
         return;
     }
 
-    // Sleek built-in title screen (safe-area aware, responsive from narrow mobile to 4K desktop)
+    // Sleek cinematic built-in title screen: left horizontal gradient scrim preserves vibrant cover art on the right!
     let w = b.pkt.width;
     let h = b.pkt.height;
     let [sx, sy, sw, sh] = b.safe;
-    b.pkt
-        .quads
-        .push(Quad::solid([0.0, 0.0, w, h], [0.04, 0.06, 0.10, 0.45]));
+    let scrim_w = (w * if b.is_touch() { 0.82 } else { 0.62 }).max(320.0).min(w);
+    b.pkt.quads.push(Quad::gradient_h(
+        [0.0, 0.0, scrim_w, h],
+        [0.03, 0.05, 0.09, 0.84],
+        [0.03, 0.05, 0.09, 0.0],
+    ));
+    b.pkt.quads.push(Quad::gradient_v(
+        [0.0, h * 0.72, w, h * 0.28],
+        [0.02, 0.03, 0.06, 0.0],
+        [0.02, 0.03, 0.06, 0.56],
+    ));
 
-    let title_size = (sh * 0.075).clamp(22.0, 60.0);
-    let title_y = sy + (sh * 0.14).clamp(16.0, sh * 0.22);
-    let title_h = (title_size * 2.1).min(sh * 0.28);
-    let title_x = sx + sw * 0.08;
-    let title_w = sw * 0.84;
+    let title_size = (sh * 0.072).clamp(22.0, 56.0);
+    let title_y = sy + (sh * 0.14).clamp(18.0, sh * 0.20);
+    let title_h = (title_size * 2.05).min(sh * 0.26);
+    let title_x = sx + sw * 0.07;
+    let title_w = (sw * if b.is_touch() { 0.84 } else { 0.56 }).max(220.0);
     b.push_text(TextRun {
         text: prog.meta.title.clone(),
         visible_bytes: None,
@@ -975,10 +1147,13 @@ fn project_title(
         width: title_w,
         height: title_h,
         size: title_size,
-        line_height: title_size * 1.25,
+        line_height: title_size * 1.24,
         color: b.theme.text,
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: b.theme.text_shadow,
+        outline: Some([0.02, 0.03, 0.06, 0.65]),
         scroll: 0.0,
         clip: Some([title_x, title_y, title_w, title_h]),
         font_assets: b.ui_fonts.clone(),
@@ -988,6 +1163,12 @@ fn project_title(
         inline_images: Vec::new(),
         cache_key: 0,
     });
+    // Accent rule under title
+    b.pkt.quads.push(Quad::gradient_h(
+        [title_x, title_y + title_h + 2.0, (title_w * 0.36).clamp(64.0, 180.0), 2.5],
+        b.theme.accent,
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.0],
+    ));
 
     let has_any_save = ctx.autosave.is_some_and(|s| s.exists)
         || ctx.quicksave.is_some_and(|s| s.exists)
@@ -1111,7 +1292,10 @@ fn project_ui_node(
                 line_height: size * scale * 1.3,
                 color: c,
                 emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
                 shadow: b.theme.text_shadow,
+                outline: None,
                 scroll: 0.0,
                 clip: Some(rect),
                 font_assets: b.ui_fonts.clone(),
@@ -1191,7 +1375,7 @@ fn project_story_hud(
                 .any(|it| it.image.is_some() || it.rect.is_some())
     });
 
-    // Subtle top-right reading-mode indicator pill (Auto / Skip / Long-press HoldSkip) inside safe area.
+    // Subtle top-right reading-mode indicator pill (Auto / Skip / Long-press HoldSkip) clearing host top-right chrome.
     if ctx.auto || ctx.skip || ctx.hold_skip {
         let mode_label = if ctx.skip || ctx.hold_skip {
             messages.get(loc, "skip-active")
@@ -1200,7 +1384,12 @@ fn project_story_hud(
         };
         let pill_h = if touch { 28.0 } else { 24.0 };
         let pill_w = (estimate_display_units(&mode_label) * 13.0 + 24.0).clamp(72.0, 160.0);
-        let pill_rect = [sright - pill_w - 8.0, sy + 8.0, pill_w, pill_h];
+        let pill_rect = [
+            (sright - pill_w - 8.0 - ctx.host_top_right_pad).max(sx + 8.0),
+            sy + 8.0,
+            pill_w,
+            pill_h,
+        ];
         b.rounded_panel(
             pill_rect,
             [
@@ -1223,7 +1412,10 @@ fn project_story_hud(
             line_height: 16.0,
             color: b.theme.text,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some(pill_rect),
             font_assets: b.ui_fonts.clone(),
@@ -1315,24 +1507,33 @@ fn project_story_hud(
                 [bx, by, bw, bh]
             };
 
+            let box_opacity = ctx.prefs.dialogue_opacity.clamp(0.45, 1.0);
             if !portrait_docked {
                 if let Some(bg) = dlg_bg_cfg {
                     let mut q = Quad::image(box_rect, bg);
-                    q.color[3] = alpha;
+                    q.color[3] = alpha * box_opacity;
                     b.pkt.quads.push(q);
                 } else {
                     let mut panel = b.theme.panel;
-                    panel[3] *= alpha;
+                    panel[3] = (panel[3].max(0.86) * box_opacity) * alpha;
                     let mut border = b.theme.panel_border;
-                    border[3] *= alpha;
-                    b.rounded_panel(box_rect, panel, border, 10.0);
+                    border[3] *= alpha * (0.65 + 0.35 * box_opacity);
+                    b.soft_shadow(box_rect, 12.0, alpha * box_opacity);
+                    b.rounded_panel(box_rect, panel, border, 12.0);
+                    // Subtle top edge specular highlight for refined depth
+                    b.pkt.quads.push(Quad::gradient_h(
+                        [box_rect[0] + 14.0, box_rect[1] + 1.0, (box_rect[2] - 28.0).max(16.0), 1.5],
+                        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.0],
+                        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.42 * alpha * box_opacity],
+                    ));
                 }
             } else {
                 let mut panel = b.theme.panel;
-                panel[3] = (panel[3].max(0.92)) * alpha;
+                panel[3] = (panel[3].max(0.92) * box_opacity) * alpha;
                 let mut border = b.theme.accent;
-                border[3] *= 0.65 * alpha;
-                b.rounded_panel(box_rect, panel, border, 12.0);
+                border[3] *= 0.62 * alpha;
+                b.soft_shadow(box_rect, 13.0, alpha * 0.7);
+                b.rounded_panel(box_rect, panel, border, 13.0);
             }
 
             // 2. Dialogue-bound face portrait decoration (fitted inside box_rect when auto-placed,
@@ -1460,6 +1661,11 @@ fn project_story_hud(
                 }
             }
 
+            let text_outline = ctx
+                .prefs
+                .text_outline
+                .then_some([0.02, 0.03, 0.06, 0.86]);
+
             // 4. Speaker nameplate (never overlaps subtitles, stage art in portrait mode, or face portrait!)
             let mut speaker_top_pill_rect: Option<[f32; 4]> = None;
             if !dlg.speaker.is_empty() {
@@ -1477,14 +1683,15 @@ fn project_story_hud(
                     let push_down = header_h + 6.0;
                     text_rect[1] += push_down;
                     text_rect[3] = (text_rect[3] - push_down).max(28.0);
-                    b.pkt.quads.push(Quad::solid(
+                    b.pkt.quads.push(Quad::gradient_h(
                         [
                             name_box[0],
                             name_box[1] + header_h + 1.0,
-                            (name_box[2] * 0.38).min(120.0),
-                            1.5,
+                            (name_box[2] * 0.44).min(150.0),
+                            2.0,
                         ],
-                        [sc[0], sc[1], sc[2], sc[3] * 0.7],
+                        [sc[0], sc[1], sc[2], sc[3] * 0.85],
+                        [sc[0], sc[1], sc[2], 0.0],
                     ));
                     b.push_text(TextRun {
                         text: dlg.speaker.clone(),
@@ -1497,7 +1704,10 @@ fn project_story_hud(
                         line_height: sp_size * 1.22,
                         color: sc,
                         emphasis: Vec::new(),
+                        color_spans: Vec::new(),
+                        ruby_spans: Vec::new(),
                         shadow: scaled_shadow,
+                        outline: text_outline,
                         scroll: 0.0,
                         clip: Some(name_box),
                         font_assets: b.text_fonts.clone(),
@@ -1525,7 +1735,10 @@ fn project_story_hud(
                         line_height: sp_size * 1.22,
                         color: sc,
                         emphasis: Vec::new(),
+                        color_spans: Vec::new(),
+                        ruby_spans: Vec::new(),
                         shadow: scaled_shadow,
+                        outline: text_outline,
                         scroll: 0.0,
                         clip: Some(name_box),
                         font_assets: b.text_fonts.clone(),
@@ -1542,27 +1755,42 @@ fn project_story_hud(
                     if tab_y >= sy + 4.0 {
                         let pad_x = (14.0 * ui_s).clamp(8.0, 20.0);
                         let units = estimate_display_units(&dlg.speaker);
-                        let min_w = (72.0 * ui_s).clamp(52.0, 110.0);
+                        let min_w = (76.0 * ui_s).clamp(56.0, 118.0);
                         let max_w = (box_rect[2] * 0.55).max(min_w).min((sw - 16.0).max(80.0));
-                        let tab_w = (units * sp_size + pad_x * 2.0).clamp(min_w, max_w);
+                        let tab_w = (units * sp_size + pad_x * 2.0 + 6.0).clamp(min_w, max_w);
                         let tab_x =
                             box_rect[0].clamp(sx + 4.0, (sright - tab_w - 4.0).max(sx + 4.0));
                         let tab_rect = [tab_x, tab_y, tab_w, tab_h];
                         let mut accent_bar = sc;
-                        accent_bar[3] *= 0.78;
-                        b.rounded_panel(tab_rect, [0.06, 0.08, 0.13, 0.90 * alpha], accent_bar, 7.0);
+                        accent_bar[3] *= 0.72;
+                        b.rounded_panel(
+                            tab_rect,
+                            [0.06, 0.09, 0.14, 0.90 * alpha * box_opacity.max(0.75)],
+                            accent_bar,
+                            8.0,
+                        );
+                        // Crisp character-color accent strip inside the left edge of the nameplate
+                        let strip_h = (tab_h - 10.0).max(8.0);
+                        b.pkt.quads.push(Quad::rounded(
+                            [tab_rect[0] + 5.0, tab_rect[1] + (tab_h - strip_h) * 0.5, 3.0, strip_h],
+                            sc,
+                            1.5,
+                        ));
                         b.push_text(TextRun {
                             text: dlg.speaker.clone(),
                             visible_bytes: None,
-                            x: tab_rect[0] + pad_x,
+                            x: tab_rect[0] + pad_x + 2.0,
                             y: tab_rect[1] + 1.0,
-                            width: (tab_rect[2] - pad_x * 2.0).max(20.0),
+                            width: (tab_rect[2] - pad_x * 2.0 - 2.0).max(20.0),
                             height: (tab_rect[3] - 3.0).max(14.0),
                             size: sp_size,
                             line_height: sp_size * 1.22,
                             color: sc,
                             emphasis: Vec::new(),
+                            color_spans: Vec::new(),
+                            ruby_spans: Vec::new(),
                             shadow: scaled_shadow,
+                            outline: text_outline,
                             scroll: 0.0,
                             clip: Some(tab_rect),
                             font_assets: b.text_fonts.clone(),
@@ -1591,7 +1819,10 @@ fn project_story_hud(
                             line_height: sp_size * 1.22,
                             color: sc,
                             emphasis: Vec::new(),
+                            color_spans: Vec::new(),
+                            ruby_spans: Vec::new(),
                             shadow: scaled_shadow,
+                            outline: text_outline,
                             scroll: 0.0,
                             clip: Some(name_box),
                             font_assets: b.text_fonts.clone(),
@@ -1623,13 +1854,24 @@ fn project_story_hud(
                 .filter(|s| s.emphasis)
                 .map(|s| (s.byte_start, s.byte_end))
                 .collect();
+            let color_spans: Vec<(usize, usize, [f32; 4])> = dlg
+                .spans
+                .iter()
+                .filter_map(|s| s.color.map(|c| (s.byte_start, s.byte_end, c)))
+                .collect();
+            let ruby_spans: Vec<(usize, usize, String)> = dlg
+                .spans
+                .iter()
+                .filter_map(|s| s.ruby.as_ref().map(|rb| (s.byte_start, s.byte_end, rb.clone())))
+                .collect();
             let inline_images: Vec<(usize, AssetId)> = dlg
                 .spans
                 .iter()
                 .filter_map(|s| s.inline_image.map(|id| (s.byte_start, id)))
                 .collect();
+            let line_fade = ease_out_cubic(ctx.dialogue_fade);
             let mut tc = style_text_color;
-            tc[3] *= alpha;
+            tc[3] *= alpha * line_fade;
 
             // Optional bilingual secondary line when multiple locales exist
             let secondary_text: Option<String> = if ctx.prefs.bilingual && prog.meta.locales.len() >= 2 {
@@ -1651,12 +1893,16 @@ fn project_story_hud(
                 None
             };
 
-            let (primary_h, sec_rect) = if secondary_text.is_some() && text_rect[3] >= 56.0 {
-                let ph = text_rect[3] * 0.56;
-                let sh = (text_rect[3] - ph - 4.0).max(18.0);
-                (ph, Some([text_rect[0], text_rect[1] + ph + 4.0, text_rect[2], sh]))
+            // Give extra top breathing room when ruby annotations are present so ruby never clips!
+            let ruby_top_pad = if ruby_spans.is_empty() { 0.0 } else { (fsize * 0.34).clamp(5.0, 12.0) };
+            let eff_text_y = text_rect[1] + ruby_top_pad;
+            let eff_text_h = (text_rect[3] - ruby_top_pad).max(24.0);
+            let (primary_h, sec_rect) = if secondary_text.is_some() && eff_text_h >= 56.0 {
+                let ph = eff_text_h * 0.56;
+                let sh = (eff_text_h - ph - 4.0).max(18.0);
+                (ph, Some([text_rect[0], eff_text_y + ph + 4.0, text_rect[2], sh]))
             } else {
-                (text_rect[3], None)
+                (eff_text_h, None)
             };
 
             b.push_text(TextRun {
@@ -1667,16 +1913,19 @@ fn project_story_hud(
                     Some(dlg.visible_byte_len())
                 },
                 x: text_rect[0],
-                y: text_rect[1],
+                y: eff_text_y,
                 width: text_rect[2],
                 height: primary_h,
                 size: fsize,
-                line_height: lh,
+                line_height: if ruby_spans.is_empty() { lh } else { lh.max(fsize * 1.48) },
                 color: tc,
                 emphasis,
+                color_spans,
+                ruby_spans,
                 shadow: scaled_shadow,
+                outline: text_outline,
                 scroll: 0.0,
-                clip: Some([text_rect[0], text_rect[1], text_rect[2], primary_h]),
+                clip: Some([text_rect[0], text_rect[1], text_rect[2], primary_h + ruby_top_pad]),
                 font_assets: b.text_fonts.clone(),
                 align: TextAlign::Left,
                 valign_center: false,
@@ -1688,7 +1937,7 @@ fn project_story_hud(
             if let (Some(stext), Some(sr)) = (secondary_text, sec_rect) {
                 let sec_sz = (fsize * 0.82).clamp(10.0, 26.0);
                 let mut sc = b.theme.muted;
-                sc[3] *= alpha * 0.92;
+                sc[3] *= alpha * line_fade * 0.92;
                 b.push_text(TextRun {
                     text: stext,
                     visible_bytes: None,
@@ -1700,7 +1949,10 @@ fn project_story_hud(
                     line_height: sec_sz * 1.32,
                     color: sc,
                     emphasis: Vec::new(),
+                    color_spans: Vec::new(),
+                    ruby_spans: Vec::new(),
                     shadow: scaled_shadow,
+                    outline: text_outline,
                     scroll: 0.0,
                     clip: Some(sr),
                     font_assets: b.text_fonts.clone(),
@@ -1712,15 +1964,35 @@ fn project_story_hud(
                 });
             }
 
-            // Crisp click-to-continue indicator at bottom-right when dialogue line is completely revealed
-            if dlg.finished && ctx.vm.choice.is_none() && !ctx.auto && !ctx.skip && !ctx.hold_skip {
+            // Breathing click-to-continue indicator (distinguishes inline click-pause vs end-of-line!)
+            let waiting_click = (dlg.finished || dlg.paused_for_click)
+                && ctx.vm.choice.is_none()
+                && !ctx.auto
+                && !ctx.skip
+                && !ctx.hold_skip;
+            if waiting_click {
                 let ind_sz = (fsize * 0.72).clamp(11.0, 18.0);
+                let bob = if ctx.prefs.reduced_motion {
+                    0.0
+                } else {
+                    (ctx.ui_time_s * 5.0).sin() * 2.2
+                };
+                let pulse = if ctx.prefs.reduced_motion {
+                    0.92
+                } else {
+                    0.72 + 0.28 * (ctx.ui_time_s * 5.0).sin().abs()
+                };
                 let ix = box_rect[0] + box_rect[2] - ind_sz - 10.0;
-                let iy = box_rect[1] + box_rect[3] - ind_sz - 6.0;
+                let iy = box_rect[1] + box_rect[3] - ind_sz - 7.0 + bob;
                 let mut ic = b.theme.accent;
-                ic[3] *= alpha * 0.92;
+                ic[3] *= alpha * pulse;
+                let glyph = if dlg.paused_for_click && !dlg.finished {
+                    "…"
+                } else {
+                    "▼"
+                };
                 b.push_text(TextRun {
-                    text: "▼".into(),
+                    text: glyph.into(),
                     visible_bytes: None,
                     x: ix,
                     y: iy,
@@ -1730,7 +2002,10 @@ fn project_story_hud(
                     line_height: ind_sz + 2.0,
                     color: ic,
                     emphasis: Vec::new(),
+                    color_spans: Vec::new(),
+                    ruby_spans: Vec::new(),
                     shadow: scaled_shadow,
+                    outline: None,
                     scroll: 0.0,
                     clip: Some(box_rect),
                     font_assets: b.ui_fonts.clone(),
@@ -1748,12 +2023,13 @@ fn project_story_hud(
                 let vh = if touch { 30.0 } else { 22.0 };
                 let vx = box_rect[0] + box_rect[2] - vw - 8.0;
                 let vy = box_rect[1] + 6.0;
-                b.button(
+                b.button_styled(
                     [vx, vy, vw, vh],
                     messages.get(loc, "replay-voice"),
                     UiAction::ReplayVoice,
                     true,
                     false,
+                    if touch { 0.88 } else { 0.65 },
                 );
             }
 
@@ -1816,15 +2092,22 @@ fn project_story_hud(
                 (bar_max_r - total_w).max(bar_min_l)
             };
 
+            // Ghost pill bar: subtly receded during quiet reading on desktop, brightens on hover or active mode!
+            let toolbar_opacity = if touch || ctx.hud_toolbar_hovered || ctx.auto || ctx.skip || ctx.hold_skip {
+                0.94
+            } else {
+                0.56
+            };
             for (key, action, active) in buttons {
                 let enabled = !matches!(action, UiAction::OpenSaves { save_mode: true })
                     || !ctx.replay_active;
-                b.button(
+                b.button_styled(
                     [bx, bar_y, btn_w, bar_h],
                     messages.get(loc, key),
                     action,
                     enabled,
                     active,
+                    toolbar_opacity,
                 );
                 bx += btn_w + gap;
             }
@@ -1960,14 +2243,35 @@ fn project_story_hud(
     }
 }
 
-fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &str) -> [f32; 4] {
+fn overlay_shell(
+    b: &mut Builder<'_>,
+    ctx: &UiContext<'_>,
+    title: String,
+    messages: &Messages,
+    loc: &str,
+) -> [f32; 4] {
     let w = b.pkt.width;
     let h = b.pkt.height;
     let [sx, sy, sw, sh] = b.safe;
     let touch = b.is_touch();
-    b.pkt
-        .quads
-        .push(Quad::solid([0.0, 0.0, w, h], [0.03, 0.05, 0.09, 0.80]));
+    let anim = ease_out_cubic(ctx.overlay_anim);
+
+    // True frosted-glass backdrop over blurred live stage when ambient_backdrop is enabled!
+    if ctx.prefs.ambient_backdrop && b.pkt.stage_quad_range[1] > b.pkt.stage_quad_range[0] {
+        let mut frost = Quad::solid([0.0, 0.0, w, h], [0.24, 0.28, 0.36, 0.96 * anim]);
+        frost.uv = cover_uv(b.pkt.stage_rect[2], b.pkt.stage_rect[3], w, h);
+        frost.special = SpecialQuad::FrostedBackdrop;
+        b.pkt.quads.push(frost);
+        b.pkt.needs_blur = true;
+        b.pkt
+            .quads
+            .push(Quad::solid([0.0, 0.0, w, h], [0.02, 0.04, 0.08, 0.54 * anim]));
+    } else {
+        b.pkt
+            .quads
+            .push(Quad::solid([0.0, 0.0, w, h], [0.03, 0.05, 0.09, 0.80 * anim]));
+    }
+
     let pw = (sw * if touch { 0.94 } else { 0.86 })
         .clamp(280.0, 960.0)
         .min((sw - 12.0).max(200.0));
@@ -1975,7 +2279,8 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
         .clamp(260.0, 680.0)
         .min((sh - 12.0).max(200.0));
     let px = sx + (sw - pw) * 0.5;
-    let py = sy + (sh - ph) * 0.5;
+    let slide_y = (1.0 - anim) * 14.0;
+    let py = sy + (sh - ph) * 0.5 + slide_y;
     let pad = (pw * 0.035).clamp(12.0, 24.0);
     let hdr_h = if touch {
         (ph * 0.11).clamp(46.0, 58.0)
@@ -1988,18 +2293,24 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
     } else {
         (hdr_h * 0.72).clamp(28.0, 38.0)
     };
-    b.rounded_panel(
-        [px, py, pw, ph],
-        b.theme.surface,
-        [b.theme.panel_border[0], b.theme.panel_border[1], b.theme.panel_border[2], 0.65],
-        12.0,
-    );
-    b.pkt.quads.push(Quad::rounded(
-        [px + 12.0, py + 1.0, (pw - 24.0).max(20.0), 2.5],
-        b.theme.accent,
-        1.5,
+    let mut surf = b.theme.surface;
+    surf[3] *= anim;
+    let border = [
+        b.theme.panel_border[0],
+        b.theme.panel_border[1],
+        b.theme.panel_border[2],
+        0.65 * anim,
+    ];
+    b.soft_shadow([px, py, pw, ph], 14.0, anim);
+    b.rounded_panel([px, py, pw, ph], surf, border, 14.0);
+    b.pkt.quads.push(Quad::gradient_h(
+        [px + 16.0, py + 1.0, (pw - 32.0).max(20.0), 2.0],
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.90 * anim],
+        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.15 * anim],
     ));
     let title_size = (hdr_h * 0.46).clamp(16.0, 26.0);
+    let mut tc = b.theme.text;
+    tc[3] *= anim;
     b.push_text(TextRun {
         text: title,
         visible_bytes: None,
@@ -2009,9 +2320,12 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
         height: back_h,
         size: title_size,
         line_height: title_size * 1.25,
-        color: b.theme.text,
+        color: tc,
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([px + pad, py, (pw - pad * 2.0 - back_w).max(60.0), hdr_h]),
         font_assets: b.ui_fonts.clone(),
@@ -2042,7 +2356,7 @@ fn overlay_shell(b: &mut Builder<'_>, title: String, messages: &Messages, loc: &
 }
 
 fn project_menu_overlay(b: &mut Builder<'_>, ctx: &UiContext<'_>, messages: &Messages, loc: &str) {
-    let area = overlay_shell(b, messages.get(loc, "menu"), messages, loc);
+    let area = overlay_shell(b, ctx, messages.get(loc, "menu"), messages, loc);
     let touch = b.is_touch();
     let has_quick = ctx.quicksave.is_some_and(|s| s.exists);
     let has_voice = ctx.vm.dialogue.as_ref().is_some_and(|d| d.voice.is_some());
@@ -2164,7 +2478,10 @@ fn draw_slot_card(
         line_height: top_h,
         color: if enabled { b.theme.accent } else { b.theme.muted },
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([tx, rect[1] + 2.0, tw, top_h + 2.0]),
         font_assets: b.ui_fonts.clone(),
@@ -2187,7 +2504,10 @@ fn draw_slot_card(
         line_height: (sum_h * 0.72).clamp(14.0, 20.0),
         color: if enabled { b.theme.text } else { b.theme.muted },
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([tx, sum_y, tw, sum_h]),
         font_assets: b.text_fonts.clone(),
@@ -2214,7 +2534,7 @@ fn project_saves_overlay(
     save_mode: bool,
 ) {
     let title = messages.get(loc, if save_mode { "save" } else { "load" });
-    let mut area = overlay_shell(b, title, messages, loc);
+    let mut area = overlay_shell(b, ctx, title, messages, loc);
     let touch = b.is_touch();
     let gap = (area[3] * 0.022).clamp(6.0, 10.0);
 
@@ -2371,7 +2691,10 @@ fn project_saves_overlay(
             line_height: 18.0,
             color: b.theme.muted,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some([mid_x, by, mid_w, nav_h]),
             font_assets: b.ui_fonts.clone(),
@@ -2425,7 +2748,10 @@ fn push_slider_row(
         line_height: label_size * 1.25,
         color: b.theme.text,
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([x, y, label_w, row_h]),
         font_assets: b.ui_fonts.clone(),
@@ -2503,7 +2829,10 @@ fn push_toggle_row(
         line_height: label_size * 1.25,
         color: b.theme.text,
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([x, y, label_w, row_h]),
         font_assets: b.ui_fonts.clone(),
@@ -2528,37 +2857,32 @@ fn project_settings_overlay(
     messages: &Messages,
     loc: &str,
 ) {
-    let area = overlay_shell(b, messages.get(loc, "settings"), messages, loc);
+    let area = overlay_shell(b, ctx, messages.get(loc, "settings"), messages, loc);
     let touch = b.is_touch();
     let tab_h = if touch { 40.0 } else { 34.0 };
     let tab_gap = 8.0;
-    let tab_w = ((area[2] - tab_gap) * 0.5).min(200.0);
-    b.button(
-        [area[0], area[1], tab_w, tab_h],
-        messages.get(loc, "tab-reading"),
-        UiAction::SettingsTab(0),
-        true,
-        ctx.settings_tab == 0,
-    );
-    b.button(
-        [area[0] + tab_w + tab_gap, area[1], tab_w, tab_h],
-        messages.get(loc, "tab-audio"),
-        UiAction::SettingsTab(1),
-        true,
-        ctx.settings_tab == 1,
-    );
+    let tab_w = ((area[2] - tab_gap * 2.0) / 3.0).min(184.0);
+    for (idx, key) in [(0u8, "tab-reading"), (1u8, "tab-visual"), (2u8, "tab-audio")] {
+        b.button(
+            [area[0] + idx as f32 * (tab_w + tab_gap), area[1], tab_w, tab_h],
+            messages.get(loc, key),
+            UiAction::SettingsTab(idx),
+            true,
+            ctx.settings_tab == idx,
+        );
+    }
 
     let body_y = area[1] + tab_h + 10.0;
     let body_h = (area[3] - tab_h - 10.0).max(120.0);
     let locales = &ctx.vm.program().meta.locales;
-    let total_rows = if ctx.settings_tab == 0 {
-        6 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2)
-    } else {
-        6
+    let total_rows = match ctx.settings_tab {
+        0 => 6 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2),
+        1 => 4,
+        _ => 6,
     };
-    let gap = (body_h * 0.02).clamp(5.0, 9.0);
+    let gap = (body_h * 0.02).clamp(5.0, 10.0);
     let min_rh = if touch { 34.0 } else { 28.0 };
-    let max_rh = if touch { 46.0 } else { 42.0 };
+    let max_rh = if touch { 48.0 } else { 44.0 };
     let row_h = ((body_h - gap * (total_rows - 1) as f32) / total_rows as f32).clamp(min_rh, max_rh);
     let mut y = body_y;
 
@@ -2693,8 +3017,68 @@ fn project_settings_overlay(
                 lx += lw + lgap;
             }
         }
+    } else if ctx.settings_tab == 1 {
+        // Tab 1: Display & Visual Comfort
+        push_slider_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            format!(
+                "{}: {}%",
+                messages.get(loc, "dialogue-opacity"),
+                (ctx.prefs.dialogue_opacity * 100.0).round() as u32
+            ),
+            ((ctx.prefs.dialogue_opacity - 0.45) / 0.55).clamp(0.0, 1.0),
+            UiAction::SetDialogueOpacity((ctx.prefs.dialogue_opacity - 0.08).clamp(0.45, 1.0)),
+            UiAction::SetDialogueOpacity((ctx.prefs.dialogue_opacity + 0.08).clamp(0.45, 1.0)),
+            |t| UiAction::SetDialogueOpacity((0.45 + t * 0.55).clamp(0.45, 1.0)),
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "ambient-backdrop"),
+            ctx.prefs.ambient_backdrop,
+            UiAction::ToggleAmbientBackdrop,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "image-sharpening"),
+            ctx.prefs.image_sharpening,
+            UiAction::ToggleImageSharpening,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "text-outline"),
+            ctx.prefs.text_outline,
+            UiAction::ToggleTextOutline,
+            messages,
+            loc,
+        );
     } else {
-        // Tab 1: Audio & Voice
+        // Tab 2: Audio & Voice
         push_slider_row(
             b,
             area[0],
@@ -2775,63 +3159,138 @@ fn project_history_overlay(
     messages: &Messages,
     loc: &str,
 ) {
-    let area = overlay_shell(b, messages.get(loc, "history"), messages, loc);
+    let area = overlay_shell(b, ctx, messages.get(loc, "history"), messages, loc);
     let touch = b.is_touch();
     let nav_h = if touch { 44.0 } else { 36.0 };
-    let row_h = (area[3] * 0.165).clamp(50.0, 72.0);
+    let row_h = (area[3] * 0.175).clamp(54.0, 78.0);
     let visible_rows = ((area[3] - nav_h - 10.0) / row_h).max(1.0) as usize;
     let total = ctx.vm.history.len();
     let end = total.saturating_sub(ctx.history_scroll);
     let start = end.saturating_sub(visible_rows);
 
     let mut y = area[1];
-    let fsize = (row_h * 0.27).clamp(14.0, 18.0);
+    let fsize = (row_h * 0.25).clamp(13.5, 17.5);
     let voice_btn_w = if touch { 68.0 } else { 58.0 };
     let voice_btn_h = if touch { 36.0 } else { 28.0 };
     for (idx, entry) in ctx.vm.history.range(start..end).enumerate() {
-        let card_rect = [area[0], y, area[2], row_h - 5.0];
-        let tint = if idx % 2 == 0 {
-            [0.11, 0.15, 0.22, 0.52]
+        let card_h = row_h - 6.0;
+        let card_rect = [area[0], y, area[2], card_h];
+        let has_speaker = !entry.speaker.is_empty();
+        let tint = if has_speaker {
+            if idx % 2 == 0 {
+                [0.12, 0.16, 0.24, 0.62]
+            } else {
+                [0.10, 0.14, 0.21, 0.48]
+            }
         } else {
-            [0.09, 0.12, 0.18, 0.36]
+            [0.08, 0.10, 0.15, 0.34]
         };
-        b.pkt.quads.push(Quad::rounded(card_rect, tint, 7.0));
+        let border = if has_speaker {
+            [b.theme.panel_border[0], b.theme.panel_border[1], b.theme.panel_border[2], 0.26]
+        } else {
+            [0.0; 4]
+        };
+        b.rounded_panel(card_rect, tint, border, 8.0);
 
-        let text = if entry.speaker.is_empty() {
-            entry.text.clone()
-        } else {
-            format!("【{}】 {}", entry.speaker, entry.text)
-        };
         let has_v = entry.voice.is_some();
-        let text_w = if has_v {
-            (area[2] - voice_btn_w - 22.0).max(60.0)
+        let left_x = area[0] + if has_speaker { 14.0 } else { 10.0 };
+        let right_pad = if has_v { voice_btn_w + 16.0 } else { 10.0 };
+        let text_w = (area[0] + area[2] - left_x - right_pad).max(60.0);
+
+        if has_speaker {
+            // Crisp left character accent bar + dedicated speaker header line!
+            b.pkt.quads.push(Quad::rounded(
+                [area[0] + 4.0, y + 7.0, 3.0, (card_h - 14.0).max(12.0)],
+                b.theme.accent,
+                1.5,
+            ));
+            let sp_h = (card_h * 0.32).clamp(15.0, 20.0);
+            b.push_text(TextRun {
+                text: entry.speaker.clone(),
+                visible_bytes: None,
+                x: left_x,
+                y: y + 4.0,
+                width: text_w,
+                height: sp_h,
+                size: (sp_h * 0.72).clamp(11.5, 14.0),
+                line_height: sp_h,
+                color: b.theme.accent,
+                emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
+                shadow: None,
+                outline: None,
+                scroll: 0.0,
+                clip: Some([left_x, y + 3.0, text_w, sp_h + 2.0]),
+                font_assets: b.ui_fonts.clone(),
+                align: TextAlign::Left,
+                valign_center: true,
+                auto_fit: true,
+                inline_images: Vec::new(),
+                cache_key: 0,
+            });
+            let body_y = y + sp_h + 4.0;
+            let body_h = (card_h - sp_h - 7.0).max(18.0);
+            b.push_text(TextRun {
+                text: entry.text.clone(),
+                visible_bytes: None,
+                x: left_x,
+                y: body_y,
+                width: text_w,
+                height: body_h,
+                size: fsize,
+                line_height: fsize * 1.32,
+                color: b.theme.text,
+                emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
+                shadow: None,
+                outline: None,
+                scroll: 0.0,
+                clip: Some([left_x, body_y, text_w, body_h]),
+                font_assets: b.text_fonts.clone(),
+                align: TextAlign::Left,
+                valign_center: false,
+                auto_fit: true,
+                inline_images: Vec::new(),
+                cache_key: 0,
+            });
         } else {
-            (area[2] - 16.0).max(60.0)
-        };
-        b.push_text(TextRun {
-            text,
-            visible_bytes: None,
-            x: area[0] + 8.0,
-            y: y + 4.0,
-            width: text_w,
-            height: row_h - 12.0,
-            size: fsize,
-            line_height: fsize * 1.38,
-            color: b.theme.text,
-            emphasis: Vec::new(),
-            shadow: None,
-            scroll: 0.0,
-            clip: Some([area[0] + 6.0, y + 2.0, text_w + 2.0, row_h - 8.0]),
-            font_assets: b.text_fonts.clone(),
-            align: TextAlign::Left,
-            valign_center: false,
-            auto_fit: true,
-            inline_images: Vec::new(),
-            cache_key: 0,
-        });
+            // Narration row: subtly muted tone for immediate visual rhythm vs spoken dialogue
+            let nar_col = [
+                b.theme.text[0] * 0.86,
+                b.theme.text[1] * 0.89,
+                b.theme.text[2] * 0.94,
+                0.92,
+            ];
+            b.push_text(TextRun {
+                text: entry.text.clone(),
+                visible_bytes: None,
+                x: left_x,
+                y: y + 5.0,
+                width: text_w,
+                height: card_h - 10.0,
+                size: fsize,
+                line_height: fsize * 1.36,
+                color: nar_col,
+                emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
+                shadow: None,
+                outline: None,
+                scroll: 0.0,
+                clip: Some([left_x, y + 3.0, text_w, card_h - 6.0]),
+                font_assets: b.text_fonts.clone(),
+                align: TextAlign::Left,
+                valign_center: true,
+                auto_fit: true,
+                inline_images: Vec::new(),
+                cache_key: 0,
+            });
+        }
         if let Some(voice_asset) = entry.voice {
             let vx = area[0] + area[2] - voice_btn_w - 6.0;
-            let vy = y + ((row_h - 5.0) - voice_btn_h) * 0.5;
+            let vy = y + (card_h - voice_btn_h) * 0.5;
             b.button(
                 [vx, vy, voice_btn_w, voice_btn_h],
                 format!("▶ {}", messages.get(loc, "replay-voice")),
@@ -2873,7 +3332,10 @@ fn project_history_overlay(
             line_height: 17.0,
             color: b.theme.muted,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some([mid_x, by, mid_w, nav_h]),
             font_assets: b.ui_fonts.clone(),
@@ -2895,6 +3357,7 @@ fn project_gallery_overlay(
     let prog = ctx.vm.program();
     let area = overlay_shell(
         b,
+        ctx,
         if loc.starts_with("zh") {
             "鉴赏 / 回想".into()
         } else {
@@ -2985,7 +3448,10 @@ fn project_gallery_overlay(
                 line_height: 16.0,
                 color: if unlocked { b.theme.text } else { b.theme.muted },
                 emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
                 shadow: None,
+                outline: None,
                 scroll: 0.0,
                 clip: Some(rect),
                 font_assets: b.ui_fonts.clone(),
@@ -3035,7 +3501,10 @@ fn project_gallery_overlay(
             line_height: 18.0,
             color: b.theme.muted,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: Some([mid_x, by, mid_w, nav_h]),
             font_assets: b.ui_fonts.clone(),
@@ -3142,7 +3611,10 @@ fn project_cg_viewer(
             line_height: 18.0,
             color: b.theme.muted,
             emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
             shadow: None,
+            outline: None,
             scroll: 0.0,
             clip: None,
             font_assets: b.ui_fonts.clone(),
@@ -3164,6 +3636,7 @@ fn project_cg_viewer(
 
 fn project_confirm_modal(
     b: &mut Builder<'_>,
+    ctx: &UiContext<'_>,
     messages: &Messages,
     loc: &str,
     confirm: ConfirmKind,
@@ -3171,9 +3644,10 @@ fn project_confirm_modal(
     let w = b.pkt.width;
     let h = b.pkt.height;
     let [sx, sy, sw, sh] = b.safe;
+    let anim = ease_out_cubic(ctx.overlay_anim);
     b.pkt
         .quads
-        .push(Quad::solid([0.0, 0.0, w, h], [0.02, 0.03, 0.07, 0.72]));
+        .push(Quad::solid([0.0, 0.0, w, h], [0.02, 0.03, 0.07, 0.72 * anim]));
     // Backdrop hit absorbs accidental clicks behind modal
     let bg_id = b.next_hit_id;
     b.next_hit_id += 1;
@@ -3188,12 +3662,13 @@ fn project_confirm_modal(
     let cw = (sw * 0.78).clamp(260.0, 420.0).min((sw - 24.0).max(220.0));
     let ch = 152.0;
     let cx = sx + (sw - cw) * 0.5;
-    let cy = sy + (sh - ch) * 0.5;
+    let cy = sy + (sh - ch) * 0.5 + (1.0 - anim) * 10.0;
+    b.soft_shadow([cx, cy, cw, ch], 13.0, anim);
     b.rounded_panel(
         [cx, cy, cw, ch],
         b.theme.surface,
         [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
-        12.0,
+        13.0,
     );
     let (msg, ok_label) = match confirm {
         ConfirmKind::OverwriteSlot(slot) => (
@@ -3216,7 +3691,10 @@ fn project_confirm_modal(
         line_height: 24.0,
         color: b.theme.text,
         emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
         shadow: None,
+        outline: None,
         scroll: 0.0,
         clip: Some([cx + 14.0, cy + 14.0, cw - 28.0, 62.0]),
         font_assets: b.ui_fonts.clone(),
@@ -3246,8 +3724,13 @@ fn project_confirm_modal(
     );
 }
 
-fn project_ended_overlay(b: &mut Builder<'_>, messages: &Messages, loc: &str) {
-    let area = overlay_shell(b, messages.get(loc, "ending"), messages, loc);
+fn project_ended_overlay(
+    b: &mut Builder<'_>,
+    ctx: &UiContext<'_>,
+    messages: &Messages,
+    loc: &str,
+) {
+    let area = overlay_shell(b, ctx, messages.get(loc, "ending"), messages, loc);
     let bw = area[2].min(240.0);
     b.button(
         [
@@ -3424,6 +3907,13 @@ mod tests {
                 input_mode: InputMode::Pointer,
                 portrait_reader: false,
                 toast: None,
+                overlay_anim: 1.0,
+                toast_anim: 1.0,
+                dialogue_fade: 1.0,
+                ui_time_s: 0.0,
+                hud_toolbar_hovered: false,
+                host_top_left_pad: 0.0,
+                host_top_right_pad: 0.0,
             };
             let pkt = project(&ctx, vw, vh, &msgs);
             let (_, scale) = fit_stage(800.0, 600.0, vw, vh);
@@ -3569,6 +4059,13 @@ mod tests {
             input_mode: InputMode::Pointer,
             portrait_reader: true,
             toast: None,
+            overlay_anim: 1.0,
+            toast_anim: 1.0,
+            dialogue_fade: 1.0,
+            ui_time_s: 0.0,
+            hud_toolbar_hovered: false,
+            host_top_left_pad: 0.0,
+            host_top_right_pad: 0.0,
         };
         let pkt = project(&ctx, 800.0, 600.0, &msgs);
         // Only the LPM button hit exists — dialogue HUD & 7 buttons are suppressed!
@@ -3621,6 +4118,13 @@ mod tests {
             input_mode: InputMode::Touch,
             portrait_reader: true,
             toast: None,
+            overlay_anim: 1.0,
+            toast_anim: 1.0,
+            dialogue_fade: 1.0,
+            ui_time_s: 0.0,
+            hud_toolbar_hovered: false,
+            host_top_left_pad: 0.0,
+            host_top_right_pad: 0.0,
         };
         let pkt = project(&ctx, 390.0, 844.0, &msgs);
         // Stage docked at safe top (59px)
@@ -3699,6 +4203,13 @@ mod tests {
             input_mode: InputMode::Touch,
             portrait_reader: true,
             toast: None,
+            overlay_anim: 1.0,
+            toast_anim: 1.0,
+            dialogue_fade: 1.0,
+            ui_time_s: 0.0,
+            hud_toolbar_hovered: false,
+            host_top_left_pad: 0.0,
+            host_top_right_pad: 0.0,
         };
         let saves_pkt = project(&saves_ctx, 844.0, 390.0, &msgs);
         // Must have pagination buttons and stay inside safe horizontal/bottom insets!
@@ -3726,5 +4237,120 @@ mod tests {
                 h.rect
             );
         }
+    }
+
+    #[test]
+    fn visual_upgrades_ambient_frosted_sharpen_ruby_outline_and_chrome_clearance_work() {
+        let prog = livemaker_like_program();
+        let mut vm = Vm::new(prog, Some("zh-Hans".into())).unwrap();
+        vm.step(1000).unwrap();
+        // Inject a visible stage layer + rich colored/ruby span to exercise every visual path
+        vm.layers.push(LayerState {
+            id: LayerId(1),
+            parent: None,
+            asset: Some(AssetId(0)),
+            transform: Transform2D::default(),
+            shake_offset: [0.0, 0.0],
+            text: None,
+        });
+        if let Some(dlg) = &mut vm.dialogue {
+            dlg.spans.push(nir_vm::ResolvedSpan {
+                byte_start: 0,
+                byte_end: 6,
+                emphasis: false,
+                color: Some([1.0, 0.4, 0.5, 1.0]),
+                ruby: Some("テスト".into()),
+                speed: 1.0,
+                inline_image: None,
+            });
+        }
+        let prefs = Preferences::default();
+        let msgs = Messages::default();
+
+        // 1. Widescreen 1920x1080 over 800x600 stage (scale = 1.8 > 1.22):
+        //    AmbientBackdrop + CAS sharpening + rich color + ruby + outline + chrome clearance!
+        let story_ctx = UiContext {
+            vm: &vm,
+            screen: Screen::Story,
+            prefs: &prefs,
+            auto: true,
+            skip: false,
+            hold_skip: false,
+            interface_hidden: false,
+            replay_active: false,
+            slots: &[],
+            autosave: None,
+            quicksave: None,
+            saves_page: 0,
+            history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: true,
+            loading_visible: true,
+            tz_offset_mins: 0,
+            hovered_hit: None,
+            pressed_hit: None,
+            safe_insets: SafeInsets::default(),
+            input_mode: InputMode::Pointer,
+            portrait_reader: false,
+            toast: Some("Saved"),
+            overlay_anim: 1.0,
+            toast_anim: 1.0,
+            dialogue_fade: 1.0,
+            ui_time_s: 0.5,
+            hud_toolbar_hovered: false,
+            host_top_left_pad: 92.0,
+            host_top_right_pad: 52.0,
+        };
+        let spkt = project(&story_ctx, 1920.0, 1080.0, &msgs);
+        assert!(spkt.needs_blur, "widescreen margins should enable blurred ambient backdrop");
+        assert!(spkt.quads.iter().any(|q| q.special == SpecialQuad::AmbientBackdrop));
+        assert!(
+            spkt.quads.iter().any(|q| q.asset == Some(AssetId(0)) && q.sharpen > 0.15),
+            "upscaled 800x600 stage art on 1080p should enable CAS-lite sharpening"
+        );
+        let dlg_run = spkt
+            .texts
+            .iter()
+            .find(|t| t.text.contains("测试台词"))
+            .expect("dialogue text missing");
+        assert_eq!(dlg_run.color_spans.len(), 1);
+        assert_eq!(dlg_run.ruby_spans.len(), 1);
+        assert!(dlg_run.outline.is_some());
+        // Loading pill clears left host shelf button (>= 92px)
+        let load_run = spkt
+            .texts
+            .iter()
+            .find(|t| t.text.contains("加载画面"))
+            .expect("loading pill missing");
+        assert!(load_run.x >= 96.0);
+
+        // 2. Settings Tab 1 (Display) exposes frosted backdrop & all 4 visual controls!
+        let settings_ctx = UiContext {
+            screen: Screen::Settings,
+            settings_tab: 1,
+            ..story_ctx
+        };
+        let epkt = project(&settings_ctx, 1280.0, 720.0, &msgs);
+        assert!(epkt.needs_blur);
+        assert!(epkt.quads.iter().any(|q| q.special == SpecialQuad::FrostedBackdrop));
+        assert!(epkt
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, UiAction::ToggleAmbientBackdrop)));
+        assert!(epkt
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, UiAction::ToggleImageSharpening)));
+        assert!(epkt
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, UiAction::ToggleTextOutline)));
+        assert!(epkt
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, UiAction::SetDialogueOpacity(_))));
     }
 }

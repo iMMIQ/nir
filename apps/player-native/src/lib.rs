@@ -909,6 +909,13 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 ];
                 self.runtime
                     .set_hover(self.cursor_logical[0], self.cursor_logical[1]);
+                if let Some(win) = &self.window {
+                    win.set_cursor(if self.runtime.has_hovered_hit() {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {

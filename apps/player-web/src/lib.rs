@@ -605,6 +605,30 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
+        pub fn set_host_top_chrome_pads(&mut self, left: f32, right: f32) {
+            self.runtime.set_host_top_chrome_pads(left, right);
+        }
+
+        #[wasm_bindgen]
+        pub fn has_hovered_hit(&self) -> bool {
+            self.runtime.has_hovered_hit()
+        }
+
+        #[wasm_bindgen]
+        pub fn is_story_reading(&self) -> bool {
+            self.runtime.is_story_reading()
+        }
+
+        /// Returns the active stage viewport in physical canvas pixels `[x, y, w, h]`
+        /// for clean, letterbox-free save thumbnail capture.
+        #[wasm_bindgen]
+        pub fn stage_rect_phys(&self) -> Vec<f32> {
+            let r = self.runtime.stage_rect();
+            let d = self.dpr;
+            vec![r[0] * d, r[1] * d, r[2] * d, r[3] * d]
+        }
+
+        #[wasm_bindgen]
         pub fn set_tz_offset_mins(&mut self, offset_mins: i32) {
             self.runtime.set_tz_offset_mins(offset_mins);
         }

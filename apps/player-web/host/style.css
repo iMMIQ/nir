@@ -35,6 +35,12 @@ html, body {
   cursor: default;
   touch-action: none;
 }
+#stage.pointer-hover {
+  cursor: pointer;
+}
+#stage.cursor-idle {
+  cursor: none;
+}
 #video-layer {
   position: fixed;
   inset: 0;
@@ -104,6 +110,11 @@ html, body {
   opacity: 1;
   background: rgba(29, 44, 68, 0.88);
 }
+#shelf-btn.chrome-idle,
+#fs-btn.chrome-idle {
+  opacity: 0;
+  pointer-events: none;
+}
 #shelf-btn[hidden] {
   display: none;
 }
@@ -143,6 +154,7 @@ html, body {
   z-index: 12;
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
+  transition: opacity 220ms ease, background 160ms ease;
 }
 #fs-btn[hidden] {
   display: none;
@@ -154,20 +166,34 @@ html, body {
   place-items: center;
   padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   background: radial-gradient(circle at center, #182233 0%, #0d1118 75%);
-  transition: opacity 220ms ease;
+  transition: opacity 260ms ease;
   z-index: 20;
+  overflow: hidden;
+}
+#loader.has-cover::before {
+  content: "";
+  position: absolute;
+  inset: -24px;
+  background-image: var(--loader-cover);
+  background-size: cover;
+  background-position: center;
+  filter: blur(22px) brightness(0.36) saturate(1.15);
+  transform: scale(1.06);
+  z-index: -1;
 }
 #loader.hidden {
   opacity: 0;
   pointer-events: none;
 }
 .loader-card {
-  width: min(360px, 82vw);
-  padding: 20px 24px;
-  border-radius: 12px;
-  background: rgba(18, 25, 38, 0.9);
-  border: 1px solid rgba(114, 168, 224, 0.28);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  width: min(380px, 84vw);
+  padding: 22px 26px;
+  border-radius: 14px;
+  background: rgba(14, 20, 32, 0.78);
+  border: 1px solid rgba(124, 182, 238, 0.30);
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 .loader-title {
   font-size: 14px;
