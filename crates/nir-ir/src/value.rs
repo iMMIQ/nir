@@ -198,7 +198,11 @@ impl Default for Preferences {
 impl Preferences {
     pub fn sanitize(&mut self) {
         let clamp = |v: f32, lo: f32, hi: f32, def: f32| {
-            if v.is_finite() { v.clamp(lo, hi) } else { def }
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                def
+            }
         };
         self.text_speed = clamp(self.text_speed, 0.0, 8.0, 1.0);
         self.auto_delay_ms = self.auto_delay_ms.min(15_000);

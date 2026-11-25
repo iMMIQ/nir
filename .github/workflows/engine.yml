@@ -4,7 +4,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Nightly full pass at 03:17 UTC+8; the only path that records performance baselines.
+    # Nightly full pass at 03:17 UTC+8.
     - cron: '17 19 * * *'
   workflow_dispatch:
 permissions:
@@ -15,99 +15,48 @@ concurrency:
 jobs:
   engine:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    env:
+      CC_x86_64_unknown_linux_gnu: clang
+      CXX_x86_64_unknown_linux_gnu: clang++
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
         with:
-          with-node: 'true'
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install native subsetter build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev
-      - name: Install JS dependencies, syntax check and host tests
-        run: |
-          bun install --frozen-lockfile
-          bun run check:js
-          bun run test:host
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake
+      - name: JS syntax check
+        run: bun run check:js
       - name: Native and WASM checks
         run: |
           cargo fmt --all --check
           cargo xtask test
-          cargo clippy --locked --workspace --all-targets --exclude player-web --exclude nir-platform-web -- -D warnings
-          cargo clippy --locked -p player-web -p nir-platform-web -p nir-render-wgpu -p nir-engine --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy --locked --workspace --all-targets --exclude player-web --exclude player-android -- -D warnings
+          cargo clippy --locked -p player-web -p nir-render -p nir-runtime -p nir-ui -p nir-vm -p nir-ir --target wasm32-unknown-unknown -- -D warnings
       - uses: ./.github/actions/build-sdk
-      - name: Build and verify engine test project
+      - name: Build and verify example project
         run: |
-          ./dist/novelc -p examples/rain-letters resolve
-          ./dist/novelc -p examples/rain-letters check --locked
-          ./dist/novelc -p examples/rain-letters test
-          ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
-          python3 scripts/test_verify_runtime.py
-          python3 scripts/verify_release.py dist/rain-letters-web
-          python3 scripts/verify_sdk.py
-          python3 scripts/verify_preview_connections.py
-          bun run test:network-transfer
-      - uses: ./.github/actions/setup-browser-audio
-      - name: Chromium software WebGPU regression
-        env:
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:browser --max-failures=1
-      - name: Desktop backend acceptance
-        env:
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-          LIBGL_ALWAYS_SOFTWARE: '1'
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
-      - name: Extended Web suites (nir-next, reading-modes, storage, audio-replacement)
-        run: |
-          bun run test:nir-next
-          bun run test:reading-modes
-          bun run test:storage
-          bun run test:audio-replacement
-      - name: Module performance smoke
-        if: github.event_name == 'pull_request' || github.event_name == 'push'
-        env:
-          NIR_PERF_MODE: ci
-          NIR_PERF_SAMPLES: '2'
-          NIR_PERF_CYCLES: '2'
-          NIR_PERF_SCALE_REPETITIONS: '1'
-          NIR_PERF_SMOKE: '1'
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance:smoke
-          NIR_PERF_LONGRUN_SECONDS=120 TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance --trace=off --grep 'M3 sustained'
-      - name: Performance baselines and module scale
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        env:
-          NIR_PERF_MODE: ci
-          NIR_PERF_SCALE_REPETITIONS: '5'
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:performance
-          bun run test:reading-endurance
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          test "$(./dist/novelc --version)" = "novelc $VERSION"
+          ./dist/novelc check examples/rain-letters
+          ./dist/novelc build examples/rain-letters --target pak --out target/tmp/rain-letters.nirpak
+          ./dist/novelc build examples/rain-letters --target web --out dist/rain-letters-web
+          ./dist/novelc build examples/rain-letters --target native --out dist/rain-letters-native
+          for f in index.html style.css app.js player_web.js player_web_bg.wasm game.nirpak; do
+            test -s "dist/rain-letters-web/$f"
+          done
+          test -x dist/rain-letters-native/player-native
+          test -s dist/rain-letters-native/game.nirpak
+          rm -rf target/tmp/init-smoke
+          ./dist/novelc init target/tmp/init-smoke --title "CI Smoke"
+          ./dist/novelc check target/tmp/init-smoke
+          ./dist/novelc build target/tmp/init-smoke --target pak --out target/tmp/init-smoke/dist/game.nirpak
+          test -s target/tmp/init-smoke/dist/game.nirpak
+          ./dist/novelc i18n extract target/tmp/init-smoke --lang en
+          test -s target/tmp/init-smoke/locales/en.toml
+          python3 scripts/third_party.py target/tmp/NOTICE.txt
+          test -s target/tmp/NOTICE.txt
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

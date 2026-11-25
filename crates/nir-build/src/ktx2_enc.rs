@@ -75,7 +75,10 @@ pub fn encode_ktx2_bcn(rgba: &[u8], width: u32, height: u32, has_alpha: bool) ->
     fmt.compress(&padded, pad_w, pad_h, params, &mut raw_blocks);
 
     // ZLIB supercompress the BCn block payload (typically shrinks BC1/BC3 on anime CGs by 2x-4x on disk!)
-    let mut zenc = ZlibEncoder::new(Vec::with_capacity(raw_blocks.len() / 2), Compression::default());
+    let mut zenc = ZlibEncoder::new(
+        Vec::with_capacity(raw_blocks.len() / 2),
+        Compression::default(),
+    );
     let _ = zenc.write_all(&raw_blocks);
     let compressed = zenc.finish().unwrap_or_else(|_| raw_blocks.clone());
 
@@ -136,7 +139,7 @@ pub fn encode_ktx2_bcn(rgba: &[u8], width: u32, height: u32, has_alpha: bool) ->
     out.extend_from_slice(&kvd_len.to_le_bytes()); // 60..64
     out.extend_from_slice(&sgd_offset.to_le_bytes()); // 64..72
     out.extend_from_slice(&sgd_len.to_le_bytes()); // 72..80
-    // Level 0 index (24 bytes): byteOffset, byteLength, uncompressedByteLength
+                                                   // Level 0 index (24 bytes): byteOffset, byteLength, uncompressedByteLength
     out.extend_from_slice(&level_offset.to_le_bytes());
     out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
     out.extend_from_slice(&(raw_blocks.len() as u64).to_le_bytes());

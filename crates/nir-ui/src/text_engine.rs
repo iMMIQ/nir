@@ -183,8 +183,7 @@ impl TextEngine {
     fn ensure_fonts_ready(&mut self) {
         if self.fallback_dirty && (!self.families.is_empty() || !self.fallback_families.is_empty())
         {
-            let mut unique =
-                Vec::with_capacity(self.families.len() + self.fallback_families.len());
+            let mut unique = Vec::with_capacity(self.families.len() + self.fallback_families.len());
             for &fam in self.families.values() {
                 if !unique.contains(&fam) {
                     unique.push(fam);
@@ -211,7 +210,9 @@ impl TextEngine {
             self.fallback_dirty = false;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if self.families.is_empty() && self.fallback_families.is_empty() && !self.system_fonts_loaded
+        if self.families.is_empty()
+            && self.fallback_families.is_empty()
+            && !self.system_fonts_loaded
         {
             self.fonts.db_mut().load_system_fonts();
             self.system_fonts_loaded = true;
@@ -309,9 +310,8 @@ impl TextEngine {
 
         if r.auto_fit && r.height > 1.0 && !r.text.is_empty() {
             let want_single_line = !r.text.contains('\n') && r.height < r.size * 1.95;
-            let overflows = |rc: usize, ch: f32| {
-                (want_single_line && rc > 1) || ch > r.height + 1.0
-            };
+            let overflows =
+                |rc: usize, ch: f32| (want_single_line && rc > 1) || ch > r.height + 1.0;
 
             // Stage 1: For multi-line dialogue text, gently tighten excess line-height first
             // (absorbs LiveMaker extra leading / font-metric differences without shrinking text!).
@@ -320,7 +320,15 @@ impl TextEngine {
                 if cur_lh > tight_lh + 0.5 {
                     let needed_ratio = (r.height / content_h).clamp(0.75, 0.98);
                     cur_lh = (cur_lh * needed_ratio).max(tight_lh);
-                    b = Self::build_buffer(&mut self.fonts, r, &attrs, rich, align, cur_size, cur_lh);
+                    b = Self::build_buffer(
+                        &mut self.fonts,
+                        r,
+                        &attrs,
+                        rich,
+                        align,
+                        cur_size,
+                        cur_lh,
+                    );
                     (run_count, content_h) = Self::measure_buffer(&b);
                 }
             }
@@ -452,7 +460,10 @@ mod tests {
         };
         run.compute_key();
         engine.layout_texts(std::slice::from_ref(&run));
-        let entry = engine.buffers.get(&run.cache_key).expect("shaped buffer cached");
+        let entry = engine
+            .buffers
+            .get(&run.cache_key)
+            .expect("shaped buffer cached");
         assert!(
             entry.effective_size < 24.0,
             "auto_fit should shrink overflowing dialogue font (got {})",

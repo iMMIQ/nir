@@ -710,9 +710,14 @@ mod wasm_host {
             if let Ok(surface) =
                 gpu_instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             {
-                if let Ok(r) =
-                    Renderer::new(gpu_instance, surface, width, height, RendererBackend::WebGpu)
-                        .await
+                if let Ok(r) = Renderer::new(
+                    gpu_instance,
+                    surface,
+                    width,
+                    height,
+                    RendererBackend::WebGpu,
+                )
+                .await
                 {
                     return Ok(r);
                 }

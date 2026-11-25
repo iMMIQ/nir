@@ -191,7 +191,10 @@ fn scan_assets(root: &Path) -> Result<Vec<DiscoveredAsset>> {
 fn scan_scripts(root: &Path) -> Result<Vec<nirs::ScriptFile>> {
     let scripts_dir = root.join("scripts");
     if !scripts_dir.is_dir() {
-        bail!("E_PROJECT: missing `scripts/` directory in {}", root.display());
+        bail!(
+            "E_PROJECT: missing `scripts/` directory in {}",
+            root.display()
+        );
     }
     let mut files = Vec::new();
     collect_files(&scripts_dir, &mut files)?;
@@ -339,7 +342,10 @@ fn compile_project_with_compression(
     }
     remap_ops_assets(&mut compiled.ops, &remap);
     let remap_opt = |o: Option<AssetId>| o.and_then(|id| remap.get(&id).copied());
-    let ui_fonts: Vec<AssetId> = fonts.iter().filter_map(|id| remap.get(id).copied()).collect();
+    let ui_fonts: Vec<AssetId> = fonts
+        .iter()
+        .filter_map(|id| remap.get(id).copied())
+        .collect();
 
     let mut ui = UiTheme::default();
     if let Some(hex) = &manifest.theme.accent {
@@ -384,8 +390,8 @@ fn compile_project_with_compression(
 
     let optimize_one = |orig_idx: usize| -> Result<AssetWorkOutput> {
         let src = &discovered[orig_idx];
-        let raw = fs::read(&src.path)
-            .with_context(|| format!("reading asset {}", src.path.display()))?;
+        let raw =
+            fs::read(&src.path).with_context(|| format!("reading asset {}", src.path.display()))?;
         let mut features = 0u32;
         let mut trimmed = false;
         let out = match src.kind {
@@ -596,7 +602,10 @@ fn compile_project_with_compression(
         .into_iter()
         .map(|b| {
             let h = sha256_bytes(&b);
-            BlobBacking::Mem { bytes: b, sha256: h }
+            BlobBacking::Mem {
+                bytes: b,
+                sha256: h,
+            }
         })
         .collect();
     let generated_thumbs = run_gallery_thumbs_pass(&mut program, &mut backings, &cache_dir, opt);
@@ -618,7 +627,8 @@ fn compile_project_with_compression(
         texts: compiled.texts.len(),
         total_assets_scanned: total_scanned,
         packed_assets: program.assets.len(),
-        pruned_assets: total_scanned.saturating_sub(program.assets.len().saturating_sub(generated_thumbs)),
+        pruned_assets: total_scanned
+            .saturating_sub(program.assets.len().saturating_sub(generated_thumbs)),
         trimmed_sprites,
         delta_patched,
         generated_thumbs,
@@ -759,7 +769,13 @@ pub fn package_android(
         .meta
         .game_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     let package_name = format!("org.nir.g{pkg_suffix}");
 
@@ -893,7 +909,8 @@ fn run_delta_pass(
 
             // Fast warm-cache hit for this chunk!
             if let Ok(plan_bytes) = fs::read(&plan_path) {
-                if let Ok(entries) = serde_json::from_slice::<Vec<CachedDeltaPlanEntry>>(&plan_bytes)
+                if let Ok(entries) =
+                    serde_json::from_slice::<Vec<CachedDeltaPlanEntry>>(&plan_bytes)
                 {
                     let mut all_present = true;
                     let mut resolved = Vec::with_capacity(entries.len());
@@ -964,10 +981,7 @@ fn run_delta_pass(
             for dr in deltas {
                 let orig_len = backings[dr.asset_idx].info().size as i64;
                 let saved = orig_len - dr.patch_webp.len() as i64;
-                let patch_key = format!(
-                    "dl_{:x}.nioc",
-                    Sha256::digest(&dr.patch_webp)
-                );
+                let patch_key = format!("dl_{:x}.nioc", Sha256::digest(&dr.patch_webp));
                 let patch_path = cache_dir.join(&patch_key);
                 let cref = write_image_cache(
                     &patch_path,
@@ -1229,7 +1243,11 @@ fn prepare_direct_build(
                     .with_context(|| format!("decoding direct image `{}`", src.name))?;
                 let orig_len = src.source_fingerprint.map_or(0, |(len, _)| len as i64);
                 let (res, _) = match &pixels {
-                    DirectPixels::Rgb { width, height, data } => optimize_decoded_pixels(
+                    DirectPixels::Rgb {
+                        width,
+                        height,
+                        data,
+                    } => optimize_decoded_pixels(
                         RawPixels::Rgb {
                             width: *width,
                             height: *height,
@@ -1238,7 +1256,11 @@ fn prepare_direct_build(
                         orig_len,
                         opt,
                     )?,
-                    DirectPixels::Rgba { width, height, data } => optimize_decoded_pixels(
+                    DirectPixels::Rgba {
+                        width,
+                        height,
+                        data,
+                    } => optimize_decoded_pixels(
                         RawPixels::Rgba {
                             width: *width,
                             height: *height,
@@ -1260,12 +1282,7 @@ fn prepare_direct_build(
                 let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
                     let fp_path = fp_image_cache_path(cache_dir, &src.name, fp, opt);
                     BlobBacking::Cache(write_image_cache(
-                        &fp_path,
-                        res.codec,
-                        res.width,
-                        res.height,
-                        res.trim,
-                        &res.bytes,
+                        &fp_path, res.codec, res.width, res.height, res.trim, &res.bytes,
                     ))
                 } else {
                     let sha = sha256_bytes(&res.bytes);
@@ -1291,8 +1308,7 @@ fn prepare_direct_build(
             }
         }
 
-        let raw = (src.loader)()
-            .with_context(|| format!("loading direct asset `{}`", src.name))?;
+        let raw = (src.loader)().with_context(|| format!("loading direct asset `{}`", src.name))?;
         let out = match src.kind {
             AssetKind::Image => {
                 let res = optimize_image(&raw, src.codec, opt, cache_dir)?;
@@ -1308,12 +1324,7 @@ fn prepare_direct_build(
                 let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
                     let fp_path = fp_image_cache_path(cache_dir, &src.name, fp, opt);
                     BlobBacking::Cache(write_image_cache(
-                        &fp_path,
-                        res.codec,
-                        res.width,
-                        res.height,
-                        res.trim,
-                        &res.bytes,
+                        &fp_path, res.codec, res.width, res.height, res.trim, &res.bytes,
                     ))
                 } else {
                     let sha = sha256_bytes(&res.bytes);
@@ -1621,13 +1632,10 @@ pub fn build_direct_program_with_compression(
     let infos: Vec<StreamingBlobInfo> = prep.backings.iter().map(BlobBacking::info).collect();
 
     let mut nirpak = Vec::new();
-    let (_, patched_assets) = write_nirpak_streaming(
-        &prep.program,
-        &infos,
-        compression,
-        &mut nirpak,
-        |idx, w| prep.backings[idx].stream_to(w),
-    )?;
+    let (_, patched_assets) =
+        write_nirpak_streaming(&prep.program, &infos, compression, &mut nirpak, |idx, w| {
+            prep.backings[idx].stream_to(w)
+        })?;
     prep.program.assets = patched_assets;
 
     let mut media_blobs = Vec::with_capacity(prep.backings.len());
@@ -1826,7 +1834,9 @@ fn collect_program_assets(program: &NirProgram) -> BTreeSet<AssetId> {
                     }
                 }
             }
-            Op::ChoiceList { click_se: Some(a), .. } => {
+            Op::ChoiceList {
+                click_se: Some(a), ..
+            } => {
                 out.insert(*a);
             }
             Op::ChoiceMenu {
@@ -1895,9 +1905,7 @@ fn remap_program_assets(program: &mut NirProgram, remap: &BTreeMap<AssetId, Asse
             item.preview_image = item.preview_image.map(m);
         }
     }
-    program
-        .asset_lookup
-        .retain(|_, id| remap.contains_key(id));
+    program.asset_lookup.retain(|_, id| remap.contains_key(id));
     for id in program.asset_lookup.values_mut() {
         *id = m(*id);
     }
@@ -2187,9 +2195,18 @@ label ending:
 
         let (decoded, _) = decode_nirpak_header(&built.nirpak).unwrap();
         // AssetId(1) -> remapped to AssetId(0); AssetId(2) -> remapped to AssetId(1)
-        assert_eq!(decoded.asset_lookup.get("gfx/dyn_bg.png"), Some(&AssetId(1)));
+        assert_eq!(
+            decoded.asset_lookup.get("gfx/dyn_bg.png"),
+            Some(&AssetId(1))
+        );
         assert_eq!(decoded.menus[0].items[0].image, Some(AssetId(0)));
-        assert!(matches!(decoded.ops[0], Op::LayerSet { asset: Some(AssetId(0)), .. }));
+        assert!(matches!(
+            decoded.ops[0],
+            Op::LayerSet {
+                asset: Some(AssetId(0)),
+                ..
+            }
+        ));
     }
 
     #[test]

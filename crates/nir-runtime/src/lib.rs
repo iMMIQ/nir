@@ -22,7 +22,10 @@ const PROFILE_FLUSH_INTERVAL_US: u64 = 5_000_000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostCommand {
     /// Request the host to load/decode an asset (image/audio/font). `urgent` = needed now.
-    LoadAsset { id: AssetId, urgent: bool },
+    LoadAsset {
+        id: AssetId,
+        urgent: bool,
+    },
     /// Hint the renderer/audio host to LRU-evict textures outside this active pinned set.
     HintPinnedAssets(BTreeSet<AssetId>),
     PlayAudio {
@@ -544,7 +547,12 @@ impl Runtime {
         }
         match self.screen {
             Screen::Story => {
-                if self.vm.choice.as_ref().is_some_and(|c| c.cancel_pc.is_some()) {
+                if self
+                    .vm
+                    .choice
+                    .as_ref()
+                    .is_some_and(|c| c.cancel_pc.is_some())
+                {
                     self.dispatch(UiAction::CancelChoice);
                 } else {
                     self.dispatch(UiAction::OpenMenu);
@@ -567,7 +575,8 @@ impl Runtime {
                 self.skip = false;
                 self.interface_hidden = false;
                 let profile = self.vm.profile.clone();
-                if let Ok(mut vm) = Vm::new(self.program.clone(), Some(self.prefs.text_locale.clone()))
+                if let Ok(mut vm) =
+                    Vm::new(self.program.clone(), Some(self.prefs.text_locale.clone()))
                 {
                     vm.set_profile(profile);
                     self.vm = vm;
@@ -836,11 +845,14 @@ impl Runtime {
             UiAction::ScrollHistory(delta) => {
                 let max_scroll = self.vm.history.len().saturating_sub(1);
                 if delta > 0 {
-                    self.history_scroll =
-                        self.history_scroll.saturating_add(delta as usize).min(max_scroll);
+                    self.history_scroll = self
+                        .history_scroll
+                        .saturating_add(delta as usize)
+                        .min(max_scroll);
                 } else {
-                    self.history_scroll =
-                        self.history_scroll.saturating_sub(delta.unsigned_abs() as usize);
+                    self.history_scroll = self
+                        .history_scroll
+                        .saturating_sub(delta.unsigned_abs() as usize);
                 }
             }
             UiAction::SavesPage(delta) => {
@@ -848,7 +860,9 @@ impl Runtime {
                 if delta > 0 {
                     self.saves_page = self.saves_page.saturating_add(delta as usize).min(max_page);
                 } else {
-                    self.saves_page = self.saves_page.saturating_sub(delta.unsigned_abs() as usize);
+                    self.saves_page = self
+                        .saves_page
+                        .saturating_sub(delta.unsigned_abs() as usize);
                 }
             }
             UiAction::TogglePortraitReader => {
@@ -938,9 +952,9 @@ impl Runtime {
             return;
         }
 
-        let (intents, visual_changed) = self
-            .vm
-            .tick_with_dirty(delta_us, self.prefs.text_speed, self.prefs.reduced_motion);
+        let (intents, visual_changed) =
+            self.vm
+                .tick_with_dirty(delta_us, self.prefs.text_speed, self.prefs.reduced_motion);
         self.handle_intents(intents);
         if visual_changed {
             self.dirty = true;
@@ -992,8 +1006,8 @@ impl Runtime {
     /// Rebuilds the `DrawPacket` ONLY when `dirty` is true (zero safety-frame polling!).
     /// Returns `Some(&DrawPacket)` if visual state actually changed and GPU should draw.
     pub fn prepare_frame(&mut self, width: f32, height: f32) -> Option<&DrawPacket> {
-        let size_changed =
-            (self.last_packet.width - width).abs() > 0.5 || (self.last_packet.height - height).abs() > 0.5;
+        let size_changed = (self.last_packet.width - width).abs() > 0.5
+            || (self.last_packet.height - height).abs() > 0.5;
         if !self.dirty && !size_changed {
             return None;
         }
@@ -1107,13 +1121,16 @@ impl Runtime {
                 }
                 VmIntent::PlayVideo { asset, skippable } => {
                     self.request_asset(asset, true);
-                    self.commands.push(HostCommand::PlayVideo { asset, skippable });
+                    self.commands
+                        .push(HostCommand::PlayVideo { asset, skippable });
                 }
                 VmIntent::StopVideo => {
                     self.commands.push(HostCommand::StopVideo);
                 }
                 VmIntent::OpenModal(kind) => {
-                    if self.frozen_vm.is_some() && matches!(kind, ModalKind::Replay | ModalKind::Gallery) {
+                    if self.frozen_vm.is_some()
+                        && matches!(kind, ModalKind::Replay | ModalKind::Gallery)
+                    {
                         self.dispatch(UiAction::ExitReplay);
                         continue;
                     }
@@ -1168,7 +1185,8 @@ impl Runtime {
             Some(false) if urgent => {
                 // Promote an already-queued background prefetch to urgent!
                 self.requested_assets.insert(id, true);
-                self.commands.push(HostCommand::LoadAsset { id, urgent: true });
+                self.commands
+                    .push(HostCommand::LoadAsset { id, urgent: true });
             }
             _ => {}
         }
@@ -1303,8 +1321,13 @@ mod tests {
 
     #[test]
     fn runtime_flow_save_rollback_and_dirty_gating() {
-        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
-            .unwrap();
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
         assert_eq!(rt.screen, Screen::Title);
         assert!(rt.prepare_frame(1280.0, 720.0).is_some());
         // Clean frame produces None (zero redundant GPU draws, no 16-frame polling!)
@@ -1322,7 +1345,9 @@ mod tests {
         assert_eq!(rt.vm().history.len(), 2);
         let mid_cmds = rt.take_commands();
         assert!(
-            !mid_cmds.iter().any(|c| matches!(c, HostCommand::SaveProfile(_))),
+            !mid_cmds
+                .iter()
+                .any(|c| matches!(c, HostCommand::SaveProfile(_))),
             "SaveProfile must be debounced rather than written synchronously on every line"
         );
 
@@ -1355,8 +1380,13 @@ mod tests {
 
     #[test]
     fn dirty_gating_ignores_sub_grapheme_and_wait_ticks() {
-        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
-            .unwrap();
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
         rt.dispatch(UiAction::NewGame);
         assert!(rt.prepare_frame(1280.0, 720.0).is_some());
         // default_reveal_us = 10_000us; a 3_000us tick doesn't reveal a new grapheme -> no redraw!
@@ -1432,7 +1462,10 @@ mod tests {
             ],
             texts: BTreeMap::from([(
                 "en".into(),
-                vec![TextEntry::plain("After modal"), TextEntry::plain("Replay line")],
+                vec![
+                    TextEntry::plain("After modal"),
+                    TextEntry::plain("Replay line"),
+                ],
             )]),
             ui: UiTheme::default(),
             assets: vec![],
@@ -1441,7 +1474,8 @@ mod tests {
             menus: vec![],
         });
 
-        let mut rt = Runtime::new(prog, Preferences::default(), ProfileData::default(), vec![]).unwrap();
+        let mut rt =
+            Runtime::new(prog, Preferences::default(), ProfileData::default(), vec![]).unwrap();
         rt.dispatch(UiAction::NewGame);
         assert_eq!(rt.screen, Screen::Saves { save_mode: false });
         rt.dispatch(UiAction::CloseOverlay);
@@ -1460,8 +1494,13 @@ mod tests {
 
     #[test]
     fn async_asset_and_font_loads_always_trigger_redraw_and_eviction_reloads() {
-        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
-            .unwrap();
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
         assert!(rt.prepare_frame(1280.0, 720.0).is_some());
         assert!(rt.prepare_frame(1280.0, 720.0).is_none());
 
@@ -1480,19 +1519,32 @@ mod tests {
         rt.mark_assets_evicted(&[AssetId(7)]);
         rt.request_asset(AssetId(7), true);
         let cmds = rt.take_commands();
-        assert!(cmds.iter().any(|c| matches!(c, HostCommand::LoadAsset { id: AssetId(7), urgent: true })));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            HostCommand::LoadAsset {
+                id: AssetId(7),
+                urgent: true
+            }
+        )));
 
         // SetFontScale updates prefs cleanly and persists them.
         rt.dispatch(UiAction::SetFontScale(1.2));
         assert!((rt.prefs.font_scale - 1.2).abs() < 0.001);
         let pcmds = rt.take_commands();
-        assert!(pcmds.iter().any(|c| matches!(c, HostCommand::SavePreferences(_))));
+        assert!(pcmds
+            .iter()
+            .any(|c| matches!(c, HostCommand::SavePreferences(_))));
     }
 
     #[test]
     fn touch_gestures_and_host_lifecycle_pause_work_end_to_end() {
-        let mut rt = Runtime::new(test_prog(), Preferences::default(), ProfileData::default(), vec![])
-            .unwrap();
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
         rt.dispatch(UiAction::NewGame);
         assert!(rt.prepare_frame(390.0, 844.0).is_some());
         rt.take_commands();

@@ -163,8 +163,7 @@ fn respond_arc_bytes_with_range(req: Request, data: Arc<Vec<u8>>, cache_control:
 /// Serves a static directory (e.g. a built Web bundle) over HTTP with `Range` support.
 pub fn serve_static(dir: &Path, host: &str, port: u16) -> Result<()> {
     let addr = format!("{host}:{port}");
-    let server = Server::http(&addr)
-        .map_err(|e| anyhow::anyhow!("binding http://{addr}: {e}"))?;
+    let server = Server::http(&addr).map_err(|e| anyhow::anyhow!("binding http://{addr}: {e}"))?;
     println!("NIR static preview: http://{addr}/");
     for req in server.incoming_requests() {
         let url_path = req.url().split('?').next().unwrap_or("/");
@@ -224,7 +223,9 @@ pub fn run_dev_server(project_dir: &Path, sdk_web_dir: &Path, host: &str, port: 
                                     *guard = Arc::new(rebuilt.nirpak);
                                 }
                                 let v = version.fetch_add(1, Ordering::SeqCst) + 1;
-                                println!("[hot-reload #{v}] rebuilt game.nirpak ({size_kb:.1} KiB)");
+                                println!(
+                                    "[hot-reload #{v}] rebuilt game.nirpak ({size_kb:.1} KiB)"
+                                );
                             }
                             Err(e) => {
                                 eprintln!("[hot-reload error] {e:#}");
@@ -237,8 +238,7 @@ pub fn run_dev_server(project_dir: &Path, sdk_web_dir: &Path, host: &str, port: 
     }
 
     let addr = format!("{host}:{port}");
-    let server = Server::http(&addr)
-        .map_err(|e| anyhow::anyhow!("binding http://{addr}: {e}"))?;
+    let server = Server::http(&addr).map_err(|e| anyhow::anyhow!("binding http://{addr}: {e}"))?;
     println!("NIR dev server listening at http://{addr}/ (live hot-reload active)");
 
     for req in server.incoming_requests() {

@@ -725,11 +725,19 @@ pub fn decode_nirpak_header_only(bytes: &[u8]) -> Result<(NirProgram, usize, u64
         .checked_add(prog_len)
         .ok_or_else(|| NirError::new("E_PACK", "header", "program length overflow"))?;
     if bytes.len() < media_base {
-        return Err(NirError::new("E_PACK", "header", "truncated nirpak program section"));
+        return Err(NirError::new(
+            "E_PACK",
+            "header",
+            "truncated nirpak program section",
+        ));
     }
     let prog_slice = &bytes[NIRPAK_HEADER_LEN..media_base];
     if crc32(prog_slice) != expected_crc {
-        return Err(NirError::new("E_PACK", "crc", "program section CRC mismatch"));
+        return Err(NirError::new(
+            "E_PACK",
+            "crc",
+            "program section CRC mismatch",
+        ));
     }
 
     let is_postcard = flags & FLAG_POSTCARD != 0;
@@ -765,7 +773,11 @@ pub fn decode_nirpak_header(bytes: &[u8]) -> Result<(NirProgram, usize)> {
         .checked_add(media_len as usize)
         .ok_or_else(|| NirError::new("E_PACK", "header", "media length overflow"))?;
     if bytes.len() < expected_total {
-        return Err(NirError::new("E_PACK", "header", "truncated nirpak payload"));
+        return Err(NirError::new(
+            "E_PACK",
+            "header",
+            "truncated nirpak payload",
+        ));
     }
     Ok((program, media_base))
 }
@@ -842,10 +854,7 @@ mod tests {
                 Op::StoreVar(VarId(0)),
                 Op::End { outcome: StrId(0) },
             ],
-            texts: BTreeMap::from([(
-                "zh-Hans".into(),
-                vec![TextEntry::plain("你好，新世界！")],
-            )]),
+            texts: BTreeMap::from([("zh-Hans".into(), vec![TextEntry::plain("你好，新世界！")])]),
             ui: UiTheme::default(),
             assets: vec![AssetMeta {
                 id: AssetId(0),
@@ -993,7 +1002,13 @@ mod tests {
                 ui_fonts: vec![],
                 text_fonts: vec![],
             },
-            strings: vec!["entry".into(), "a0".into(), "a1".into(), "a2".into(), "a3".into()],
+            strings: vec![
+                "entry".into(),
+                "a0".into(),
+                "a1".into(),
+                "a2".into(),
+                "a3".into(),
+            ],
             vars: vec![],
             funcs: vec![FuncMeta {
                 name: StrId(0),

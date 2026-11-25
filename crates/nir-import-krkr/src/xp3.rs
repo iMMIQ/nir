@@ -39,8 +39,8 @@ pub struct Xp3Archive {
 
 impl Xp3Archive {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file =
-            File::open(path).with_context(|| format!("opening XP3 archive `{}`", path.display()))?;
+        let mut file = File::open(path)
+            .with_context(|| format!("opening XP3 archive `{}`", path.display()))?;
         let file_len = file.metadata()?.len();
         let base_offset = find_xp3_magic(&mut file, file_len)?;
 
@@ -137,10 +137,7 @@ impl ArchiveSource for Xp3Archive {
                     .with_context(|| format!("decompressing XP3 entry `{normalized_path}`"))?;
                 out.extend_from_slice(&plain);
             } else {
-                ensure!(
-                    seg.orig_size <= 256 * 1024 * 1024,
-                    "XP3 segment too large"
-                );
+                ensure!(seg.orig_size <= 256 * 1024 * 1024, "XP3 segment too large");
                 let mut plain = vec![0u8; seg.orig_size as usize];
                 file.read_exact(&mut plain)?;
                 out.extend_from_slice(&plain);

@@ -79,9 +79,8 @@ pub fn extract_settings(lpb_data: Option<&[u8]>, archive: &DirArchive) -> LiveNo
                     cfg.stage_height = *h as u32;
                 }
             }
-            if let Some(Literal::String(t)) = settings
-                .get("タイトル")
-                .or_else(|| settings.get("Title"))
+            if let Some(Literal::String(t)) =
+                settings.get("タイトル").or_else(|| settings.get("Title"))
             {
                 if !t.trim().is_empty() {
                     cfg.title = Some(t.trim().to_owned());
@@ -205,9 +204,7 @@ pub fn extract_dialogue_styles(
 
     // Fallback: if no explicit `@ParamStr[0] == ...` branches, scan whole script as "(標準)"
     if styles.is_empty() {
-        if let Some(st) =
-            eval_style_branch("(標準)", cmds, stage, default_face_pos, archive)
-        {
+        if let Some(st) = eval_style_branch("(標準)", cmds, stage, default_face_pos, archive) {
             styles.push(st);
         }
     }
@@ -330,7 +327,8 @@ fn eval_style_branch(
                 if obj_name != "メッセージボックス" {
                     continue;
                 }
-                let [bx, by, bw, bh] = base_rect.unwrap_or([0.0, 0.0, stage[0] as f32, stage[1] as f32]);
+                let [bx, by, bw, bh] =
+                    base_rect.unwrap_or([0.0, 0.0, stage[0] as f32, stage[1] as f32]);
                 let rx = props
                     .get(&4)
                     .and_then(|e| eval_layout_i32(e, stage, &obj_sizes))
@@ -459,7 +457,9 @@ fn eval_layout_i32(
                     }
                     35 => Value::Int(stage[0] as i64),
                     36 => Value::Int(stage[1] as i64),
-                    37 if args.len() == 1 => Value::Int(resolve(&args[0], &env)?.as_i64().unwrap_or(0)),
+                    37 if args.len() == 1 => {
+                        Value::Int(resolve(&args[0], &env)?.as_i64().unwrap_or(0))
+                    }
                     _ => return None,
                 }
             }

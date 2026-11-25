@@ -297,7 +297,10 @@ impl<'a> Compiler<'a> {
                     .or_else(|| trimmed.strip_prefix("@var "))
                 {
                     let (name, expr) = rest.split_once('=').ok_or_else(|| {
-                        anyhow!("E_NIRS ({}:{line_no}): expected `var <name> = <literal>`", file.name)
+                        anyhow!(
+                            "E_NIRS ({}:{line_no}): expected `var <name> = <literal>`",
+                            file.name
+                        )
                     })?;
                     let val = parse_literal(expr.trim())?;
                     self.ensure_var(name.trim(), val);
@@ -389,7 +392,10 @@ impl<'a> Compiler<'a> {
                 }
 
                 // Control blocks: `if <expr>:`, `elif <expr>:`, `else:`, `endif` / `end`
-                if let Some(cond_str) = trimmed.strip_prefix("if ").and_then(|s| s.strip_suffix(':')) {
+                if let Some(cond_str) = trimmed
+                    .strip_prefix("if ")
+                    .and_then(|s| s.strip_suffix(':'))
+                {
                     self.compile_expr(cond_str.trim(), &loc)?;
                     let jif_idx = self.ops.len();
                     self.ops.push(Op::JumpIfFalse(0));
@@ -463,10 +469,13 @@ impl<'a> Compiler<'a> {
                         idx += 1;
                         let oloc = format!("{}:{oln}", file.name);
                         let (left, target) = rest.split_once("->").ok_or_else(|| {
-                            anyhow!("E_NIRS ({oloc}): choice option expects `- \"Label\" -> target`")
+                            anyhow!(
+                                "E_NIRS ({oloc}): choice option expects `- \"Label\" -> target`"
+                            )
                         })?;
                         let target = target.trim().to_owned();
-                        let (label_part, cond_part) = if let Some((l, c)) = left.rsplit_once(" if ") {
+                        let (label_part, cond_part) = if let Some((l, c)) = left.rsplit_once(" if ")
+                        {
                             (l.trim(), Some(c.trim()))
                         } else {
                             (left.trim(), None)
@@ -515,7 +524,10 @@ impl<'a> Compiler<'a> {
             }
 
             if !if_stack.is_empty() {
-                bail!("E_NIRS ({}): unclosed `if` block (missing `endif`)", file.name);
+                bail!(
+                    "E_NIRS ({}): unclosed `if` block (missing `endif`)",
+                    file.name
+                );
             }
             if in_func {
                 self.ops.push(Op::Ret { has_value: false });
@@ -895,7 +907,8 @@ impl<'a> Compiler<'a> {
                     match k {
                         "amp" => {
                             if let Some((a, b)) = v.split_once(',') {
-                                spec.amplitude = [a.parse().unwrap_or(12.0), b.parse().unwrap_or(12.0)];
+                                spec.amplitude =
+                                    [a.parse().unwrap_or(12.0), b.parse().unwrap_or(12.0)];
                             } else if let Ok(a) = v.parse::<f32>() {
                                 spec.amplitude = [a, a];
                             }
@@ -1122,7 +1135,11 @@ impl<'a> Compiler<'a> {
         let name = lhs.trim();
         let vid = self.ensure_var(name, Value::Int(0));
         // Built-in `rand(min, max)`
-        if let Some(inner) = rhs.trim().strip_prefix("rand(").and_then(|s| s.strip_suffix(')')) {
+        if let Some(inner) = rhs
+            .trim()
+            .strip_prefix("rand(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
             if let Some((a, b)) = inner.split_once(',') {
                 let min: i64 = a.trim().parse()?;
                 let max: i64 = b.trim().parse()?;
@@ -1361,7 +1378,11 @@ fn parse_literal(s: &str) -> Result<Value> {
 
 pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
     let h = hex.trim().trim_start_matches('#');
-    let byte = |i| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
+    let byte = |i| {
+        u8::from_str_radix(&h[i..i + 2], 16)
+            .ok()
+            .map(|v| v as f32 / 255.0)
+    };
     match h.len() {
         6 => Some([byte(0)?, byte(2)?, byte(4)?, 1.0]),
         8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),

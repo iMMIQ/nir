@@ -31,11 +31,7 @@ enum IndexedRef {
 
 /// Evaluates `expr` as a value expression, pushing its final result onto the VM stack.
 /// If the expression is empty, pushes `Value::Null`.
-pub fn compile_value_expr(
-    expr: &Expression,
-    bridge: &mut dyn ExprBridge,
-    ops: &mut Vec<Op>,
-) {
+pub fn compile_value_expr(expr: &Expression, bridge: &mut dyn ExprBridge, ops: &mut Vec<Op>) {
     if expr.operations.is_empty() {
         if let Some(lit) = &expr.literal {
             emit_literal(lit, bridge, ops, &BTreeSet::new());
@@ -79,11 +75,7 @@ pub fn compile_value_expr(
 }
 
 /// Compiles a `Calc` statement expression (all side effects executed, stack balanced).
-pub fn compile_calc_stmt(
-    expr: &Expression,
-    bridge: &mut dyn ExprBridge,
-    ops: &mut Vec<Op>,
-) {
+pub fn compile_calc_stmt(expr: &Expression, bridge: &mut dyn ExprBridge, ops: &mut Vec<Op>) {
     if expr.operations.is_empty() {
         return;
     }
@@ -203,7 +195,9 @@ pub fn eval_static_const(expr: &Expression, stage: [u32; 2]) -> Option<Value> {
                 match fn_id {
                     35 => Value::Int(stage[0] as i64),
                     36 => Value::Int(stage[1] as i64),
-                    37 if args.len() == 1 => Value::Int(resolve(&args[0], &env)?.as_i64().unwrap_or(0)),
+                    37 if args.len() == 1 => {
+                        Value::Int(resolve(&args[0], &env)?.as_i64().unwrap_or(0))
+                    }
                     _ => return None,
                 }
             }
@@ -338,7 +332,9 @@ fn compile_single_op(
             store_dst(dst, temp_names, bridge, ops);
         }
         other => {
-            bridge.note_adapted(format!("unknown LSB expression operator {other} evaluated to 0"));
+            bridge.note_adapted(format!(
+                "unknown LSB expression operator {other} evaluated to 0"
+            ));
             ops.push(Op::PushInt(0));
             store_dst(dst, temp_names, bridge, ops);
         }

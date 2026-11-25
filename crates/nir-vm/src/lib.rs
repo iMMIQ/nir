@@ -16,7 +16,10 @@ const MAX_HISTORY: usize = 500;
 const HISTORY_ROLLBACK_SLACK: usize = 32;
 const MAX_CALL_DEPTH: usize = 64;
 const MAX_FUEL_PER_STEP: u32 = 200_000;
-const RNG_SEED: [u8; 32] = [0x4E, 0x49, 0x52, 0x32, 42, 7, 13, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+const RNG_SEED: [u8; 32] = [
+    0x4E, 0x49, 0x52, 0x32, 42, 7, 13, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24,
+];
 
 fn build_label_index(program: &NirProgram) -> Arc<HashMap<u32, StrId>> {
     let mut map = HashMap::with_capacity(program.labels.len());
@@ -71,11 +74,7 @@ impl Vm {
         Self::new_at(program, entry, locale)
     }
 
-    pub fn new_at(
-        program: Arc<NirProgram>,
-        func: FuncId,
-        locale: Option<String>,
-    ) -> Result<Self> {
+    pub fn new_at(program: Arc<NirProgram>, func: FuncId, locale: Option<String>) -> Result<Self> {
         let fmeta = program
             .func(func)
             .ok_or_else(|| NirError::new("E_VM", "entry", "missing entry function"))?;
@@ -171,10 +170,7 @@ impl Vm {
                 .dialogue
                 .as_ref()
                 .is_some_and(|d| !d.finished && !d.paused_for_click)
-            || self
-                .choice
-                .as_ref()
-                .is_some_and(|c| c.timeout_us.is_some())
+            || self.choice.as_ref().is_some_and(|c| c.timeout_us.is_some())
     }
 
     pub fn is_current_dialogue_read(&self) -> bool {
@@ -426,7 +422,10 @@ impl Vm {
             return Err(NirError::new(
                 "E_SAVE_GAME",
                 "restore",
-                format!("save belongs to {}, not {}", snap.game_id, program.meta.game_id),
+                format!(
+                    "save belongs to {}, not {}",
+                    snap.game_id, program.meta.game_id
+                ),
             ));
         }
         let vars = program
@@ -445,8 +444,7 @@ impl Vm {
             .last_label
             .as_deref()
             .and_then(|n| program.find_label(n));
-        let pc = if snap.version == program.meta.version
-            && (snap.pc as usize) <= program.ops.len()
+        let pc = if snap.version == program.meta.version && (snap.pc as usize) <= program.ops.len()
         {
             snap.pc
         } else if let Some(lbl) = found_lbl {
@@ -494,8 +492,7 @@ impl Vm {
         }
 
         let history_seq = snap.history.len() as u64;
-        let history: VecDeque<Arc<HistoryEntry>> =
-            snap.history.into_iter().map(Arc::new).collect();
+        let history: VecDeque<Arc<HistoryEntry>> = snap.history.into_iter().map(Arc::new).collect();
         let label_by_pc = build_label_index(&program);
 
         let vm = Self {
@@ -586,13 +583,11 @@ impl Vm {
             Op::PushBool(b) => self.stack.push(Value::Bool(*b)),
             Op::PushInt(n) => self.stack.push(Value::Int(*n)),
             Op::PushFloat(f) => self.stack.push(Value::Float(*f)),
-            Op::PushStr(id) => self.stack.push(Value::Str(self.program.str(*id).to_owned())),
+            Op::PushStr(id) => self
+                .stack
+                .push(Value::Str(self.program.str(*id).to_owned())),
             Op::LoadVar(id) => {
-                let v = self
-                    .vars
-                    .get(id.0 as usize)
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let v = self.vars.get(id.0 as usize).cloned().unwrap_or(Value::Null);
                 self.stack.push(v);
             }
             Op::StoreVar(id) => {
@@ -852,14 +847,8 @@ impl Vm {
                 reveal_us,
                 append,
             } => {
-                let (speaker, speaker_color, text, voice, reveal_us, append) = (
-                    *speaker,
-                    *speaker_color,
-                    *text,
-                    *voice,
-                    *reveal_us,
-                    *append,
-                );
+                let (speaker, speaker_color, text, voice, reveal_us, append) =
+                    (*speaker, *speaker_color, *text, *voice, *reveal_us, *append);
                 // Auto-commit any staged scene edits cleanly before displaying dialogue.
                 if self.pending_dirty {
                     self.commit_staged_if_dirty(Transition::Cut, 0, false);
@@ -997,10 +986,7 @@ impl Vm {
                 let mut offered = Vec::new();
                 for (i, item) in items.iter().enumerate() {
                     if let Some(cvar) = item.cond_var {
-                        let visible = self
-                            .vars
-                            .get(cvar.0 as usize)
-                            .is_some_and(Value::as_bool);
+                        let visible = self.vars.get(cvar.0 as usize).is_some_and(Value::as_bool);
                         if !visible {
                             continue;
                         }
@@ -1011,9 +997,7 @@ impl Vm {
                         .map(|e| self.instantiate_text(e).0)
                         .unwrap_or_default();
                     let disabled = item.disabled_var.is_some_and(|dvar| {
-                        self.vars
-                            .get(dvar.0 as usize)
-                            .is_some_and(Value::as_bool)
+                        self.vars.get(dvar.0 as usize).is_some_and(Value::as_bool)
                     });
                     offered.push(OfferedChoice {
                         index: i as u16,
@@ -1476,7 +1460,16 @@ impl Vm {
             } => {
                 let disabled_val = self.pop()?;
                 let hidden_val = self.pop()?;
-                let (menu, result_var, index_var, cancelable, hover_se, click_se, fade_out_us, timeout_us) = (
+                let (
+                    menu,
+                    result_var,
+                    index_var,
+                    cancelable,
+                    hover_se,
+                    click_se,
+                    fade_out_us,
+                    timeout_us,
+                ) = (
                     *menu,
                     *result_var,
                     *index_var,
@@ -1505,7 +1498,11 @@ impl Vm {
                     let label = self.program.str(item.label).to_owned();
                     offered.push(OfferedChoice {
                         index: orig_idx as u16,
-                        label: if label.is_empty() { name.clone() } else { label },
+                        label: if label.is_empty() {
+                            name.clone()
+                        } else {
+                            label
+                        },
                         image: item.image,
                         hover_image: item.hover_image,
                         disabled_image: item.disabled_image,
@@ -1903,7 +1900,9 @@ impl Vm {
                     .get(tl_id.0 as usize)
                     .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
                 let total_us = ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
-                if self.timelines[tl_idx].elapsed_us >= total_us && !self.timelines[tl_idx].scrap_on_end {
+                if self.timelines[tl_idx].elapsed_us >= total_us
+                    && !self.timelines[tl_idx].scrap_on_end
+                {
                     let done_layer = self.timelines[tl_idx].layer;
                     if matches!(self.wait, WaitReason::Timeline { layer, .. } if layer == done_layer)
                     {
@@ -2020,7 +2019,8 @@ impl Vm {
                             }
                             let actual_delta = stopped.saturating_sub(dlg.visible_graphemes);
                             dlg.visible_graphemes = stopped;
-                            if dlg.visible_graphemes >= dlg.total_graphemes && !dlg.paused_for_click {
+                            if dlg.visible_graphemes >= dlg.total_graphemes && !dlg.paused_for_click
+                            {
                                 dlg.finished = true;
                             }
                             dlg.advance_visible_bytes(actual_delta);
@@ -2116,10 +2116,14 @@ impl Vm {
                 self.dialogue_shake = [0.0, 0.0];
                 self.wait = WaitReason::None;
             }
-            WaitReason::Timer { skippable: true, .. } => {
+            WaitReason::Timer {
+                skippable: true, ..
+            } => {
                 self.wait = WaitReason::None;
             }
-            WaitReason::Video { skippable: true, .. } => {
+            WaitReason::Video {
+                skippable: true, ..
+            } => {
                 self.intents.push(VmIntent::StopVideo);
                 self.wait = WaitReason::None;
             }
@@ -2166,8 +2170,7 @@ impl Vm {
     }
 
     pub fn notify_audio_ended(&mut self, channel: ChannelId) {
-        self.audio
-            .retain(|c| !(c.channel == channel && !c.looped));
+        self.audio.retain(|c| !(c.channel == channel && !c.looped));
     }
 
     pub fn choose(&mut self, offered_idx: usize) -> Vec<VmIntent> {
@@ -2796,16 +2799,16 @@ fn eval_binop(op: BinOp, lhs: Value, rhs: Value) -> Result<Value> {
         BinOp::BitXor => Ok(Value::Int(
             lhs.as_i64().unwrap_or(0) ^ rhs.as_i64().unwrap_or(0),
         )),
-        BinOp::Shl => Ok(Value::Int(
-            lhs.as_i64()
-                .unwrap_or(0)
-                .wrapping_shl(rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32),
-        )),
-        BinOp::Shr => Ok(Value::Int(
-            lhs.as_i64()
-                .unwrap_or(0)
-                .wrapping_shr(rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32),
-        )),
+        BinOp::Shl => {
+            Ok(Value::Int(lhs.as_i64().unwrap_or(0).wrapping_shl(
+                rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32,
+            )))
+        }
+        BinOp::Shr => {
+            Ok(Value::Int(lhs.as_i64().unwrap_or(0).wrapping_shr(
+                rhs.as_i64().unwrap_or(0).clamp(0, 63) as u32,
+            )))
+        }
         BinOp::And => Ok(Value::Bool(lhs.as_bool() && rhs.as_bool())),
         BinOp::Or => Ok(Value::Bool(lhs.as_bool() || rhs.as_bool())),
         BinOp::Eq => Ok(Value::Bool(values_eq(&lhs, &rhs))),
@@ -2921,7 +2924,13 @@ mod tests {
                 ui_fonts: vec![],
                 text_fonts: vec![],
             },
-            strings: vec!["main".into(), "affection".into(), "Aki".into(), "start".into(), "good".into()],
+            strings: vec![
+                "main".into(),
+                "affection".into(),
+                "Aki".into(),
+                "start".into(),
+                "good".into(),
+            ],
             vars: vec![VarMeta {
                 name: StrId(1),
                 default: Value::Int(0),
@@ -2983,10 +2992,7 @@ mod tests {
                 vec![
                     TextEntry::plain("Hello!"),
                     TextEntry {
-                        spans: vec![
-                            RichSpan::Text("Score: ".into()),
-                            RichSpan::Var(VarId(0)),
-                        ],
+                        spans: vec![RichSpan::Text("Score: ".into()), RichSpan::Var(VarId(0))],
                     },
                 ],
             )]),
@@ -3019,9 +3025,13 @@ mod tests {
 
         // Next step hits Say("Hello!") with voice
         let intents = vm.step(1000).unwrap();
-        assert!(intents
-            .iter()
-            .any(|i| matches!(i, VmIntent::PlayAudio { asset: AssetId(1), .. })));
+        assert!(intents.iter().any(|i| matches!(
+            i,
+            VmIntent::PlayAudio {
+                asset: AssetId(1),
+                ..
+            }
+        )));
         assert_eq!(vm.wait, WaitReason::Dialogue);
         assert_eq!(vm.dialogue.as_ref().unwrap().visible_text(), "");
 
@@ -3091,9 +3101,18 @@ mod tests {
                 "done".into(),          // 10
             ],
             vars: vec![
-                VarMeta { name: StrId(1), default: Value::Null },
-                VarMeta { name: StrId(2), default: Value::Str(String::new()) },
-                VarMeta { name: StrId(3), default: Value::Int(-1) },
+                VarMeta {
+                    name: StrId(1),
+                    default: Value::Null,
+                },
+                VarMeta {
+                    name: StrId(2),
+                    default: Value::Str(String::new()),
+                },
+                VarMeta {
+                    name: StrId(3),
+                    default: Value::Int(-1),
+                },
             ],
             funcs: vec![FuncMeta {
                 name: StrId(0),
@@ -3106,9 +3125,15 @@ mod tests {
                 // ListPush + ListCompact + ResolveAsset + LayerSetDyn
                 Op::LoadVar(VarId(0)),
                 Op::PushStr(StrId(5)),
-                Op::CallBuiltin { func: BuiltinFn::ListPush, argc: 2 },
+                Op::CallBuiltin {
+                    func: BuiltinFn::ListPush,
+                    argc: 2,
+                },
                 Op::PushStr(StrId(6)),
-                Op::CallBuiltin { func: BuiltinFn::ListPush, argc: 2 },
+                Op::CallBuiltin {
+                    func: BuiltinFn::ListPush,
+                    argc: 2,
+                },
                 Op::StoreVar(VarId(0)),
                 Op::PushStr(StrId(4)),
                 Op::ResolveAsset,
@@ -3214,7 +3239,13 @@ mod tests {
         assert_eq!(vm.layers.len(), 2);
         assert_eq!(vm.layers[0].asset, Some(AssetId(10)));
         assert_eq!(vm.layers[1].text.as_ref().unwrap().text, "A");
-        assert!(matches!(vm.wait, WaitReason::Timeline { layer: LayerId(2), .. }));
+        assert!(matches!(
+            vm.wait,
+            WaitReason::Timeline {
+                layer: LayerId(2),
+                ..
+            }
+        ));
 
         // Advance past 500ms timeline -> finishes & advances to ChoiceMenu
         vm.tick(600_000, 1.0, false);
@@ -3228,7 +3259,13 @@ mod tests {
         assert_eq!(c.items.len(), 1);
         assert_eq!(c.items[0].label, "Start");
         let intents = vm.choose(0);
-        assert!(intents.iter().any(|i| matches!(i, VmIntent::PlayAudio { asset: AssetId(11), .. })));
+        assert!(intents.iter().any(|i| matches!(
+            i,
+            VmIntent::PlayAudio {
+                asset: AssetId(11),
+                ..
+            }
+        )));
         assert_eq!(vm.vars[1], Value::Str("Start".into()));
         assert_eq!(vm.vars[2], Value::Int(0));
 
@@ -3329,10 +3366,19 @@ mod tests {
         let vm = Vm::new(prog, None).unwrap();
         let pred = vm.predict_assets(16);
         assert!(pred.contains(&AssetId(0)), "delta base must be predicted");
-        assert!(pred.contains(&AssetId(1)), "then-branch delta asset must be predicted");
-        assert!(pred.contains(&AssetId(2)), "else-branch asset must be predicted");
+        assert!(
+            pred.contains(&AssetId(1)),
+            "then-branch delta asset must be predicted"
+        );
+        assert!(
+            pred.contains(&AssetId(2)),
+            "else-branch asset must be predicted"
+        );
         let p0 = pred.iter().position(|&a| a == AssetId(0)).unwrap();
         let p1 = pred.iter().position(|&a| a == AssetId(1)).unwrap();
-        assert!(p0 < p1, "delta base must be prefetched ahead of delta patch");
+        assert!(
+            p0 < p1,
+            "delta base must be prefetched ahead of delta patch"
+        );
     }
 }

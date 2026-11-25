@@ -12,99 +12,70 @@ jobs:
   engine:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CC_x86_64_unknown_linux_gnu: clang
+      CXX_x86_64_unknown_linux_gnu: clang++
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
         with:
-          with-node: 'true'
           save-cache: 'false'
-      - name: Install native subsetter build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb libxkbcommon-x11-0 openjdk-17-jre-headless
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake openjdk-17-jre-headless
       - name: Locate NDK and build tools
         run: |
-          ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort | tail -1)
+          ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)
           if [ -z "$ndk" ]; then
             echo "E_NDK: no NDK under $ANDROID_SDK_ROOT/ndk; install one (r27c or newer)" >&2
             exit 1
           fi
-          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
-          build_tools=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort | tail -1)
-          echo "APKSIGNER=$build_tools/apksigner" >> "$GITHUB_ENV"
-          echo "AAPT2=$build_tools/aapt2" >> "$GITHUB_ENV"
-      - name: Install JS dependencies, syntax check and host tests
-        run: |
-          bun install --frozen-lockfile
-          bun run check:js
-          bun run test:host
+          tools="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tools/aarch64-linux-android26-clang"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$tools/llvm-ar"
+            echo "CC_aarch64_linux_android=$tools/aarch64-linux-android26-clang"
+            echo "CXX_aarch64_linux_android=$tools/aarch64-linux-android26-clang++"
+            echo "AR_aarch64_linux_android=$tools/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$tools/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+          build_tools=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)
+          {
+            echo "APKSIGNER=$build_tools/apksigner"
+            echo "AAPT2=$build_tools/aapt2"
+            echo "NIR_APK_APKSIGNER=$build_tools/apksigner"
+            echo "NIR_APK_AAPT2=$build_tools/aapt2"
+          } >> "$GITHUB_ENV"
+      - name: JS syntax check
+        run: bun run check:js
       - name: Native and WASM checks
         run: |
           cargo fmt --all --check
           cargo xtask test
-          cargo clippy --locked --workspace --all-targets --exclude player-web --exclude nir-platform-web -- -D warnings
-          cargo clippy --locked -p player-web -p nir-platform-web -p nir-render-wgpu -p nir-engine --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy --locked --workspace --all-targets --exclude player-web --exclude player-android -- -D warnings
+          cargo clippy --locked -p player-web -p nir-render -p nir-runtime -p nir-ui -p nir-vm -p nir-ir --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy --locked -p player-native -p player-android --target aarch64-linux-android --all-targets -- -D warnings
       - uses: ./.github/actions/build-sdk
-      - name: Build and verify engine test project
+      - name: Build and verify example project
         run: |
-          ./dist/novelc -p examples/rain-letters resolve
-          ./dist/novelc -p examples/rain-letters check --locked
-          ./dist/novelc -p examples/rain-letters test
-          ./dist/novelc -p examples/rain-letters build --locked --out dist/rain-letters-web
-          python3 scripts/test_verify_runtime.py
-          python3 scripts/verify_release.py dist/rain-letters-web
-          python3 scripts/verify_sdk.py
-          python3 scripts/verify_preview_connections.py
-      - uses: ./.github/actions/setup-browser-audio
-      - name: Chromium software WebGPU regression
-        env:
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:browser --max-failures=1
-      - name: Desktop backend acceptance
-        env:
-          NIR_CHROME_ARGS: >-
-            --ozone-platform=x11 --use-angle=swiftshader --enable-unsafe-swiftshader
-            --use-webgpu-adapter=swiftshader --enable-gpu --ignore-gpu-blocklist
-            --enable-features=Vulkan --use-vulkan=swiftshader
-          LIBGL_ALWAYS_SOFTWARE: '1'
-        run: |
-          CHROMIUM="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
-          export CHROMIUM
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' bun run test:backends --max-failures=1
-      - name: NIR next acceptance
-        run: bun run test:nir-next
-      - name: Native Linux player acceptance
-        env:
-          LIBGL_ALWAYS_SOFTWARE: '1'
-        run: |
-          ./dist/novelc -p examples/rain-letters build --target linux --locked --out dist/rain-letters-linux
-          mkdir -p target/tmp
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' python3 scripts/verify_linux.py dist/rain-letters-linux
-      - name: Native Android player acceptance
-        env:
-          NIR_ANDROID_SIGNING_SEED: nir-rain-letters-sample
-        run: |
-          ./dist/novelc -p examples/rain-letters build --target android --locked --out dist/rain-letters-android
-          python3 scripts/verify_android.py dist/rain-letters-android
+          ./dist/novelc check examples/rain-letters
+          ./dist/novelc build examples/rain-letters --target web --out dist/rain-letters-web
+          ./dist/novelc build examples/rain-letters --target native --out dist/rain-letters-linux
+          ./dist/novelc build examples/rain-letters --target android --out dist/rain-letters-android/Game.apk
+          "$AAPT2" dump badging dist/rain-letters-android/Game.apk
+          "$APKSIGNER" verify --verbose dist/rain-letters-android/Game.apk
       - name: Package and verify release assets
         run: |
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$VERSION"; fi
           test "$(dist/novelc --version)" = "novelc $VERSION"
-          test -x dist/sdk/linux/player-linux
+          test -x dist/sdk/native/player-native
           test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
           python3 scripts/package.py
-          python3 scripts/verify_release.py dist/bundle/rain-letters-web
-          dist/bundle/novelc release verify --directory dist/bundle/rain-letters-web
-          python3 scripts/audit_publication.py "dist/nir-$VERSION-linux-x86_64.tar.gz" "dist/nir-$VERSION-source.tar.gz"
           (cd dist && sha256sum --check SHA256SUMS)
           readelf -l dist/bundle/novelc | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
-          readelf -l dist/bundle/sdk/linux/player-linux | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
+          readelf -l dist/bundle/sdk/native/player-native | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

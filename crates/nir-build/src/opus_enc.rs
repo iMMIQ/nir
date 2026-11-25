@@ -86,8 +86,8 @@ pub fn encode_ogg_opus(
         (stereo_kbps.clamp(32, 256) as u32) * 1000
     };
 
-    let mut comments = OpusEncComments::create()
-        .map_err(|e| anyhow::anyhow!("libopusenc comments: {e}"))?;
+    let mut comments =
+        OpusEncComments::create().map_err(|e| anyhow::anyhow!("libopusenc comments: {e}"))?;
     let mut enc = OpusEncoder::create_pull(
         &mut comments,
         rate_enum,
@@ -145,10 +145,7 @@ pub fn probe_ogg_opus_meta(bytes: &[u8]) -> Option<(u32, u16, u64)> {
 
     let mut last_granule = 0u64;
     let search_start = bytes.len().saturating_sub(65_536);
-    if let Some(rel) = bytes[search_start..]
-        .windows(4)
-        .rposition(|w| w == b"OggS")
-    {
+    if let Some(rel) = bytes[search_start..].windows(4).rposition(|w| w == b"OggS") {
         let off = search_start + rel;
         if off + 14 <= bytes.len() {
             let g = u64::from_le_bytes(bytes[off + 6..off + 14].try_into().ok()?);

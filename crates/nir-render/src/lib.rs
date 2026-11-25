@@ -290,8 +290,7 @@ pub fn composite_delta_rgba(
                     }
                     let so = (y * pw + x0) * 4;
                     let doff = (dy * bw + ox + x0) * 4;
-                    out[doff..doff + copy_w * 4]
-                        .copy_from_slice(&patch_rgba[so..so + copy_w * 4]);
+                    out[doff..doff + copy_w * 4].copy_from_slice(&patch_rgba[so..so + copy_w * 4]);
                 }
             }
         }
@@ -525,7 +524,11 @@ fn hash_transition_quads(quads: &[Quad], sw: u32, sh: u32, epoch: u64) -> u64 {
 fn select_surface_format(
     formats: &[wgpu::TextureFormat],
     backend: RendererBackend,
-) -> Result<(wgpu::TextureFormat, wgpu::TextureFormat, Vec<wgpu::TextureFormat>)> {
+) -> Result<(
+    wgpu::TextureFormat,
+    wgpu::TextureFormat,
+    Vec<wgpu::TextureFormat>,
+)> {
     if backend.is_gl() {
         let fmt = formats
             .iter()
@@ -542,7 +545,11 @@ fn select_surface_format(
             .or_else(|| formats.first().copied())
             .ok_or_else(|| rerr("no surface format"))?;
         let fmt = surface_fmt.add_srgb_suffix();
-        let views = if fmt == surface_fmt { vec![] } else { vec![fmt] };
+        let views = if fmt == surface_fmt {
+            vec![]
+        } else {
+            vec![fmt]
+        };
         Ok((surface_fmt, fmt, views))
     }
 }
@@ -861,7 +868,8 @@ impl Renderer {
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         Ok(Self {
             _instance: instance,
@@ -1176,7 +1184,11 @@ impl Renderer {
         if pad_w == 0 || pad_h == 0 || pad_w > max_dim || pad_h > max_dim {
             return Err(rerr("ktx2 exceeds GPU texture limit"));
         }
-        if !self.device.features().contains(ktx.format.required_feature()) {
+        if !self
+            .device
+            .features()
+            .contains(ktx.format.required_feature())
+        {
             let rgba = decode_ktx2_to_rgba_premultiplied(ktx)?;
             return self.upload_rgba_premultiplied(id, ktx.width, ktx.height, &rgba);
         }
@@ -1472,7 +1484,9 @@ impl Renderer {
                 }
                 let row = TextBounds {
                     left: bounds.left,
-                    top: bounds.top.max(((y_draw + run.line_top - r.scroll) * dpr) as i32),
+                    top: bounds
+                        .top
+                        .max(((y_draw + run.line_top - r.scroll) * dpr) as i32),
                     right: bounds.right.min(((x + right + 1.0) * dpr) as i32),
                     bottom: bounds
                         .bottom
@@ -1532,12 +1546,7 @@ impl Renderer {
             if let Some(s) = r.shadow {
                 let sk = r.shadow_cache_key();
                 if let Some(entry) = self.text.buffers.get(&sk) {
-                    let scol = [
-                        s.color[0],
-                        s.color[1],
-                        s.color[2],
-                        s.color[3] * r.color[3],
-                    ];
+                    let scol = [s.color[0], s.color[1], s.color[2], s.color[3] * r.color[3]];
                     Self::push_text_areas(
                         &mut areas,
                         entry,
@@ -2053,7 +2062,9 @@ mod tests {
         dfd.extend_from_slice(&u32::MAX.to_le_bytes());
 
         let mut ktx = Vec::new();
-        ktx.extend_from_slice(&[0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A]);
+        ktx.extend_from_slice(&[
+            0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+        ]);
         ktx.extend_from_slice(&134u32.to_le_bytes()); // BC1_RGBA_SRGB_BLOCK
         ktx.extend_from_slice(&1u32.to_le_bytes());
         ktx.extend_from_slice(&4u32.to_le_bytes());

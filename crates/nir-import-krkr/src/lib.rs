@@ -204,9 +204,12 @@ impl EngineImporter for KrkrImporter {
         }
 
         if project.scripts.is_empty() {
-            project
-                .scripts
-                .insert("main".into(), vec![VnStmt::End { outcome: "end".into() }]);
+            project.scripts.insert(
+                "main".into(),
+                vec![VnStmt::End {
+                    outcome: "end".into(),
+                }],
+            );
         }
         report.assets_converted = project.assets.len();
         Ok((project, report))
@@ -244,7 +247,10 @@ impl<'a> KrkrResolver<'a> {
                 return None;
             }
         };
-        let without_ext = vfs_path.rsplit_once('.').map(|(a, _)| a).unwrap_or(&vfs_path);
+        let without_ext = vfs_path
+            .rsplit_once('.')
+            .map(|(a, _)| a)
+            .unwrap_or(&vfs_path);
         let stem = sanitize_ident(without_ext);
         let ext = vfs_path.rsplit('.').next().unwrap_or("bin");
 
@@ -420,7 +426,12 @@ mod tests {
         // Pick option 0 ("駅を出る" -> *walk)
         let _ = vm.choose(0);
         vm.step(1000).unwrap();
-        assert!(vm.dialogue.as_ref().unwrap().full_text.contains("外は涼しい"));
+        assert!(vm
+            .dialogue
+            .as_ref()
+            .unwrap()
+            .full_text
+            .contains("外は涼しい"));
         vm.advance(false);
         vm.advance(false);
         vm.step(1000).unwrap();

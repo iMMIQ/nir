@@ -100,17 +100,25 @@ impl EngineImporter for LiveMakerImporter {
                     }
                 }
                 if let Ok(settings) = lsb::project_settings(&data) {
-                    if let Some(lsb::Literal::Int(w)) = settings.get("画面幅").or_else(|| settings.get("ScreenWidth")) {
+                    if let Some(lsb::Literal::Int(w)) = settings
+                        .get("画面幅")
+                        .or_else(|| settings.get("ScreenWidth"))
+                    {
                         if *w >= 320 {
                             project.stage_width = *w as u32;
                         }
                     }
-                    if let Some(lsb::Literal::Int(h)) = settings.get("画面高さ").or_else(|| settings.get("ScreenHeight")) {
+                    if let Some(lsb::Literal::Int(h)) = settings
+                        .get("画面高さ")
+                        .or_else(|| settings.get("ScreenHeight"))
+                    {
                         if *h >= 240 {
                             project.stage_height = *h as u32;
                         }
                     }
-                    if let Some(lsb::Literal::String(t)) = settings.get("タイトル").or_else(|| settings.get("Title")) {
+                    if let Some(lsb::Literal::String(t)) =
+                        settings.get("タイトル").or_else(|| settings.get("Title"))
+                    {
                         if !t.trim().is_empty() {
                             project.title = t.clone();
                         }
@@ -127,7 +135,10 @@ impl EngineImporter for LiveMakerImporter {
             .cloned()
             .collect();
         if let Some(ref start) = startup_lsb {
-            if let Some(pos) = lsb_files.iter().position(|f| f == start || f.ends_with(start)) {
+            if let Some(pos) = lsb_files
+                .iter()
+                .position(|f| f == start || f.ends_with(start))
+            {
                 let first = lsb_files.remove(pos);
                 lsb_files.insert(0, first);
             }
@@ -171,9 +182,12 @@ impl EngineImporter for LiveMakerImporter {
 
         // Ensure entry script exists even on empty fixtures
         if project.scripts.is_empty() {
-            project
-                .scripts
-                .insert("main".into(), vec![VnStmt::End { outcome: "end".into() }]);
+            project.scripts.insert(
+                "main".into(),
+                vec![VnStmt::End {
+                    outcome: "end".into(),
+                }],
+            );
         }
         report.assets_converted = project.assets.len();
 
@@ -307,10 +321,8 @@ impl<'a> LowerCtx<'a> {
                         });
                         self.report.record_exact();
                     } else {
-                        self.report.record_adapted(
-                            &src_loc,
-                            "complex LiveMaker Calc expression skipped",
-                        );
+                        self.report
+                            .record_adapted(&src_loc, "complex LiveMaker Calc expression skipped");
                     }
                 }
                 lsb::Body::Condition(expr) if cmd.name() == "If" => {
@@ -373,7 +385,8 @@ impl<'a> LowerCtx<'a> {
                         });
                         self.report.record_exact();
                     } else {
-                        self.report.record_adapted(&src_loc, "dynamic ObjDel skipped");
+                        self.report
+                            .record_adapted(&src_loc, "dynamic ObjDel skipped");
                     }
                 }
                 lsb::Body::Flip { parameters, .. } => {
@@ -407,10 +420,8 @@ impl<'a> LowerCtx<'a> {
                             duration_ms: ms.clamp(16, 10_000) as u32,
                             ease: Some("ease_out".into()),
                         });
-                        self.report.record_adapted(
-                            &src_loc,
-                            "PropMotion mapped to NIR v2 Tween",
-                        );
+                        self.report
+                            .record_adapted(&src_loc, "PropMotion mapped to NIR v2 Tween");
                     } else {
                         self.report
                             .record_adapted(&src_loc, "PropMotion parameters simplified");
@@ -471,21 +482,18 @@ impl<'a> LowerCtx<'a> {
         let x = props.get(&5).and_then(expr_i32).map(|v| v as f32);
         let y = props.get(&6).and_then(expr_i32).map(|v| v as f32);
         let z = props.get(&9).and_then(expr_i32);
-        let source = props
-            .values()
-            .filter_map(expr_string)
-            .find(|s| {
-                let low = s.to_ascii_lowercase();
-                low.ends_with(".gal")
-                    || low.ends_with(".png")
-                    || low.ends_with(".jpg")
-                    || low.ends_with(".bmp")
-                    || low.ends_with(".wav")
-                    || low.ends_with(".ogg")
-                    || low.ends_with(".mp3")
-                    || low.ends_with(".lcm")
-                    || low.ends_with(".lmt")
-            });
+        let source = props.values().filter_map(expr_string).find(|s| {
+            let low = s.to_ascii_lowercase();
+            low.ends_with(".gal")
+                || low.ends_with(".png")
+                || low.ends_with(".jpg")
+                || low.ends_with(".bmp")
+                || low.ends_with(".wav")
+                || low.ends_with(".ogg")
+                || low.ends_with(".mp3")
+                || low.ends_with(".lcm")
+                || low.ends_with(".lmt")
+        });
 
         match cmd_name {
             "ImgNew" | "TileNew" | "MapImgNew" => {
@@ -514,15 +522,17 @@ impl<'a> LowerCtx<'a> {
                         self.report.record_exact();
                     }
                 } else {
-                    self.report
-                        .record_adapted(src_loc, format!("{cmd_name} without literal image source"));
+                    self.report.record_adapted(
+                        src_loc,
+                        format!("{cmd_name} without literal image source"),
+                    );
                 }
             }
             "Sound" | "MediaPlay" => {
                 if let Some(src) = source {
                     if let Some(asset_path) = self.import_audio_asset(src_loc, &src) {
-                        let is_bgm = name.to_ascii_lowercase().contains("bgm")
-                            || cmd_name == "MediaPlay";
+                        let is_bgm =
+                            name.to_ascii_lowercase().contains("bgm") || cmd_name == "MediaPlay";
                         if is_bgm {
                             out.push(VnStmt::Bgm {
                                 asset: asset_path,
@@ -539,7 +549,8 @@ impl<'a> LowerCtx<'a> {
                     }
                 } else {
                     out.push(VnStmt::StopBgm { fade_ms: Some(300) });
-                    self.report.record_adapted(src_loc, "Sound without source mapped to bgm stop");
+                    self.report
+                        .record_adapted(src_loc, "Sound without source mapped to bgm stop");
                 }
             }
             "Cinema" => {
@@ -549,7 +560,9 @@ impl<'a> LowerCtx<'a> {
                             if let Ok(cin) = cinema::parse(&bytes) {
                                 for (clip_idx, clip) in cin.clips.iter().enumerate() {
                                     if let cinema::Clip::Image(ic) = clip {
-                                        if let Some(asset) = self.import_image_asset(src_loc, &ic.media) {
+                                        if let Some(asset) =
+                                            self.import_image_asset(src_loc, &ic.media)
+                                        {
                                             let slot = format!("cin_{clip_idx}");
                                             out.push(VnStmt::Show {
                                                 slot: slot.clone(),
@@ -557,10 +570,14 @@ impl<'a> LowerCtx<'a> {
                                                 x: Some(ic.position_start[0] as f32),
                                                 y: Some(ic.position_start[1] as f32),
                                                 z: Some(ic.order),
-                                                opacity: Some((ic.opacity[0] as f32 / 255.0).clamp(0.0, 1.0)),
+                                                opacity: Some(
+                                                    (ic.opacity[0] as f32 / 255.0).clamp(0.0, 1.0),
+                                                ),
                                                 scale: None,
                                             });
-                                            if ic.duration > 0 && ic.position_end != ic.position_start {
+                                            if ic.duration > 0
+                                                && ic.position_end != ic.position_start
+                                            {
                                                 if ic.position_end[0] != ic.position_start[0] {
                                                     out.push(VnStmt::Tween {
                                                         slot: slot.clone(),
@@ -585,7 +602,9 @@ impl<'a> LowerCtx<'a> {
                                 }
                                 self.report.record_adapted(
                                     src_loc,
-                                    format!("Cinema timeline `{src}` flattened to Persistent Layers"),
+                                    format!(
+                                        "Cinema timeline `{src}` flattened to Persistent Layers"
+                                    ),
                                 );
                                 return;
                             }
@@ -607,17 +626,17 @@ impl<'a> LowerCtx<'a> {
                     target_label: sanitize_ident(&name),
                     condition: None,
                 });
-                self.report.record_adapted(src_loc, "LiveMaker Button mapped to Choice");
+                self.report
+                    .record_adapted(src_loc, "LiveMaker Button mapped to Choice");
             }
             "MesNew" | "BoxNew" => {
                 out.push(VnStmt::Window { visible: true });
-                self.report.record_adapted(src_loc, format!("{cmd_name} mapped to window show"));
+                self.report
+                    .record_adapted(src_loc, format!("{cmd_name} mapped to window show"));
             }
             other => {
-                self.report.record_adapted(
-                    src_loc,
-                    format!("object command `{other}` adapted"),
-                );
+                self.report
+                    .record_adapted(src_loc, format!("object command `{other}` adapted"));
             }
         }
     }
@@ -702,9 +721,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn import_audio_asset(&mut self, src_loc: &str, raw_name: &str) -> Option<String> {
-        let vfs_path = self
-            .vfs
-            .find_by_stem(raw_name, &["ogg", "wav", "mp3"])?;
+        let vfs_path = self.vfs.find_by_stem(raw_name, &["ogg", "wav", "mp3"])?;
         if let Some(existing) = self.converted_assets.get(&vfs_path) {
             return Some(existing.clone());
         }
@@ -919,7 +936,9 @@ mod tests {
         std::fs::write(dir.path().join("main.lsb"), lsb_bytes).unwrap();
 
         let importer = LiveMakerImporter;
-        let probe = importer.detect(dir.path()).expect("should detect LiveMaker");
+        let probe = importer
+            .detect(dir.path())
+            .expect("should detect LiveMaker");
         assert_eq!(probe.engine_id, "livemaker");
 
         let (project, report) = importer

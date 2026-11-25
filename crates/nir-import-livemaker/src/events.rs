@@ -225,7 +225,11 @@ pub fn lower_event(
         }
         "MESON" => {
             let ms = arg(0).parse::<i64>().unwrap_or(0);
-            let dur_us = if ms <= 0 { 0 } else { (ms as u64).min(10_000) * 1000 };
+            let dur_us = if ms <= 0 {
+                0
+            } else {
+                (ms as u64).min(10_000) * 1000
+            };
             ops.push(Op::TextWindow {
                 visible: true,
                 transition: if dur_us > 0 {
@@ -239,7 +243,11 @@ pub fn lower_event(
         }
         "MESOFF" => {
             let ms = arg(0).parse::<i64>().unwrap_or(0);
-            let dur_us = if ms <= 0 { 0 } else { (ms as u64).min(10_000) * 1000 };
+            let dur_us = if ms <= 0 {
+                0
+            } else {
+                (ms as u64).min(10_000) * 1000
+            };
             ops.push(Op::TextWindow {
                 visible: false,
                 transition: if dur_us > 0 {
@@ -342,7 +350,8 @@ pub fn lower_event(
                 .filter(|s| !s.is_empty())
                 .collect();
             for (idx, t) in targets.iter().enumerate() {
-                let target = if *t == "メッセージボックス" || *t == "メッセージボックス土台" {
+                let target = if *t == "メッセージボックス" || *t == "メッセージボックス土台"
+                {
                     TweenTarget::DialogueBox
                 } else {
                     TweenTarget::Layer(bridge.resolve_layer(t))
@@ -709,7 +718,10 @@ fn parse_axis(token: &str, extent: f32, horizontal: bool) -> (f32, f32) {
 }
 
 fn parse_lm_solid_color(s: &str) -> Option<[f32; 4]> {
-    let hex = s.trim().strip_prefix('$').or_else(|| s.trim().strip_prefix('#'))?;
+    let hex = s
+        .trim()
+        .strip_prefix('$')
+        .or_else(|| s.trim().strip_prefix('#'))?;
     if hex.len() != 6 {
         return None;
     }

@@ -235,10 +235,7 @@ fn decode_asset_for_pool(
 
     if let Some(delta) = &meta.delta {
         let base_id = delta.base;
-        let cached_base = base_cache
-            .lock()
-            .ok()
-            .and_then(|mut g| g.get(base_id));
+        let cached_base = base_cache.lock().ok().and_then(|mut g| g.get(base_id));
         let (bw, bh, base_rgba) = if let Some(hit) = cached_base {
             hit
         } else {

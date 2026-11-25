@@ -245,8 +245,7 @@ fn try_build_delta(
     };
 
     let overhead = tile_mask.len() + 24;
-    if (patch_webp.len() + overhead) * MIN_SAVINGS_DEN
-        >= target.orig_encoded_len * MIN_SAVINGS_NUM
+    if (patch_webp.len() + overhead) * MIN_SAVINGS_DEN >= target.orig_encoded_len * MIN_SAVINGS_NUM
     {
         return None;
     }
@@ -327,8 +326,7 @@ fn apply_delta_rgba_straight(
                     }
                     let so = (y * pw + x0) * 4;
                     let doff = (dy * bw + ox + x0) * 4;
-                    out[doff..doff + copy_w * 4]
-                        .copy_from_slice(&patch_rgba[so..so + copy_w * 4]);
+                    out[doff..doff + copy_w * 4].copy_from_slice(&patch_rgba[so..so + copy_w * 4]);
                 }
             }
         }

@@ -86,7 +86,10 @@ struct BinReader<'a> {
 
 impl<'a> BinReader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(n).context("E_IMPORT_LPM: offset overflow")?;
+        let end = self
+            .at
+            .checked_add(n)
+            .context("E_IMPORT_LPM: offset overflow")?;
         let slice = self
             .data
             .get(self.at..end)
@@ -101,7 +104,10 @@ impl<'a> BinReader<'a> {
 
     fn string(&mut self) -> Result<String> {
         let n = self.i32()?;
-        ensure!((0..=1024 * 1024).contains(&n), "E_IMPORT_LPM: invalid string length");
+        ensure!(
+            (0..=1024 * 1024).contains(&n),
+            "E_IMPORT_LPM: invalid string length"
+        );
         lsb::decode(self.take(n as usize)?)
     }
 }
@@ -115,7 +121,10 @@ fn parse_lpm106(data: &[u8]) -> Result<LpmMenu> {
     let width = r.i32()?.clamp(1, 8192) as u32;
     let height = r.i32()?.clamp(1, 8192) as u32;
     let count = r.i32()?;
-    ensure!((0..=512).contains(&count), "E_IMPORT_LPM: invalid button count");
+    ensure!(
+        (0..=512).contains(&count),
+        "E_IMPORT_LPM: invalid button count"
+    );
     let mut buttons = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let left = r.i32()?;
@@ -172,7 +181,10 @@ fn parse_lpm106(data: &[u8]) -> Result<LpmMenu> {
 }
 
 fn parse_lpm200(data: &[u8]) -> Result<LpmMenu> {
-    ensure!(data.len() <= 2 * 1024 * 1024, "E_IMPORT_LPM: XML exceeds 2 MiB");
+    ensure!(
+        data.len() <= 2 * 1024 * 1024,
+        "E_IMPORT_LPM: XML exceeds 2 MiB"
+    );
     let text = match std::str::from_utf8(data) {
         Ok(s) => s.to_owned(),
         Err(_) => {

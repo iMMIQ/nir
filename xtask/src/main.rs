@@ -23,7 +23,7 @@ fn android_tool(name: &str) -> String {
     }
 }
 
-fn android_ndk_tools() -> Option<PathBuf> {
+fn android_ndk_tools() -> Option<(PathBuf, PathBuf)> {
     let host_tags: &[&str] = if cfg!(target_os = "macos") {
         &["darwin-x86_64", "darwin-arm64"]
     } else if cfg!(windows) {
@@ -35,7 +35,8 @@ fn android_ndk_tools() -> Option<PathBuf> {
         .iter()
         .filter_map(std::env::var_os)
         .filter_map(|root| {
-            let prebuilt = Path::new(&root).join("toolchains/llvm/prebuilt");
+            let root_path = PathBuf::from(root);
+            let prebuilt = root_path.join("toolchains/llvm/prebuilt");
             host_tags
                 .iter()
                 .map(|tag| prebuilt.join(tag).join("bin"))
@@ -43,6 +44,7 @@ fn android_ndk_tools() -> Option<PathBuf> {
                     bin.join(android_tool("aarch64-linux-android26-clang"))
                         .is_file()
                 })
+                .map(|bin| (root_path, bin))
         })
         .next()
 }
@@ -90,11 +92,23 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("wasm-opt"));
             if Command::new(&wasm_opt).arg("--version").output().is_ok() {
                 let wasm_path = "dist/sdk/player_web_bg.wasm";
-                run(Command::new(&wasm_opt).args(["-Os", "--enable-bulk-memory", wasm_path, "-o", wasm_path]))?;
+                run(Command::new(&wasm_opt).args([
+                    "-Os",
+                    "--enable-bulk-memory",
+                    wasm_path,
+                    "-o",
+                    wasm_path,
+                ]))?;
             } else {
                 println!("SDK: wasm-opt not found on PATH; skipping WASM size pass");
             }
-            for name in ["index.html", "style.css", "app.js", "manifest.webmanifest", "sw.js"] {
+            for name in [
+                "index.html",
+                "style.css",
+                "app.js",
+                "manifest.webmanifest",
+                "sw.js",
+            ] {
                 let src = format!("apps/player-web/host/{name}");
                 if Path::new(&src).is_file() {
                     fs::copy(src, format!("dist/sdk/{name}"))?;
@@ -109,10 +123,15 @@ fn main() -> Result<()> {
             } else {
                 "player-native"
             };
-            fs::copy(format!("target/release/{bin}"), format!("dist/sdk/native/{bin}"))?;
+            fs::copy(
+                format!("target/release/{bin}"),
+                format!("dist/sdk/native/{bin}"),
+            )?;
 
             // 3. Optional Android cdylib cross-compile when NDK is present
-            if let Some(tools) = android_ndk_tools() {
+            if let Some((ndk_root, tools)) = android_ndk_tools() {
+                let clang = tools.join(android_tool("aarch64-linux-android26-clang"));
+                let clangxx = tools.join(android_tool("aarch64-linux-android26-clang++"));
                 let mut build = Command::new("cargo");
                 build
                     .args([
@@ -123,13 +142,19 @@ fn main() -> Result<()> {
                         "aarch64-linux-android",
                         "--release",
                     ])
-                    .env(
-                        "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
-                        tools.join(android_tool("aarch64-linux-android26-clang")),
-                    );
+                    .env("ANDROID_NDK_ROOT", &ndk_root)
+                    .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", &clang)
+                    .env("CC_aarch64_linux_android", &clang)
+                    .env("CXX_aarch64_linux_android", &clangxx);
                 let ar = tools.join(android_tool("llvm-ar"));
                 if ar.is_file() {
-                    build.env("CARGO_TARGET_AARCH64_LINUX_ANDROID_AR", ar);
+                    build
+                        .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_AR", &ar)
+                        .env("AR_aarch64_linux_android", &ar);
+                }
+                let ranlib = tools.join(android_tool("llvm-ranlib"));
+                if ranlib.is_file() {
+                    build.env("RANLIB_aarch64_linux_android", &ranlib);
                 }
                 run(&mut build)?;
                 fs::create_dir_all("dist/sdk/android/lib/arm64-v8a")?;
@@ -143,7 +168,11 @@ fn main() -> Result<()> {
 
             // 4. Build `novelc` CLI
             run(Command::new("cargo").args(["build", "-p", "novelc", "--release"]))?;
-            let novelc = if cfg!(windows) { "novelc.exe" } else { "novelc" };
+            let novelc = if cfg!(windows) {
+                "novelc.exe"
+            } else {
+                "novelc"
+            };
             fs::copy(format!("target/release/{novelc}"), format!("dist/{novelc}"))?;
 
             // 5. Generate compact shared Pan-CJK Web fallback font if not yet present

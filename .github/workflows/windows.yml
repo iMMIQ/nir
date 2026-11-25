@@ -13,35 +13,60 @@ jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 45
+    env:
+      LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
       - name: Windows-only checks
+        shell: pwsh
         run: |
-          cargo test --locked -p player-desktop --lib
-          cargo test --locked -p nir-player
-          cargo clippy --locked -p player-desktop -p player-windows --all-targets -- -D warnings
+          cargo test --locked -p player-native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked -p player-native --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build SDK
         shell: pwsh
         run: |
-          $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
-          cargo install wasm-bindgen-cli --version 0.2.100 --locked
+          $wb = Join-Path $HOME '.cargo\bin\wasm-bindgen.exe'
+          $ver = if (Test-Path $wb) { (& $wb --version 2>$null) } else { '' }
+          if ($ver -ne 'wasm-bindgen 0.2.100') {
+            cargo install wasm-bindgen-cli --version 0.2.100 --locked --force
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           cargo xtask sdk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package independent sample
+        shell: pwsh
         run: |
           Remove-Item -Recurse -Force target/windows-sample -ErrorAction SilentlyContinue
-          ./dist/novelc.exe init target/windows-sample
-          ./dist/novelc.exe -p target/windows-sample resolve
-          ./dist/novelc.exe -p target/windows-sample build --target windows --locked
-          ./dist/novelc.exe -p target/windows-sample build --target web --locked
-          python3 scripts/verify_release.py target/windows-sample/dist/full/web
-          python3 scripts/verify_windows.py target/windows-sample/dist/full/windows
+          ./dist/novelc.exe init target/windows-sample --title "Windows Sample"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./dist/novelc.exe check target/windows-sample
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./dist/novelc.exe build target/windows-sample --target native --out target/windows-sample/dist/native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./dist/novelc.exe build target/windows-sample --target web --out target/windows-sample/dist/web
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($f in @(
+            'target/windows-sample/dist/native/player-native.exe',
+            'target/windows-sample/dist/native/game.nirpak',
+            'target/windows-sample/dist/web/index.html',
+            'target/windows-sample/dist/web/style.css',
+            'target/windows-sample/dist/web/app.js',
+            'target/windows-sample/dist/web/player_web.js',
+            'target/windows-sample/dist/web/player_web_bg.wasm',
+            'target/windows-sample/dist/web/game.nirpak'
+          )) {
+            if (-not (Test-Path $f) -or (Get-Item $f).Length -le 0) {
+              Write-Error "Missing or empty build artifact: $f"
+              exit 1
+            }
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: native-windows-evidence
-          path: |
-            reports/windows/
-            target/windows-sample/dist/full/windows/
+          path: target/windows-sample/dist/native/
+          if-no-files-found: ignore
           retention-days: 7

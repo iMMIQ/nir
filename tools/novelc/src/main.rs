@@ -15,7 +15,9 @@ mod dev;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use nir_build::optimize::{AudioCodecMode, OptimizeConfig};
-use nir_import_core::{emit_nirs_project, DecodedPixels, ImportOptions, ImporterRegistry, RawAssetData};
+use nir_import_core::{
+    emit_nirs_project, DecodedPixels, ImportOptions, ImporterRegistry, RawAssetData,
+};
 use nir_import_krkr::KrkrImporter;
 use nir_import_livemaker::LiveMakerImporter;
 use std::fs;
@@ -284,8 +286,9 @@ fn main() -> Result<()> {
             let (src_path, idx) = if let Some(s) = source {
                 (s, face_index.unwrap_or(0))
             } else {
-                let (detected, auto_idx) = nir_build::optimize::find_system_cjk_font()
-                    .context("no system Noto Sans CJK font found; pass --source <font.ttc|otf|ttf>")?;
+                let (detected, auto_idx) = nir_build::optimize::find_system_cjk_font().context(
+                    "no system Noto Sans CJK font found; pass --source <font.ttc|otf|ttf>",
+                )?;
                 (detected, face_index.unwrap_or(auto_idx))
             };
             let bytes = nir_build::optimize::build_web_cjk_fallback_font(&src_path, idx)?;
@@ -330,7 +333,11 @@ fn cmd_init(dir: &Path, title: &str) -> Result<()> {
     );
     fs::write(dir.join("scripts/main.nirs"), script)?;
     println!("Initialized NIR v2 project at `{}`", dir.display());
-    println!("Next steps:\n  novelc check {}\n  novelc build {} --target pak", dir.display(), dir.display());
+    println!(
+        "Next steps:\n  novelc check {}\n  novelc build {} --target pak",
+        dir.display(),
+        dir.display()
+    );
     Ok(())
 }
 
@@ -509,27 +516,25 @@ fn cmd_convert(
                             loader: std::sync::Arc::new(|| {
                                 anyhow::bail!("pixel asset should use pixel_loader")
                             }),
-                            pixel_loader: Some(std::sync::Arc::new(move || {
-                                match (px_fn)()? {
-                                    DecodedPixels::Rgb {
-                                        width,
-                                        height,
-                                        data,
-                                    } => Ok(nir_build::DirectPixels::Rgb {
-                                        width,
-                                        height,
-                                        data,
-                                    }),
-                                    DecodedPixels::Rgba {
-                                        width,
-                                        height,
-                                        data,
-                                    } => Ok(nir_build::DirectPixels::Rgba {
-                                        width,
-                                        height,
-                                        data,
-                                    }),
-                                }
+                            pixel_loader: Some(std::sync::Arc::new(move || match (px_fn)()? {
+                                DecodedPixels::Rgb {
+                                    width,
+                                    height,
+                                    data,
+                                } => Ok(nir_build::DirectPixels::Rgb {
+                                    width,
+                                    height,
+                                    data,
+                                }),
+                                DecodedPixels::Rgba {
+                                    width,
+                                    height,
+                                    data,
+                                } => Ok(nir_build::DirectPixels::Rgba {
+                                    width,
+                                    height,
+                                    data,
+                                }),
                             })),
                             source_fingerprint: fp,
                         },

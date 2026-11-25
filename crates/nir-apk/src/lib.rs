@@ -55,7 +55,9 @@ impl ScreenOrientation {
         match name.trim().to_ascii_lowercase().as_str() {
             "landscape" => Some(Self::Landscape),
             "portrait" => Some(Self::Portrait),
-            "sensorlandscape" | "sensor_landscape" | "sensor-landscape" => Some(Self::SensorLandscape),
+            "sensorlandscape" | "sensor_landscape" | "sensor-landscape" => {
+                Some(Self::SensorLandscape)
+            }
             "sensorportrait" | "sensor_portrait" | "sensor-portrait" => Some(Self::SensorPortrait),
             "fullsensor" | "full_sensor" | "full-sensor" | "auto" => Some(Self::FullSensor),
             _ => None,
@@ -173,10 +175,7 @@ pub fn build_apk_borrowed(
     let mut names = std::collections::HashSet::new();
     for (name, _) in entries {
         validate_entry_name(name)?;
-        ensure!(
-            names.insert(*name),
-            "E_APK_ENTRY: duplicate entry {name:?}"
-        );
+        ensure!(names.insert(*name), "E_APK_ENTRY: duplicate entry {name:?}");
     }
     ensure!(
         entries.len() < zip::MAX_ENTRIES as usize,
@@ -224,9 +223,7 @@ fn assemble(
         // can directly `mmap()` the `.nirpak` out of the APK with zero extraction!
         let alignment = if is_lib || is_pak { LIB_ALIGNMENT } else { 0 };
         match source {
-            EntryRef::Bytes(bytes) => {
-                writer.add_bytes_aligned(name, method, bytes, alignment)?
-            }
+            EntryRef::Bytes(bytes) => writer.add_bytes_aligned(name, method, bytes, alignment)?,
             EntryRef::File(path) => {
                 zip::add_file_aligned(&mut writer, name, method, path, alignment)?
             }

@@ -186,9 +186,17 @@ fn try_fast_gal_opaque_jpeg(data: &[u8]) -> Result<Option<nir_import_core::Decod
         {
             return Ok(None);
         }
-        let w: u32 = root.attribute("Width").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let h: u32 = root.attribute("Height").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let Some(frame) = root.children().find(|n| n.is_element() && n.tag_name().name() == "Frame")
+        let w: u32 = root
+            .attribute("Width")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let h: u32 = root
+            .attribute("Height")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let Some(frame) = root
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "Frame")
         else {
             return Ok(None);
         };

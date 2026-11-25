@@ -824,7 +824,10 @@ fn resolve_kag_target(current_stem: &str, storage: Option<&str>, target: Option<
         .filter(|s| !s.trim().is_empty())
         .map(ks_stem)
         .unwrap_or_else(|| current_stem.to_owned());
-    match target.map(|t| t.trim().trim_start_matches('*')).filter(|t| !t.is_empty()) {
+    match target
+        .map(|t| t.trim().trim_start_matches('*'))
+        .filter(|t| !t.is_empty())
+    {
         Some(lbl) => ks_label(&stem, lbl),
         None => ks_entry_label(&stem),
     }

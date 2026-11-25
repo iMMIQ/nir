@@ -187,11 +187,20 @@ impl LocalStorage {
 
     fn enqueue_write(&self, path: PathBuf, data: Vec<u8>) -> Result<()> {
         if let Some(tx) = &self.writer_tx {
-            if tx.send(WriteOp::WriteBytes { path: path.clone(), data }).is_ok() {
+            if tx
+                .send(WriteOp::WriteBytes {
+                    path: path.clone(),
+                    data,
+                })
+                .is_ok()
+            {
                 return Ok(());
             }
         }
-        Err(anyhow::anyhow!("storage writer closed for {}", path.display()))
+        Err(anyhow::anyhow!(
+            "storage writer closed for {}",
+            path.display()
+        ))
     }
 
     fn enqueue_remove(&self, path: PathBuf) -> Result<()> {

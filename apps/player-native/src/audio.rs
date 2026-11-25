@@ -541,7 +541,8 @@ impl AudioHost {
 
     fn refresh_volumes(&self) {
         for ch in self.channels.values() {
-            ch.sink.set_volume(self.effective_gain(ch.bus, ch.base_gain));
+            ch.sink
+                .set_volume(self.effective_gain(ch.bus, ch.base_gain));
         }
     }
 }
@@ -691,7 +692,8 @@ fn decode_pcm_i16_from_pak(
         return None;
     }
 
-    let (lead, trail) = lame_trim_samples(&lead_hint, trail_hint.0, trail_hint.1, ext_hint, channels);
+    let (lead, trail) =
+        lame_trim_samples(&lead_hint, trail_hint.0, trail_hint.1, ext_hint, channels);
     let (trim_start, trim_end) = if lead + trail < pcm.len() {
         (lead, pcm.len() - trail)
     } else {
@@ -846,7 +848,11 @@ fn stream_opus_decode_loop(mut job: StreamJob) {
         let (loop_start_sample, loop_end_sample) = if let Some(r) = job.loop_region {
             let ls = ((r.start_us as u128 * 48_000u128) / 1_000_000) as usize * ch_usize;
             let le = ((r.end_us as u128 * 48_000u128) / 1_000_000) as usize * ch_usize;
-            if ls < le { (ls, Some(le)) } else { (0, None) }
+            if ls < le {
+                (ls, Some(le))
+            } else {
+                (0, None)
+            }
         } else {
             (0, None)
         };
@@ -886,10 +892,8 @@ fn stream_opus_decode_loop(mut job: StreamJob) {
                 }
                 out_chunk.push(s_i16 as f32 * INV_I16_SCALE);
                 if out_chunk.len() >= STREAM_CHUNK_SAMPLES {
-                    let full = std::mem::replace(
-                        &mut out_chunk,
-                        Vec::with_capacity(STREAM_CHUNK_SAMPLES),
-                    );
+                    let full =
+                        std::mem::replace(&mut out_chunk, Vec::with_capacity(STREAM_CHUNK_SAMPLES));
                     if job.tx.send(full).is_err() {
                         return;
                     }
@@ -904,8 +908,7 @@ fn stream_opus_decode_loop(mut job: StreamJob) {
             if !out_chunk.is_empty() {
                 let _ = job.tx.send(out_chunk);
             }
-            if let (Some((cache, id)), Some(samples)) =
-                (job.cache_short.take(), cache_accum.take())
+            if let (Some((cache, id)), Some(samples)) = (job.cache_short.take(), cache_accum.take())
             {
                 if !samples.is_empty() {
                     let end = samples.len();
@@ -977,8 +980,8 @@ fn stream_symphonia_decode_loop(mut job: StreamJob) {
             let _ = m.send(Some((sample_rate, ch.max(1))));
         }
 
-        let Ok(mut decoder) = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+        let Ok(mut decoder) =
+            symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
         else {
             return;
         };
@@ -1011,10 +1014,8 @@ fn stream_symphonia_decode_loop(mut job: StreamJob) {
                 }
                 out_chunk.push(s);
                 if out_chunk.len() >= STREAM_CHUNK_SAMPLES {
-                    let full = std::mem::replace(
-                        out_chunk,
-                        Vec::with_capacity(STREAM_CHUNK_SAMPLES),
-                    );
+                    let full =
+                        std::mem::replace(out_chunk, Vec::with_capacity(STREAM_CHUNK_SAMPLES));
                     if job.tx.send(full).is_err() {
                         return false;
                     }
@@ -1088,8 +1089,7 @@ fn stream_symphonia_decode_loop(mut job: StreamJob) {
             if !out_chunk.is_empty() {
                 let _ = job.tx.send(out_chunk);
             }
-            if let (Some((cache, id)), Some(samples)) =
-                (job.cache_short.take(), cache_accum.take())
+            if let (Some((cache, id)), Some(samples)) = (job.cache_short.take(), cache_accum.take())
             {
                 if !samples.is_empty() {
                     let end = samples.len();

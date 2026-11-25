@@ -33,7 +33,11 @@ pub struct NirError {
 }
 
 impl NirError {
-    pub fn new(code: &'static str, location: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(
+        code: &'static str,
+        location: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             code,
             location: location.into(),

@@ -526,13 +526,12 @@ impl<'a> Compiler<'a> {
                 scope,
             } = &cmd.body
             {
-                let default = eval_static_const(initial, self.stage).unwrap_or_else(|| {
-                    match value_type {
+                let default =
+                    eval_static_const(initial, self.stage).unwrap_or_else(|| match value_type {
                         4 => Value::Str(String::new()),
                         2 => Value::Float(0.0),
                         _ => Value::Int(0),
-                    }
-                });
+                    });
                 self.ensure_var(name, default);
                 if *scope == 3 {
                     let key = self.intern_str(&format!("lm_prof_{name}"));
@@ -664,7 +663,9 @@ impl<'a> Compiler<'a> {
     fn register_audio_asset(&mut self, raw: &str) -> Option<AssetId> {
         let vfs = self.find_vfs_file(raw, &["サウンド"], &["ogg", "wav", "mp3"])?;
         let id = self.register_vfs_audio(&vfs)?;
-        if self.first_title_bgm.is_none() && (vfs.contains("bgm") || raw.to_ascii_lowercase().contains("bgm")) {
+        if self.first_title_bgm.is_none()
+            && (vfs.contains("bgm") || raw.to_ascii_lowercase().contains("bgm"))
+        {
             self.first_title_bgm = Some(id);
         }
         Some(id)
@@ -824,14 +825,8 @@ impl<'a> Compiler<'a> {
                                 kind: TimelineClipKind::Box {
                                     pos_start: [points[0][0] as f32, points[0][1] as f32],
                                     pos_end: [points[1][0] as f32, points[1][1] as f32],
-                                    size_start: [
-                                        values[1].max(1) as f32,
-                                        values[2].max(1) as f32,
-                                    ],
-                                    size_end: [
-                                        values[3].max(1) as f32,
-                                        values[4].max(1) as f32,
-                                    ],
+                                    size_start: [values[1].max(1) as f32, values[2].max(1) as f32],
+                                    size_end: [values[3].max(1) as f32, values[4].max(1) as f32],
                                     color: [r, g, b, 1.0],
                                     opacity: [1.0, 1.0],
                                 },
@@ -861,10 +856,10 @@ impl<'a> Compiler<'a> {
         let bytes = self.archive.read_if_exists(&vfs).ok().flatten()?;
         let parsed = lpm::parse_lpm(&bytes, &vfs).ok()?;
 
-        let background = parsed
-            .background
-            .as_deref()
-            .and_then(|p| self.register_vfs_image(p).or_else(|| self.register_image_asset(p)));
+        let background = parsed.background.as_deref().and_then(|p| {
+            self.register_vfs_image(p)
+                .or_else(|| self.register_image_asset(p))
+        });
 
         let mut items = Vec::with_capacity(parsed.buttons.len());
         for btn in &parsed.buttons {
@@ -981,7 +976,9 @@ impl<'a> Compiler<'a> {
                         continue;
                     };
                     let (thumb_raw, replay_id) = match line.rsplit_once('/') {
-                        Some((p, id_str)) => (p.trim(), id_str.trim().parse::<u32>().unwrap_or(ord as u32)),
+                        Some((p, id_str)) => {
+                            (p.trim(), id_str.trim().parse::<u32>().unwrap_or(ord as u32))
+                        }
                         None => (line, ord as u32),
                     };
                     let thumb = self.register_image_asset(thumb_raw);
@@ -1048,11 +1045,7 @@ impl<'a> Compiler<'a> {
                 .split('.')
                 .next()
                 .unwrap_or(&norm);
-            let group_key = stem
-                .split(['-', '_'])
-                .next()
-                .unwrap_or(stem)
-                .to_owned();
+            let group_key = stem.split(['-', '_']).next().unwrap_or(stem).to_owned();
             let flag = self.intern_str(&format!("cg_{group_key}"));
             self.cg_unlock_by_asset.insert(asset_id, flag);
             if !groups.contains_key(&group_key) {
@@ -1181,7 +1174,12 @@ impl<'a> Compiler<'a> {
                     while body_end < cmds.len() && cmds[body_end].indent > base_indent {
                         body_end += 1;
                     }
-                    arms.push((cond, arm_idx, base_idx + body_start, &cmds[body_start..body_end]));
+                    arms.push((
+                        cond,
+                        arm_idx,
+                        base_idx + body_start,
+                        &cmds[body_start..body_end],
+                    ));
                     cursor = body_end;
                     if cond.is_none() {
                         break;
@@ -1445,7 +1443,9 @@ impl<'a> Compiler<'a> {
                         });
                     } else if !matches!(
                         name,
-                        "メッセージボックス" | "メッセージボックス土台" | "メッセージボックスコントロール"
+                        "メッセージボックス"
+                            | "メッセージボックス土台"
+                            | "メッセージボックスコントロール"
                     ) {
                         let lid = self.resolve_layer(name);
                         self.ops.push(Op::LayerRemove { layer: lid });
@@ -1569,10 +1569,7 @@ impl<'a> Compiler<'a> {
     /// Returns `true` if handled as an ABI shim.
     fn try_lower_abi_call(&mut self, tgt_page: &str, _line: u32, params: &[Expression]) -> bool {
         if tgt_page == "メッセージボックス作成.lsb" {
-            let style_name = params
-                .first()
-                .and_then(literal_string)
-                .unwrap_or("(標準)");
+            let style_name = params.first().and_then(literal_string).unwrap_or("(標準)");
             let idx = self
                 .style_index_by_name
                 .get(style_name)
@@ -1607,10 +1604,8 @@ impl<'a> Compiler<'a> {
             return true;
         }
         if tgt_page.ends_with("メッセージボックス/プレビューメニュー処理.lsb") {
-            self.report.record_adapted(
-                &self.current_loc,
-                "message box toolbar handled by NIR HUD",
-            );
+            self.report
+                .record_adapted(&self.current_loc, "message box toolbar handled by NIR HUD");
             return true;
         }
         if tgt_page.ends_with("シーン回想/■フラグon.lsb") {
@@ -1619,10 +1614,8 @@ impl<'a> Compiler<'a> {
                 self.ops.push(Op::ProfileSetFlag(flag));
                 self.report.record_exact();
             } else {
-                self.report.record_adapted(
-                    &self.current_loc,
-                    "dynamic replay unlock ID omitted",
-                );
+                self.report
+                    .record_adapted(&self.current_loc, "dynamic replay unlock ID omitted");
             }
             return true;
         }
@@ -1695,7 +1688,8 @@ impl<'a> Compiler<'a> {
             let lpm_raw = params.get(1).and_then(literal_string).unwrap_or("");
             let res_var = self.ensure_var("選択値", Value::Str(String::new()));
             let idx_var = self.ensure_var("選択番号", Value::Int(-1));
-            let Some(vfs_lpm) = self.find_vfs_file(lpm_raw, &["グラフィック"], &["lpm"]) else {
+            let Some(vfs_lpm) = self.find_vfs_file(lpm_raw, &["グラフィック"], &["lpm"])
+            else {
                 // Missing LPM file in source archive (commonly an unlinked flowchart node).
                 let empty = self.intern_str("");
                 self.ops.push(Op::PushStr(empty));
@@ -2090,9 +2084,7 @@ fn analyze_dynamic_var_prefixes(
     let mut prefixes: BTreeSet<String> = BTreeSet::new();
     let mut matched_vars: BTreeSet<String> = BTreeSet::new();
 
-    let norm_prefix = |raw: &str| -> String {
-        normalize_vfs_path(raw.trim()).to_lowercase()
-    };
+    let norm_prefix = |raw: &str| -> String { normalize_vfs_path(raw.trim()).to_lowercase() };
 
     let eval_expr_prefix = |expr: &Expression| -> Option<Option<String>> {
         if expr.operations.is_empty() {
@@ -2105,13 +2097,14 @@ fn analyze_dynamic_var_prefixes(
         let mut ssa: BTreeMap<String, Option<String>> = BTreeMap::new();
         let mut last_dst: Option<String> = None;
         for (op_code, dst, operands) in &expr.operations {
-            let eval_lit = |lit: &Literal, ssa: &BTreeMap<String, Option<String>>| -> Option<String> {
-                match lit {
-                    Literal::String(s) => Some(s.clone()),
-                    Literal::Variable(name) => ssa.get(name).cloned().flatten(),
-                    _ => None,
-                }
-            };
+            let eval_lit =
+                |lit: &Literal, ssa: &BTreeMap<String, Option<String>>| -> Option<String> {
+                    match lit {
+                        Literal::String(s) => Some(s.clone()),
+                        Literal::Variable(name) => ssa.get(name).cloned().flatten(),
+                        _ => None,
+                    }
+                };
             let val = match (*op_code, operands.as_slice()) {
                 // `+` (2) or `&` string concatenation (19)
                 (2 | 19, [lhs, rhs]) => match (eval_lit(lhs, &ssa), eval_lit(rhs, &ssa)) {
@@ -2183,7 +2176,10 @@ fn analyze_dynamic_var_prefixes(
                         };
                         let val = match (*op_code, operands.as_slice()) {
                             (2 | 19, [lhs, rhs]) => {
-                                match (eval_lit(lhs, &ssa, &block_env), eval_lit(rhs, &ssa, &block_env)) {
+                                match (
+                                    eval_lit(lhs, &ssa, &block_env),
+                                    eval_lit(rhs, &ssa, &block_env),
+                                ) {
                                     (Some(lp), Some(rp)) => Some(format!("{lp}{rp}")),
                                     (Some(lp), None) if !lp.is_empty() => Some(lp),
                                     _ => None,
@@ -2279,7 +2275,9 @@ fn split_speaker_and_trim(mut spans: Vec<RichSpan>) -> (Option<String>, Vec<Rich
             if !l1.is_empty()
                 && l1.chars().count() <= 16
                 && !l1.contains(['。', '、', '「', '」', '（', '）', '！', '？'])
-                && (rest_t.starts_with('「') || rest_t.starts_with('（') || rest_t.starts_with('『'))
+                && (rest_t.starts_with('「')
+                    || rest_t.starts_with('（')
+                    || rest_t.starts_with('『'))
             {
                 speaker = Some(l1.to_owned());
                 *first = rest_t.to_owned();
@@ -2388,7 +2386,10 @@ mod tests {
         // Glyph 0: Event CREATECG
         tpw.push(6);
         lsb::tests::u32b(&mut tpw, u32::MAX);
-        lsb::tests::string(&mut tpw, "\u{1}CREATECG\r\nbg\r\nbg.png\r\nNORMAL\r\n#1\r\nC\r\nC\r\n0\r\n0\r\n0\r\n");
+        lsb::tests::string(
+            &mut tpw,
+            "\u{1}CREATECG\r\nbg\r\nbg.png\r\nNORMAL\r\n#1\r\nC\r\nC\r\n0\r\n0\r\n0\r\n",
+        );
         // Glyph 1: Char 'A'
         tpw.push(1);
         lsb::tests::u32b(&mut tpw, u32::MAX);

@@ -1,93 +1,128 @@
 #!/usr/bin/env python3
-"""Package only the selected immutable release and the tested, standalone SDK."""
+"""Package the tested, standalone NIR v2 SDK, CLI, and Rain Letters Web demo."""
 import gzip
 import hashlib
-import json
+import io
 from pathlib import Path
 import shutil
+import subprocess
 import tarfile
 import tomllib
-import subprocess
-import io
 
-version=tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
-dist=Path("dist");bundle=dist/"bundle"
-actual=subprocess.check_output([str(dist/"novelc"),"--version"],text=True).strip()
+version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+dist = Path("dist")
+bundle = dist / "bundle"
+actual = subprocess.check_output([str(dist / "novelc"), "--version"], text=True).strip()
 assert actual == f"novelc {version}", f"CLI version mismatch: {actual}"
-if bundle.exists():shutil.rmtree(bundle)
+
+if bundle.exists():
+    shutil.rmtree(bundle)
 bundle.mkdir(exist_ok=True)
-shutil.copy2(dist/"novelc",bundle/"novelc")
-shutil.copytree(dist/"sdk",bundle/"sdk",dirs_exist_ok=True)
-shutil.copytree("docs",bundle/"docs",dirs_exist_ok=True,ignore=shutil.ignore_patterns("specs","validation"))
+shutil.copy2(dist / "novelc", bundle / "novelc")
+shutil.copytree(dist / "sdk", bundle / "sdk", dirs_exist_ok=True)
+shutil.copytree("docs", bundle / "docs", dirs_exist_ok=True, ignore=shutil.ignore_patterns("specs", "validation"))
 for name in ("LICENSE", "COPYING", "LICENSE-NOTICE.md"):
-    shutil.copy2(name,bundle/name)
-source=dist/"rain-letters-web"
-channel=json.loads((source/"channels/stable.json").read_text())
-manifest_path=f"releases/{channel['release']}.json"
-manifest=json.loads((source/manifest_path).read_text())
-selected=["index.html","bootstrap.js","NOTICE.txt","channels/stable.json",manifest_path,*[o["path"] for o in manifest["objects"].values()]]
-selected += [f"releases/{channel['release']}/index.html", f"releases/{channel['release']}/bootstrap.js"]
-if "style" in manifest["launch"]:
-    selected += ["style.css", f"releases/{channel['release']}/style.css"]
-selected += [name+".gz" for name in list(selected) if (source/(name+".gz")).is_file()]
-web=bundle/"rain-letters-web"
+    shutil.copy2(name, bundle / name)
+
+source = dist / "rain-letters-web"
+required_web = [
+    "index.html",
+    "style.css",
+    "app.js",
+    "player_web.js",
+    "player_web_bg.wasm",
+    "game.nirpak",
+]
+optional_web = [
+    "manifest.webmanifest",
+    "sw.js",
+    "fallback-cjk.otf",
+    "fallback-cjk.ttf",
+]
+web = bundle / "rain-letters-web"
 web.mkdir(exist_ok=True)
-for name in selected:
-    target=web/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source/name,target)
-(bundle/"README.md").write_text(f'''# NIR {version} 叙事引擎 SDK 与 CLI · Linux x86_64
+for name in required_web:
+    src = source / name
+    assert src.is_file(), f"missing required web artifact: {src}"
+    shutil.copy2(src, web / name)
+for name in optional_web:
+    src = source / name
+    if src.is_file():
+        shutil.copy2(src, web / name)
 
-本包提供创建、检查、预览和构建叙事作品所需的引擎运行时与作者工具。
+(bundle / "README.md").write_text(
+    f"""# NIR {version} 叙事引擎 SDK 与 CLI · Linux x86_64
 
-- novelc：作品开发 CLI。
-- sdk/：配套浏览器运行时、工程模板与 Schema。
-- docs/：编写说明、架构、能力边界和测试记录。
-- rain-letters-web/：《雨后书简》测试工程的静态构建，用于检查引擎运行链路。
+本包提供创建、检查、预览和构建 NIR v2 叙事作品所需的引擎运行时与作者工具。
+
+- `novelc`：作品开发 CLI（init / check / build / convert / dev / serve / i18n）。
+- `sdk/`：配套 Web（WebGPU / WebGL2 WASM）、Linux 原生播放器与 Android 原生库。
+- `docs/`：架构说明文档。
+- `rain-letters-web/`：《雨后书简》示例工程的 Web 构建。
 
 解压后，在本目录创建作品，无需安装 Rust：
 
+```sh
+./novelc init my-story --title "My Story"
+./novelc check my-story
+./novelc dev my-story
+./novelc build my-story --target web
+./novelc build my-story --target native
+./novelc build my-story --target android
 ```
-./novelc init my-story
-./novelc -p my-story resolve
-./novelc -p my-story doctor
-./novelc -p my-story check --locked
-./novelc -p my-story test
-./novelc -p my-story dev
-./novelc -p my-story build --locked
-```
 
-init 默认创建带母版字体的独立最小作品；CLI 自动编译运行字体。使用 init --template web-basic 可创建功能回归工程。novelc 和 sdk 必须配套保留。最终作品默认输出到 my-story/dist/full/web，可完整上传至 HTTPS 静态站点，保留 NOTICE.txt。
+运行附带的示例工程：
 
-SDK 内含 Linux 原生播放器 sdk/linux/player-linux。运行 `./novelc -p my-story build --target linux --locked` 输出原生 Linux 版本 dist/full/linux（Vulkan 渲染，无需浏览器）；要求 x86_64、glibc 2.39+ 与 Vulkan 驱动，详见 docs/LINUX.md。
-
-SDK 亦内含 Android 播放器 sdk/android/lib/arm64-v8a/libplayer.so（实验性）。运行 `./novelc -p my-story build --target android --locked` 输出可直接安装的 APK（dist/full/android/Game.apk；Android 8.0+ arm64，Vulkan 渲染）。签名密钥首次构建时自动生成于作品 config/android-signing.pem，更新安装必须保留同一密钥。详见 docs/ANDROID.md。
-
-运行附带的测试工程：
-
-```
+```sh
 ./novelc serve rain-letters-web
 ```
 
-在桌面 Chromium 或 Firefox 打开 http://127.0.0.1:4173/ 。播放器自动选择 WebGPU/WebGL2。首次点击/按键解锁音频；空格继续，Esc 打开菜单。测试工程包含简中 / 英文正文和两条测试路线，使用简单图像与合成测试音频。
+在桌面或移动浏览器打开 http://127.0.0.1:4173/ 。
 
 许可：LGPL-3.0-or-later；完整许可见 LICENSE、COPYING 和 LICENSE-NOTICE.md。对应源码随同版本源码包提供：https://github.com/iMMIQ/nir/releases 。
+""",
+    encoding="utf-8",
+)
 
-能力边界见 docs/CAPABILITIES.md，发行操作与验收见 docs/M4-RELEASE.md。CLI 构建环境为 Ubuntu 24.04（glibc 2.39）；浏览器验收使用软件渲染。
-''')
+
 def canonical(info):
-    info.uid=info.gid=0;info.uname=info.gname="";info.mtime=0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
     return info
-def archive(path,root,paths,prefix):
-    with path.open("wb") as file,gzip.GzipFile(filename="",mode="wb",fileobj=file,mtime=0) as gz,tarfile.open(fileobj=gz,mode="w") as tar:
+
+
+def archive(path, root, paths, prefix):
+    with (
+        path.open("wb") as file,
+        gzip.GzipFile(filename="", mode="wb", fileobj=file, mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
         for p in sorted(paths):
-            tar.add(p,arcname=str(Path(prefix)/p.relative_to(root)),recursive=False,filter=canonical)
-archive(dist/f"nir-{version}-linux-x86_64.tar.gz",bundle,[p for p in bundle.rglob("*") if p.is_file()],f"nir-{version}")
+            tar.add(p, arcname=str(Path(prefix) / p.relative_to(root)), recursive=False, filter=canonical)
+
+
+archive(
+    dist / f"nir-{version}-linux-x86_64.tar.gz",
+    bundle,
+    [p for p in bundle.rglob("*") if p.is_file()],
+    f"nir-{version}",
+)
+
 # Archive committed bytes, never runner-generated lock files or local changes.
 source_tar = subprocess.check_output(["git", "archive", "--format=tar", f"--prefix=nir-{version}-source/", "HEAD"])
-with (dist/f"nir-{version}-source.tar.gz").open("wb") as file, gzip.GzipFile(filename="",mode="wb",fileobj=file,mtime=0) as gz, tarfile.open(fileobj=gz,mode="w") as target, tarfile.open(fileobj=io.BytesIO(source_tar),mode="r:") as original:
+with (
+    (dist / f"nir-{version}-source.tar.gz").open("wb") as file,
+    gzip.GzipFile(filename="", mode="wb", fileobj=file, mtime=0) as gz,
+    tarfile.open(fileobj=gz, mode="w") as target,
+    tarfile.open(fileobj=io.BytesIO(source_tar), mode="r:") as original,
+):
     for member in original:
         target.addfile(canonical(member), original.extractfile(member) if member.isfile() else None)
-checks=[]
-for name in [f"nir-{version}-linux-x86_64.tar.gz",f"nir-{version}-source.tar.gz"]:
-    path=dist/name;checks.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}")
+
+checks = []
+for name in [f"nir-{version}-linux-x86_64.tar.gz", f"nir-{version}-source.tar.gz"]:
+    path = dist / name
+    checks.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}")
     print(f"{name}: {path.stat().st_size:,} bytes")
-(dist/"SHA256SUMS").write_text("\n".join(checks)+"\n")
+(dist / "SHA256SUMS").write_text("\n".join(checks) + "\n", encoding="utf-8")

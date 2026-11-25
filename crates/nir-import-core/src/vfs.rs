@@ -79,8 +79,7 @@ impl ArchiveSource for DirArchive {
         let Some(real) = self.files.get(normalized_path) else {
             return Ok(None);
         };
-        let bytes =
-            fs::read(real).with_context(|| format!("reading file `{}`", real.display()))?;
+        let bytes = fs::read(real).with_context(|| format!("reading file `{}`", real.display()))?;
         Ok(Some(bytes))
     }
 }
@@ -97,8 +96,7 @@ impl MemoryArchive {
     }
 
     pub fn insert(&mut self, path: impl AsRef<str>, bytes: Vec<u8>) {
-        self.files
-            .insert(normalize_vfs_path(path.as_ref()), bytes);
+        self.files.insert(normalize_vfs_path(path.as_ref()), bytes);
     }
 }
 
@@ -179,7 +177,10 @@ impl CompositeVfs {
         }
         for ext in exts {
             let target = format!("{needle_base}.{ext}");
-            if let Some(hit) = all.iter().find(|p| p.rsplit('/').next() == Some(target.as_str())) {
+            if let Some(hit) = all
+                .iter()
+                .find(|p| p.rsplit('/').next() == Some(target.as_str()))
+            {
                 return Some(hit.clone());
             }
         }

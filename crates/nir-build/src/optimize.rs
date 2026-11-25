@@ -216,9 +216,8 @@ pub fn fp_image_cache_path(
     fp: (u64, u64),
     cfg: &OptimizeConfig,
 ) -> PathBuf {
-    let key = sha256_hex(
-        format!("fp:{}:{}:{}:{}", cfg.image_sig(), asset_name, fp.0, fp.1).as_bytes(),
-    );
+    let key =
+        sha256_hex(format!("fp:{}:{}:{}:{}", cfg.image_sig(), asset_name, fp.0, fp.1).as_bytes());
     cache_dir.join(format!("{key}.nioc"))
 }
 
@@ -228,9 +227,8 @@ pub fn fp_audio_cache_path(
     fp: (u64, u64),
     cfg: &OptimizeConfig,
 ) -> PathBuf {
-    let key = sha256_hex(
-        format!("fp:{}:{}:{}:{}", cfg.audio_sig(), asset_name, fp.0, fp.1).as_bytes(),
-    );
+    let key =
+        sha256_hex(format!("fp:{}:{}:{}:{}", cfg.audio_sig(), asset_name, fp.0, fp.1).as_bytes());
     cache_dir.join(format!("{key}.niac"))
 }
 
@@ -586,7 +584,11 @@ pub fn optimize_decoded_pixels(
     cfg: &OptimizeConfig,
 ) -> Result<(OptimizedAsset, bool)> {
     match pixels {
-        RawPixels::Rgb { width, height, data } => {
+        RawPixels::Rgb {
+            width,
+            height,
+            data,
+        } => {
             if cfg.enabled && cfg.ktx2_textures && width >= 64 && height >= 64 {
                 let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
                 for px in data.as_chunks::<3>().0 {
@@ -610,7 +612,8 @@ pub fn optimize_decoded_pixels(
                 ));
             }
             let q = effective_webp_quality(width, height, false, cfg);
-            let encoded = encode_webp_rgb_q(data, width, height, q, cfg.lossless_images || !cfg.enabled);
+            let encoded =
+                encode_webp_rgb_q(data, width, height, q, cfg.lossless_images || !cfg.enabled);
             Ok((
                 OptimizedAsset {
                     saved_bytes: orig_source_len - encoded.len() as i64,
@@ -627,7 +630,11 @@ pub fn optimize_decoded_pixels(
                 false,
             ))
         }
-        RawPixels::Rgba { width, height, data } => {
+        RawPixels::Rgba {
+            width,
+            height,
+            data,
+        } => {
             let rgba = image::RgbaImage::from_raw(width, height, data.to_vec())
                 .context("E_OPT_IMAGE: RGBA buffer size mismatch")?;
             let (mut final_rgba, trim) = if cfg.enabled && cfg.auto_trim_sprites {
@@ -673,7 +680,13 @@ pub fn optimize_decoded_pixels(
 
             let q = effective_webp_quality(w, h, has_transparency, cfg);
             let encoded = if has_transparency {
-                encode_webp_rgba_q(final_rgba.as_raw(), w, h, q, cfg.lossless_images || !cfg.enabled)
+                encode_webp_rgba_q(
+                    final_rgba.as_raw(),
+                    w,
+                    h,
+                    q,
+                    cfg.lossless_images || !cfg.enabled,
+                )
             } else {
                 let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
                 for px in final_rgba.as_raw().as_chunks::<4>().0 {
@@ -709,7 +722,10 @@ pub fn optimize_image(
     let orig_len = raw.len() as i64;
 
     // Fast header-only path for disabled optimizer, KTX2, or non-KTX2 JPEG passthrough.
-    if !cfg.enabled || source_codec == MediaCodec::Ktx2 || (source_codec == MediaCodec::Jpeg && !cfg.ktx2_textures) {
+    if !cfg.enabled
+        || source_codec == MediaCodec::Ktx2
+        || (source_codec == MediaCodec::Jpeg && !cfg.ktx2_textures)
+    {
         let (orig_w, orig_h) = probe_image_dimensions(raw, source_codec)?;
         return Ok(OptimizedAsset {
             bytes: raw.to_vec(),
@@ -894,7 +910,13 @@ pub fn decode_to_rgba(bytes: &[u8], codec: MediaCodec) -> Option<(u32, u32, Vec<
     let has_alpha = img.color().has_alpha();
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    let actual_alpha = has_alpha && rgba.as_raw().as_chunks::<4>().0.iter().any(|px| px[3] < 255);
+    let actual_alpha = has_alpha
+        && rgba
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] < 255);
     Some((w, h, rgba.into_raw(), actual_alpha))
 }
 
@@ -1127,7 +1149,11 @@ fn trim_mono_silence(wav: &mut WavPcm) {
         return;
     }
     const THRESHOLD: i16 = 65; // ~-54 dBFS
-    let Some(first) = wav.samples.iter().position(|&s| s.saturating_abs() > THRESHOLD) else {
+    let Some(first) = wav
+        .samples
+        .iter()
+        .position(|&s| s.saturating_abs() > THRESHOLD)
+    else {
         return;
     };
     let last = wav
@@ -1256,11 +1282,19 @@ pub fn find_system_cjk_font() -> Option<(PathBuf, u32)> {
 pub fn build_web_cjk_fallback_font(source_path: &Path, face_index: u32) -> Result<Vec<u8>> {
     let raw = fs::read(source_path)
         .with_context(|| format!("reading source CJK font `{}`", source_path.display()))?;
-    let face = ttf_parser::Face::parse(&raw, face_index)
-        .map_err(|_| anyhow::anyhow!("E_FONT: invalid face {face_index} in `{}`", source_path.display()))?;
-    let source = hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(&raw)?, face_index)?;
+    let face = ttf_parser::Face::parse(&raw, face_index).map_err(|_| {
+        anyhow::anyhow!(
+            "E_FONT: invalid face {face_index} in `{}`",
+            source_path.display()
+        )
+    })?;
+    let source =
+        hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(&raw)?, face_index)?;
     let mut input = hb_subset::SubsetInput::new().context("E_FONT_SUBSET")?;
-    input.flags().remove_unrecognized_tables().retain_legacy_names();
+    input
+        .flags()
+        .remove_unrecognized_tables()
+        .retain_legacy_names();
     input.layout_feature_tag_set().clear();
 
     let ranges: &[(u32, u32)] = &[
@@ -1659,7 +1693,11 @@ mod tests {
         let res_mp3 = optimize_audio(&wav, MediaCodec::Wav, &cfg_mp3, dir.path()).unwrap();
         assert_eq!(res_mp3.codec, MediaCodec::Mp3);
         assert_eq!(res_mp3.channels, 1, "dual-mono should auto-downmix to mono");
-        assert!(res_mp3.duration_us < 420_000, "silence should be trimmed: {}", res_mp3.duration_us);
+        assert!(
+            res_mp3.duration_us < 420_000,
+            "silence should be trimmed: {}",
+            res_mp3.duration_us
+        );
         assert!(nir_ir::lame::parse(&res_mp3.bytes).is_some());
 
         // 2. Opus mode: should produce even smaller Ogg Opus at 48 kHz mono!

@@ -121,7 +121,12 @@ impl TextRun {
         r.shadow = None;
         r.x += s.offset[0];
         r.y += s.offset[1];
-        r.color = [s.color[0], s.color[1], s.color[2], s.color[3] * self.color[3]];
+        r.color = [
+            s.color[0],
+            s.color[1],
+            s.color[2],
+            s.color[3] * self.color[3],
+        ];
         r.emphasis.clear();
         r.compute_key();
         Some(r)

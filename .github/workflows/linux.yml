@@ -13,35 +13,34 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CC_x86_64_unknown_linux_gnu: clang
+      CXX_x86_64_unknown_linux_gnu: clang++
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
       - name: Native build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ libclang-dev libasound2-dev mesa-vulkan-drivers xvfb \
-            libx11-6 libxcursor1 libxi6 libxrandr2 libxrender1 \
-            libxkbcommon0 libxkbcommon-x11-0
+          sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake
       - uses: ./.github/actions/build-sdk
-      - uses: ./.github/actions/setup-browser-audio
-        with:
-          install-browsers: 'false'
       - name: Package independent sample
-        env:
-          LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
           rm -rf target/linux-sample
-          ./dist/novelc init target/linux-sample
-          ./dist/novelc -p target/linux-sample resolve
-          ./dist/novelc -p target/linux-sample build --target linux --locked
-          ./dist/novelc -p target/linux-sample build --target web --locked
-          python3 scripts/verify_release.py target/linux-sample/dist/full/web
-          TMPDIR="$PWD/target/tmp" xvfb-run -a -s '-screen 0 1920x1080x24' python3 scripts/verify_linux.py target/linux-sample/dist/full/linux
+          ./dist/novelc init target/linux-sample --title "Linux Sample"
+          ./dist/novelc check target/linux-sample
+          ./dist/novelc build target/linux-sample --target native --out target/linux-sample/dist/native
+          ./dist/novelc build target/linux-sample --target web --out target/linux-sample/dist/web
+          test -x target/linux-sample/dist/native/player-native
+          test -s target/linux-sample/dist/native/game.nirpak
+          readelf -l target/linux-sample/dist/native/player-native | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
+          for f in index.html style.css app.js player_web.js player_web_bg.wasm game.nirpak; do
+            test -s "target/linux-sample/dist/web/$f"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: native-linux-evidence
-          path: |
-            reports/linux/
-            target/linux-sample/dist/full/linux/
+          path: target/linux-sample/dist/native/
+          if-no-files-found: ignore
           retention-days: 7

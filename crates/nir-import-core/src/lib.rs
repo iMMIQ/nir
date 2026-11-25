@@ -207,7 +207,11 @@ impl ImporterRegistry {
         matches
     }
 
-    fn resolve_importer(&self, source: &Path, engine_id: Option<&str>) -> Result<&dyn EngineImporter> {
+    fn resolve_importer(
+        &self,
+        source: &Path,
+        engine_id: Option<&str>,
+    ) -> Result<&dyn EngineImporter> {
         if let Some(id) = engine_id.filter(|s| *s != "auto") {
             self.by_id(id).ok_or_else(|| {
                 anyhow::anyhow!(
