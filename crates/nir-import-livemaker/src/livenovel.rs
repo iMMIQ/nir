@@ -294,8 +294,8 @@ pub fn import_direct(
     // 11. Backpatch all jumps & function entry PCs
     c.backpatch_all();
 
-    // 12. If any event used dynamic `?var` paths, statically narrow prefixes & register dynamic assets!
-    c.populate_dynamic_assets(is_livenovel, &author_scripts);
+    // 12. If any event used dynamic `?var` paths, run interprocedural IR prefix analysis & register dynamic assets!
+    c.populate_dynamic_assets(is_livenovel);
 
     // 13. Register any bundled TTF/OTF fonts
     let mut fonts = Vec::new();
@@ -307,7 +307,20 @@ pub fn import_direct(
         }
     }
 
-    // 14. Assemble `UiTheme` and `NirProgram`
+    // 14. Assemble `UiTheme`, detect accurate title BG/BGM from entry CFG, and build `NirProgram`
+    let mut excluded_title_bgs: BTreeSet<AssetId> = BTreeSet::new();
+    for st in &dialogue_styles {
+        if let Some(bg) = st.dialogue_bg {
+            excluded_title_bgs.insert(bg);
+        }
+    }
+    for g in &gallery {
+        if let Some(th) = g.thumb {
+            excluded_title_bgs.insert(th);
+        }
+    }
+    let (title_bg, title_bgm) = c.detect_title_media(&excluded_title_bgs);
+
     let mut ui = UiTheme::default();
     if let Some(std_style) = dialogue_styles.first() {
         ui.dialogue_bg = std_style.dialogue_bg;
@@ -325,9 +338,6 @@ pub fn import_direct(
     }
     ui.dialogue_styles = dialogue_styles;
     ui.gallery = gallery;
-
-    let title_bg = c.first_title_bg;
-    let title_bgm = c.first_title_bgm;
 
     c.report.statements_emitted = c.ops.len();
     c.report.assets_converted = c.raw_assets.len();
@@ -428,11 +438,9 @@ struct Compiler<'a> {
     temp_locals: BTreeMap<String, u16>,
     max_local_count: u16,
 
-    // Dynamic path variable sets & title hints
+    // Dynamic path variable sets
     dynamic_image_vars: BTreeSet<String>,
     dynamic_audio_vars: BTreeSet<String>,
-    first_title_bg: Option<AssetId>,
-    first_title_bgm: Option<AssetId>,
     current_loc: String,
 }
 
@@ -487,8 +495,6 @@ impl<'a> Compiler<'a> {
             max_local_count: 1,
             dynamic_image_vars: BTreeSet::new(),
             dynamic_audio_vars: BTreeSet::new(),
-            first_title_bg: None,
-            first_title_bgm: None,
             current_loc: String::new(),
         }
     }
@@ -594,11 +600,7 @@ impl<'a> Compiler<'a> {
             &["グラフィック", "グラフィック/顔"],
             &["gal", "png", "jpg", "jpeg", "webp", "bmp"],
         )?;
-        let id = self.register_vfs_image(&vfs)?;
-        if self.first_title_bg.is_none() {
-            self.first_title_bg = Some(id);
-        }
-        Some(id)
+        self.register_vfs_image(&vfs)
     }
 
     fn register_vfs_image(&mut self, vfs_path: &str) -> Option<AssetId> {
@@ -662,13 +664,7 @@ impl<'a> Compiler<'a> {
 
     fn register_audio_asset(&mut self, raw: &str) -> Option<AssetId> {
         let vfs = self.find_vfs_file(raw, &["サウンド"], &["ogg", "wav", "mp3"])?;
-        let id = self.register_vfs_audio(&vfs)?;
-        if self.first_title_bgm.is_none()
-            && (vfs.contains("bgm") || raw.to_ascii_lowercase().contains("bgm"))
-        {
-            self.first_title_bgm = Some(id);
-        }
-        Some(id)
+        self.register_vfs_audio(&vfs)
     }
 
     fn register_vfs_audio(&mut self, vfs_path: &str) -> Option<AssetId> {
@@ -1071,16 +1067,24 @@ impl<'a> Compiler<'a> {
         items
     }
 
-    fn populate_dynamic_assets(
-        &mut self,
-        is_livenovel: bool,
-        author_scripts: &BTreeMap<String, Script>,
-    ) {
+    fn populate_dynamic_assets(&mut self, is_livenovel: bool) {
         if self.dynamic_image_vars.is_empty() && self.dynamic_audio_vars.is_empty() {
             return;
         }
-        let img_filter = analyze_dynamic_var_prefixes(&self.dynamic_image_vars, author_scripts);
-        let aud_filter = analyze_dynamic_var_prefixes(&self.dynamic_audio_vars, author_scripts);
+        let img_filter = analyze_dynamic_prefixes_ir(
+            &self.dynamic_image_vars,
+            &self.ops,
+            &self.vars,
+            &self.strings,
+            is_livenovel,
+        );
+        let aud_filter = analyze_dynamic_prefixes_ir(
+            &self.dynamic_audio_vars,
+            &self.ops,
+            &self.vars,
+            &self.strings,
+            is_livenovel,
+        );
 
         let files = self.all_files.clone();
         for f in files {
@@ -1108,6 +1112,180 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
+    }
+
+    fn is_valid_title_bg(&self, id: AssetId, excluded: &BTreeSet<AssetId>) -> bool {
+        if excluded.contains(&id) {
+            return false;
+        }
+        let Some(asset) = self.raw_assets.get(id.0 as usize) else {
+            return false;
+        };
+        if asset.kind != AssetKind::Image {
+            return false;
+        }
+        let low = asset.name.to_lowercase();
+        if low.contains("メッセージボックス")
+            || low.contains("messagebox")
+            || low.contains("シーン回想")
+            || low.contains("cgモード")
+            || low.contains("ボタン")
+        {
+            return false;
+        }
+        if let Some((w, h)) = layout::probe_image_size(&self.archive, &asset.name) {
+            let min_w = (self.stage[0] / 2).max(320);
+            let min_h = (self.stage[1] / 2).max(240);
+            return w >= min_w && h >= min_h;
+        }
+        false
+    }
+
+    /// Detects the authentic title screen background & BGM by walking reachable bytecode from `FuncId(0)`
+    /// (excluding dialogue box skins and gallery thumbnails that previously polluted `title_bg`).
+    fn detect_title_media(&self, excluded_bgs: &BTreeSet<AssetId>) -> (Option<AssetId>, Option<AssetId>) {
+        let mut title_bg: Option<AssetId> = None;
+        let mut title_bgm: Option<AssetId> = None;
+
+        // 1. Walk reachable CFG from FuncId(0) (up to 512 ops) to capture the first real title scene.
+        let ops_len = self.ops.len();
+        if ops_len > 0 {
+            let mut visited = vec![false; ops_len];
+            let mut queue = std::collections::VecDeque::new();
+            let entry_pc = self.funcs.first().map_or(0, |f| f.entry_pc as usize);
+            if entry_pc < ops_len {
+                queue.push_back(entry_pc);
+            }
+            let mut steps = 0usize;
+            while let Some(mut pc) = queue.pop_front() {
+                while pc < ops_len && !visited[pc] && steps < 512 {
+                    visited[pc] = true;
+                    steps += 1;
+                    match &self.ops[pc] {
+                        Op::ChoiceMenu { menu, .. } => {
+                            if title_bg.is_none() {
+                                if let Some(tmpl) = self.menus.get(menu.0 as usize) {
+                                    if let Some(bg) = tmpl.background {
+                                        if self.is_valid_title_bg(bg, excluded_bgs) {
+                                            title_bg = Some(bg);
+                                        }
+                                    }
+                                }
+                            }
+                            // Stop exploring past the first interactive title menu once we have media.
+                            if title_bg.is_some() && title_bgm.is_some() {
+                                break;
+                            }
+                        }
+                        Op::LayerSet { asset: Some(a), .. }
+                        | Op::LayerAsset { asset: Some(a), .. } => {
+                            if title_bg.is_none() && self.is_valid_title_bg(*a, excluded_bgs) {
+                                title_bg = Some(*a);
+                            }
+                        }
+                        Op::AudioPlay {
+                            bus: AudioBus::Bgm,
+                            asset,
+                            ..
+                        } => {
+                            if title_bgm.is_none() {
+                                title_bgm = Some(*asset);
+                            }
+                        }
+                        Op::Jump(t) => {
+                            pc = *t as usize;
+                            continue;
+                        }
+                        Op::JumpIfFalse(t) => {
+                            let target = *t as usize;
+                            if target < ops_len && !visited[target] {
+                                queue.push_back(target);
+                            }
+                        }
+                        Op::Call { func, .. } => {
+                            if let Some(f) = self.funcs.get(func.0 as usize) {
+                                let fpc = f.entry_pc as usize;
+                                if fpc < ops_len && !visited[fpc] {
+                                    queue.push_back(fpc);
+                                }
+                            }
+                        }
+                        Op::Ret { .. } | Op::End { .. } => break,
+                        _ => {}
+                    }
+                    pc += 1;
+                }
+                if title_bg.is_some() && title_bgm.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // 2. Fallback: look for menu backgrounds or title-named full-screen images.
+        if title_bg.is_none() {
+            for tmpl in &self.menus {
+                if let Some(bg) = tmpl.background {
+                    if self.is_valid_title_bg(bg, excluded_bgs) {
+                        title_bg = Some(bg);
+                        break;
+                    }
+                }
+            }
+        }
+        if title_bg.is_none() {
+            let mut first_valid = None;
+            for (idx, asset) in self.raw_assets.iter().enumerate() {
+                let id = AssetId(idx as u32);
+                if !self.is_valid_title_bg(id, excluded_bgs) {
+                    continue;
+                }
+                if first_valid.is_none() {
+                    first_valid = Some(id);
+                }
+                let low = asset.name.to_lowercase();
+                if low.contains("title")
+                    || low.contains("tittle")
+                    || low.contains("タイトル")
+                    || low.contains("top")
+                    || low.contains("menu")
+                {
+                    title_bg = Some(id);
+                    break;
+                }
+            }
+            if title_bg.is_none() {
+                title_bg = first_valid;
+            }
+        }
+
+        if title_bgm.is_none() {
+            let mut first_bgm = None;
+            for (idx, asset) in self.raw_assets.iter().enumerate() {
+                if asset.kind != AssetKind::Audio {
+                    continue;
+                }
+                let low = asset.name.to_lowercase();
+                if low.contains("bgm") {
+                    let id = AssetId(idx as u32);
+                    if first_bgm.is_none() {
+                        first_bgm = Some(id);
+                    }
+                    if low.contains("title")
+                        || low.contains("タイトル")
+                        || low.contains("menu")
+                        || low.contains("op")
+                    {
+                        title_bgm = Some(id);
+                        break;
+                    }
+                }
+            }
+            if title_bgm.is_none() {
+                title_bgm = first_bgm;
+            }
+        }
+
+        (title_bg, title_bgm)
     }
 
     fn compile_page(&mut self, page: &str, script: &Script) {
@@ -1797,6 +1975,7 @@ impl<'a> Compiler<'a> {
 
     fn lower_text_ins(&mut self, novel: &lsb::Novel) {
         let mut cur_spans: Vec<RichSpan> = Vec::new();
+        let mut pending_voice: Option<Op> = None;
         for glyph in &novel.glyphs {
             match glyph {
                 Glyph::Char(ch) => push_text_span(&mut cur_spans, ch),
@@ -1815,7 +1994,7 @@ impl<'a> Compiler<'a> {
                     if *kind == 0 {
                         push_text_span(&mut cur_spans, "\n");
                     } else {
-                        self.flush_dialogue(&mut cur_spans);
+                        self.flush_dialogue(&mut cur_spans, &mut pending_voice);
                     }
                 }
                 Glyph::Event(raw_parts) => {
@@ -1830,9 +2009,32 @@ impl<'a> Compiler<'a> {
                         self.report.record_exact();
                         continue;
                     }
-                    self.flush_dialogue(&mut cur_spans);
+                    self.flush_dialogue(&mut cur_spans, &mut pending_voice);
                     let mut ev_ops = Vec::new();
                     events::lower_event(&ev_name, ev_args, self, &mut ev_ops);
+                    // Hold an immediately-preceding standard Voice PLAYSND so the next Op::Say
+                    // binds `voice: Some(asset)` directly (enables History replay & character volume!).
+                    if ev_ops.len() == 1 {
+                        if let Op::AudioPlay {
+                            bus: AudioBus::Voice,
+                            gain,
+                            looped: false,
+                            fade_in_us: 0,
+                            loop_region: None,
+                            ..
+                        } = ev_ops[0]
+                        {
+                            if (gain - 1.0).abs() < 0.05 {
+                                if let Some(prev) = pending_voice.replace(ev_ops.pop().unwrap()) {
+                                    self.ops.push(prev);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(prev) = pending_voice.take() {
+                        self.ops.push(prev);
+                    }
                     self.ops.extend(ev_ops);
                 }
                 Glyph::InlineImage { source, .. } => {
@@ -1860,10 +2062,13 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        self.flush_dialogue(&mut cur_spans);
+        self.flush_dialogue(&mut cur_spans, &mut pending_voice);
+        if let Some(unconsumed) = pending_voice.take() {
+            self.ops.push(unconsumed);
+        }
     }
 
-    fn flush_dialogue(&mut self, spans: &mut Vec<RichSpan>) {
+    fn flush_dialogue(&mut self, spans: &mut Vec<RichSpan>, pending_voice: &mut Option<Op>) {
         if spans.is_empty() {
             return;
         }
@@ -1881,6 +2086,15 @@ impl<'a> Compiler<'a> {
             return;
         }
 
+        let voice = match pending_voice.take() {
+            Some(Op::AudioPlay { asset, .. }) => Some(asset),
+            Some(other) => {
+                self.ops.push(other);
+                None
+            }
+            None => None,
+        };
+
         // Trim leading/trailing newlines and extract optional speaker prefix (`【Name】` or `Name\n「...`)
         let (speaker_opt, cleaned_spans) = split_speaker_and_trim(taken);
         let speaker = speaker_opt.map(|s| self.intern_str(&s));
@@ -1892,7 +2106,7 @@ impl<'a> Compiler<'a> {
             speaker,
             speaker_color: None,
             text: text_id,
-            voice: None,
+            voice,
             reveal_us: 0,
             append: false,
         });
@@ -2004,7 +2218,7 @@ impl EventBridge for Compiler<'_> {
         }
         let bus = if key.contains("BGM") {
             AudioBus::Bgm
-        } else if key.contains("VOICE") {
+        } else if key.contains("VOICE") || key.contains("音声") || key.contains("ボイス") {
             AudioBus::Voice
         } else {
             AudioBus::Sfx
@@ -2050,176 +2264,313 @@ impl EventBridge for Compiler<'_> {
 
 enum DynamicFilter {
     All,
+    /// Conservative LiveNovel fallback: only files inside the media root (e.g. `グラフィック/` or `サウンド/`),
+    /// preventing unrelated root extras (like `ファイルシート/*.jpg`) from bloating `.nirpak`.
+    RootOnly,
     Prefixes(BTreeSet<String>),
 }
 
 impl DynamicFilter {
     fn matches(&self, vfs_path: &str, default_root: &str) -> bool {
-        let Self::Prefixes(prefixes) = self else {
-            return true;
-        };
-        let low = vfs_path.to_lowercase();
-        let rel = low.strip_prefix(default_root).unwrap_or(&low);
-        let fname = low.rsplit('/').next().unwrap_or(&low);
-        prefixes.iter().any(|pref| {
-            let p_rel = pref.strip_prefix(default_root).unwrap_or(pref);
-            low.starts_with(pref.as_str())
-                || rel.starts_with(p_rel)
-                || (!p_rel.contains('/') && fname.starts_with(p_rel))
-        })
+        match self {
+            Self::All => true,
+            Self::RootOnly => vfs_path.to_lowercase().starts_with(default_root),
+            Self::Prefixes(prefixes) => {
+                let low = vfs_path.to_lowercase();
+                let rel = low.strip_prefix(default_root).unwrap_or(&low);
+                let fname = low.rsplit('/').next().unwrap_or(&low);
+                prefixes.iter().any(|pref| {
+                    let p_rel = pref.strip_prefix(default_root).unwrap_or(pref);
+                    low.starts_with(pref.as_str())
+                        || rel.starts_with(p_rel)
+                        || (!p_rel.contains('/') && fname.starts_with(p_rel))
+                })
+            }
+        }
     }
 }
 
-/// Statically analyzes string prefixes assigned to every dynamic `?var` variable across all
-/// author scripts. If every non-empty assignment to every variable in `vars` starts with a known
-/// literal prefix (>= 2 chars), narrows dynamic registration strictly to matching files;
-/// otherwise conservatively falls back to `DynamicFilter::All` so fidelity is never compromised.
-fn analyze_dynamic_var_prefixes(
-    vars: &BTreeSet<String>,
-    author_scripts: &BTreeMap<String, Script>,
+/// Abstract string-prefix value tracked by the interprocedural IR dataflow analyzer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StrAbs {
+    /// No non-empty value observed yet (or reset to `""`).
+    Empty,
+    /// Finite set of `(prefix, is_exact_literal)` possibilities.
+    Known(BTreeSet<(String, bool)>),
+    /// Could start with an arbitrary runtime string.
+    Unknown,
+}
+
+impl StrAbs {
+    fn exact(s: String) -> Self {
+        if s.trim().is_empty() {
+            Self::Empty
+        } else {
+            let mut set = BTreeSet::new();
+            set.insert((s, true));
+            Self::Known(set)
+        }
+    }
+
+    fn join(&mut self, other: &Self) -> bool {
+        match (&*self, other) {
+            (_, Self::Empty) | (Self::Unknown, _) => false,
+            (Self::Empty, _) => {
+                *self = other.clone();
+                true
+            }
+            (_, Self::Unknown) => {
+                *self = Self::Unknown;
+                true
+            }
+            (Self::Known(cur), Self::Known(add)) => {
+                if cur.len() + add.len() > 256 {
+                    *self = Self::Unknown;
+                    return true;
+                }
+                let mut merged = cur.clone();
+                let before = merged.len();
+                merged.extend(add.iter().cloned());
+                if merged.len() != before {
+                    *self = Self::Known(merged);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn concat(lhs: &Self, rhs: &Self) -> Self {
+        match (lhs, rhs) {
+            (Self::Empty, r) => r.clone(),
+            (l, Self::Empty) => l.clone(),
+            (Self::Unknown, _) => Self::Unknown,
+            (Self::Known(lset), Self::Unknown) => {
+                // Preserves every known left prefix even when RHS is dynamic!
+                let out: BTreeSet<(String, bool)> = lset.iter().map(|(s, _)| (s.clone(), false)).collect();
+                Self::Known(out)
+            }
+            (Self::Known(lset), Self::Known(rset)) => {
+                let mut out = BTreeSet::new();
+                for (ls, l_exact) in lset {
+                    if *l_exact {
+                        for (rs, r_exact) in rset {
+                            out.insert((format!("{ls}{rs}"), *r_exact));
+                            if out.len() > 256 {
+                                // Collapse to directory/left prefixes instead of losing precision.
+                                let collapsed: BTreeSet<(String, bool)> =
+                                    lset.iter().map(|(s, _)| (s.clone(), false)).collect();
+                                return Self::Known(collapsed);
+                            }
+                        }
+                    } else {
+                        out.insert((ls.clone(), false));
+                    }
+                }
+                if out.is_empty() {
+                    Self::Empty
+                } else {
+                    Self::Known(out)
+                }
+            }
+        }
+    }
+}
+
+/// Interprocedural fixed-point dataflow analysis over compiled NIR bytecode (`ops`) to infer exact
+/// path prefixes for every dynamic `?var` variable across branches, local temporaries, and chained
+/// `Concat` operations. Falls back safely to `RootOnly` (LiveNovel) or `All` if any variable's
+/// prefix is genuinely unknown.
+fn analyze_dynamic_prefixes_ir(
+    target_vars: &BTreeSet<String>,
+    ops: &[Op],
+    vars: &[VarMeta],
+    strings: &[String],
+    is_livenovel: bool,
 ) -> DynamicFilter {
-    if vars.is_empty() {
+    if target_vars.is_empty() {
         return DynamicFilter::Prefixes(BTreeSet::new());
     }
-    let mut prefixes: BTreeSet<String> = BTreeSet::new();
-    let mut matched_vars: BTreeSet<String> = BTreeSet::new();
-
-    let norm_prefix = |raw: &str| -> String { normalize_vfs_path(raw.trim()).to_lowercase() };
-
-    let eval_expr_prefix = |expr: &Expression| -> Option<Option<String>> {
-        if expr.operations.is_empty() {
-            return match &expr.literal {
-                Some(Literal::String(s)) => Some(Some(s.clone())),
-                None => Some(Some(String::new())),
-                _ => Some(None),
-            };
-        }
-        let mut ssa: BTreeMap<String, Option<String>> = BTreeMap::new();
-        let mut last_dst: Option<String> = None;
-        for (op_code, dst, operands) in &expr.operations {
-            let eval_lit =
-                |lit: &Literal, ssa: &BTreeMap<String, Option<String>>| -> Option<String> {
-                    match lit {
-                        Literal::String(s) => Some(s.clone()),
-                        Literal::Variable(name) => ssa.get(name).cloned().flatten(),
-                        _ => None,
-                    }
-                };
-            let val = match (*op_code, operands.as_slice()) {
-                // `+` (2) or `&` string concatenation (19)
-                (2 | 19, [lhs, rhs]) => match (eval_lit(lhs, &ssa), eval_lit(rhs, &ssa)) {
-                    (Some(lp), Some(rp)) => Some(format!("{lp}{rp}")),
-                    (Some(lp), None) if !lp.is_empty() => Some(lp),
-                    _ => None,
-                },
-                // `=` assignment (0 | 1) or unary pass-through
-                (0 | 1, [only]) => eval_lit(only, &ssa),
-                _ => None,
-            };
-            ssa.insert(dst.clone(), val);
-            last_dst = Some(dst.clone());
-        }
-        last_dst.map(|d| ssa.get(&d).cloned().flatten())
+    let fallback = if is_livenovel {
+        DynamicFilter::RootOnly
+    } else {
+        DynamicFilter::All
     };
 
-    for script in author_scripts.values() {
-        // Straight-line local prefix environment within a basic block (cleared on any branch/call/indent change).
-        // 100% sound: only propagates prefixes across uninterrupted sequential assignments!
-        let mut block_env: BTreeMap<String, Option<String>> = BTreeMap::new();
-        let mut prev_indent: Option<u32> = None;
+    let str_at = |sid: StrId| -> &str { strings.get(sid.0 as usize).map_or("", String::as_str) };
+    let mut var_abs: Vec<StrAbs> = vars
+        .iter()
+        .map(|vm| match &vm.default {
+            Value::Str(s) => StrAbs::exact(s.clone()),
+            Value::Int(n) if *n != 0 => StrAbs::exact(n.to_string()),
+            _ => StrAbs::Empty,
+        })
+        .collect();
 
-        for cmd in &script.commands {
-            if cmd.muted {
-                continue;
-            }
-            if prev_indent != Some(cmd.indent) {
-                block_env.clear();
-                prev_indent = Some(cmd.indent);
-            }
-            match &cmd.body {
-                Body::Variable { name, initial, .. } => {
-                    let pref = eval_expr_prefix(initial).flatten();
-                    if vars.contains(name) {
-                        if let Some(pref_opt) = eval_expr_prefix(initial) {
-                            match pref_opt {
-                                Some(s) if s.trim().is_empty() => {} // empty init resolves to nothing
-                                Some(s) => {
-                                    let p = norm_prefix(&s);
-                                    if p.chars().count() < 2 {
-                                        return DynamicFilter::All;
-                                    }
-                                    prefixes.insert(p);
-                                    matched_vars.insert(name.clone());
-                                }
-                                None => return DynamicFilter::All,
-                            }
-                        }
-                    }
-                    block_env.insert(name.clone(), pref);
+    // Identify jump targets so local stack/temp state resets cleanly at control-flow joins.
+    let mut join_pcs = vec![false; ops.len()];
+    for op in ops {
+        match *op {
+            Op::Jump(t) | Op::JumpIfFalse(t) => {
+                if (t as usize) < ops.len() {
+                    join_pcs[t as usize] = true;
                 }
-                Body::Calc(expr) => {
-                    let mut ssa: BTreeMap<String, Option<String>> = BTreeMap::new();
-                    for (op_code, dst, operands) in &expr.operations {
-                        let eval_lit = |lit: &Literal,
-                                        ssa: &BTreeMap<String, Option<String>>,
-                                        block_env: &BTreeMap<String, Option<String>>|
-                         -> Option<String> {
-                            match lit {
-                                Literal::String(s) => Some(s.clone()),
-                                Literal::Variable(name) => ssa
-                                    .get(name)
-                                    .cloned()
-                                    .flatten()
-                                    .or_else(|| block_env.get(name).cloned().flatten()),
-                                _ => None,
-                            }
-                        };
-                        let val = match (*op_code, operands.as_slice()) {
-                            (2 | 19, [lhs, rhs]) => {
-                                match (
-                                    eval_lit(lhs, &ssa, &block_env),
-                                    eval_lit(rhs, &ssa, &block_env),
-                                ) {
-                                    (Some(lp), Some(rp)) => Some(format!("{lp}{rp}")),
-                                    (Some(lp), None) if !lp.is_empty() => Some(lp),
-                                    _ => None,
-                                }
-                            }
-                            (0 | 1, [only]) => eval_lit(only, &ssa, &block_env),
-                            _ => None,
-                        };
-                        if vars.contains(dst) {
-                            match &val {
-                                Some(s) if s.trim().is_empty() => {} // reset to ""
-                                Some(s) => {
-                                    let p = norm_prefix(s);
-                                    if p.chars().count() < 2 {
-                                        return DynamicFilter::All;
-                                    }
-                                    prefixes.insert(p);
-                                    matched_vars.insert(dst.clone());
-                                }
-                                None => return DynamicFilter::All,
-                            }
-                        }
-                        if !dst.starts_with("____") {
-                            block_env.insert(dst.clone(), val.clone());
-                        }
-                        ssa.insert(dst.clone(), val);
+            }
+            Op::Choice {
+                ref items,
+                cancel_pc,
+                ..
+            } => {
+                for it in items {
+                    if (it.target_pc as usize) < ops.len() {
+                        join_pcs[it.target_pc as usize] = true;
                     }
                 }
-                Body::Text { .. } => {}
-                _ => {
-                    block_env.clear();
+                if let Some(c) = cancel_pc {
+                    if (c as usize) < ops.len() {
+                        join_pcs[c as usize] = true;
+                    }
                 }
             }
+            _ => {}
         }
     }
 
-    if matched_vars.len() == vars.len() && !prefixes.is_empty() {
+    // Iterate global fixed point over `ops` (typically converges in 2-4 passes).
+    for _pass in 0..12 {
+        let mut changed = false;
+        let mut stack: Vec<StrAbs> = Vec::with_capacity(16);
+        let mut locals: BTreeMap<u16, StrAbs> = BTreeMap::new();
+
+        for (pc, op) in ops.iter().enumerate() {
+            if join_pcs[pc] {
+                stack.clear();
+                locals.clear();
+            }
+            match op {
+                Op::PushStr(sid) => stack.push(StrAbs::exact(str_at(*sid).to_owned())),
+                Op::PushInt(n) => stack.push(StrAbs::exact(n.to_string())),
+                Op::PushFloat(f) => stack.push(StrAbs::exact(f.to_string())),
+                Op::PushBool(b) => stack.push(StrAbs::exact(if *b { "1" } else { "0" }.into())),
+                Op::PushNull => stack.push(StrAbs::Empty),
+                Op::LoadVar(vid) => {
+                    let v = var_abs
+                        .get(vid.0 as usize)
+                        .cloned()
+                        .unwrap_or(StrAbs::Unknown);
+                    stack.push(v);
+                }
+                Op::StoreVar(vid) => {
+                    let val = stack.pop().unwrap_or(StrAbs::Unknown);
+                    if let Some(slot) = var_abs.get_mut(vid.0 as usize) {
+                        if slot.join(&val) {
+                            changed = true;
+                        }
+                    }
+                }
+                Op::LoadLocal(slot) => {
+                    let v = locals.get(slot).cloned().unwrap_or(StrAbs::Unknown);
+                    stack.push(v);
+                }
+                Op::StoreLocal(slot) => {
+                    let val = stack.pop().unwrap_or(StrAbs::Unknown);
+                    locals.insert(*slot, val);
+                }
+                Op::Pop => {
+                    let _ = stack.pop();
+                }
+                Op::BinOp(BinOp::Concat) => {
+                    let rhs = stack.pop().unwrap_or(StrAbs::Unknown);
+                    let lhs = stack.pop().unwrap_or(StrAbs::Unknown);
+                    stack.push(StrAbs::concat(&lhs, &rhs));
+                }
+                Op::BinOp(_) => {
+                    let _ = stack.pop();
+                    let _ = stack.pop();
+                    stack.push(StrAbs::Unknown);
+                }
+                Op::UnaryOp(_) => {
+                    let _ = stack.pop();
+                    stack.push(StrAbs::Unknown);
+                }
+                Op::CallBuiltin { argc, .. } => {
+                    for _ in 0..*argc {
+                        let _ = stack.pop();
+                    }
+                    stack.push(StrAbs::Unknown);
+                }
+                Op::ResolveAsset => {
+                    let _ = stack.pop();
+                    stack.push(StrAbs::Unknown);
+                }
+                Op::LayerSetDyn { .. }
+                | Op::LayerAssetDyn { .. }
+                | Op::AudioPlayDyn { .. }
+                | Op::SetDialoguePortraitDyn
+                | Op::ProfileSetVal { .. }
+                | Op::JumpIfFalse(_) => {
+                    let _ = stack.pop();
+                }
+                Op::LayerSetText { text: None, .. } => {
+                    let _ = stack.pop();
+                }
+                Op::ChoiceList { .. } | Op::ChoiceMenu { .. } => {
+                    let _ = stack.pop();
+                    let _ = stack.pop();
+                    stack.clear();
+                    locals.clear();
+                }
+                Op::Call { argc, .. } => {
+                    for _ in 0..*argc {
+                        let _ = stack.pop();
+                    }
+                    stack.clear();
+                    locals.clear();
+                }
+                Op::Jump(_) | Op::Ret { .. } | Op::End { .. } => {
+                    stack.clear();
+                    locals.clear();
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let norm_prefix = |raw: &str| -> String { normalize_vfs_path(raw.trim()).to_lowercase() };
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    let mut resolved_count = 0usize;
+
+    for vname in target_vars {
+        let Some(idx) = vars.iter().position(|vm| str_at(vm.name) == vname) else {
+            return fallback;
+        };
+        match &var_abs[idx] {
+            StrAbs::Known(set) if !set.is_empty() => {
+                for (raw, _) in set {
+                    let p = norm_prefix(raw);
+                    if p.chars().count() < 2 {
+                        return fallback;
+                    }
+                    prefixes.insert(p);
+                }
+                resolved_count += 1;
+            }
+            StrAbs::Empty => {
+                // Variable is only ever empty — matches nothing.
+                resolved_count += 1;
+            }
+            _ => return fallback,
+        }
+    }
+
+    if resolved_count == target_vars.len() && !prefixes.is_empty() {
         DynamicFilter::Prefixes(prefixes)
     } else {
-        DynamicFilter::All
+        fallback
     }
 }
 
@@ -2427,6 +2778,146 @@ mod tests {
         let (lines, _choices, _modals, outcome) = simulate_vm(prog, FuncId(0), 100).unwrap();
         assert_eq!(lines, 1);
         assert_eq!(outcome.as_deref(), Some("end"));
+    }
+
+    #[test]
+    fn direct_import_voice_binding_title_bg_filter_and_quakestop_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("ノベルシステム")).unwrap();
+        std::fs::create_dir_all(root.join("グラフィック")).unwrap();
+        std::fs::create_dir_all(root.join("サウンド")).unwrap();
+        std::fs::create_dir_all(root.join("ファイルシート")).unwrap();
+
+        // Dialogue skin (1280x188) vs real title BG (1280x720) vs unrelated root extra
+        image::RgbaImage::from_pixel(1280, 188, image::Rgba([0, 0, 0, 200]))
+            .save(root.join("グラフィック/msgframe.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(1280, 720, image::Rgba([80, 120, 200, 255]))
+            .save(root.join("グラフィック/title_bg.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(600, 600, image::Rgba([255, 255, 255, 255]))
+            .save(root.join("ファイルシート/sheet01.png"))
+            .unwrap();
+
+        // Tiny valid 16-bit mono WAV for voice
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + 1600).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&22050u32.to_le_bytes());
+        wav.extend_from_slice(&44100u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&1600u32.to_le_bytes());
+        wav.extend(std::iter::repeat_n(0u8, 1600));
+        std::fs::write(root.join("サウンド/v001.wav"), &wav).unwrap();
+
+        // Build TextIns: CREATECG msgframe -> CREATECG title_bg -> PLAYSND voice -> "Hello" -> QUAKESTOP
+        let mut tpw = b"TpWord105".to_vec();
+        lsb::tests::u32b(&mut tpw, 1);
+        tpw.extend([0u8; 22]);
+        lsb::tests::string(&mut tpw, "");
+        lsb::tests::string(&mut tpw, "");
+        tpw.extend([0u8; 8]);
+        lsb::tests::u32b(&mut tpw, 0);
+        lsb::tests::u32b(&mut tpw, 0);
+        // 5 glyphs: CREATECG(msgframe), CREATECG(title_bg), PLAYSND(voice), Char('H'), QUAKESTOP
+        lsb::tests::u32b(&mut tpw, 5);
+        for ev in [
+            "\u{1}CREATECG\r\nframe\r\nmsgframe.png\r\nNORMAL\r\n#1\r\nC\r\nC\r\n0\r\n0\r\n0\r\n",
+            "\u{1}CREATECG\r\nbg\r\ntitle_bg.png\r\nNORMAL\r\n#1\r\nC\r\nC\r\n0\r\n0\r\n0\r\n",
+            "\u{1}PLAYSND\r\nv001.wav\r\n音声\r\nONCE\r\n1000\r\n0\r\n",
+        ] {
+            tpw.push(6);
+            lsb::tests::u32b(&mut tpw, u32::MAX);
+            lsb::tests::string(&mut tpw, ev);
+        }
+        // Char 'H'
+        tpw.push(1);
+        lsb::tests::u32b(&mut tpw, u32::MAX);
+        lsb::tests::u32b(&mut tpw, u32::MAX);
+        lsb::tests::u32b(&mut tpw, 0);
+        tpw.extend_from_slice(&[b'H', 0]);
+        lsb::tests::u32b(&mut tpw, 0);
+        // QUAKESTOP (empty args -> wildcard stop-all)
+        tpw.push(6);
+        lsb::tests::u32b(&mut tpw, u32::MAX);
+        lsb::tests::string(&mut tpw, "\u{1}QUAKESTOP\r\n\r\n");
+
+        let mut text_args = Vec::new();
+        lsb::tests::u32b(&mut text_args, tpw.len() as u32);
+        text_args.extend(tpw);
+        lsb::tests::u32b(&mut text_args, 1);
+        text_args.push(1);
+        lsb::tests::string(&mut text_args, "____arg");
+        lsb::tests::u32b(&mut text_args, 1);
+        text_args.push(4);
+        lsb::tests::string(&mut text_args, "msg");
+        for _ in 0..3 {
+            lsb::tests::literal(&mut text_args, 1);
+        }
+
+        let script = lsb::tests::script(&[
+            lsb::tests::command(20, 0, &text_args),
+            lsb::tests::command(6, 1, &lsb::tests::integer(1)),
+        ]);
+        std::fs::write(root.join("00000001.lsb"), &script).unwrap();
+
+        let (direct, report) = import_direct(root, &ImportOptions::default()).unwrap();
+        assert_eq!(report.fallback_count, 0);
+
+        // 1. Title BG must skip the 1280x188 msgframe and select the full-screen 1280x720 title_bg!
+        let tbg = direct.program.meta.title_bg.expect("title_bg detected");
+        assert!(
+            direct.raw_assets[tbg.0 as usize]
+                .name
+                .contains("title_bg"),
+            "expected title_bg, got {}",
+            direct.raw_assets[tbg.0 as usize].name
+        );
+
+        // 2. Voice PLAYSND must fold into Op::Say.voice (no detached Voice AudioPlay)!
+        let say_with_voice = direct
+            .program
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Say { voice: Some(_), .. }));
+        assert!(say_with_voice, "PLAYSND(Voice) should bind to Op::Say.voice");
+        let detached_voice = direct.program.ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::AudioPlay {
+                    bus: AudioBus::Voice,
+                    ..
+                }
+            )
+        });
+        assert!(!detached_voice, "bound voice should not emit duplicate AudioPlay");
+
+        // 3. QUAKESTOP with empty target must emit wildcard stop-all LayerId(u32::MAX)!
+        let has_wildcard_stop = direct.program.ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::ShakeStop {
+                    target: TweenTarget::Layer(LayerId(u32::MAX))
+                }
+            )
+        });
+        assert!(has_wildcard_stop, "QUAKESTOP must emit wildcard stop-all");
+
+        // 4. Root extra folder `ファイルシート/sheet01.png` must NOT be pulled into assets!
+        assert!(
+            !direct
+                .raw_assets
+                .iter()
+                .any(|a| a.name.contains("sheet01")),
+            "unrelated root sheet01.png must not be imported"
+        );
     }
 
     #[test]

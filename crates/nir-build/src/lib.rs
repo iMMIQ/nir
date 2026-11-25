@@ -16,11 +16,12 @@ pub mod opus_enc;
 use anyhow::{bail, Context, Result};
 use nir_ir::*;
 use optimize::{
-    decode_to_rgba, detect_asset_kind_and_codec, effective_webp_quality, fp_audio_cache_path,
-    fp_image_cache_path, generate_gallery_thumbnail, optimize_audio, optimize_decoded_pixels,
-    optimize_image, read_audio_cache_meta_only, read_cached_payload, read_image_cache_meta_only,
-    sha256_bytes, stream_cached_payload, subset_font, write_audio_cache, write_image_cache,
-    CachedPayloadRef, OptimizeConfig, RawPixels, OPTIMIZER_VERSION,
+    build_embedded_game_cjk_font, decode_to_rgba, detect_asset_kind_and_codec,
+    effective_webp_quality, encode_webp_rgba_q, fp_audio_cache_path_for_bus, fp_image_cache_path,
+    generate_gallery_thumbnail, optimize_audio_for_bus, optimize_decoded_pixels, optimize_image,
+    read_audio_cache_meta_only, read_cached_payload, read_image_cache_meta_only, sha256_bytes,
+    stream_cached_payload, subset_font, write_audio_cache, write_image_cache, CachedPayloadRef,
+    OptimizeConfig, RawPixels, OPTIMIZER_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -388,7 +389,11 @@ fn compile_project_with_compression(
         trimmed: bool,
     }
 
-    let optimize_one = |orig_idx: usize| -> Result<AssetWorkOutput> {
+    // Infer per-asset audio bus so BGM receives higher mono floor & MDCT bias and skips silence trim.
+    let remapped_title_bgm = remap_opt(title_bgm);
+    let inferred_buses = infer_audio_buses_from_ops(remapped_title_bgm, &compiled.ops);
+
+    let optimize_one = |new_idx: usize, orig_idx: usize| -> Result<AssetWorkOutput> {
         let src = &discovered[orig_idx];
         let raw =
             fs::read(&src.path).with_context(|| format!("reading asset {}", src.path.display()))?;
@@ -423,7 +428,8 @@ fn compile_project_with_compression(
                 }
             }
             AssetKind::Audio => {
-                let res = optimize_audio(&raw, src.codec, opt, &cache_dir)?;
+                let bus = inferred_buses.get(&AssetId(new_idx as u32)).copied();
+                let res = optimize_audio_for_bus(&raw, src.codec, bus, opt, &cache_dir)?;
                 let saved_bytes = res.saved_bytes;
                 match res.codec {
                     MediaCodec::Mp3 => features |= FEATURE_MP3,
@@ -506,7 +512,11 @@ fn compile_project_with_compression(
         .min(kept_indices.len().max(1));
 
     let results: Vec<Result<AssetWorkOutput>> = if worker_count <= 1 || kept_indices.len() <= 1 {
-        kept_indices.iter().map(|&idx| optimize_one(idx)).collect()
+        kept_indices
+            .iter()
+            .enumerate()
+            .map(|(new_idx, &orig_idx)| optimize_one(new_idx, orig_idx))
+            .collect()
     } else {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
@@ -520,7 +530,7 @@ fn compile_project_with_compression(
                     if i >= kept_indices.len() {
                         break;
                     }
-                    let res = optimize_one(kept_indices[i]);
+                    let res = optimize_one(i, kept_indices[i]);
                     *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
                 });
             }
@@ -609,6 +619,7 @@ fn compile_project_with_compression(
         })
         .collect();
     let generated_thumbs = run_gallery_thumbs_pass(&mut program, &mut backings, &cache_dir, opt);
+    let generated_fonts = run_auto_embed_font_pass(&mut program, &mut backings, &cache_dir, opt);
     let (delta_patched, delta_saved) = run_delta_pass(&mut program, &mut backings, &cache_dir, opt);
     saved_bytes += delta_saved;
 
@@ -627,8 +638,12 @@ fn compile_project_with_compression(
         texts: compiled.texts.len(),
         total_assets_scanned: total_scanned,
         packed_assets: program.assets.len(),
-        pruned_assets: total_scanned
-            .saturating_sub(program.assets.len().saturating_sub(generated_thumbs)),
+        pruned_assets: total_scanned.saturating_sub(
+            program
+                .assets
+                .len()
+                .saturating_sub(generated_thumbs + generated_fonts),
+        ),
         trimmed_sprites,
         delta_patched,
         generated_thumbs,
@@ -848,9 +863,31 @@ struct CachedDeltaPlanEntry {
     saved_bytes: i64,
 }
 
-/// Chunked, disk-cached 16×16 tile-masked star-graph differential compression pass.
-/// Processes name-sorted same-dimension chunks of <= 64 images to cap peak RAM (< 200 MiB)
-/// while caching chunk delta plans so warm rebuilds finish in milliseconds!
+#[derive(Serialize, Deserialize)]
+struct CachedTrimBaseEntry {
+    asset_idx: usize,
+    trim: SpriteTrim,
+    cache_file_name: String,
+    orig_size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedTrimDeltaPlan {
+    bases: Vec<CachedTrimBaseEntry>,
+    patches: Vec<CachedDeltaPlanEntry>,
+    patch_trims: Vec<SpriteTrim>,
+    net_saved: i64,
+}
+
+/// Global thumbnail-clustered, disk-cached 16×16 tile-masked star-graph differential compression pass.
+///
+/// 1. **Untrimmed CGs/BGs & Sprites**: groups same-dimension images, computes tiny 2.3 KB
+///    thumbnails (zero RAM accumulation), clusters globally into semantically similar groups of
+///    `<= 64` (medoid-first, eliminating cross-chunk misses), and runs Top-4 base delta compression.
+/// 2. **Trimmed Standing Sprites**: groups alpha-trimmed sprites by `(orig_w, orig_h)`, clusters
+///    them via canvas-space thumbnails, aligns each star group onto its tight union bounding box,
+///    and adopts differential patches whenever total group bytes (including base re-encode) drop
+///    by `>= 12%`!
 fn run_delta_pass(
     program: &mut NirProgram,
     backings: &mut [BlobBacking],
@@ -861,8 +898,11 @@ fn run_delta_pass(
         return (0, 0);
     }
 
-    // Group eligible untrimmed non-KTX2 images by (width, height) and sort by asset name so
-    // sequential CG/sprite variants (`01x01..01x25`, `sk01..sk08`) cluster together cleanly.
+    let mut total_patched = 0usize;
+    let mut total_saved = 0i64;
+    const MAX_CLUSTER: usize = 64;
+
+    // --- Pass 1: Untrimmed same-dimension images with global semantic thumbnail clustering ---
     let mut buckets: BTreeMap<(u32, u32), Vec<(String, usize)>> = BTreeMap::new();
     for (idx, meta) in program.assets.iter().enumerate() {
         if meta.kind == AssetKind::Image
@@ -878,77 +918,93 @@ fn run_delta_pass(
         }
     }
 
-    let mut total_patched = 0usize;
-    let mut total_saved = 0i64;
-    const CHUNK_SIZE: usize = 64;
-
     for ((w, h), mut items) in buckets {
         if items.len() < 2 {
             continue;
         }
         items.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for chunk in items.chunks(CHUNK_SIZE) {
-            if chunk.len() < 2 {
-                continue;
-            }
-            // Compute deterministic chunk cache key from ordered asset content digests + config.
-            let mut hasher = Sha256::new();
-            hasher.update(OPTIMIZER_VERSION.as_bytes());
-            hasher.update(b":deltaplan:");
-            hasher.update(w.to_le_bytes());
-            hasher.update(h.to_le_bytes());
-            hasher.update([opt.webp_quality, opt.lossless_images as u8]);
-            for &(_, idx) in chunk {
-                let info = backings[idx].info();
-                hasher.update(info.hash);
-                hasher.update(info.size.to_le_bytes());
-            }
-            let plan_key = format!("{:x}", hasher.finalize());
-            let plan_path = cache_dir.join(format!("dp_{plan_key}.json"));
+        // Bucket-level cache key lets warm rebuilds skip BOTH thumbnail decode AND pixel diff!
+        let mut hasher = Sha256::new();
+        hasher.update(OPTIMIZER_VERSION.as_bytes());
+        hasher.update(b":deltabucket_v2:");
+        hasher.update(w.to_le_bytes());
+        hasher.update(h.to_le_bytes());
+        hasher.update([opt.webp_quality, opt.lossless_images as u8]);
+        for &(_, idx) in &items {
+            let info = backings[idx].info();
+            hasher.update(info.hash);
+            hasher.update(info.size.to_le_bytes());
+        }
+        let plan_key = format!("{:x}", hasher.finalize());
+        let plan_path = cache_dir.join(format!("bp_{plan_key}.json"));
 
-            // Fast warm-cache hit for this chunk!
-            if let Ok(plan_bytes) = fs::read(&plan_path) {
-                if let Ok(entries) =
-                    serde_json::from_slice::<Vec<CachedDeltaPlanEntry>>(&plan_bytes)
-                {
-                    let mut all_present = true;
-                    let mut resolved = Vec::with_capacity(entries.len());
-                    for e in entries {
-                        let p = cache_dir.join(&e.cache_file_name);
-                        let orig_len = backings
-                            .get(e.asset_idx)
-                            .map_or(0, |b| b.info().size as i64);
-                        if let Some(meta) = read_image_cache_meta_only(&p, orig_len) {
-                            resolved.push((e, meta.cache_ref));
-                        } else {
-                            all_present = false;
-                            break;
-                        }
-                    }
-                    if all_present {
-                        for (e, cref) in resolved {
-                            let meta = &mut program.assets[e.asset_idx];
-                            meta.codec = MediaCodec::Webp;
-                            meta.size = cref.payload_len;
-                            meta.delta = Some(ImageDelta {
-                                base: AssetId(e.base_idx as u32),
-                                x: e.x,
-                                y: e.y,
-                                tile_mask: e.tile_mask,
-                            });
-                            backings[e.asset_idx] = BlobBacking::Cache(cref);
-                            total_patched += 1;
-                            total_saved += e.saved_bytes;
-                        }
-                        continue;
+        if let Ok(plan_bytes) = fs::read(&plan_path) {
+            if let Ok(entries) = serde_json::from_slice::<Vec<CachedDeltaPlanEntry>>(&plan_bytes) {
+                let mut all_present = true;
+                let mut resolved = Vec::with_capacity(entries.len());
+                for e in entries {
+                    let p = cache_dir.join(&e.cache_file_name);
+                    let orig_len = backings
+                        .get(e.asset_idx)
+                        .map_or(0, |b| b.info().size as i64);
+                    if let Some(meta) = read_image_cache_meta_only(&p, orig_len) {
+                        resolved.push((e, meta.cache_ref));
+                    } else {
+                        all_present = false;
+                        break;
                     }
                 }
+                if all_present {
+                    for (e, cref) in resolved {
+                        let meta = &mut program.assets[e.asset_idx];
+                        meta.codec = MediaCodec::Webp;
+                        meta.size = cref.payload_len;
+                        meta.delta = Some(ImageDelta {
+                            base: AssetId(e.base_idx as u32),
+                            x: e.x,
+                            y: e.y,
+                            tile_mask: e.tile_mask,
+                        });
+                        backings[e.asset_idx] = BlobBacking::Cache(cref);
+                        total_patched += 1;
+                        total_saved += e.saved_bytes;
+                    }
+                    continue;
+                }
             }
+        }
 
-            // Cold delta clustering for this chunk: decode up to 64 images into bounded RAM.
-            let mut candidates = Vec::with_capacity(chunk.len());
-            for &(_, idx) in chunk {
+        // Cold pass: extract compact 32×18 thumbnails (one image in RAM at a time) & cluster globally.
+        let mut valid_idxs: Vec<usize> = Vec::with_capacity(items.len());
+        let mut thumbs: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        for &(_, idx) in &items {
+            let codec = program.assets[idx].codec;
+            let Ok(bytes) = backings[idx].read_all() else {
+                continue;
+            };
+            let Some((dw, dh, rgba, _)) = decode_to_rgba(&bytes, codec) else {
+                continue;
+            };
+            if dw == w && dh == h {
+                thumbs.push(delta::compute_thumb(&rgba, dw as usize, dh as usize));
+                valid_idxs.push(idx);
+            }
+        }
+        if valid_idxs.len() < 2 {
+            continue;
+        }
+        let clusters = delta::cluster_by_thumbs(&thumbs, MAX_CLUSTER);
+        drop(thumbs);
+
+        let mut plan_entries: Vec<CachedDeltaPlanEntry> = Vec::new();
+        for cluster in clusters {
+            if cluster.len() < 2 {
+                continue;
+            }
+            let mut candidates = Vec::with_capacity(cluster.len());
+            for local in cluster {
+                let idx = valid_idxs[local];
                 let codec = program.assets[idx].codec;
                 let Ok(bytes) = backings[idx].read_all() else {
                     continue;
@@ -974,10 +1030,8 @@ fn run_delta_pass(
             let any_alpha = candidates.iter().any(|c| c.has_alpha);
             let q = effective_webp_quality(w, h, any_alpha, opt);
             let deltas = delta::compress_delta_candidates(&candidates, q, opt.lossless_images);
-            // Drop decoded pixel buffers immediately before caching!
             drop(candidates);
 
-            let mut plan_entries = Vec::with_capacity(deltas.len());
             for dr in deltas {
                 let orig_len = backings[dr.asset_idx].info().size as i64;
                 let saved = orig_len - dr.patch_webp.len() as i64;
@@ -1010,12 +1064,356 @@ fn run_delta_pass(
                 total_patched += 1;
                 total_saved += saved;
             }
-            let _ = fs::create_dir_all(cache_dir);
-            if let Ok(json) = serde_json::to_vec(&plan_entries) {
-                let tmp = plan_path.with_extension(format!("json.{}.tmp", std::process::id()));
-                if fs::write(&tmp, &json).is_ok() {
-                    let _ = fs::rename(&tmp, &plan_path);
+        }
+        let _ = fs::create_dir_all(cache_dir);
+        if let Ok(json) = serde_json::to_vec(&plan_entries) {
+            let tmp = plan_path.with_extension(format!("json.{}.tmp", std::process::id()));
+            if fs::write(&tmp, &json).is_ok() {
+                let _ = fs::rename(&tmp, &plan_path);
+            }
+        }
+    }
+
+    // --- Pass 2: Trimmed Standing-Sprite Union-BBox Delta ---
+    let mut trim_buckets: BTreeMap<(u32, u32), Vec<(String, usize, SpriteTrim)>> = BTreeMap::new();
+    for (idx, meta) in program.assets.iter().enumerate() {
+        if meta.kind == AssetKind::Image && meta.codec != MediaCodec::Ktx2 && meta.delta.is_none() {
+            if let Some(t) = meta.trim {
+                if t.orig_w >= 128 && t.orig_h >= 128 && t.w >= 64 && t.h >= 64 {
+                    trim_buckets
+                        .entry((t.orig_w, t.orig_h))
+                        .or_default()
+                        .push((program.str(meta.name).to_owned(), idx, t));
                 }
+            }
+        }
+    }
+
+    const MAX_TRIM_CLUSTER: usize = 48;
+    for ((orig_w, orig_h), mut items) in trim_buckets {
+        if items.len() < 2 {
+            continue;
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut hasher = Sha256::new();
+        hasher.update(OPTIMIZER_VERSION.as_bytes());
+        hasher.update(b":trimdelta_v1:");
+        hasher.update(orig_w.to_le_bytes());
+        hasher.update(orig_h.to_le_bytes());
+        hasher.update([opt.webp_quality, opt.lossless_images as u8]);
+        for &(_, idx, t) in &items {
+            let info = backings[idx].info();
+            hasher.update(info.hash);
+            hasher.update(info.size.to_le_bytes());
+            hasher.update(t.x.to_le_bytes());
+            hasher.update(t.y.to_le_bytes());
+            hasher.update(t.w.to_le_bytes());
+            hasher.update(t.h.to_le_bytes());
+        }
+        let plan_key = format!("{:x}", hasher.finalize());
+        let plan_path = cache_dir.join(format!("tp_{plan_key}.json"));
+
+        if let Ok(plan_bytes) = fs::read(&plan_path) {
+            if let Ok(plan) = serde_json::from_slice::<CachedTrimDeltaPlan>(&plan_bytes) {
+                if plan.patches.len() == plan.patch_trims.len() {
+                    let mut all_present = true;
+                    let mut resolved_bases = Vec::with_capacity(plan.bases.len());
+                    for b in &plan.bases {
+                        let p = cache_dir.join(&b.cache_file_name);
+                        if let Some(m) = read_image_cache_meta_only(&p, b.orig_size as i64) {
+                            resolved_bases.push((b.asset_idx, b.trim, m.cache_ref));
+                        } else {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    let mut resolved_patches = Vec::with_capacity(plan.patches.len());
+                    if all_present {
+                        for (e, &ptrim) in plan.patches.iter().zip(plan.patch_trims.iter()) {
+                            let p = cache_dir.join(&e.cache_file_name);
+                            let orig_len = backings
+                                .get(e.asset_idx)
+                                .map_or(0, |b| b.info().size as i64);
+                            if let Some(m) = read_image_cache_meta_only(&p, orig_len) {
+                                resolved_patches.push((e, ptrim, m.cache_ref));
+                            } else {
+                                all_present = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_present {
+                        for (b_idx, trim, cref) in resolved_bases {
+                            let meta = &mut program.assets[b_idx];
+                            meta.codec = MediaCodec::Webp;
+                            meta.width = trim.w;
+                            meta.height = trim.h;
+                            meta.trim = Some(trim);
+                            meta.size = cref.payload_len;
+                            backings[b_idx] = BlobBacking::Cache(cref);
+                        }
+                        for (e, ptrim, cref) in resolved_patches {
+                            let meta = &mut program.assets[e.asset_idx];
+                            meta.codec = MediaCodec::Webp;
+                            meta.width = ptrim.w;
+                            meta.height = ptrim.h;
+                            meta.trim = Some(ptrim);
+                            meta.size = cref.payload_len;
+                            meta.delta = Some(ImageDelta {
+                                base: AssetId(e.base_idx as u32),
+                                x: e.x,
+                                y: e.y,
+                                tile_mask: e.tile_mask.clone(),
+                            });
+                            backings[e.asset_idx] = BlobBacking::Cache(cref);
+                            total_patched += 1;
+                        }
+                        total_saved += plan.net_saved;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Cold trimmed-sprite clustering via full-canvas 32×18 thumbnails.
+        let mut valid_items: Vec<(usize, SpriteTrim)> = Vec::with_capacity(items.len());
+        let mut thumbs: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        for &(_, idx, trim) in &items {
+            let codec = program.assets[idx].codec;
+            let Ok(bytes) = backings[idx].read_all() else {
+                continue;
+            };
+            let Some((dw, dh, rgba, _)) = decode_to_rgba(&bytes, codec) else {
+                continue;
+            };
+            if dw == trim.w && dh == trim.h {
+                thumbs.push(delta::compute_trimmed_thumb(&rgba, trim));
+                valid_items.push((idx, trim));
+            }
+        }
+        if valid_items.len() < 2 {
+            continue;
+        }
+        let clusters = delta::cluster_by_thumbs(&thumbs, MAX_TRIM_CLUSTER);
+        drop(thumbs);
+
+        let mut plan = CachedTrimDeltaPlan {
+            bases: Vec::new(),
+            patches: Vec::new(),
+            patch_trims: Vec::new(),
+            net_saved: 0,
+        };
+
+        for cluster in clusters {
+            if cluster.len() < 2 {
+                continue;
+            }
+            // Compute tight union bounding box of this cluster's sprites.
+            let mut ux0 = u32::MAX;
+            let mut uy0 = u32::MAX;
+            let mut ux1 = 0u32;
+            let mut uy1 = 0u32;
+            let mut max_member_area = 0u64;
+            for &local in &cluster {
+                let (_, t) = valid_items[local];
+                ux0 = ux0.min(t.x);
+                uy0 = uy0.min(t.y);
+                ux1 = ux1.max(t.x.saturating_add(t.w));
+                uy1 = uy1.max(t.y.saturating_add(t.h));
+                max_member_area = max_member_area.max(t.w as u64 * t.h as u64);
+            }
+            let uw = ux1.saturating_sub(ux0);
+            let uh = uy1.saturating_sub(uy0);
+            let union_area = uw as u64 * uh as u64;
+            if uw < 128
+                || uh < 128
+                || ux1 > orig_w
+                || uy1 > orig_h
+                || union_area > max_member_area.saturating_mul(4)
+            {
+                continue;
+            }
+            let union_trim = SpriteTrim {
+                x: ux0,
+                y: uy0,
+                w: uw,
+                h: uh,
+                orig_w,
+                orig_h,
+            };
+
+            let mut candidates: Vec<delta::DeltaCandidate> = Vec::with_capacity(cluster.len());
+            let mut orig_trims: BTreeMap<usize, SpriteTrim> = BTreeMap::new();
+            let mut orig_sizes: BTreeMap<usize, usize> = BTreeMap::new();
+            for &local in &cluster {
+                let (idx, t) = valid_items[local];
+                let codec = program.assets[idx].codec;
+                let Ok(bytes) = backings[idx].read_all() else {
+                    continue;
+                };
+                let orig_len = bytes.len();
+                let Some((dw, dh, rgba, _)) = decode_to_rgba(&bytes, codec) else {
+                    continue;
+                };
+                if dw != t.w || dh != t.h {
+                    continue;
+                }
+                let mut canvas = vec![0u8; uw as usize * uh as usize * 4];
+                let dx = (t.x - ux0) as usize;
+                let dy = (t.y - uy0) as usize;
+                let row_bytes = t.w as usize * 4;
+                for y in 0..t.h as usize {
+                    let src_off = y * row_bytes;
+                    let dst_off = ((dy + y) * uw as usize + dx) * 4;
+                    canvas[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&rgba[src_off..src_off + row_bytes]);
+                }
+                orig_trims.insert(idx, t);
+                orig_sizes.insert(idx, orig_len);
+                candidates.push(delta::DeltaCandidate {
+                    asset_idx: idx,
+                    width: uw,
+                    height: uh,
+                    has_alpha: true,
+                    orig_encoded_len: orig_len,
+                    rgba: canvas,
+                });
+            }
+            if candidates.len() < 2 {
+                continue;
+            }
+
+            let q = effective_webp_quality(uw, uh, true, opt);
+            let deltas = delta::compress_delta_candidates(&candidates, q, opt.lossless_images);
+            if deltas.is_empty() {
+                continue;
+            }
+
+            // Group patches by base keyframe so each star group pays for its own union-bbox base re-encode.
+            let mut by_base: BTreeMap<usize, Vec<delta::DeltaResult>> = BTreeMap::new();
+            for dr in deltas {
+                by_base
+                    .entry(dr.delta.base.0 as usize)
+                    .or_default()
+                    .push(dr);
+            }
+            let cand_by_asset: BTreeMap<usize, &delta::DeltaCandidate> =
+                candidates.iter().map(|c| (c.asset_idx, c)).collect();
+
+            for (base_idx, group_deltas) in by_base {
+                let Some(&base_cand) = cand_by_asset.get(&base_idx) else {
+                    continue;
+                };
+                let base_orig_trim = orig_trims[&base_idx];
+                let base_orig_size = orig_sizes[&base_idx];
+
+                let reencoded_base = if base_orig_trim != union_trim {
+                    Some(encode_webp_rgba_q(
+                        &base_cand.rgba,
+                        uw,
+                        uh,
+                        q,
+                        opt.lossless_images,
+                    ))
+                } else {
+                    None
+                };
+                let new_base_len = reencoded_base
+                    .as_ref()
+                    .map_or(base_orig_size, Vec::len);
+
+                let orig_group_bytes: usize = base_orig_size
+                    + group_deltas
+                        .iter()
+                        .map(|d| orig_sizes[&d.asset_idx])
+                        .sum::<usize>();
+                let new_group_bytes: usize = new_base_len
+                    + group_deltas
+                        .iter()
+                        .map(|d| d.patch_webp.len() + d.delta.tile_mask.len())
+                        .sum::<usize>();
+
+                // Adopt this star group only if net savings (including union-bbox base overhead) >= 12%!
+                if new_group_bytes * 100 > orig_group_bytes * 88 {
+                    continue;
+                }
+
+                if let Some(base_webp) = reencoded_base {
+                    let base_key = format!("tb_{:x}.nioc", Sha256::digest(&base_webp));
+                    let base_path = cache_dir.join(&base_key);
+                    let base_cref = write_image_cache(
+                        &base_path,
+                        MediaCodec::Webp,
+                        uw,
+                        uh,
+                        Some(union_trim),
+                        &base_webp,
+                    );
+                    plan.bases.push(CachedTrimBaseEntry {
+                        asset_idx: base_idx,
+                        trim: union_trim,
+                        cache_file_name: base_key,
+                        orig_size: base_orig_size as u64,
+                    });
+                    let bmeta = &mut program.assets[base_idx];
+                    bmeta.codec = MediaCodec::Webp;
+                    bmeta.width = uw;
+                    bmeta.height = uh;
+                    bmeta.trim = Some(union_trim);
+                    bmeta.size = base_cref.payload_len;
+                    backings[base_idx] = BlobBacking::Cache(base_cref);
+                }
+
+                let mut group_patch_disk_bytes = 0usize;
+                for dr in group_deltas {
+                    let orig_len = orig_sizes[&dr.asset_idx] as i64;
+                    let patch_len = dr.patch_webp.len();
+                    group_patch_disk_bytes += patch_len;
+                    let patch_key = format!("dl_{:x}.nioc", Sha256::digest(&dr.patch_webp));
+                    let patch_path = cache_dir.join(&patch_key);
+                    let cref = write_image_cache(
+                        &patch_path,
+                        MediaCodec::Webp,
+                        dr.patch_width,
+                        dr.patch_height,
+                        Some(union_trim),
+                        &dr.patch_webp,
+                    );
+                    plan.patches.push(CachedDeltaPlanEntry {
+                        asset_idx: dr.asset_idx,
+                        base_idx,
+                        x: dr.delta.x,
+                        y: dr.delta.y,
+                        tile_mask: dr.delta.tile_mask.clone(),
+                        patch_w: dr.patch_width,
+                        patch_h: dr.patch_height,
+                        cache_file_name: patch_key,
+                        saved_bytes: orig_len - patch_len as i64,
+                    });
+                    plan.patch_trims.push(union_trim);
+                    let meta = &mut program.assets[dr.asset_idx];
+                    meta.codec = MediaCodec::Webp;
+                    meta.width = uw;
+                    meta.height = uh;
+                    meta.trim = Some(union_trim);
+                    meta.size = cref.payload_len;
+                    meta.delta = Some(dr.delta);
+                    backings[dr.asset_idx] = BlobBacking::Cache(cref);
+                    total_patched += 1;
+                }
+                let group_net_saved =
+                    orig_group_bytes as i64 - (new_base_len + group_patch_disk_bytes) as i64;
+                plan.net_saved += group_net_saved;
+                total_saved += group_net_saved;
+            }
+        }
+
+        let _ = fs::create_dir_all(cache_dir);
+        if let Ok(json) = serde_json::to_vec(&plan) {
+            let tmp = plan_path.with_extension(format!("json.{}.tmp", std::process::id()));
+            if fs::write(&tmp, &json).is_ok() {
+                let _ = fs::rename(&tmp, &plan_path);
             }
         }
     }
@@ -1024,6 +1422,65 @@ fn run_delta_pass(
         program.features |= FEATURE_DELTA_IMAGE | FEATURE_WEBP;
     }
     (total_patched, total_saved)
+}
+
+/// Auto-embeds a compact game-subset CJK font (~150–300 KB) when `opt.auto_embed_cjk_font` is set
+/// and the game bundles no fonts, covering every character in the game plus all built-in NIR UI
+/// strings so Web cold start never downloads the 6.3 MB Pan-CJK fallback font!
+fn run_auto_embed_font_pass(
+    program: &mut NirProgram,
+    backings: &mut Vec<BlobBacking>,
+    cache_dir: &Path,
+    opt: &OptimizeConfig,
+) -> usize {
+    if !opt.enabled
+        || !opt.subset_fonts
+        || !opt.auto_embed_cjk_font
+        || !program.meta.ui_fonts.is_empty()
+        || !program.meta.text_fonts.is_empty()
+    {
+        return 0;
+    }
+    let mut chars = program.collect_all_chars();
+    chars.extend(nir_ir::ui_messages::EN_FTL.chars());
+    chars.extend(nir_ir::ui_messages::ZH_HANS_FTL.chars());
+    for c in ' '..='~' {
+        chars.insert(c);
+    }
+    for c in "　「」『』（）【】《》、。！？…—・～：；％＋－×÷".chars() {
+        chars.insert(c);
+    }
+    let Some((font_bytes, codec)) = build_embedded_game_cjk_font(&chars, opt, cache_dir) else {
+        return 0;
+    };
+    let new_id = AssetId(program.assets.len() as u32);
+    let name_str = StrId(program.strings.len() as u32);
+    program.strings.push("__embedded/cjk_subset".into());
+    let sha = sha256_bytes(&font_bytes);
+    let sz = font_bytes.len() as u64;
+    program.assets.push(AssetMeta {
+        id: new_id,
+        name: name_str,
+        kind: AssetKind::Font,
+        codec,
+        width: 0,
+        height: 0,
+        trim: None,
+        duration_us: 0,
+        sample_rate: 0,
+        channels: 0,
+        loop_region: None,
+        offset: 0,
+        size: sz,
+        delta: None,
+    });
+    backings.push(BlobBacking::Mem {
+        bytes: font_bytes,
+        sha256: sha,
+    });
+    program.meta.ui_fonts.push(new_id);
+    program.meta.text_fonts.push(new_id);
+    1
 }
 
 /// Auto-generates compact `256×144` WebP thumbnails for `program.ui.gallery` items whose
@@ -1110,6 +1567,7 @@ struct PreparedDirectBuild {
     trimmed_sprites: usize,
     delta_patched: usize,
     generated_thumbs: usize,
+    generated_fonts: usize,
     saved_bytes: i64,
 }
 
@@ -1169,10 +1627,14 @@ fn prepare_direct_build(
         trimmed: bool,
     }
 
-    let optimize_one = |orig_idx: usize| -> Result<DirectAssetOut> {
+    // Infer per-asset AudioBus (BGM > SFX > Voice) after remapping so Opus/MP3 optimization is bus-aware!
+    let inferred_buses = infer_audio_buses(&program);
+
+    let optimize_one = |new_idx: usize, orig_idx: usize| -> Result<DirectAssetOut> {
         let src = &raw_assets[orig_idx];
         let mut features = 0u32;
         let mut trimmed = false;
+        let bus = inferred_buses.get(&AssetId(new_idx as u32)).copied();
 
         // Ultra-fast warm rebuild path: check source-fingerprint cache BEFORE touching disk/decoder!
         if opt.enabled {
@@ -1207,7 +1669,8 @@ fn prepare_direct_build(
                         }
                     }
                     AssetKind::Audio => {
-                        let fp_path = fp_audio_cache_path(cache_dir, &src.name, fp, opt);
+                        let fp_path =
+                            fp_audio_cache_path_for_bus(cache_dir, &src.name, fp, bus, opt);
                         if let Some(meta) = read_audio_cache_meta_only(&fp_path, fp.0 as i64) {
                             match meta.codec {
                                 MediaCodec::Mp3 => features |= FEATURE_MP3,
@@ -1349,7 +1812,7 @@ fn prepare_direct_build(
                 }
             }
             AssetKind::Audio => {
-                let res = optimize_audio(&raw, src.codec, opt, cache_dir)?;
+                let res = optimize_audio_for_bus(&raw, src.codec, bus, opt, cache_dir)?;
                 match res.codec {
                     MediaCodec::Mp3 => features |= FEATURE_MP3,
                     MediaCodec::Ogg => features |= FEATURE_OGG,
@@ -1357,7 +1820,7 @@ fn prepare_direct_build(
                     _ => {}
                 }
                 let backing = if let Some(fp) = src.source_fingerprint.filter(|_| opt.enabled) {
-                    let fp_path = fp_audio_cache_path(cache_dir, &src.name, fp, opt);
+                    let fp_path = fp_audio_cache_path_for_bus(cache_dir, &src.name, fp, bus, opt);
                     BlobBacking::Cache(write_audio_cache(
                         &fp_path,
                         res.codec,
@@ -1464,7 +1927,11 @@ fn prepare_direct_build(
         .min(kept_indices.len().max(1));
 
     let results: Vec<Result<DirectAssetOut>> = if worker_count <= 1 || kept_indices.len() <= 1 {
-        kept_indices.iter().map(|&idx| optimize_one(idx)).collect()
+        kept_indices
+            .iter()
+            .enumerate()
+            .map(|(new_idx, &orig_idx)| optimize_one(new_idx, orig_idx))
+            .collect()
     } else {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
@@ -1478,7 +1945,7 @@ fn prepare_direct_build(
                     if i >= kept_indices.len() {
                         break;
                     }
-                    let res = optimize_one(kept_indices[i]);
+                    let res = optimize_one(i, kept_indices[i]);
                     *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
                 });
             }
@@ -1527,8 +1994,9 @@ fn prepare_direct_build(
     program.features = features;
     program.assets = assets_meta;
 
-    // 6. Auto-generate gallery thumbnails first (before delta pass marks full CGs as patches!), then run tile-masked delta pass!
+    // 6. Auto-generate gallery thumbnails & compact CJK font first, then run global/trimmed delta pass!
     let generated_thumbs = run_gallery_thumbs_pass(&mut program, &mut backings, cache_dir, opt);
+    let generated_fonts = run_auto_embed_font_pass(&mut program, &mut backings, cache_dir, opt);
     let (delta_patched, delta_saved) = run_delta_pass(&mut program, &mut backings, cache_dir, opt);
     saved_bytes += delta_saved;
 
@@ -1539,6 +2007,7 @@ fn prepare_direct_build(
         trimmed_sprites,
         delta_patched,
         generated_thumbs,
+        generated_fonts,
         saved_bytes,
     })
 }
@@ -1583,7 +2052,7 @@ pub fn build_direct_program_to_file(
         .program
         .assets
         .len()
-        .saturating_sub(prep.generated_thumbs);
+        .saturating_sub(prep.generated_thumbs + prep.generated_fonts);
     Ok(BuildSummary {
         game_id: prep.program.meta.game_id,
         title: prep.program.meta.title,
@@ -1652,7 +2121,7 @@ pub fn build_direct_program_with_compression(
         .program
         .assets
         .len()
-        .saturating_sub(prep.generated_thumbs);
+        .saturating_sub(prep.generated_thumbs + prep.generated_fonts);
 
     let summary = BuildSummary {
         game_id: prep.program.meta.game_id.clone(),
@@ -1719,6 +2188,157 @@ fn remap_ui_node_assets(node: &mut UiNode, remap: &BTreeMap<AssetId, AssetId>) {
         }
         UiWidget::Text { .. } => {}
     }
+}
+
+fn collect_ui_node_replay_funcs(node: &UiNode, out: &mut Vec<FuncId>) {
+    match &node.widget {
+        UiWidget::Container { children, .. } | UiWidget::Stack { children, .. } => {
+            for ch in children {
+                collect_ui_node_replay_funcs(ch, out);
+            }
+        }
+        UiWidget::Button {
+            action: UiAction::StartReplay(fid),
+            ..
+        } => {
+            out.push(*fid);
+        }
+        _ => {}
+    }
+}
+
+/// Computes the CFG-reachable bytecode instruction bitmap starting from `meta.entry_func`,
+/// every gallery `replay_func`, and every `UiAction::StartReplay` in `ui.title_screen`.
+fn compute_reachable_ops(program: &NirProgram) -> Vec<bool> {
+    let n = program.ops.len();
+    let mut visited = vec![false; n];
+    if n == 0 {
+        return visited;
+    }
+    let mut queue = std::collections::VecDeque::new();
+    let enqueue = |pc: usize, visited: &mut [bool], queue: &mut std::collections::VecDeque<usize>| {
+        if pc < visited.len() && !visited[pc] {
+            visited[pc] = true;
+            queue.push_back(pc);
+        }
+    };
+
+    if let Some(f) = program.funcs.get(program.meta.entry_func.0 as usize) {
+        enqueue(f.entry_pc as usize, &mut visited, &mut queue);
+    } else {
+        enqueue(0, &mut visited, &mut queue);
+    }
+    for g in &program.ui.gallery {
+        if let Some(fid) = g.replay_func {
+            if let Some(f) = program.funcs.get(fid.0 as usize) {
+                enqueue(f.entry_pc as usize, &mut visited, &mut queue);
+            }
+        }
+    }
+    if let Some(ts) = &program.ui.title_screen {
+        let mut replay_funcs = Vec::new();
+        for node in &ts.nodes {
+            collect_ui_node_replay_funcs(node, &mut replay_funcs);
+        }
+        for fid in replay_funcs {
+            if let Some(f) = program.funcs.get(fid.0 as usize) {
+                enqueue(f.entry_pc as usize, &mut visited, &mut queue);
+            }
+        }
+    }
+
+    while let Some(pc) = queue.pop_front() {
+        match &program.ops[pc] {
+            Op::Jump(target) => enqueue(*target as usize, &mut visited, &mut queue),
+            Op::JumpIfFalse(target) => {
+                enqueue(*target as usize, &mut visited, &mut queue);
+                enqueue(pc + 1, &mut visited, &mut queue);
+            }
+            Op::Call { func, .. } => {
+                if let Some(f) = program.funcs.get(func.0 as usize) {
+                    enqueue(f.entry_pc as usize, &mut visited, &mut queue);
+                }
+                enqueue(pc + 1, &mut visited, &mut queue);
+            }
+            Op::Choice {
+                items, cancel_pc, ..
+            } => {
+                for item in items {
+                    enqueue(item.target_pc as usize, &mut visited, &mut queue);
+                }
+                if let Some(cp) = cancel_pc {
+                    enqueue(*cp as usize, &mut visited, &mut queue);
+                }
+                enqueue(pc + 1, &mut visited, &mut queue);
+            }
+            Op::Ret { .. } | Op::End { .. } => {}
+            _ => enqueue(pc + 1, &mut visited, &mut queue),
+        }
+    }
+    visited
+}
+
+fn record_bus_priority(map: &mut BTreeMap<AssetId, AudioBus>, id: AssetId, bus: AudioBus) {
+    let rank = |b: AudioBus| match b {
+        AudioBus::Bgm => 3u8,
+        AudioBus::Sfx => 2,
+        AudioBus::Voice => 1,
+    };
+    map.entry(id)
+        .and_modify(|cur| {
+            if rank(bus) > rank(*cur) {
+                *cur = bus;
+            }
+        })
+        .or_insert(bus);
+}
+
+fn infer_audio_buses_from_ops(
+    title_bgm: Option<AssetId>,
+    ops: &[Op],
+) -> BTreeMap<AssetId, AudioBus> {
+    let mut map = BTreeMap::new();
+    if let Some(id) = title_bgm {
+        record_bus_priority(&mut map, id, AudioBus::Bgm);
+    }
+    for op in ops {
+        match op {
+            Op::AudioPlay { bus, asset, .. } => record_bus_priority(&mut map, *asset, *bus),
+            Op::Say { voice: Some(a), .. } => record_bus_priority(&mut map, *a, AudioBus::Voice),
+            Op::ChoiceList {
+                click_se: Some(a), ..
+            } => record_bus_priority(&mut map, *a, AudioBus::Sfx),
+            Op::ChoiceMenu {
+                hover_se, click_se, ..
+            } => {
+                if let Some(a) = hover_se {
+                    record_bus_priority(&mut map, *a, AudioBus::Sfx);
+                }
+                if let Some(a) = click_se {
+                    record_bus_priority(&mut map, *a, AudioBus::Sfx);
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn infer_audio_buses(program: &NirProgram) -> BTreeMap<AssetId, AudioBus> {
+    let mut map = infer_audio_buses_from_ops(program.meta.title_bgm, &program.ops);
+    if let Some(ts) = &program.ui.title_screen {
+        if let Some(id) = ts.bgm {
+            record_bus_priority(&mut map, id, AudioBus::Bgm);
+        }
+    }
+    for tl in &program.timelines {
+        for clip in &tl.clips {
+            if let TimelineClipKind::Sound { asset, bus, .. } = clip.kind {
+                record_bus_priority(&mut map, asset, bus);
+            }
+        }
+    }
+    map
 }
 
 fn collect_program_assets(program: &NirProgram) -> BTreeSet<AssetId> {
@@ -1805,7 +2425,11 @@ fn collect_program_assets(program: &NirProgram) -> BTreeSet<AssetId> {
             }
         }
     }
-    for op in &program.ops {
+    let reachable = compute_reachable_ops(program);
+    for (pc, op) in program.ops.iter().enumerate() {
+        if !reachable[pc] {
+            continue;
+        }
         match op {
             Op::LayerSet { asset: Some(a), .. } | Op::LayerAsset { asset: Some(a), .. } => {
                 out.insert(*a);
@@ -2322,5 +2946,251 @@ label ending:
         let (dktx, _) = decode_nirpak_header(&built_ktx.nirpak).unwrap();
         assert_eq!(dktx.assets[0].codec, MediaCodec::Ktx2);
         assert_ne!(dktx.features & FEATURE_KTX2, 0);
+    }
+
+    #[test]
+    fn trimmed_sprite_union_bbox_delta_and_cfg_pruning_work() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build 3 standing sprites on a 512x512 canvas with rich body texture + slightly differing
+        // trimmed bounding boxes (e.g. ahoge/ribbon + eye expression change).
+        let make_sprite = |variant: u8| -> Vec<u8> {
+            let mut img = image::RgbaImage::from_pixel(512, 512, image::Rgba([0, 0, 0, 0]));
+            // Shared detailed body (non-linear high-entropy pattern like real sprite artwork): x in 140..370, y in 90..480
+            for y in 90..480u32 {
+                for x in 140..370u32 {
+                    let h = x
+                        .wrapping_mul(0x9E37_79B1)
+                        .wrapping_add(y.wrapping_mul(0x85EB_CA77));
+                    let h = (h ^ (h >> 15)).wrapping_mul(0x2C1B_3C6D);
+                    let r = (h & 255) as u8;
+                    let g = ((h >> 8) & 255) as u8;
+                    let b = ((h >> 16) & 255) as u8;
+                    img.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+                }
+            }
+            // Variant-specific tiny extension + eye change so each sprite trims to a distinct rect!
+            if variant == 1 {
+                for y in 82..90u32 {
+                    for x in 240..256u32 {
+                        img.put_pixel(x, y, image::Rgba([220, 40, 80, 255]));
+                    }
+                }
+                for y in 160..178u32 {
+                    for x in 210..270u32 {
+                        img.put_pixel(x, y, image::Rgba([250, 220, 200, 255]));
+                    }
+                }
+            } else if variant == 2 {
+                for y in 150..168u32 {
+                    for x in 370..382u32 {
+                        img.put_pixel(x, y, image::Rgba([60, 180, 240, 255]));
+                    }
+                }
+                for y in 180..196u32 {
+                    for x in 220..260u32 {
+                        img.put_pixel(x, y, image::Rgba([255, 80, 120, 255]));
+                    }
+                }
+            }
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+
+        let sp0 = make_sprite(0);
+        let sp1 = make_sprite(1);
+        let sp2 = make_sprite(2);
+        let dead_png = make_sprite(0);
+
+        let mk_src = |name: &str, bytes: Vec<u8>| DirectAssetSource {
+            name: name.into(),
+            kind: AssetKind::Image,
+            codec: MediaCodec::Png,
+            loader: Arc::new(move || Ok(bytes.clone())),
+            pixel_loader: None,
+            source_fingerprint: None,
+        };
+        let raw_assets = vec![
+            mk_src("char/a_01", sp0.clone()),
+            mk_src("char/a_02", sp1.clone()),
+            mk_src("char/a_03", sp2.clone()),
+            mk_src("dead/unreachable", dead_png),
+        ];
+
+        // Program uses assets 0, 1, 2 in reachable entry func; asset 3 is ONLY in unreachable pc 4!
+        let prog = NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.trimdelta".into(),
+                title: "TrimDelta".into(),
+                version: "1.0".into(),
+                stage_width: 512,
+                stage_height: 512,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![
+                Op::LayerSet {
+                    layer: LayerId(0),
+                    parent: None,
+                    asset: Some(AssetId(0)),
+                    transform: Box::new(Transform2D::default()),
+                },
+                Op::LayerAsset {
+                    layer: LayerId(0),
+                    asset: Some(AssetId(1)),
+                },
+                Op::LayerAsset {
+                    layer: LayerId(0),
+                    asset: Some(AssetId(2)),
+                },
+                Op::End { outcome: StrId(0) },
+                // Unreachable dead op referencing AssetId(3) -> must be CFG-pruned!
+                Op::LayerAsset {
+                    layer: LayerId(0),
+                    asset: Some(AssetId(3)),
+                },
+            ],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        };
+
+        let cache = dir.path().join("cache");
+        let opt = OptimizeConfig {
+            lossless_images: true,
+            ..OptimizeConfig::default()
+        };
+        let built = build_direct_program(prog.clone(), raw_assets, &BTreeSet::new(), &cache, &opt)
+            .unwrap();
+        // CFG pruning must drop dead/unreachable (AssetId(3))!
+        assert_eq!(built.summary.packed_assets, 3);
+        assert_eq!(built.summary.pruned_assets, 1);
+        assert_eq!(built.summary.trimmed_sprites, 3);
+        // Trimmed sprites must be union-bbox delta-compressed!
+        assert!(
+            built.summary.delta_patched >= 2,
+            "expected >= 2 trimmed sprites delta-patched, got {}",
+            built.summary.delta_patched
+        );
+
+        let (dec, _) = decode_nirpak_header(&built.nirpak).unwrap();
+        assert_ne!(dec.features & FEATURE_DELTA_IMAGE, 0);
+        // Verify union trim aligns across base and delta children!
+        let mut delta_count = 0usize;
+        for a in &dec.assets {
+            if let Some(d) = &a.delta {
+                delta_count += 1;
+                let base = dec.asset(d.base).unwrap();
+                assert_eq!(a.trim, base.trim, "delta child & base must share union trim");
+                assert_eq!((a.width, a.height), (base.width, base.height));
+                assert!(!d.tile_mask.is_empty());
+            }
+        }
+        assert!(delta_count >= 2);
+
+        // Verify warm cache hit reproduces identical delta plan!
+        let raw_assets2 = vec![
+            mk_src("char/a_01", sp0),
+            mk_src("char/a_02", sp1),
+            mk_src("char/a_03", sp2),
+            mk_src("dead/unreachable", make_sprite(0)),
+        ];
+        let cached = build_direct_program(prog, raw_assets2, &BTreeSet::new(), &cache, &opt)
+            .unwrap();
+        assert_eq!(cached.summary.delta_patched, built.summary.delta_patched);
+    }
+
+    #[test]
+    fn auto_embed_cjk_font_embeds_compact_subset_when_system_font_available() {
+        if optimize::find_system_cjk_font().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let prog = NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.embedfont".into(),
+                title: "测试标题".into(),
+                version: "1.0".into(),
+                stage_width: 1280,
+                stage_height: 720,
+                default_locale: "zh-Hans".into(),
+                locales: vec!["zh-Hans".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![Op::End { outcome: StrId(0) }],
+            texts: BTreeMap::from([(
+                "zh-Hans".into(),
+                vec![TextEntry::plain("你好世界！日本語テスト。")],
+            )]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        };
+        let opt = OptimizeConfig {
+            auto_embed_cjk_font: true,
+            ..OptimizeConfig::default()
+        };
+        let built = build_direct_program(
+            prog,
+            vec![],
+            &BTreeSet::new(),
+            &dir.path().join("cache"),
+            &opt,
+        )
+        .unwrap();
+        assert_eq!(built.program.meta.ui_fonts.len(), 1);
+        assert_eq!(built.program.meta.text_fonts.len(), 1);
+        let fid = built.program.meta.ui_fonts[0];
+        let blob = &built.media_blobs[fid.0 as usize];
+        assert!(
+            blob.len() < 400 * 1024,
+            "embedded subset font should be tiny (<400KB), got {} bytes",
+            blob.len()
+        );
+        let face = ttf_parser::Face::parse(blob, 0).expect("embedded font must parse cleanly");
+        assert!(face.glyph_index('你').is_some());
+        assert!(face.glyph_index('世').is_some());
+        assert!(face.glyph_index('語').is_some());
+        assert!(face.glyph_index('A').is_some());
     }
 }

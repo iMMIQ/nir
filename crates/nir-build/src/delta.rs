@@ -17,12 +17,21 @@ use std::collections::BTreeMap;
 const TILE: usize = 16;
 const THUMB_W: usize = 32;
 const THUMB_H: usize = 18;
-/// Pixel channel tolerance absorbing minor JPEG/WebP quantization jitter when clustering.
-const DIFF_TOL: i16 = 5;
+/// Channel diff threshold for gentle block-level denoising (requires >= 4 pixels in a 16x16 tile).
+/// Must stay above typical WebP quantization noise (~6-8) so clean background tiles aren't falsely dirtied.
+const DIFF_TOL_SOFT: i16 = 9;
+/// Single-pixel strong diff threshold (even 1 changed eye highlight or blush pixel marks the tile dirty!).
+const DIFF_TOL_STRONG: i16 = 14;
+/// Alpha single-pixel threshold so sprite silhouettes never lose edge detail.
+const DIFF_TOL_ALPHA: i16 = 8;
+/// Minimum number of soft-changed pixels inside a 16x16 tile to ignore single-pixel codec jitter.
+const MIN_SOFT_PIXELS_PER_TILE: usize = 4;
 /// Maximum fraction of changed pixels allowed before promoting image to a new base keyframe.
-const MAX_DIRTY_RATIO: f32 = 0.42;
-/// Minimum thumbnail L1 MAD threshold required to attempt full pixel diff.
-const MAX_THUMB_MAD: f32 = 28.0;
+const MAX_DIRTY_RATIO: f32 = 0.45;
+/// Maximum thumbnail L1 MAD threshold required to attempt full pixel diff.
+const MAX_THUMB_MAD: f32 = 30.0;
+/// Number of closest candidate bases evaluated per target image to minimize patch size.
+const TOP_K_BASES: usize = 4;
 /// Minimum compressed byte savings ratio required to adopt a delta patch (20% saved).
 const MIN_SAVINGS_NUM: usize = 80;
 const MIN_SAVINGS_DEN: usize = 100;
@@ -46,7 +55,7 @@ pub struct DeltaResult {
     pub patch_webp: Vec<u8>,
 }
 
-fn compute_thumb(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+pub fn compute_thumb(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(THUMB_W * THUMB_H * 4);
     for ty in 0..THUMB_H {
         let sy = (ty * h) / THUMB_H;
@@ -54,6 +63,33 @@ fn compute_thumb(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
             let sx = (tx * w) / THUMB_W;
             let off = (sy * w + sx) * 4;
             out.extend_from_slice(&rgba[off..off + 4]);
+        }
+    }
+    out
+}
+
+/// Computes a 32×18 canvas thumbnail directly from a trimmed sprite without allocating a full canvas!
+pub fn compute_trimmed_thumb(
+    trimmed_rgba: &[u8],
+    trim: nir_ir::SpriteTrim,
+) -> Vec<u8> {
+    let orig_w = trim.orig_w as usize;
+    let orig_h = trim.orig_h as usize;
+    let tx0 = trim.x as usize;
+    let ty0 = trim.y as usize;
+    let tw = trim.w as usize;
+    let th = trim.h as usize;
+    let mut out = Vec::with_capacity(THUMB_W * THUMB_H * 4);
+    for ty in 0..THUMB_H {
+        let sy = (ty * orig_h) / THUMB_H;
+        for tx in 0..THUMB_W {
+            let sx = (tx * orig_w) / THUMB_W;
+            if sx >= tx0 && sx < tx0 + tw && sy >= ty0 && sy < ty0 + th {
+                let off = ((sy - ty0) * tw + (sx - tx0)) * 4;
+                out.extend_from_slice(&trimmed_rgba[off..off + 4]);
+            } else {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+            }
         }
     }
     out
@@ -67,8 +103,64 @@ fn thumb_mad(a: &[u8], b: &[u8]) -> f32 {
     sum as f32 / a.len().max(1) as f32
 }
 
+/// Clusters an arbitrarily large same-dimension image bucket into semantic similarity groups
+/// of size `<= max_cluster` using compact 32×18 thumbnails (zero cross-chunk misses, bounded RAM!).
+/// Each returned cluster places its medoid (minimum average MAD to cluster peers) first as ideal base.
+pub fn cluster_by_thumbs(thumbs: &[Vec<u8>], max_cluster: usize) -> Vec<Vec<usize>> {
+    let max_c = max_cluster.max(2);
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut centroids: Vec<usize> = Vec::new();
+
+    for (idx, th) in thumbs.iter().enumerate() {
+        let mut best_c = None;
+        let mut best_mad = MAX_THUMB_MAD;
+        for (ci, &rep_idx) in centroids.iter().enumerate() {
+            if clusters[ci].len() >= max_c {
+                continue;
+            }
+            let mad = thumb_mad(th, &thumbs[rep_idx]);
+            if mad < best_mad {
+                best_mad = mad;
+                best_c = Some(ci);
+            }
+        }
+        if let Some(ci) = best_c {
+            clusters[ci].push(idx);
+        } else {
+            centroids.push(idx);
+            clusters.push(vec![idx]);
+        }
+    }
+
+    // Reorder each cluster of size >= 3 so its medoid sits at index 0 (maximizes star-graph hits!).
+    for cluster in &mut clusters {
+        if cluster.len() < 3 {
+            continue;
+        }
+        let mut best_pos = 0usize;
+        let mut best_sum = f32::MAX;
+        for (pos, &i) in cluster.iter().enumerate() {
+            let mut sum = 0.0f32;
+            for &j in cluster.iter() {
+                if i != j {
+                    sum += thumb_mad(&thumbs[i], &thumbs[j]);
+                }
+            }
+            if sum < best_sum {
+                best_sum = sum;
+                best_pos = pos;
+            }
+        }
+        if best_pos != 0 {
+            cluster.swap(0, best_pos);
+        }
+    }
+
+    clusters
+}
+
 /// Runs star-graph (depth=1) 16×16 tile-masked delta compression across all candidates.
-/// `webp_quality` and `lossless` mirror the active `OptimizeConfig`.
+/// Evaluates up to `TOP_K_BASES` closest bases per target to minimize patch size.
 pub fn compress_delta_candidates(
     candidates: &[DeltaCandidate],
     webp_quality: u8,
@@ -99,26 +191,43 @@ pub fn compress_delta_candidates(
 
         for (local_i, &cand_i) in idxs.iter().enumerate() {
             let cand = &candidates[cand_i];
-            let mut best_base: Option<usize> = None;
-            let mut best_mad = MAX_THUMB_MAD;
-            for &b_local in &bases {
-                let mad = thumb_mad(&thumbs[local_i], &thumbs[b_local]);
-                if mad < best_mad {
-                    best_mad = mad;
-                    best_base = Some(b_local);
-                }
-            }
+            let mut ranked: Vec<(f32, usize)> = bases
+                .iter()
+                .filter_map(|&b_local| {
+                    let mad = thumb_mad(&thumbs[local_i], &thumbs[b_local]);
+                    (mad < MAX_THUMB_MAD).then_some((mad, b_local))
+                })
+                .collect();
+            ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+            ranked.truncate(TOP_K_BASES);
 
-            let mut adopted = false;
-            if let Some(b_local) = best_base {
+            // Fast pixel-diff pre-screen across Top-K closest bases (< 1ms integer loop),
+            // then WebP-encode ONLY the winning base once (4× faster than encoding all K bases!).
+            let mut best_diff: Option<(usize, DeltaDiff)> = None;
+            for (_, b_local) in ranked {
                 let base = &candidates[idxs[b_local]];
-                if let Some(res) = try_build_delta(base, cand, webp_quality, lossless) {
-                    results.push(res);
-                    adopted = true;
+                if let Some(diff) = analyze_delta_diff(base, cand) {
+                    let better = match &best_diff {
+                        None => true,
+                        Some((_, prev)) => {
+                            (diff.dirty_pixels, diff.bbox_tiles())
+                                < (prev.dirty_pixels, prev.bbox_tiles())
+                        }
+                    };
+                    if better {
+                        best_diff = Some((b_local, diff));
+                    }
                 }
             }
 
-            if !adopted {
+            let best_res = best_diff.and_then(|(b_local, diff)| {
+                let base = &candidates[idxs[b_local]];
+                encode_delta_patch(base, cand, &diff, webp_quality, lossless)
+            });
+
+            if let Some(res) = best_res {
+                results.push(res);
+            } else {
                 bases.push(local_i);
             }
         }
@@ -126,12 +235,23 @@ pub fn compress_delta_candidates(
     results
 }
 
-fn try_build_delta(
-    base: &DeltaCandidate,
-    target: &DeltaCandidate,
-    webp_quality: u8,
-    lossless: bool,
-) -> Option<DeltaResult> {
+struct DeltaDiff {
+    tiles_x: usize,
+    dirty_tiles: Vec<bool>,
+    dirty_pixels: usize,
+    min_tx: usize,
+    max_tx: usize,
+    min_ty: usize,
+    max_ty: usize,
+}
+
+impl DeltaDiff {
+    fn bbox_tiles(&self) -> usize {
+        (self.max_tx - self.min_tx + 1) * (self.max_ty - self.min_ty + 1)
+    }
+}
+
+fn analyze_delta_diff(base: &DeltaCandidate, target: &DeltaCandidate) -> Option<DeltaDiff> {
     let w = target.width as usize;
     let h = target.height as usize;
     let tiles_x = w.div_ceil(TILE);
@@ -151,7 +271,8 @@ fn try_build_delta(
         for tx in 0..tiles_x {
             let x0 = tx * TILE;
             let x1 = (x0 + TILE).min(w);
-            let mut tile_dirty = false;
+            let mut soft_count = 0usize;
+            let mut has_strong = false;
             for y in y0..y1 {
                 let row_off = y * w * 4;
                 for x in x0..x1 {
@@ -160,13 +281,17 @@ fn try_build_delta(
                     let dg = (t_px[o + 1] as i16 - b_px[o + 1] as i16).abs();
                     let db = (t_px[o + 2] as i16 - b_px[o + 2] as i16).abs();
                     let da = (t_px[o + 3] as i16 - b_px[o + 3] as i16).abs();
-                    if dr > DIFF_TOL || dg > DIFF_TOL || db > DIFF_TOL || da > DIFF_TOL {
-                        dirty_pixels += 1;
-                        tile_dirty = true;
+                    let mx = dr.max(dg).max(db).max(da);
+                    if da > DIFF_TOL_ALPHA || mx > DIFF_TOL_STRONG {
+                        has_strong = true;
+                        soft_count += 1;
+                    } else if mx > DIFF_TOL_SOFT {
+                        soft_count += 1;
                     }
                 }
             }
-            if tile_dirty {
+            if has_strong || soft_count >= MIN_SOFT_PIXELS_PER_TILE {
+                dirty_pixels += soft_count.max(1);
                 dirty_tiles[ty * tiles_x + tx] = true;
                 min_tx = min_tx.min(tx);
                 max_tx = max_tx.max(tx);
@@ -184,6 +309,34 @@ fn try_build_delta(
     if dirty_ratio > MAX_DIRTY_RATIO || min_tx > max_tx || min_ty > max_ty {
         return None;
     }
+
+    Some(DeltaDiff {
+        tiles_x,
+        dirty_tiles,
+        dirty_pixels,
+        min_tx,
+        max_tx,
+        min_ty,
+        max_ty,
+    })
+}
+
+fn encode_delta_patch(
+    base: &DeltaCandidate,
+    target: &DeltaCandidate,
+    diff: &DeltaDiff,
+    webp_quality: u8,
+    lossless: bool,
+) -> Option<DeltaResult> {
+    let w = target.width as usize;
+    let h = target.height as usize;
+    let t_px = &target.rgba;
+    let tiles_x = diff.tiles_x;
+    let min_tx = diff.min_tx;
+    let max_tx = diff.max_tx;
+    let min_ty = diff.min_ty;
+    let max_ty = diff.max_ty;
+    let dirty_tiles = &diff.dirty_tiles;
 
     let px0 = min_tx * TILE;
     let py0 = min_ty * TILE;
@@ -237,12 +390,13 @@ fn try_build_delta(
         }
     }
 
-    let enc = webp::Encoder::from_rgba(&patch_rgba, pw as u32, ph as u32);
-    let patch_webp = if lossless {
-        enc.encode_lossless().to_vec()
-    } else {
-        enc.encode(webp_quality as f32).to_vec()
-    };
+    let patch_webp = crate::optimize::encode_webp_rgba_q(
+        &patch_rgba,
+        pw as u32,
+        ph as u32,
+        webp_quality,
+        lossless,
+    );
 
     let overhead = tile_mask.len() + 24;
     if (patch_webp.len() + overhead) * MIN_SAVINGS_DEN >= target.orig_encoded_len * MIN_SAVINGS_NUM

@@ -502,7 +502,226 @@ class SaveStore {
   }
 }
 
-// --- WebAudio API Mixer with Mobile Streaming BGM, iOS Unlock/Interrupted Recovery & Bounded LRU ---
+// --- Zero-Reencode Ogg Opus -> CoreAudio CAF v1 Remuxer (enables native Opus on iOS Safari!) ---
+function isOggOpusPayload(mime, bytes) {
+  if (mime && mime.toLowerCase().includes('opus')) return true;
+  if (!bytes || bytes.byteLength < 36) return false;
+  if (bytes[0] !== 0x4f || bytes[1] !== 0x67 || bytes[2] !== 0x67 || bytes[3] !== 0x53) {
+    return false;
+  }
+  const lim = Math.min(bytes.byteLength - 8, 64);
+  for (let i = 26; i <= lim; i++) {
+    if (
+      bytes[i] === 0x4f && bytes[i + 1] === 0x70 && bytes[i + 2] === 0x75 && bytes[i + 3] === 0x73 &&
+      bytes[i + 4] === 0x48 && bytes[i + 5] === 0x65 && bytes[i + 6] === 0x61 && bytes[i + 7] === 0x64
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function opusPacketFrameCount48k(pkt) {
+  if (!pkt || pkt.byteLength === 0) return 960;
+  const toc = pkt[0];
+  const cfg = toc >> 3;
+  let frameSamples;
+  if (cfg < 12) {
+    frameSamples = [480, 960, 1920, 2880][cfg & 3];
+  } else if (cfg < 16) {
+    frameSamples = [480, 960][cfg & 1];
+  } else {
+    frameSamples = [120, 240, 480, 960][cfg & 3];
+  }
+  const code = toc & 3;
+  let frames;
+  if (code === 0) {
+    frames = 1;
+  } else if (code === 1 || code === 2) {
+    frames = 2;
+  } else {
+    frames = pkt.byteLength >= 2 ? (pkt[1] & 0x3f) : 1;
+  }
+  return frameSamples * Math.max(1, frames);
+}
+
+function writeCafVarInt(out, value) {
+  let v = value >>> 0;
+  const tmp = [];
+  tmp.push(v & 0x7f);
+  v >>>= 7;
+  while (v > 0) {
+    tmp.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  for (let i = tmp.length - 1; i >= 0; i--) {
+    out.push(tmp[i]);
+  }
+}
+
+function oggOpusToCaf(oggBytes) {
+  if (!oggBytes || oggBytes.byteLength < 36) return null;
+  const dv = new DataView(oggBytes.buffer, oggBytes.byteOffset, oggBytes.byteLength);
+  let pos = 0;
+  const len = oggBytes.byteLength;
+
+  const packets = [];
+  let pendingParts = [];
+  let pendingLen = 0;
+  let lastGranule = 0n;
+
+  const flushPacket = () => {
+    if (pendingParts.length === 1) {
+      packets.push(pendingParts[0]);
+    } else if (pendingParts.length > 1) {
+      const merged = new Uint8Array(pendingLen);
+      let off = 0;
+      for (const p of pendingParts) {
+        merged.set(p, off);
+        off += p.byteLength;
+      }
+      packets.push(merged);
+    }
+    pendingParts = [];
+    pendingLen = 0;
+  };
+
+  while (pos + 27 <= len) {
+    if (
+      oggBytes[pos] !== 0x4f ||
+      oggBytes[pos + 1] !== 0x67 ||
+      oggBytes[pos + 2] !== 0x67 ||
+      oggBytes[pos + 3] !== 0x53
+    ) {
+      break;
+    }
+    const headerType = oggBytes[pos + 5];
+    const granule = dv.getBigUint64(pos + 6, true);
+    const numSegs = oggBytes[pos + 26];
+    const segStart = pos + 27;
+    const bodyStart = segStart + numSegs;
+    if (bodyStart > len) break;
+
+    if ((headerType & 0x01) === 0 && pendingLen > 0) {
+      flushPacket();
+    }
+    let bodyOff = bodyStart;
+    for (let s = 0; s < numSegs; s++) {
+      const segLen = oggBytes[segStart + s];
+      if (bodyOff + segLen > len) return null;
+      if (segLen > 0) {
+        pendingParts.push(oggBytes.subarray(bodyOff, bodyOff + segLen));
+        pendingLen += segLen;
+      }
+      bodyOff += segLen;
+      if (segLen < 255) {
+        flushPacket();
+      }
+    }
+    if (granule !== 0xffffffffffffffffn && packets.length >= 2) {
+      lastGranule = granule;
+    }
+    pos = bodyOff;
+  }
+  if (pendingLen > 0) flushPacket();
+  if (packets.length < 3) return null;
+
+  const head = packets[0];
+  if (
+    head.byteLength < 19 ||
+    head[0] !== 0x4f || head[1] !== 0x70 || head[2] !== 0x75 || head[3] !== 0x73 ||
+    head[4] !== 0x48 || head[5] !== 0x65 || head[6] !== 0x61 || head[7] !== 0x64
+  ) {
+    return null;
+  }
+  const channels = head[9];
+  const preSkip = head[10] | (head[11] << 8);
+  if (channels < 1 || channels > 2) return null;
+
+  const audioPkts = packets.slice(2);
+  let totalPayload = 0;
+  let totalSamples = 0;
+  let constFrames = opusPacketFrameCount48k(audioPkts[0]);
+  const pktSamples = new Int32Array(audioPkts.length);
+  for (let i = 0; i < audioPkts.length; i++) {
+    const p = audioPkts[i];
+    totalPayload += p.byteLength;
+    const f = opusPacketFrameCount48k(p);
+    pktSamples[i] = f;
+    totalSamples += f;
+    if (f !== constFrames) constFrames = 0;
+  }
+
+  let validFrames = totalSamples - preSkip;
+  if (lastGranule > BigInt(preSkip)) {
+    const gValid = Number(lastGranule - BigInt(preSkip));
+    if (gValid > 0 && gValid <= totalSamples - preSkip) {
+      validFrames = gValid;
+    }
+  }
+  validFrames = Math.max(0, validFrames);
+  const remainderFrames = Math.max(0, totalSamples - preSkip - validFrames);
+
+  const paktVarInts = [];
+  for (let i = 0; i < audioPkts.length; i++) {
+    writeCafVarInt(paktVarInts, audioPkts[i].byteLength);
+    if (constFrames === 0) {
+      writeCafVarInt(paktVarInts, pktSamples[i]);
+    }
+  }
+
+  // CAF v1 layout: file header (8) + desc (12+32) + pakt (12+24+varints) + data (12+4+payload)
+  const totalSize = 8 + (12 + 32) + (12 + 24 + paktVarInts.length) + (12 + 4 + totalPayload);
+  const out = new Uint8Array(totalSize);
+  const view = new DataView(out.buffer);
+  let w = 0;
+  const putFourCC = (s) => {
+    out[w++] = s.charCodeAt(0);
+    out[w++] = s.charCodeAt(1);
+    out[w++] = s.charCodeAt(2);
+    out[w++] = s.charCodeAt(3);
+  };
+
+  // File header: 'caff', version=1, flags=0
+  putFourCC('caff');
+  view.setUint16(w, 1, false); w += 2;
+  view.setUint16(w, 0, false); w += 2;
+
+  // 'desc' chunk (32 bytes)
+  putFourCC('desc');
+  view.setBigInt64(w, 32n, false); w += 8;
+  view.setFloat64(w, 48000.0, false); w += 8;
+  putFourCC('opus');
+  view.setUint32(w, 0, false); w += 4; // formatFlags
+  view.setUint32(w, 0, false); w += 4; // bytesPerPacket (VBR)
+  view.setUint32(w, constFrames, false); w += 4; // framesPerPacket (960 or 0 if variable)
+  view.setUint32(w, channels, false); w += 4; // channelsPerFrame
+  view.setUint32(w, 0, false); w += 4; // bitsPerChannel
+
+  // 'pakt' chunk
+  putFourCC('pakt');
+  view.setBigInt64(w, BigInt(24 + paktVarInts.length), false); w += 8;
+  view.setBigInt64(w, BigInt(audioPkts.length), false); w += 8;
+  view.setBigInt64(w, BigInt(validFrames), false); w += 8;
+  view.setInt32(w, preSkip, false); w += 4;
+  view.setInt32(w, remainderFrames, false); w += 4;
+  for (let i = 0; i < paktVarInts.length; i++) {
+    out[w++] = paktVarInts[i];
+  }
+
+  // 'data' chunk
+  putFourCC('data');
+  view.setBigInt64(w, BigInt(4 + totalPayload), false); w += 8;
+  view.setUint32(w, 0, false); w += 4; // editCount
+  for (let i = 0; i < audioPkts.length; i++) {
+    out.set(audioPkts[i], w);
+    w += audioPkts[i].byteLength;
+  }
+
+  return out;
+}
+
+// --- WebAudio API Mixer with Mobile Streaming BGM, iOS Opus-in-CAF Remux & Bounded LRU ---
 class WebAudioMixer {
   constructor(decodedLimit, onCodecUnsupported) {
     this.ctx = null;
@@ -514,6 +733,7 @@ class WebAudioMixer {
     this.decodedLimit = decodedLimit || 96 * 1024 * 1024;
     this.inflightDecode = new Map();
     this.hostSuspended = false;
+    this.preferCafOpus = deviceProfile.isIOS;
     this.warnedOgg = false;
     this.onCodecUnsupported = onCodecUnsupported || null;
     this.prefs = { master_volume: 0.9, bgm_volume: 0.75, voice_volume: 1.0, sfx_volume: 0.85 };
@@ -627,8 +847,34 @@ class WebAudioMixer {
     const task = (async () => {
       const bytes = await fetchBytes();
       if (!bytes || bytes.byteLength === 0) return null;
-      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      const audioBuf = await ctx.decodeAudioData(copy);
+      const isOpus = isOggOpusPayload(mime, bytes);
+      let audioBuf = null;
+      if (this.preferCafOpus && isOpus) {
+        const caf = oggOpusToCaf(bytes);
+        if (caf) {
+          try {
+            audioBuf = await ctx.decodeAudioData(caf.buffer);
+          } catch { /* fall through to native decode */ }
+        }
+      }
+      if (!audioBuf) {
+        const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        try {
+          audioBuf = await ctx.decodeAudioData(copy);
+        } catch (nativeErr) {
+          if (isOpus) {
+            const caf = oggOpusToCaf(bytes);
+            if (caf) {
+              audioBuf = await ctx.decodeAudioData(caf.buffer);
+              this.preferCafOpus = true;
+            } else {
+              throw nativeErr;
+            }
+          } else {
+            throw nativeErr;
+          }
+        }
+      }
       this._putDecoded(assetId, audioBuf);
       return audioBuf;
     })()
@@ -661,7 +907,11 @@ class WebAudioMixer {
       return false;
     }
     const probe = document.createElement('audio');
-    return Boolean(probe.canPlayType && probe.canPlayType(cmd.mime || 'audio/mpeg'));
+    if (!probe.canPlayType) return false;
+    if (this.preferCafOpus && cmd.mime && cmd.mime.toLowerCase().includes('opus')) {
+      return Boolean(probe.canPlayType('audio/x-caf'));
+    }
+    return Boolean(probe.canPlayType(cmd.mime || 'audio/mpeg'));
   }
 
   async _playStreamingBgm(ctx, cmd, playToken, fetchBytes, onEnded) {
@@ -669,7 +919,16 @@ class WebAudioMixer {
     const slot = this.channels.get(cmd.channel);
     if (!bytes || bytes.byteLength === 0 || !slot || slot.pending !== playToken) return false;
 
-    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: cmd.mime || 'audio/mpeg' }));
+    let blobBytes = bytes;
+    let blobMime = cmd.mime || 'audio/mpeg';
+    if (this.preferCafOpus && isOggOpusPayload(cmd.mime, bytes)) {
+      const caf = oggOpusToCaf(bytes);
+      if (caf) {
+        blobBytes = caf;
+        blobMime = 'audio/x-caf';
+      }
+    }
+    const blobUrl = URL.createObjectURL(new Blob([blobBytes], { type: blobMime }));
     const el = new Audio();
     el.preload = 'auto';
     el.loop = Boolean(cmd.looped);

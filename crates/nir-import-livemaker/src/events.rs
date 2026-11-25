@@ -366,9 +366,28 @@ pub fn lower_event(
             bridge.record_exact();
         }
         "QUAKESTOP" => {
-            ops.push(Op::ShakeStop {
-                target: TweenTarget::DialogueBox,
-            });
+            let targets_raw = arg(0).trim();
+            let targets: Vec<&str> = targets_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if targets.is_empty() {
+                // Stop all active shakes (stage layers + dialogue box) when no specific target is given.
+                ops.push(Op::ShakeStop {
+                    target: TweenTarget::Layer(LayerId(u32::MAX)),
+                });
+            } else {
+                for t in targets {
+                    let target = if t == "メッセージボックス" || t == "メッセージボックス土台"
+                    {
+                        TweenTarget::DialogueBox
+                    } else {
+                        TweenTarget::Layer(bridge.resolve_layer(t))
+                    };
+                    ops.push(Op::ShakeStop { target });
+                }
+            }
             bridge.record_exact();
         }
         "FACE" => {

@@ -1274,17 +1274,26 @@ impl Vm {
             }
             Op::ShakeStop { target } => {
                 let target = *target;
-                self.shakes.retain(|s| s.target != target);
-                match target {
-                    TweenTarget::Layer(lid) => {
-                        for l in self.layers.iter_mut().chain(self.pending_layers.iter_mut()) {
-                            if l.id == lid {
-                                l.shake_offset = [0.0, 0.0];
+                if target == TweenTarget::Layer(LayerId(u32::MAX)) {
+                    // Wildcard stop-all: clears all active layer and dialogue box shakes cleanly.
+                    self.shakes.clear();
+                    for l in self.layers.iter_mut().chain(self.pending_layers.iter_mut()) {
+                        l.shake_offset = [0.0, 0.0];
+                    }
+                    self.dialogue_shake = [0.0, 0.0];
+                } else {
+                    self.shakes.retain(|s| s.target != target);
+                    match target {
+                        TweenTarget::Layer(lid) => {
+                            for l in self.layers.iter_mut().chain(self.pending_layers.iter_mut()) {
+                                if l.id == lid {
+                                    l.shake_offset = [0.0, 0.0];
+                                }
                             }
                         }
+                        TweenTarget::DialogueBox => self.dialogue_shake = [0.0, 0.0],
+                        TweenTarget::Audio(_) => {}
                     }
-                    TweenTarget::DialogueBox => self.dialogue_shake = [0.0, 0.0],
-                    TweenTarget::Audio(_) => {}
                 }
                 if self.wait == WaitReason::Shake && self.shakes.is_empty() {
                     self.wait = WaitReason::None;
@@ -3380,5 +3389,94 @@ mod tests {
             p0 < p1,
             "delta base must be prefetched ahead of delta patch"
         );
+    }
+
+    #[test]
+    fn shake_stop_wildcard_clears_layers_and_dialogue_box() {
+        let prog = Arc::new(NirProgram {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.shake".into(),
+                title: "Shake".into(),
+                version: "1.0".into(),
+                stage_width: 800,
+                stage_height: 600,
+                default_locale: "en".into(),
+                locales: vec!["en".into()],
+                entry_func: FuncId(0),
+                save_slots: 4,
+                default_reveal_us: 0,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: vec![],
+                text_fonts: vec![],
+            },
+            strings: vec!["main".into()],
+            vars: vec![],
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: vec![],
+            ops: vec![
+                Op::LayerSet {
+                    layer: LayerId(1),
+                    parent: None,
+                    asset: None,
+                    transform: Box::new(Transform2D::default()),
+                },
+                Op::Shake {
+                    target: TweenTarget::Layer(LayerId(1)),
+                    spec: ShakeSpec {
+                        amplitude: [12.0, 8.0],
+                        freq_hz: 20.0,
+                        duration_us: 2_000_000,
+                        decay: false,
+                        mode: ShakeMode::Wave,
+                    },
+                    wait: false,
+                },
+                Op::Shake {
+                    target: TweenTarget::DialogueBox,
+                    spec: ShakeSpec {
+                        amplitude: [10.0, 6.0],
+                        freq_hz: 20.0,
+                        duration_us: 2_000_000,
+                        decay: false,
+                        mode: ShakeMode::Wave,
+                    },
+                    wait: false,
+                },
+                Op::Wait {
+                    duration_us: 100_000,
+                    skippable: false,
+                },
+                Op::ShakeStop {
+                    target: TweenTarget::Layer(LayerId(u32::MAX)),
+                },
+                Op::End { outcome: StrId(0) },
+            ],
+            texts: BTreeMap::from([("en".into(), vec![])]),
+            ui: UiTheme::default(),
+            assets: vec![],
+            asset_lookup: BTreeMap::new(),
+            timelines: vec![],
+            menus: vec![],
+        });
+
+        let mut vm = Vm::new(prog, None).unwrap();
+        vm.step(64).unwrap();
+        assert_eq!(vm.shakes.len(), 2);
+        // Tick partway through the shake so offsets become non-zero
+        vm.tick(12_500, 1.0, false);
+        assert!(vm.layers[0].shake_offset[0].abs() > 0.1 || vm.dialogue_shake[0].abs() > 0.1);
+        // Finish the Wait and hit wildcard ShakeStop
+        vm.tick(100_000, 1.0, false);
+        vm.step(64).unwrap();
+        assert!(vm.shakes.is_empty());
+        assert_eq!(vm.layers[0].shake_offset, [0.0, 0.0]);
+        assert_eq!(vm.dialogue_shake, [0.0, 0.0]);
     }
 }

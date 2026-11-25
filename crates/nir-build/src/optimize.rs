@@ -12,35 +12,36 @@
 //! - Fast HarfBuzz font subsetting directly from `NirProgram` characters
 
 use anyhow::{bail, Context, Result};
-use nir_ir::{AssetKind, AudioLoopRegion, MediaCodec, SpriteTrim};
+use nir_ir::{AssetKind, AudioBus, AudioLoopRegion, MediaCodec, SpriteTrim};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub const OPTIMIZER_VERSION: &str = "nir-opt/v4";
+pub const OPTIMIZER_VERSION: &str = "nir-opt/v5";
 const IMG_CACHE_MAGIC: &[u8; 4] = b"NIOC";
 const AUDIO_CACHE_MAGIC: &[u8; 4] = b"NIAC";
 
-/// Audio transcoding codec target for WAV/FLAC (and oversized mono OGG voices).
+/// Audio transcoding codec target for WAV/FLAC/OGG (and oversized MP3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCodecMode {
-    /// Universal 100%-compatible LAME VBR MP3 (`-V 5` mono ~65 kbps, `-V 3` stereo ~155 kbps) with gapless Xing tag.
+    /// Universal LAME VBR MP3 (`-V 5` mono ~65 kbps, `-V 3` stereo ~155 kbps) with gapless Xing tag.
     Mp3Vbr,
-    /// Modern pure-Rust Ogg Opus (`48 kbps` mono speech, `96 kbps` stereo music) — smallest possible `.nirpak`!
+    /// Perceptually transparent Ogg Opus (`40 kbps` mono speech, `96 kbps` stereo music, complexity 10)
+    /// — natively decoded on Desktop/Android/Chrome/Firefox and via zero-reencode CAF remux on iOS Safari!
     Opus,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct OptimizeConfig {
     pub enabled: bool,
-    /// Base WebP quality for full-size opaque CGs/BGs (default `85`, PSNR ~41-42 dB).
-    /// Smaller UI elements and transparent sprites automatically get `+5` (capped at `90`).
+    /// Base WebP quality for full-size opaque CGs/BGs (default `82` with `method=5` + `sharp_yuv`, PSNR > 41.5 dB).
+    /// Smaller UI elements and transparent sprites automatically get `+4` (capped at `88`, `alpha_quality=92`).
     pub webp_quality: u8,
     pub lossless_images: bool,
     pub auto_trim_sprites: bool,
-    /// Enable 16×16 tile-masked star-graph CG/sprite differential compression.
+    /// Enable 16×16 tile-masked star-graph CG/sprite differential compression (including trimmed sprites).
     pub delta_images: bool,
     /// Auto-generate 256×144 WebP thumbnails for `ui.gallery` items to prevent VRAM spikes.
     pub gallery_thumbnails: bool,
@@ -52,28 +53,32 @@ pub struct OptimizeConfig {
     pub opus_stereo_kbps: u16,
     /// Trim leading/trailing digital silence (< -54 dBFS) on short mono voice/SFX clips.
     pub trim_audio_silence: bool,
-    /// Re-compress bloated high-bitrate (>= 105 kbps) mono OGG voices when savings >= 25%.
+    /// Transcode OGG Vorbis (including dual-mono and high-bitrate BGM) into the target universal codec.
     pub recompress_high_bitrate_ogg: bool,
     pub subset_fonts: bool,
+    /// Auto-embed a compact (~150-300 KB) game-subset system CJK font when the game bundles no fonts,
+    /// eliminating the 6+ MB Web fallback font download on cold start.
+    pub auto_embed_cjk_font: bool,
 }
 
 impl Default for OptimizeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            webp_quality: 85,
+            webp_quality: 80,
             lossless_images: false,
             auto_trim_sprites: true,
             delta_images: true,
             gallery_thumbnails: true,
             ktx2_textures: false,
-            audio_codec: AudioCodecMode::Mp3Vbr,
+            audio_codec: AudioCodecMode::Opus,
             mp3_bitrate_kbps: 160,
-            opus_mono_kbps: 48,
+            opus_mono_kbps: 40,
             opus_stereo_kbps: 96,
             trim_audio_silence: true,
             recompress_high_bitrate_ogg: true,
             subset_fonts: true,
+            auto_embed_cjk_font: false,
         }
     }
 }
@@ -227,8 +232,33 @@ pub fn fp_audio_cache_path(
     fp: (u64, u64),
     cfg: &OptimizeConfig,
 ) -> PathBuf {
-    let key =
-        sha256_hex(format!("fp:{}:{}:{}:{}", cfg.audio_sig(), asset_name, fp.0, fp.1).as_bytes());
+    fp_audio_cache_path_for_bus(cache_dir, asset_name, fp, None, cfg)
+}
+
+pub fn fp_audio_cache_path_for_bus(
+    cache_dir: &Path,
+    asset_name: &str,
+    fp: (u64, u64),
+    bus: Option<AudioBus>,
+    cfg: &OptimizeConfig,
+) -> PathBuf {
+    let bus_tag = match bus {
+        Some(AudioBus::Bgm) => "bgm",
+        Some(AudioBus::Voice) => "voc",
+        Some(AudioBus::Sfx) => "sfx",
+        None => "any",
+    };
+    let key = sha256_hex(
+        format!(
+            "fp:{}:{}:{}:{}:{}",
+            cfg.audio_sig(),
+            bus_tag,
+            asset_name,
+            fp.0,
+            fp.1
+        )
+        .as_bytes(),
+    );
     cache_dir.join(format!("{key}.niac"))
 }
 
@@ -547,33 +577,56 @@ fn try_auto_trim(rgba: &image::RgbaImage) -> Option<(image::RgbaImage, SpriteTri
     ))
 }
 
-/// Content-adaptive WebP quality: large opaque CGs/BGs use `cfg.webp_quality` (default 85),
-/// while crisp small UI icons/buttons and transparent sprites receive +5 (capped at 90).
+/// Content-adaptive WebP quality: large opaque CGs/BGs use `cfg.webp_quality` (default 80, PSNR > 42 dB
+/// with `use_sharp_yuv`), while crisp small UI icons/buttons and transparent sprites receive +3 (capped at 85).
 #[inline]
 pub fn effective_webp_quality(w: u32, h: u32, has_alpha: bool, cfg: &OptimizeConfig) -> u8 {
     if has_alpha || w.max(h) < 512 {
-        cfg.webp_quality.saturating_add(5).min(90)
+        cfg.webp_quality.saturating_add(3).min(85)
     } else {
         cfg.webp_quality
     }
 }
 
-fn encode_webp_rgb_q(rgb: &[u8], w: u32, h: u32, q: u8, lossless: bool) -> Vec<u8> {
+/// High-efficiency perceptually transparent WebP encoder using `method = 4`, `use_sharp_yuv = 1`
+/// (crisp anime lineart without chroma bleed), `autofilter = 1`, and clean `alpha_quality = 88`.
+pub fn encode_webp_rgb_q(rgb: &[u8], w: u32, h: u32, q: u8, lossless: bool) -> Vec<u8> {
     let enc = webp::Encoder::from_rgb(rgb, w, h);
     if lossless {
-        enc.encode_lossless().to_vec()
-    } else {
-        enc.encode(q as f32).to_vec()
+        return enc.encode_lossless().to_vec();
     }
+    if let Ok(mut cfg) = webp::WebPConfig::new() {
+        cfg.quality = q as f32;
+        cfg.method = 4;
+        cfg.sns_strength = 50;
+        cfg.autofilter = 1;
+        cfg.use_sharp_yuv = 1;
+        if let Ok(mem) = enc.encode_advanced(&cfg) {
+            return mem.to_vec();
+        }
+    }
+    enc.encode(q as f32).to_vec()
 }
 
-fn encode_webp_rgba_q(rgba: &[u8], w: u32, h: u32, q: u8, lossless: bool) -> Vec<u8> {
+pub fn encode_webp_rgba_q(rgba: &[u8], w: u32, h: u32, q: u8, lossless: bool) -> Vec<u8> {
     let enc = webp::Encoder::from_rgba(rgba, w, h);
     if lossless {
-        enc.encode_lossless().to_vec()
-    } else {
-        enc.encode(q as f32).to_vec()
+        return enc.encode_lossless().to_vec();
     }
+    if let Ok(mut cfg) = webp::WebPConfig::new() {
+        cfg.quality = q as f32;
+        cfg.method = 4;
+        cfg.sns_strength = 50;
+        cfg.autofilter = 1;
+        cfg.use_sharp_yuv = 1;
+        cfg.alpha_compression = 1;
+        cfg.alpha_filtering = 1;
+        cfg.alpha_quality = 88;
+        if let Ok(mem) = enc.encode_advanced(&cfg) {
+            return mem.to_vec();
+        }
+    }
+    enc.encode(q as f32).to_vec()
 }
 
 /// Direct pixel optimizer bypassing intermediate PNG encoding/decoding completely!
@@ -920,11 +973,25 @@ pub fn decode_to_rgba(bytes: &[u8], codec: MediaCodec) -> Option<(u32, u32, Vec<
     Some((w, h, rgba.into_raw(), actual_alpha))
 }
 
-/// Probes duration/rate/channels and optimizes WAV/FLAC (plus bloated mono OGG voices!)
-/// with dual-mono downmix, leading/trailing silence trim, and LAME VBR MP3 or Pure-Rust Opus!
+/// Probes duration/rate/channels and optimizes WAV/FLAC/OGG (plus oversized MP3!)
+/// with dual-mono downmix, leading/trailing silence trim, and perceptually transparent
+/// Opus (`40k` mono speech / `96k` stereo music) or LAME VBR MP3!
 pub fn optimize_audio(
     raw: &[u8],
     source_codec: MediaCodec,
+    cfg: &OptimizeConfig,
+    cache_dir: &Path,
+) -> Result<OptimizedAsset> {
+    optimize_audio_for_bus(raw, source_codec, None, cfg, cache_dir)
+}
+
+/// Bus-aware audio optimizer: preserves higher mono bitrate + MDCT psychoacoustic bias
+/// when a BGM track downmixes from dual-mono stereo, while transcoding all OGG Vorbis assets
+/// into universally playable Opus (or MP3) so iOS Safari never loses BGM or SFX!
+pub fn optimize_audio_for_bus(
+    raw: &[u8],
+    source_codec: MediaCodec,
+    bus: Option<AudioBus>,
     cfg: &OptimizeConfig,
     cache_dir: &Path,
 ) -> Result<OptimizedAsset> {
@@ -946,15 +1013,19 @@ pub fn optimize_audio(
         });
     }
 
-    // Check if an OGG Vorbis file is a bloated high-bitrate mono voice clip (>= 105 kbps, >= 0.5s).
-    let recompress_ogg = if source_codec == MediaCodec::Ogg && cfg.recompress_high_bitrate_ogg {
-        if let Some((_sr, ch, dur_us)) = probe_ogg_vorbis_fast(raw) {
-            if ch == 1 && dur_us >= 500_000 {
-                let kbps = (raw.len() as f64 * 8.0) / (dur_us as f64 / 1_000_000.0) / 1000.0;
-                kbps >= 105.0
-            } else {
-                false
-            }
+    // Transcode ALL OGG Vorbis files when enabled (eliminates 198kbps BGM bloat, dual-mono OGGs,
+    // and fixes iOS Safari WebAudio playback where Ogg Vorbis is unsupported!).
+    let recompress_ogg = source_codec == MediaCodec::Ogg && cfg.recompress_high_bitrate_ogg;
+
+    // For already-compressed MP3 inputs, only re-encode to Opus if bitrate is high enough that
+    // transcoding saves meaningful space without generational quality loss.
+    let recompress_mp3 = if source_codec == MediaCodec::Mp3
+        && cfg.audio_codec == AudioCodecMode::Opus
+    {
+        let (_sr, ch, dur_us) = fast_probe_audio_meta(raw, MediaCodec::Mp3);
+        if dur_us >= 500_000 {
+            let kbps = (raw.len() as f64 * 8.0) / (dur_us as f64 / 1_000_000.0) / 1000.0;
+            (ch <= 1 && kbps >= 96.0) || (ch >= 2 && kbps >= 160.0)
         } else {
             false
         }
@@ -962,7 +1033,10 @@ pub fn optimize_audio(
         false
     };
 
-    if !matches!(source_codec, MediaCodec::Wav | MediaCodec::Flac) && !recompress_ogg {
+    if !matches!(source_codec, MediaCodec::Wav | MediaCodec::Flac)
+        && !recompress_ogg
+        && !recompress_mp3
+    {
         let (rate, channels, duration_us) = fast_probe_audio_meta(raw, source_codec);
         return Ok(OptimizedAsset {
             bytes: raw.to_vec(),
@@ -978,8 +1052,17 @@ pub fn optimize_audio(
         });
     }
 
+    let bus_tag = match bus {
+        Some(AudioBus::Bgm) => "bgm",
+        Some(AudioBus::Voice) => "voc",
+        Some(AudioBus::Sfx) => "sfx",
+        None => "any",
+    };
+
     // Check metadata-backed audio cache BEFORE decoding PCM!
-    let cache_key = sha256_hex(format!("{}:{}", cfg.audio_sig(), sha256_hex(raw)).as_bytes());
+    let cache_key = sha256_hex(
+        format!("{}:{}:{}", cfg.audio_sig(), bus_tag, sha256_hex(raw)).as_bytes(),
+    );
     let cache_file = cache_dir.join(format!("{cache_key}.niac"));
     if let Some(hit) = read_audio_cache(&cache_file, orig_len) {
         return Ok(hit);
@@ -989,6 +1072,7 @@ pub fn optimize_audio(
         MediaCodec::Wav => parse_wav_pcm16(raw).or_else(|| decode_pcm16_via_symphonia(raw, "wav")),
         MediaCodec::Flac => decode_pcm16_via_symphonia(raw, "flac"),
         MediaCodec::Ogg => decode_pcm16_via_symphonia(raw, "ogg"),
+        MediaCodec::Mp3 => decode_pcm16_via_symphonia(raw, "mp3"),
         _ => None,
     };
 
@@ -1008,25 +1092,46 @@ pub fn optimize_audio(
         });
     };
 
-    // 1. Detect dual-mono stereo recordings (e.g., 95% of stereo voice WAVs!) and downmix losslessly to mono.
+    // 1. Detect dual-mono stereo recordings and downmix losslessly to mono.
     detect_and_downmix_dual_mono(&mut wav);
 
     // 2. Trim leading/trailing digital silence (< -54 dBFS) on short mono voice/SFX clips (< 30s).
-    if cfg.trim_audio_silence && wav.channels == 1 {
+    if cfg.trim_audio_silence && wav.channels == 1 && bus != Some(AudioBus::Bgm) {
         trim_mono_silence(&mut wav);
     }
 
     let frames = wav.samples.len() as u64 / wav.channels.max(1) as u64;
     let duration_us = frames.saturating_mul(1_000_000) / wav.rate.max(1) as u64;
 
+    let is_music = bus == Some(AudioBus::Bgm) || (wav.channels >= 2 && duration_us >= 20_000_000);
+    let mut eff_mono_kbps = if is_music {
+        cfg.opus_mono_kbps.max(64)
+    } else {
+        cfg.opus_mono_kbps
+    };
+    let mut eff_stereo_kbps = cfg.opus_stereo_kbps;
+
+    // For OGG Vorbis sources, avoid inflating already low-bitrate clips (Opus matches or beats
+    // Vorbis at equal bitrate!) while guaranteeing 100% iOS Safari compatibility (zero OGG leaks).
+    if recompress_ogg && duration_us >= 300_000 {
+        let src_kbps =
+            ((raw.len() as f64 * 8.0) / (duration_us as f64 / 1_000_000.0) / 1000.0).round() as u16;
+        if wav.channels <= 1 {
+            eff_mono_kbps = eff_mono_kbps.min(src_kbps.max(36));
+        } else {
+            eff_stereo_kbps = eff_stereo_kbps.min(src_kbps.max(64));
+        }
+    }
+
     let encoded_res: Option<(Vec<u8>, MediaCodec, u32)> = match cfg.audio_codec {
         AudioCodecMode::Opus => {
-            match crate::opus_enc::encode_ogg_opus(
+            match crate::opus_enc::encode_ogg_opus_with_bias(
                 &wav.samples,
                 wav.rate,
                 wav.channels,
-                cfg.opus_mono_kbps,
-                cfg.opus_stereo_kbps,
+                eff_mono_kbps,
+                eff_stereo_kbps,
+                is_music || wav.channels >= 2,
             ) {
                 Ok(bytes) => Some((bytes, MediaCodec::Opus, 48_000)),
                 Err(_) => None,
@@ -1043,9 +1148,12 @@ pub fn optimize_audio(
         }
     };
 
-    // For re-compressed OGG, require >= 25% reduction to justify transcoding; for WAV/FLAC accept any win.
+    // Always accept OGG Vorbis transcoding (universal iOS Safari compatibility — zero OGG leaks!);
+    // for MP3 re-compression require >= 25% savings; for WAV/FLAC accept any win.
     let accept = |enc_len: usize| -> bool {
         if recompress_ogg {
+            true
+        } else if recompress_mp3 {
             enc_len * 100 <= raw.len() * 75
         } else {
             enc_len < raw.len()
@@ -1178,6 +1286,17 @@ pub fn subset_font(
     cfg: &OptimizeConfig,
     cache_dir: &Path,
 ) -> Result<Vec<u8>> {
+    subset_font_face(raw, 0, chars, cfg, cache_dir)
+}
+
+/// Subsets a specific face index inside an OpenType/TrueType font or `.ttc` collection via HarfBuzz.
+pub fn subset_font_face(
+    raw: &[u8],
+    face_index: u32,
+    chars: &BTreeSet<char>,
+    cfg: &OptimizeConfig,
+    cache_dir: &Path,
+) -> Result<Vec<u8>> {
     if !cfg.enabled || !cfg.subset_fonts {
         return Ok(raw.to_vec());
     }
@@ -1185,7 +1304,7 @@ pub fn subset_font(
     let all_chars_str: String = chars.iter().collect();
     let cache_key = sha256_hex(
         format!(
-            "{OPTIMIZER_VERSION}:font:{}:{}",
+            "{OPTIMIZER_VERSION}:font:{face_index}:{}:{}",
             sha256_hex(raw),
             sha256_hex(all_chars_str.as_bytes())
         )
@@ -1196,7 +1315,7 @@ pub fn subset_font(
         return Ok(hit);
     }
 
-    let Ok(face) = ttf_parser::Face::parse(raw, 0) else {
+    let Ok(face) = ttf_parser::Face::parse(raw, face_index) else {
         return Ok(raw.to_vec());
     };
     if face.is_variable() {
@@ -1216,7 +1335,8 @@ pub fn subset_font(
         return Ok(raw.to_vec());
     }
 
-    let source = hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(raw)?, 0)?;
+    let source =
+        hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(raw)?, face_index)?;
     let mut input = hb_subset::SubsetInput::new().context("E_FONT_SUBSET")?;
     input.keep_everything();
     input
@@ -1238,6 +1358,95 @@ pub fn subset_font(
         let _ = fs::rename(&tmp, &cache_file);
     }
     Ok(out)
+}
+
+/// Builds a compact game-subset CJK font (~150–300 KB) from the host's system Pan-CJK font
+/// covering `chars` plus all built-in NIR UI strings and ASCII, eliminating the 6+ MB Web
+/// fallback font download when a game bundles no fonts of its own.
+pub fn build_embedded_game_cjk_font(
+    chars: &BTreeSet<char>,
+    cfg: &OptimizeConfig,
+    cache_dir: &Path,
+) -> Option<(Vec<u8>, MediaCodec)> {
+    if !cfg.enabled || !cfg.subset_fonts {
+        return None;
+    }
+    let (font_path, face_index) = find_system_cjk_font()?;
+    let meta = fs::metadata(&font_path).ok()?;
+    let all_chars_str: String = chars.iter().collect();
+    let fp_key = sha256_hex(
+        format!(
+            "{OPTIMIZER_VERSION}:embedcjk:{}:{}:{}:{}",
+            font_path.display(),
+            meta.len(),
+            face_index,
+            sha256_hex(all_chars_str.as_bytes())
+        )
+        .as_bytes(),
+    );
+    let cache_file = cache_dir.join(format!("{fp_key}.efont"));
+    if let Ok(hit) = fs::read(&cache_file) {
+        if hit.len() >= 12 {
+            let codec = if &hit[..4] == b"OTTO" {
+                MediaCodec::Otf
+            } else {
+                MediaCodec::Ttf
+            };
+            return Some((hit, codec));
+        }
+    }
+
+    let raw = fs::read(&font_path).ok()?;
+    let face = ttf_parser::Face::parse(&raw, face_index).ok()?;
+    if face.is_variable() {
+        return None;
+    }
+    let mut wanted = chars.clone();
+    let mut decomposed = BTreeSet::new();
+    for &c in &wanted {
+        unicode_normalization::char::decompose_canonical(c, |d| {
+            decomposed.insert(d);
+        });
+    }
+    wanted.extend(&decomposed);
+    wanted.retain(|c| face.glyph_index(*c).is_some());
+    if wanted.is_empty() {
+        return None;
+    }
+    let source =
+        hb_subset::FontFace::new_with_index(hb_subset::Blob::from_bytes(&raw).ok()?, face_index)
+            .ok()?;
+    let mut input = hb_subset::SubsetInput::new().ok()?;
+    // Strip unused CJK GSUB/GPOS layout tables (same as `build_web_cjk_fallback_font`) so the
+    // embedded subset stays ~150-300 KB instead of ~1 MB while keeping every glyph crisp!
+    input
+        .flags()
+        .remove_unrecognized_tables()
+        .retain_legacy_names();
+    input.layout_feature_tag_set().clear();
+    for &c in &wanted {
+        input.unicode_set().insert(c);
+    }
+    let out = input
+        .subset_font(&source)
+        .ok()?
+        .underlying_blob()
+        .to_vec();
+    // Guard against failing subsetting returning the full multi-MB `.ttc`!
+    if out.len() < 12 || out.len() >= raw.len() / 2 {
+        return None;
+    }
+    let _ = fs::create_dir_all(cache_dir);
+    let tmp = cache_file.with_extension(format!("efont.{}.tmp", std::process::id()));
+    if fs::write(&tmp, &out).is_ok() {
+        let _ = fs::rename(&tmp, &cache_file);
+    }
+    let codec = if &out[..4] == b"OTTO" {
+        MediaCodec::Otf
+    } else {
+        MediaCodec::Ttf
+    };
+    Some((out, codec))
 }
 
 /// Discovers a system Pan-CJK OpenType/TrueType font (preferring Noto Sans CJK SC/JP)
@@ -1688,8 +1897,11 @@ mod tests {
         }
         let wav = build_wav(sr, 2, &stereo);
 
-        // 1. Default LAME VBR MP3: should detect dual-mono -> 1 channel, trim silence (~0.34s), write LAME tag!
-        let cfg_mp3 = OptimizeConfig::default();
+        // 1. Explicit LAME VBR MP3: should detect dual-mono -> 1 channel, trim silence (~0.34s), write LAME tag!
+        let cfg_mp3 = OptimizeConfig {
+            audio_codec: AudioCodecMode::Mp3Vbr,
+            ..Default::default()
+        };
         let res_mp3 = optimize_audio(&wav, MediaCodec::Wav, &cfg_mp3, dir.path()).unwrap();
         assert_eq!(res_mp3.codec, MediaCodec::Mp3);
         assert_eq!(res_mp3.channels, 1, "dual-mono should auto-downmix to mono");
@@ -1700,11 +1912,8 @@ mod tests {
         );
         assert!(nir_ir::lame::parse(&res_mp3.bytes).is_some());
 
-        // 2. Opus mode: should produce even smaller Ogg Opus at 48 kHz mono!
-        let cfg_opus = OptimizeConfig {
-            audio_codec: AudioCodecMode::Opus,
-            ..Default::default()
-        };
+        // 2. Default Opus mode: should produce even smaller Ogg Opus at 48 kHz mono!
+        let cfg_opus = OptimizeConfig::default();
         let res_opus = optimize_audio(&wav, MediaCodec::Wav, &cfg_opus, dir.path()).unwrap();
         assert_eq!(res_opus.codec, MediaCodec::Opus);
         assert_eq!(res_opus.channels, 1);

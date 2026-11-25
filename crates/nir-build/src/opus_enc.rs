@@ -52,13 +52,33 @@ fn resample_pcm16_to_48k(samples: &[i16], src_rate: u32, channels: u16) -> Vec<i
 }
 
 /// Encodes interleaved 16-bit PCM (1 or 2 channels, any standard rate) into an RFC 7845 Ogg Opus stream.
-/// Uses `mono_kbps` (default 48) for mono speech and `stereo_kbps` (default 96) for stereo music/SFX.
+/// Uses `mono_kbps` (default 40) for mono speech and `stereo_kbps` (default 96) for stereo music/SFX.
 pub fn encode_ogg_opus(
     samples: &[i16],
     src_rate: u32,
     channels: u16,
     mono_kbps: u16,
     stereo_kbps: u16,
+) -> Result<Vec<u8>> {
+    encode_ogg_opus_with_bias(
+        samples,
+        src_rate,
+        channels,
+        mono_kbps,
+        stereo_kbps,
+        channels >= 2,
+    )
+}
+
+/// Encodes interleaved 16-bit PCM into an RFC 7845 Ogg Opus stream with explicit speech vs music
+/// psychoacoustic signal bias and maximum libopus complexity (`10`) for perceptual transparency.
+pub fn encode_ogg_opus_with_bias(
+    samples: &[i16],
+    src_rate: u32,
+    channels: u16,
+    mono_kbps: u16,
+    stereo_kbps: u16,
+    prefer_music: bool,
 ) -> Result<Vec<u8>> {
     if !(1..=2).contains(&channels) {
         bail!("Opus encoder supports 1 or 2 channels, got {channels}");
@@ -99,13 +119,13 @@ pub fn encode_ogg_opus(
     enc.set_serial_no(OGG_SERIAL)
         .and_then(|e| e.set_comment_padding(0))
         .and_then(|e| e.set_vbr(true))
-        .and_then(|e| e.set_complexity(6))
+        .and_then(|e| e.set_complexity(10))
         .and_then(|e| e.set_application(OpusEncApplication::Audio))
         .and_then(|e| {
-            e.set_signal_bias(if channels == 1 {
-                OpusEncSignalBias::LpcHybrid
-            } else {
+            e.set_signal_bias(if prefer_music {
                 OpusEncSignalBias::MDCT
+            } else {
+                OpusEncSignalBias::LpcHybrid
             })
         })
         .and_then(|e| e.set_bandwidth(OpusEncBandwidth::Fullband20kHz))

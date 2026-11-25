@@ -82,10 +82,10 @@ enum Cmd {
         no_optimize: bool,
         #[arg(long)]
         lossless: bool,
-        #[arg(long, default_value_t = 85)]
+        #[arg(long, default_value_t = 80)]
         webp_quality: u8,
-        /// Audio transcoding profile (`mp3` universal VBR, `opus` extreme 48k/96k)
-        #[arg(long, value_enum, default_value_t = CliAudioCodec::Mp3)]
+        /// Audio transcoding profile (`opus` transparent 40k/96k default, `mp3` legacy VBR)
+        #[arg(long, value_enum, default_value_t = CliAudioCodec::Opus)]
         audio_codec: CliAudioCodec,
         /// Disable 16×16 tile-masked CG/sprite differential compression
         #[arg(long)]
@@ -96,6 +96,9 @@ enum Cmd {
         /// Encode large images as KTX2 BC1/BC3 hardware-compressed GPU textures
         #[arg(long)]
         ktx2: bool,
+        /// Disable auto-embedding a compact game-subset system CJK font when the game bundles no fonts
+        #[arg(long)]
+        no_embed_font: bool,
         #[arg(long)]
         sdk: Option<PathBuf>,
     },
@@ -119,10 +122,10 @@ enum Cmd {
         no_optimize: bool,
         #[arg(long)]
         lossless: bool,
-        #[arg(long, default_value_t = 85)]
+        #[arg(long, default_value_t = 80)]
         webp_quality: u8,
-        /// Audio transcoding profile (`mp3` universal VBR, `opus` extreme 48k/96k)
-        #[arg(long, value_enum, default_value_t = CliAudioCodec::Mp3)]
+        /// Audio transcoding profile (`opus` transparent 40k/96k default, `mp3` legacy VBR)
+        #[arg(long, value_enum, default_value_t = CliAudioCodec::Opus)]
         audio_codec: CliAudioCodec,
         /// Disable 16×16 tile-masked CG/sprite differential compression
         #[arg(long)]
@@ -133,6 +136,9 @@ enum Cmd {
         /// Encode large images as KTX2 BC1/BC3 hardware-compressed GPU textures
         #[arg(long)]
         ktx2: bool,
+        /// Disable auto-embedding a compact game-subset system CJK font when the game bundles no fonts
+        #[arg(long)]
+        no_embed_font: bool,
         /// Also emit editable `.nirs` project files even when direct-to-IR is available
         #[arg(long)]
         emit_nirs: bool,
@@ -204,6 +210,7 @@ fn main() -> Result<()> {
             no_delta,
             no_thumbs,
             ktx2,
+            no_embed_font,
             sdk,
         } => {
             let opt = OptimizeConfig {
@@ -214,6 +221,7 @@ fn main() -> Result<()> {
                 delta_images: !no_delta,
                 gallery_thumbnails: !no_thumbs,
                 ktx2_textures: ktx2,
+                auto_embed_cjk_font: !no_optimize && !no_embed_font,
                 ..Default::default()
             };
             warn_mobile_build_flags(target, &opt);
@@ -233,6 +241,7 @@ fn main() -> Result<()> {
             no_delta,
             no_thumbs,
             ktx2,
+            no_embed_font,
             emit_nirs,
             sdk,
         } => {
@@ -244,6 +253,7 @@ fn main() -> Result<()> {
                 delta_images: !no_delta,
                 gallery_thumbnails: !no_thumbs,
                 ktx2_textures: ktx2,
+                auto_embed_cjk_font: !no_optimize && !no_embed_font,
                 ..Default::default()
             };
             if let Some(t) = build {
@@ -441,11 +451,6 @@ fn warn_mobile_build_flags(target: BuildTarget, opt: &OptimizeConfig) {
     if opt.ktx2_textures && matches!(target, BuildTarget::Android | BuildTarget::Web) {
         eprintln!(
             "warning: --ktx2 encodes desktop BC1/BC3 blocks, which fall back to CPU decode on mobile GPUs (ASTC/ETC2); prefer default WebP for mobile builds."
-        );
-    }
-    if opt.audio_codec == AudioCodecMode::Opus && matches!(target, BuildTarget::Web) {
-        eprintln!(
-            "warning: --audio-codec opus outputs Ogg Opus, which iOS Safari WebAudio does not decode natively; prefer default `--audio-codec mp3` for universal mobile Web compatibility."
         );
     }
 }
