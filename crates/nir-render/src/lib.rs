@@ -81,6 +81,19 @@ struct GpuTexture {
     last_used: u64,
 }
 
+struct PreparedFrame {
+    ran_text_prepare: bool,
+    inline_quad_start: usize,
+    render_from: bool,
+    render_to: bool,
+    tr_from_quad_start: usize,
+    tr_to_quad_start: usize,
+    run_blur: bool,
+    blur_stage_quad_start: usize,
+    blur_pass1_quad: usize,
+    blur_pass2_quad: usize,
+}
+
 pub struct Renderer {
     _instance: wgpu::Instance,
     pub device: wgpu::Device,
@@ -232,6 +245,98 @@ pub fn decode_image(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         premultiply_rgba(&mut pixels);
     }
     Ok((w, h, pixels))
+}
+
+/// Center-crops an RGBA8 image to `target_w:target_h` (with slight upper bias when cropping height
+/// so character faces stay nicely framed), resizes, and encodes compact WebP (q=72) for save thumbnails.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encode_thumbnail_webp(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 || target_w == 0 || target_h == 0 {
+        return Err(rerr("thumbnail dimensions must be non-zero"));
+    }
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or_else(|| rerr("thumbnail RGBA buffer length mismatch"))?;
+    let target_ar = target_w as f32 / target_h as f32;
+    let src_ar = width as f32 / height as f32;
+    let (cx, cy, cw, ch) = if src_ar > target_ar {
+        let cw = ((height as f32 * target_ar).round() as u32).clamp(1, width);
+        let cx = (width - cw) / 2;
+        (cx, 0, cw, height)
+    } else if src_ar < target_ar {
+        let ch = ((width as f32 / target_ar).round() as u32).clamp(1, height);
+        // Upper bias keeps character faces visible in 16:9 thumbnails.
+        let cy = (((height - ch) as f32 * 0.35).round() as u32).min(height - ch);
+        (0, cy, width, ch)
+    } else {
+        (0, 0, width, height)
+    };
+    let cropped = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
+    let resized =
+        image::imageops::resize(&cropped, target_w, target_h, image::imageops::FilterType::Triangle);
+    let encoded = webp::Encoder::from_rgba(resized.as_raw(), target_w, target_h).encode(72.0);
+    Ok(encoded.to_vec())
+}
+
+/// Encodes an RGBA8 image as lossless PNG (used for borderless full-res screenshots).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    use image::ImageEncoder;
+    if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err(rerr("png RGBA buffer dimension mismatch"));
+    }
+    let mut out = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut out);
+    encoder
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| rerr(format!("png encode: {e}")))?;
+    Ok(out)
+}
+
+/// Converts a premultiplied RGBA8 image into a square straight-alpha RGBA8 window icon.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resize_rgba_icon(
+    premultiplied_rgba: &[u8],
+    width: u32,
+    height: u32,
+    icon_size: u32,
+) -> Result<Vec<u8>> {
+    if width == 0
+        || height == 0
+        || icon_size == 0
+        || premultiplied_rgba.len() != (width as usize) * (height as usize) * 4
+    {
+        return Err(rerr("icon RGBA buffer dimension mismatch"));
+    }
+    let mut straight = premultiplied_rgba.to_vec();
+    for px in straight.as_chunks_mut::<4>().0 {
+        let a = px[3];
+        if a > 0 && a < 255 {
+            let af = a as f32 / 255.0;
+            for c in &mut px[..3] {
+                let lin = linear(*c as f32 / 255.0) / af;
+                *c = (srgb(lin.min(1.0)) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let img = image::RgbaImage::from_raw(width, height, straight)
+        .ok_or_else(|| rerr("icon image buffer error"))?;
+    let side = width.min(height);
+    let cx = (width - side) / 2;
+    let cy = ((height - side) as f32 * 0.35).round() as u32;
+    let cropped = image::imageops::crop_imm(&img, cx, cy.min(height - side), side, side).to_image();
+    let resized = image::imageops::resize(
+        &cropped,
+        icon_size,
+        icon_size,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok(resized.into_raw())
 }
 
 /// Composites a decoded premultiplied RGBA8 differential patch onto a premultiplied RGBA8 base.
@@ -1684,6 +1789,157 @@ impl Renderer {
         if self.surface.is_none() {
             return Ok(());
         }
+        let prepared = self.prepare_render_passes(p, dpr)?;
+
+        // Acquire swapchain frame
+        let surface = self.surface.as_mut().unwrap();
+        let frame = match surface.get_current_texture() {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                surface.configure(&self.device, &self.config);
+                match surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+                    Err(e) => return Err(rerr(e.to_string())),
+                }
+            }
+            Err(e) => return Err(rerr(e.to_string())),
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.format),
+            ..Default::default()
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nir_frame"),
+            });
+        self.encode_passes(&mut encoder, &view, p, &prepared)?;
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        self.submitted += 1;
+        if prepared.ran_text_prepare && self.text_prepares.is_multiple_of(ATLAS_TRIM_INTERVAL) {
+            self.atlas.trim();
+        }
+        Ok(())
+    }
+
+    /// Renders `p` offscreen and reads back the cropped `stage_rect` region as canonical sRGB RGBA8
+    /// (zero letterbox bars!). Used strictly on-demand for save thumbnails and `KeyP` screenshots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_stage_rgba(&mut self, p: &DrawPacket, dpr: f32) -> Result<(u32, u32, Vec<u8>)> {
+        let w = self.config.width.max(1);
+        let h = self.config.height.max(1);
+        let prepared = self.prepare_render_passes(p, dpr)?;
+
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("stage_capture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nir_capture"),
+            });
+        self.encode_passes(&mut encoder, &view, p, &prepared)?;
+
+        // Compute cropped physical `stage_rect` bounds (fallback to full viewport if degenerate).
+        let (sx, sy, sw, sh) = if p.stage_rect[2] > 16.0 && p.stage_rect[3] > 16.0 {
+            let x = ((p.stage_rect[0] * dpr).round().max(0.0) as u32).min(w.saturating_sub(1));
+            let y = ((p.stage_rect[1] * dpr).round().max(0.0) as u32).min(h.saturating_sub(1));
+            let cw = ((p.stage_rect[2] * dpr).round().max(1.0) as u32).min(w - x);
+            let ch = ((p.stage_rect[3] * dpr).round().max(1.0) as u32).min(h - y);
+            (x, y, cw.max(1), ch.max(1))
+        } else {
+            (0, 0, w, h)
+        };
+
+        let unpadded_bpr = sw * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
+        let buf_size = (padded_bpr as u64) * (sh as u64);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stage_capture_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: sx, y: sy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(sh),
+                },
+            },
+            wgpu::Extent3d {
+                width: sw,
+                height: sh,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        rx.recv()
+            .map_err(|_| rerr("capture readback channel closed"))?
+            .map_err(|e| rerr(format!("capture map_async: {e}")))?;
+
+        let mapped = slice.get_mapped_range();
+        let is_bgra = matches!(
+            self.format,
+            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
+        );
+        let mut out = vec![0u8; (sw as usize) * (sh as usize) * 4];
+        for row in 0..sh as usize {
+            let src_off = row * padded_bpr as usize;
+            let dst_off = row * unpadded_bpr as usize;
+            let src = &mapped[src_off..src_off + unpadded_bpr as usize];
+            let dst = &mut out[dst_off..dst_off + unpadded_bpr as usize];
+            if is_bgra {
+                for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = 255;
+                }
+            } else {
+                dst.copy_from_slice(src);
+                for d in dst.as_chunks_mut::<4>().0 {
+                    d[3] = 255;
+                }
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok((sw, sh, out))
+    }
+
+    fn prepare_render_passes(&mut self, p: &DrawPacket, dpr: f32) -> Result<PreparedFrame> {
         let has_transition = !p.transition_from.is_empty() || !p.transition_to.is_empty();
         if !has_transition {
             // Keep `self.scratch` GPU textures pooled across transitions; only clear cache signatures!
@@ -2122,37 +2378,41 @@ impl Renderer {
             }
         }
 
-        // 3. Acquire swapchain frame
-        let surface = self.surface.as_mut().unwrap();
-        let frame = match surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                surface.configure(&self.device, &self.config);
-                match surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-                    Err(e) => return Err(rerr(e.to_string())),
-                }
-            }
-            Err(e) => return Err(rerr(e.to_string())),
+        self.cached_inline_quads = inline_quads;
+        Ok(PreparedFrame {
+            ran_text_prepare,
+            inline_quad_start,
+            render_from,
+            render_to,
+            tr_from_quad_start,
+            tr_to_quad_start,
+            run_blur,
+            blur_stage_quad_start,
+            blur_pass1_quad,
+            blur_pass2_quad,
+        })
+    }
+
+    fn encode_passes(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        p: &DrawPacket,
+        prep: &PreparedFrame,
+    ) -> Result<()> {
+        let [s0, s1] = p.stage_quad_range;
+        let stage_slice = if s0 < s1 && s1 <= p.quads.len() {
+            &p.quads[s0..s1]
+        } else {
+            &[][..]
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.format),
-            ..Default::default()
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("nir_frame"),
-            });
 
         // 4. Optional offscreen render passes for stage transition (only when side changed!)
-        if render_from || render_to {
+        if prep.render_from || prep.render_to {
             if let Some((src, dst, sw, sh)) = &self.scratch {
                 for (need, target, quads, qstart) in [
-                    (render_from, src, &p.transition_from, tr_from_quad_start),
-                    (render_to, dst, &p.transition_to, tr_to_quad_start),
+                    (prep.render_from, src, &p.transition_from, prep.tr_from_quad_start),
+                    (prep.render_to, dst, &p.transition_to, prep.tr_to_quad_start),
                 ] {
                     if !need {
                         continue;
@@ -2186,7 +2446,7 @@ impl Renderer {
         }
 
         // 4b. Optional 1/8-res 2-Pass Kawase Blur of pure stage (cached across static frames!)
-        if run_blur {
+        if prep.run_blur {
             if let Some((blur_a, blur_b, bw, bh)) = &self.blur_pair {
                 // Step 0: Downsample pure stage quads into `blur_a`
                 {
@@ -2212,7 +2472,7 @@ impl Renderer {
                     self.paint_quads(
                         &mut pass,
                         stage_slice,
-                        blur_stage_quad_start,
+                        prep.blur_stage_quad_start,
                         [p.stage_rect[0], p.stage_rect[1]],
                         p.stage_rect[2],
                         p.stage_rect[3],
@@ -2222,8 +2482,8 @@ impl Renderer {
                 }
                 // Step 1: Kawase blur pass 1 (blur_a -> blur_b)
                 for (src_tex, dst_tex, qidx) in [
-                    (blur_a, blur_b, blur_pass1_quad),
-                    (blur_b, blur_a, blur_pass2_quad),
+                    (blur_a, blur_b, prep.blur_pass1_quad),
+                    (blur_b, blur_a, prep.blur_pass2_quad),
                 ] {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("kawase_blur_pass"),
@@ -2249,12 +2509,12 @@ impl Renderer {
             }
         }
 
-        // 5. Main swapchain pass
+        // 5. Main target pass
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2272,11 +2532,11 @@ impl Renderer {
             });
             let phys = [self.config.width, self.config.height];
             self.paint_quads(&mut pass, &p.quads, 0, [0.0, 0.0], p.width, p.height, phys, p);
-            if !inline_quads.is_empty() {
+            if !self.cached_inline_quads.is_empty() {
                 self.paint_quads(
                     &mut pass,
-                    &inline_quads,
-                    inline_quad_start,
+                    &self.cached_inline_quads,
+                    prep.inline_quad_start,
                     [0.0, 0.0],
                     p.width,
                     p.height,
@@ -2288,14 +2548,6 @@ impl Renderer {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| rerr(e.to_string()))?;
-        }
-
-        self.cached_inline_quads = inline_quads;
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        self.submitted += 1;
-        if ran_text_prepare && self.text_prepares.is_multiple_of(ATLAS_TRIM_INTERVAL) {
-            self.atlas.trim();
         }
         Ok(())
     }
@@ -2599,6 +2851,27 @@ mod tests {
         let rgba = decode_ktx2_to_rgba_premultiplied(&parsed).unwrap();
         assert_eq!(rgba.len(), 4 * 4 * 4);
         assert!(rgba[0] > 240 && rgba[1] < 10 && rgba[2] < 10 && rgba[3] == 255);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn thumbnail_webp_png_and_icon_helpers_work() {
+        let mut rgba = vec![0u8; 64 * 48 * 4];
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[90, 150, 230, 255]);
+        }
+        let webp = encode_thumbnail_webp(&rgba, 64, 48, 160, 90).unwrap();
+        assert!(webp.len() > 12 && &webp[0..4] == b"RIFF" && &webp[8..12] == b"WEBP");
+        let (tw, th, _) = decode_image(&webp).unwrap();
+        assert_eq!((tw, th), (160, 90));
+
+        let png = encode_png_rgba(&rgba, 64, 48).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let (pw, ph, _) = decode_image(&png).unwrap();
+        assert_eq!((pw, ph), (64, 48));
+
+        let icon = resize_rgba_icon(&rgba, 64, 48, 32).unwrap();
+        assert_eq!(icon.len(), 32 * 32 * 4);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

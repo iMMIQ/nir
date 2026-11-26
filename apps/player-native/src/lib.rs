@@ -5,15 +5,20 @@
 //! streaming/LRU background `rodio`/`symphonia` audio + async indexed local saves.
 
 pub mod audio;
+pub mod desktop;
+pub mod gamepad;
+pub mod linux_dbus;
 pub mod pak;
 pub mod storage;
 
 use anyhow::{Context, Result};
 use audio::AudioHost;
+use gamepad::{GamepadEvent, GamepadHost};
+use linux_dbus::{LinuxDbusHost, MediaKeyAction};
 use nir_ir::{AssetId, AssetKind, MediaCodec, UiAction, FEATURE_DELTA_IMAGE};
 use nir_render::{
-    composite_delta_rgba, decode_image, parse_ktx2_level0, wgpu, DecodedKtx2, Renderer,
-    RendererBackend,
+    composite_delta_rgba, decode_image, encode_png_rgba, parse_ktx2_level0, resize_rgba_icon, wgpu,
+    DecodedKtx2, Renderer, RendererBackend,
 };
 use nir_runtime::{HostCommand, Runtime};
 use pak::PakArchive;
@@ -27,11 +32,26 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Window, WindowId};
+
+/// Hide idle cursor after 3.2s during quiet story reading (matches Web player cinema fade!).
+const IDLE_CURSOR_HIDE_DELAY: Duration = Duration::from_millis(3200);
+/// Poll Linux sysfs battery status every 60s when active (zero overhead).
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Optional desktop launch settings passed from `main.rs` CLI arguments.
+#[derive(Debug, Clone, Default)]
+pub struct DesktopOptions {
+    pub watch_hot_reload: bool,
+    pub resume_latest: bool,
+    pub patches: Vec<(String, PathBuf)>,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
     ImageDecoded,
+    GamepadInput,
+    MediaKey,
 }
 
 enum DecodedImage {
@@ -333,6 +353,17 @@ impl Drop for DecodePool {
 
 /// Runs the unified native player on Desktop (Windows / Linux / macOS).
 pub fn run_desktop(pak_path: &Path, watch_hot_reload: bool) -> Result<()> {
+    run_desktop_with_options(
+        pak_path,
+        DesktopOptions {
+            watch_hot_reload,
+            ..Default::default()
+        },
+    )
+}
+
+/// Runs the unified native player on Desktop with CLI options (`--watch`, `--resume`, `--patch`).
+pub fn run_desktop_with_options(pak_path: &Path, opts: DesktopOptions) -> Result<()> {
     let pak = Arc::new(PakArchive::open_file(pak_path)?);
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -340,7 +371,7 @@ pub fn run_desktop(pak_path: &Path, watch_hot_reload: bool) -> Result<()> {
     run_with_event_loop(
         pak,
         None,
-        watch_hot_reload,
+        opts,
         event_loop,
         #[cfg(target_os = "android")]
         None,
@@ -379,7 +410,13 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
         .with_android_app(android_app)
         .build()
         .context("creating Android event loop")?;
-    run_with_event_loop(pak, data_dir, false, event_loop, Some(app_handle))
+    run_with_event_loop(
+        pak,
+        data_dir,
+        DesktopOptions::default(),
+        event_loop,
+        Some(app_handle),
+    )
 }
 
 /// Returns the host's local UTC offset in minutes (e.g. `+480` for UTC+8) so save timestamps
@@ -461,14 +498,60 @@ fn create_native_renderer(
     anyhow::bail!("{primary_err}")
 }
 
+fn load_patch_dir(runtime: &mut Runtime, dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut loaded = 0usize;
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Some(locale) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(n) = runtime.load_translation_patch(locale, &text) {
+                loaded += n;
+            }
+        }
+    }
+    loaded
+}
+
+fn load_startup_patches(
+    runtime: &mut Runtime,
+    pak: &PakArchive,
+    storage: &LocalStorage,
+    cli_patches: &[(String, PathBuf)],
+) {
+    if let Some(pak_dir) = pak.source_path().and_then(Path::parent) {
+        let _ = load_patch_dir(runtime, &pak_dir.join("patches"));
+    }
+    let _ = load_patch_dir(runtime, &storage.patches_dir());
+    for (locale, path) in cli_patches {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let _ = runtime.load_translation_patch(locale, &text);
+        }
+    }
+}
+
 fn run_with_event_loop(
     pak: Arc<PakArchive>,
     storage_base: Option<PathBuf>,
-    watch_hot_reload: bool,
+    opts: DesktopOptions,
     event_loop: EventLoop<UserEvent>,
     #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
 ) -> Result<()> {
-    let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base)?;
+    let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base.clone())?;
     let prefs = storage.load_preferences();
     let profile = storage.load_profile();
     let slots = storage.list_slot_summaries(pak.program.meta.save_slots);
@@ -479,47 +562,83 @@ fn run_with_event_loop(
     runtime.set_tz_offset_mins(local_tz_offset_mins());
     runtime.set_autosave_summary(storage.named_summary("autosave", u32::MAX));
     runtime.set_quicksave_summary(storage.named_summary("quicksave", u32::MAX - 1));
+    load_startup_patches(&mut runtime, &pak, &storage, &opts.patches);
     if cfg!(target_os = "android") {
         runtime.set_input_mode(nir_ui::InputMode::Touch);
+    } else {
+        runtime.set_low_power_hint(desktop::read_low_battery_hint());
+    }
+    if opts.resume_latest {
+        let _ = runtime.try_resume_latest();
+    }
+    if storage.is_concurrent_instance() {
+        runtime.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
     }
 
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
     let decode_pool = DecodePool::spawn(res_tx, event_loop.create_proxy());
+    let gp_proxy = event_loop.create_proxy();
+    let gamepad = GamepadHost::spawn(move || {
+        let _ = gp_proxy.send_event(UserEvent::GamepadInput);
+    });
+    let dbus_proxy = event_loop.create_proxy();
+    let dbus = LinuxDbusHost::spawn(pak.program.meta.title.clone(), move || {
+        let _ = dbus_proxy.send_event(UserEvent::MediaKey);
+    });
 
     let delta_bases = collect_delta_bases(&pak);
+    let now = Instant::now();
     let mut app = NativeApp {
         pak,
         delta_bases,
         runtime,
         storage,
+        storage_base,
         audio,
+        gamepad,
+        dbus,
         window: None,
         instance: wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
         renderer: None,
         decode_pool,
         res_rx,
         pending_decodes: BTreeMap::new(),
-        last_frame: Instant::now(),
-        last_reload_check: Instant::now(),
+        last_frame: now,
+        last_reload_check: now,
+        last_battery_check: now,
+        last_cursor_activity: now,
         last_back_press: None,
         next_wakeup_at: None,
         was_idle_sleeping: false,
-        watch_hot_reload,
+        watch_hot_reload: opts.watch_hot_reload,
         cursor_logical: [0.0, 0.0],
         left_mouse_down: false,
+        shift_held: false,
+        ctrl_held: false,
+        cursor_hidden: false,
+        icon_applied: false,
+        prev_story_reading: false,
+        clean_story_thumb: None,
+        clean_story_thumb_epoch: u64::MAX,
+        thumbs_uploaded: false,
+        auto_copy_hook: false,
+        last_dialogue_epoch: u64::MAX,
+        last_mpris_auto: false,
         scale_factor: 1.0,
         window_size: [1280, 720],
         should_quit: false,
         init_error: None,
+        #[cfg(not(target_os = "android"))]
+        clipboard: desktop::DesktopClipboard::new(),
+        #[cfg(not(target_os = "android"))]
+        video: desktop::DesktopVideoPlayer::new(),
         #[cfg(target_os = "android")]
         android_app,
         #[cfg(target_os = "android")]
         keep_screen_on: false,
     };
     event_loop.run_app(&mut app).context("winit event loop")?;
-    app.runtime.flush_pending_saves();
-    app.process_commands();
-    app.storage.flush();
+    app.save_and_flush_on_exit();
     if let Some(err) = app.init_error.take() {
         return Err(err);
     }
@@ -531,7 +650,10 @@ struct NativeApp {
     delta_bases: Arc<HashSet<AssetId>>,
     runtime: Runtime,
     storage: LocalStorage,
+    storage_base: Option<PathBuf>,
     audio: AudioHost,
+    gamepad: GamepadHost,
+    dbus: LinuxDbusHost,
     window: Option<Arc<Window>>,
     instance: wgpu::Instance,
     renderer: Option<Renderer>,
@@ -541,16 +663,33 @@ struct NativeApp {
     pending_decodes: BTreeMap<AssetId, bool>,
     last_frame: Instant,
     last_reload_check: Instant,
+    last_battery_check: Instant,
+    last_cursor_activity: Instant,
     last_back_press: Option<Instant>,
     next_wakeup_at: Option<Instant>,
     was_idle_sleeping: bool,
     watch_hot_reload: bool,
     cursor_logical: [f32; 2],
     left_mouse_down: bool,
+    shift_held: bool,
+    ctrl_held: bool,
+    cursor_hidden: bool,
+    icon_applied: bool,
+    prev_story_reading: bool,
+    clean_story_thumb: Option<String>,
+    clean_story_thumb_epoch: u64,
+    thumbs_uploaded: bool,
+    auto_copy_hook: bool,
+    last_dialogue_epoch: u64,
+    last_mpris_auto: bool,
     scale_factor: f32,
     window_size: [u32; 2],
     should_quit: bool,
     init_error: Option<anyhow::Error>,
+    #[cfg(not(target_os = "android"))]
+    clipboard: desktop::DesktopClipboard,
+    #[cfg(not(target_os = "android"))]
+    video: desktop::DesktopVideoPlayer,
     #[cfg(target_os = "android")]
     android_app: Option<android_activity::AndroidApp>,
     #[cfg(target_os = "android")]
@@ -578,9 +717,10 @@ impl NativeApp {
     }
 
     fn sync_wake_lock(&mut self) {
+        let want = self.runtime.is_auto_or_skip_active();
+        self.dbus.set_inhibit(want);
         #[cfg(target_os = "android")]
         if let Some(app) = &self.android_app {
-            let want = self.runtime.is_auto_or_skip_active();
             if want != self.keep_screen_on {
                 self.keep_screen_on = want;
                 use android_activity::WindowManagerFlags;
@@ -599,7 +739,393 @@ impl NativeApp {
         }
     }
 
+    fn drain_gamepad_and_media_events(&mut self) -> bool {
+        let mut any = false;
+        while let Some(ev) = self.gamepad.try_recv() {
+            any = true;
+            match ev {
+                GamepadEvent::Connected(name) => {
+                    let short: String = name.chars().take(28).collect();
+                    self.runtime
+                        .show_toast(format!("已连接手柄：{short}"), 2400);
+                }
+                GamepadEvent::Disconnected => {
+                    self.runtime.show_toast("手柄已断开", 1800);
+                }
+                GamepadEvent::Advance => {
+                    #[cfg(not(target_os = "android"))]
+                    if self.video.is_playing() {
+                        if self.video.is_skippable() {
+                            self.video.stop();
+                            self.audio.set_host_paused(false);
+                            self.runtime.notify_video_finished();
+                        }
+                        continue;
+                    }
+                    self.runtime.dispatch(UiAction::Advance);
+                }
+                GamepadEvent::CancelOrMenu => self.handle_back_action(),
+                GamepadEvent::OpenHistory => self.runtime.dispatch(UiAction::OpenHistory),
+                GamepadEvent::ToggleHideUi => self.runtime.dispatch(UiAction::ToggleHideUi),
+                GamepadEvent::ScrollUp => self.runtime.scroll_wheel(-1.0),
+                GamepadEvent::ScrollDown => self.runtime.scroll_wheel(1.0),
+                GamepadEvent::ToggleAuto => self.runtime.dispatch(UiAction::ToggleAuto),
+                GamepadEvent::QuickSave => self.runtime.dispatch(UiAction::QuickSave),
+                GamepadEvent::HoldSkip(down) => self.runtime.dispatch(UiAction::HoldSkip(down)),
+            }
+        }
+        while let Some(key) = self.dbus.try_recv_media_key() {
+            any = true;
+            match key {
+                MediaKeyAction::ToggleAuto => self.runtime.dispatch(UiAction::ToggleAuto),
+                MediaKeyAction::Advance => self.runtime.dispatch(UiAction::Advance),
+                MediaKeyAction::Rollback => self.runtime.dispatch(UiAction::Rollback),
+            }
+        }
+        any
+    }
+
+    fn sync_mpris_metadata(&mut self) {
+        let (speaker, text) = self
+            .runtime
+            .current_dialogue_info()
+            .map(|(_, s, t)| (s.to_owned(), t.trim().to_owned()))
+            .unwrap_or_default();
+        self.dbus.update_metadata(
+            &self.pak.program.meta.title,
+            &speaker,
+            &text,
+            self.runtime.auto,
+        );
+        self.last_mpris_auto = self.runtime.auto;
+    }
+
+    fn wake_cursor(&mut self) {
+        self.last_cursor_activity = Instant::now();
+        if self.cursor_hidden {
+            self.cursor_hidden = false;
+            if let Some(win) = &self.window {
+                win.set_cursor_visible(true);
+            }
+        }
+    }
+
+    fn update_idle_cursor(&mut self, now: Instant) {
+        if cfg!(target_os = "android") {
+            return;
+        }
+        let allow_hide = self.runtime.is_story_reading()
+            && !self.runtime.has_hovered_hit()
+            && !self.left_mouse_down;
+        if !allow_hide {
+            if self.cursor_hidden {
+                self.cursor_hidden = false;
+                if let Some(win) = &self.window {
+                    win.set_cursor_visible(true);
+                }
+            }
+            return;
+        }
+        if !self.cursor_hidden
+            && now.saturating_duration_since(self.last_cursor_activity) >= IDLE_CURSOR_HIDE_DELAY
+        {
+            self.cursor_hidden = true;
+            if let Some(win) = &self.window {
+                win.set_cursor_visible(false);
+            }
+        }
+    }
+
+    fn idle_cursor_wakeup_us(&self, now: Instant) -> Option<u64> {
+        if cfg!(target_os = "android")
+            || self.cursor_hidden
+            || !self.runtime.is_story_reading()
+            || self.runtime.has_hovered_hit()
+            || self.left_mouse_down
+        {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(self.last_cursor_activity);
+        let rem = IDLE_CURSOR_HIDE_DELAY.saturating_sub(elapsed);
+        Some(rem.as_micros().max(16_000) as u64)
+    }
+
+    fn capture_stage_thumb(&mut self) -> Option<String> {
+        let renderer = self.renderer.as_mut()?;
+        let packet = self.runtime.last_packet();
+        if packet.quads.is_empty() {
+            return None;
+        }
+        let (w, h, rgba) = renderer
+            .capture_stage_rgba(packet, self.scale_factor)
+            .ok()?;
+        desktop::encode_thumb_data_url(&rgba, w, h)
+    }
+
+    fn upload_thumb_data_url(&mut self, key: &str, data_url: &str) {
+        let Some((w, h, rgba)) = desktop::decode_thumb_data_url(data_url) else {
+            return;
+        };
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        if key == "autosave" {
+            let id = nir_ui::AUTOSAVE_THUMB_ASSET_ID;
+            if renderer.upload_rgba_premultiplied(id, w, h, &rgba).is_ok() {
+                self.runtime.mark_autosave_has_thumb(true);
+                self.runtime.mark_asset_loaded(id);
+            }
+        } else if key == "quicksave" {
+            let id = nir_ui::QUICKSAVE_THUMB_ASSET_ID;
+            if renderer.upload_rgba_premultiplied(id, w, h, &rgba).is_ok() {
+                self.runtime.mark_quicksave_has_thumb(true);
+                self.runtime.mark_asset_loaded(id);
+            }
+        } else if let Some(slot_str) = key.strip_prefix("slot_") {
+            if let Ok(slot) = slot_str.parse::<u32>() {
+                let id = AssetId(nir_ui::SAVE_THUMB_ASSET_BASE + slot);
+                if renderer.upload_rgba_premultiplied(id, w, h, &rgba).is_ok() {
+                    self.runtime.mark_slot_has_thumb(slot, true);
+                    self.runtime.mark_asset_loaded(id);
+                }
+            }
+        }
+    }
+
+    fn ensure_thumbs_uploaded(&mut self) {
+        if self.thumbs_uploaded {
+            return;
+        }
+        self.thumbs_uploaded = true;
+        let thumbs = self
+            .storage
+            .collect_all_thumbnails(self.pak.program.meta.save_slots);
+        for (key, url) in thumbs {
+            self.upload_thumb_data_url(&key, &url);
+        }
+    }
+
+    fn save_and_flush_on_exit(&mut self) {
+        #[cfg(not(target_os = "android"))]
+        self.video.stop();
+        if self.runtime.is_story_reading() && self.clean_story_thumb.is_none() {
+            if let Some(t) = self.capture_stage_thumb() {
+                self.clean_story_thumb = Some(t);
+            }
+        }
+        self.runtime.emit_autosave();
+        self.runtime.flush_pending_saves();
+        self.process_commands();
+        self.storage.flush();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn copy_current_dialogue(&mut self, explicit_toast: bool) {
+        let text = self
+            .runtime
+            .current_dialogue_info()
+            .map(|(_, _, t)| t.trim().to_owned())
+            .unwrap_or_default();
+        if text.is_empty() {
+            if explicit_toast {
+                self.runtime.show_toast("当前无台词可复制", 1800);
+            }
+            return;
+        }
+        if self.clipboard.copy_text(&text) {
+            if explicit_toast {
+                self.runtime.show_toast("已复制当前台词", 1600);
+            }
+        } else if explicit_toast {
+            self.runtime.show_toast("剪贴板不可用", 2200);
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn toggle_auto_copy_hook(&mut self) {
+        self.auto_copy_hook = !self.auto_copy_hook;
+        let msg = if self.auto_copy_hook {
+            "已开启台词自动复制 (Texthooker)"
+        } else {
+            "已关闭台词自动复制"
+        };
+        self.runtime.show_toast(msg, 2200);
+        if self.auto_copy_hook {
+            self.copy_current_dialogue(false);
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn capture_and_save_screenshot(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let packet = self.runtime.last_packet();
+        let Ok((w, h, rgba)) = renderer.capture_stage_rgba(packet, self.scale_factor) else {
+            self.runtime.show_toast("截图失败", 2400);
+            return;
+        };
+        let dir = self.storage.screenshots_dir();
+        let stem = desktop::safe_filename_stem(&self.pak.program.meta.title);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let filename = format!("{stem}-{stamp}.png");
+        let path = dir.join(&filename);
+        let _ = std::thread::Builder::new()
+            .name("nir-screenshot".into())
+            .spawn(move || {
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    if let Ok(png) = encode_png_rgba(&rgba, w, h) {
+                        let _ = std::fs::write(&path, png);
+                    }
+                }
+            });
+        self.runtime
+            .show_toast(format!("已保存无黑边截图：{filename}"), 2400);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "json" {
+            let locale = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("en")
+                .to_owned();
+            match std::fs::read_to_string(&path) {
+                Ok(text) => match self.runtime.load_translation_patch(&locale, &text) {
+                    Ok(count) => {
+                        self.runtime
+                            .show_toast(format!("已加载翻译补丁 [{locale}]：{count} 条"), 2800);
+                    }
+                    Err(e) => {
+                        self.runtime
+                            .show_toast(format!("翻译补丁解析失败：{e}"), 3200);
+                    }
+                },
+                Err(e) => {
+                    self.runtime
+                        .show_toast(format!("无法读取补丁文件：{e}"), 3200);
+                }
+            }
+            return;
+        }
+        if ext == "nirpak" {
+            self.switch_pak_file(&path);
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn switch_pak_file(&mut self, path: &Path) {
+        let new_pak = match PakArchive::open_file(path) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                self.runtime
+                    .show_toast(format!("无法打开 .nirpak：{e}"), 3500);
+                return;
+            }
+        };
+        let new_storage =
+            match LocalStorage::open(&new_pak.program.meta.game_id, self.storage_base.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.runtime
+                        .show_toast(format!("无法初始化存档目录：{e}"), 3500);
+                    return;
+                }
+            };
+
+        // Persist current game before switching
+        self.save_and_flush_on_exit();
+
+        let prefs = new_storage.load_preferences();
+        let profile = new_storage.load_profile();
+        let slots = new_storage.list_slot_summaries(new_pak.program.meta.save_slots);
+        let mut new_rt = match Runtime::new(new_pak.program.clone(), prefs.clone(), profile, slots)
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                self.runtime.show_toast(format!("无法启动作品：{e}"), 3500);
+                return;
+            }
+        };
+        new_rt.set_tz_offset_mins(local_tz_offset_mins());
+        new_rt.set_autosave_summary(new_storage.named_summary("autosave", u32::MAX));
+        new_rt.set_quicksave_summary(new_storage.named_summary("quicksave", u32::MAX - 1));
+        load_startup_patches(&mut new_rt, &new_pak, &new_storage, &[]);
+        new_rt.set_low_power_hint(desktop::read_low_battery_hint());
+        if new_storage.is_concurrent_instance() {
+            new_rt.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
+        } else {
+            new_rt.show_toast(format!("已切换作品：{}", new_pak.program.meta.title), 2600);
+        }
+
+        self.audio.apply_preferences(&prefs);
+        self.audio.clear_cache();
+        self.pending_decodes.clear();
+        self.decode_pool.clear_pending();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.clear_textures();
+        }
+        self.delta_bases = collect_delta_bases(&new_pak);
+        self.pak = new_pak;
+        self.storage = new_storage;
+        self.runtime = new_rt;
+        self.icon_applied = false;
+        self.prev_story_reading = false;
+        self.clean_story_thumb = None;
+        self.clean_story_thumb_epoch = u64::MAX;
+        self.thumbs_uploaded = false;
+        self.last_dialogue_epoch = u64::MAX;
+        if let Some(win) = &self.window {
+            win.set_title(&self.pak.program.meta.title);
+        }
+        self.upload_all_fonts();
+        self.process_commands();
+    }
+
+    fn maybe_apply_window_icon(&mut self, id: AssetId, width: u32, height: u32, rgba: &[u8]) {
+        if self.icon_applied || cfg!(target_os = "android") {
+            return;
+        }
+        let title_bg = self
+            .pak
+            .program
+            .ui
+            .title_screen
+            .as_ref()
+            .and_then(|s| s.background)
+            .or(self.pak.program.meta.title_bg);
+        if title_bg != Some(id) {
+            return;
+        }
+        if let Some(win) = &self.window {
+            if let Ok(icon_rgba) = resize_rgba_icon(rgba, width, height, 64) {
+                if let Ok(icon) = Icon::from_rgba(icon_rgba, 64, 64) {
+                    win.set_window_icon(Some(icon));
+                    self.icon_applied = true;
+                }
+            }
+        }
+    }
+
     fn handle_back_action(&mut self) {
+        #[cfg(not(target_os = "android"))]
+        if self.video.is_playing() {
+            if self.video.is_skippable() {
+                self.video.stop();
+                self.audio.set_host_paused(false);
+                self.runtime.notify_video_finished();
+            }
+            return;
+        }
         if self.runtime.screen == nir_ui::Screen::Title && cfg!(target_os = "android") {
             let now = Instant::now();
             if self
@@ -660,6 +1186,7 @@ impl NativeApp {
                     if self.runtime.wants_style_sample(id) {
                         self.runtime.analyze_asset_rgba(id, width, height, &rgba);
                     }
+                    self.maybe_apply_window_icon(id, width, height, &rgba);
                     if let Some(renderer) = &mut self.renderer {
                         let _ = renderer.upload_rgba_premultiplied(id, width, height, &rgba);
                         let evicted = renderer.take_evicted_assets();
@@ -691,6 +1218,27 @@ impl NativeApp {
 
     fn process_commands(&mut self) {
         let cmds = self.runtime.take_commands();
+        let has_save_cmd = cmds.iter().any(|c| {
+            matches!(
+                c,
+                HostCommand::SaveSlot { .. }
+                    | HostCommand::SaveAuto { .. }
+                    | HostCommand::SaveQuick { .. }
+            )
+        });
+        let captured_thumb = if has_save_cmd {
+            if self.runtime.is_story_reading() {
+                self.capture_stage_thumb()
+                    .or_else(|| self.clean_story_thumb.clone())
+            } else {
+                self.clean_story_thumb
+                    .clone()
+                    .or_else(|| self.capture_stage_thumb())
+            }
+        } else {
+            None
+        };
+
         for cmd in cmds {
             match cmd {
                 HostCommand::LoadAsset { id, urgent } => {
@@ -788,14 +1336,56 @@ impl NativeApp {
                 HostCommand::PauseAudioBus { bus, paused } => {
                     self.audio.set_bus_paused(bus, paused);
                 }
-                HostCommand::PlayVideo { .. } => {
-                    // Lightweight fallback notice when no video decoder plugin is bound.
-                    self.runtime.notify_video_finished();
+                HostCommand::PlayVideo { asset, skippable } => {
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let played = if let (Some(meta), Some(bytes)) =
+                            (self.pak.program.asset(asset), self.pak.asset_bytes(asset))
+                        {
+                            self.video.play(
+                                bytes,
+                                meta.codec.ext(),
+                                &self.pak.program.meta.title,
+                                skippable,
+                            )
+                        } else {
+                            Err("video asset missing from nirpak".into())
+                        };
+                        match played {
+                            Ok(()) => {
+                                self.audio.set_host_paused(true);
+                            }
+                            Err(_) => {
+                                self.runtime.show_toast(
+                                    "未检测到系统播放器 (mpv/ffplay)，已跳过影片",
+                                    2600,
+                                );
+                                self.runtime.notify_video_finished();
+                            }
+                        }
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        let _ = (asset, skippable);
+                        self.runtime.notify_video_finished();
+                    }
                 }
-                HostCommand::StopVideo => {}
-                HostCommand::SaveSlot { slot, snapshot } => {
+                HostCommand::StopVideo =>
+                {
+                    #[cfg(not(target_os = "android"))]
+                    if self.video.is_playing() {
+                        self.video.stop();
+                        self.audio.set_host_paused(false);
+                    }
+                }
+                HostCommand::SaveSlot { slot, mut snapshot } => {
+                    if snapshot.thumbnail.is_none() {
+                        snapshot.thumbnail = captured_thumb.clone();
+                    }
                     if let Err(e) = self.storage.save_slot(slot, &snapshot) {
                         self.runtime.show_toast(format!("Save failed: {e}"), 3000);
+                    } else if let Some(t) = &snapshot.thumbnail {
+                        self.upload_thumb_data_url(&format!("slot_{slot}"), t);
                     }
                 }
                 HostCommand::RequestLoadSlot(slot) => match self.storage.load_slot(slot) {
@@ -805,15 +1395,27 @@ impl NativeApp {
                 HostCommand::DeleteSlot(slot) => {
                     let _ = self.storage.delete_slot(slot);
                 }
-                HostCommand::SaveAuto { snapshot } => {
+                HostCommand::SaveAuto { mut snapshot } => {
+                    if snapshot.thumbnail.is_none() {
+                        snapshot.thumbnail = captured_thumb.clone();
+                    }
                     let _ = self.storage.save_named("autosave", &snapshot);
+                    if let Some(t) = &snapshot.thumbnail {
+                        self.upload_thumb_data_url("autosave", t);
+                    }
                 }
                 HostCommand::RequestLoadAuto => match self.storage.load_named("autosave") {
                     Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
                     Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
                 },
-                HostCommand::SaveQuick { snapshot } => {
+                HostCommand::SaveQuick { mut snapshot } => {
+                    if snapshot.thumbnail.is_none() {
+                        snapshot.thumbnail = captured_thumb.clone();
+                    }
                     let _ = self.storage.save_named("quicksave", &snapshot);
+                    if let Some(t) = &snapshot.thumbnail {
+                        self.upload_thumb_data_url("quicksave", t);
+                    }
                 }
                 HostCommand::RequestLoadQuick => match self.storage.load_named("quicksave") {
                     Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
@@ -846,6 +1448,19 @@ impl NativeApp {
         self.last_frame = now;
         self.next_wakeup_at = None;
 
+        // Capture a clean (overlay-free) Story thumbnail RIGHT BEFORE rendering a newly opened Menu/Saves overlay!
+        let pre_story_reading = self.runtime.is_story_reading();
+        let cur_dlg_epoch = self.runtime.dialogue_epoch();
+        if self.prev_story_reading
+            && !pre_story_reading
+            && self.clean_story_thumb_epoch != cur_dlg_epoch
+        {
+            if let Some(t) = self.capture_stage_thumb() {
+                self.clean_story_thumb = Some(t);
+                self.clean_story_thumb_epoch = cur_dlg_epoch;
+            }
+        }
+
         // Optional live hot-reload watch on `game.nirpak`
         if self.watch_hot_reload
             && now.duration_since(self.last_reload_check) >= Duration::from_millis(250)
@@ -862,7 +1477,23 @@ impl NativeApp {
             }
         }
 
+        // Periodic low-battery check on Linux laptops (every 60s, zero deps)
+        if !cfg!(target_os = "android")
+            && now.duration_since(self.last_battery_check) >= BATTERY_POLL_INTERVAL
+        {
+            self.last_battery_check = now;
+            self.runtime
+                .set_low_power_hint(desktop::read_low_battery_hint());
+        }
+
+        #[cfg(not(target_os = "android"))]
+        if self.video.poll_finished() {
+            self.audio.set_host_paused(false);
+            self.runtime.notify_video_finished();
+        }
+
         self.drain_decoded_images();
+        self.drain_gamepad_and_media_events();
         for ended_ch in self.audio.poll_ended() {
             self.runtime.notify_audio_ended(ended_ch);
         }
@@ -875,6 +1506,31 @@ impl NativeApp {
         self.runtime.tick(delta_us);
         self.process_commands();
         self.sync_wake_lock();
+        let haptic_ms = self.runtime.take_haptic_ms();
+        if haptic_ms > 0 {
+            self.gamepad.rumble(haptic_ms.saturating_mul(3).max(40));
+        }
+
+        // Lazy-upload stored save thumbnails ONLY when user opens the Saves screen!
+        if matches!(self.runtime.screen, nir_ui::Screen::Saves { .. }) && !self.thumbs_uploaded {
+            self.ensure_thumbs_uploaded();
+        }
+
+        // Auto-copy new dialogue lines when Texthooker mode (`Shift+C`) is active, and update MPRIS2.
+        let post_dlg_epoch = self.runtime.dialogue_epoch();
+        if post_dlg_epoch != self.last_dialogue_epoch {
+            self.last_dialogue_epoch = post_dlg_epoch;
+            self.sync_mpris_metadata();
+            #[cfg(not(target_os = "android"))]
+            if self.auto_copy_hook {
+                self.copy_current_dialogue(false);
+            }
+        } else if self.runtime.auto != self.last_mpris_auto {
+            self.sync_mpris_metadata();
+        }
+
+        self.prev_story_reading = self.runtime.is_story_reading();
+        self.update_idle_cursor(now);
 
         if self.renderer.as_ref().is_some_and(Renderer::is_lost) {
             if let (Some(win), Some(renderer)) = (&self.window, &mut self.renderer) {
@@ -882,6 +1538,7 @@ impl NativeApp {
                     renderer.rebind_surface(surface);
                     renderer.clear_textures();
                     self.pending_decodes.clear();
+                    self.thumbs_uploaded = false;
                     self.runtime.invalidate_all_textures();
                     self.process_commands();
                 }
@@ -903,13 +1560,13 @@ impl NativeApp {
 
 impl ApplicationHandler<UserEvent> for NativeApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::ImageDecoded => {
-                if self.drain_decoded_images() {
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
-                }
+        let should_redraw = match event {
+            UserEvent::ImageDecoded => self.drain_decoded_images(),
+            UserEvent::GamepadInput | UserEvent::MediaKey => self.drain_gamepad_and_media_events(),
+        };
+        if should_redraw {
+            if let Some(win) = &self.window {
+                win.request_redraw();
             }
         }
     }
@@ -971,6 +1628,7 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         self.runtime.set_host_paused(true);
         self.audio.set_host_paused(true);
         self.sync_wake_lock();
+        self.runtime.emit_autosave();
         self.runtime.flush_pending_saves();
         self.process_commands();
         self.storage.flush();
@@ -987,14 +1645,15 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                self.runtime.flush_pending_saves();
-                self.process_commands();
-                self.storage.flush();
+                self.save_and_flush_on_exit();
                 event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
                 if !focused {
                     self.left_mouse_down = false;
+                    self.shift_held = false;
+                    self.ctrl_held = false;
+                    self.wake_cursor();
                     self.runtime.pointer_cancel();
                     self.runtime.dispatch(UiAction::HoldSkip(false));
                 }
@@ -1003,10 +1662,22 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     self.audio.set_host_paused(!focused);
                     self.sync_wake_lock();
                     if !focused {
+                        self.runtime.emit_autosave();
                         self.runtime.flush_pending_saves();
                     }
                     self.process_commands();
                 }
+            }
+            WindowEvent::DroppedFile(path) => {
+                #[cfg(not(target_os = "android"))]
+                self.handle_dropped_file(path);
+                #[cfg(target_os = "android")]
+                let _ = path;
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                let st = mods.state();
+                self.shift_held = st.shift_key();
+                self.ctrl_held = st.control_key();
             }
             WindowEvent::Resized(size) => {
                 self.window_size = [size.width.max(1), size.height.max(1)];
@@ -1032,6 +1703,7 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.wake_cursor();
                 self.cursor_logical = [
                     position.x as f32 / self.scale_factor,
                     position.y as f32 / self.scale_factor,
@@ -1052,6 +1724,7 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                self.wake_cursor();
                 if !self.left_mouse_down {
                     self.runtime.set_hover(-1.0, -1.0);
                     if let Some(win) = &self.window {
@@ -1059,22 +1732,25 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Left, ElementState::Pressed) => {
-                    self.left_mouse_down = true;
-                    self.runtime
-                        .pointer_down(self.cursor_logical[0], self.cursor_logical[1]);
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.wake_cursor();
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        self.left_mouse_down = true;
+                        self.runtime
+                            .pointer_down(self.cursor_logical[0], self.cursor_logical[1]);
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        self.left_mouse_down = false;
+                        self.runtime
+                            .pointer_up(self.cursor_logical[0], self.cursor_logical[1]);
+                    }
+                    (MouseButton::Right, ElementState::Pressed) => {
+                        self.runtime.cancel_or_menu();
+                    }
+                    _ => {}
                 }
-                (MouseButton::Left, ElementState::Released) => {
-                    self.left_mouse_down = false;
-                    self.runtime
-                        .pointer_up(self.cursor_logical[0], self.cursor_logical[1]);
-                }
-                (MouseButton::Right, ElementState::Pressed) => {
-                    self.runtime.cancel_or_menu();
-                }
-                _ => {}
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -1094,10 +1770,23 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     self.handle_back_action();
                 } else if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.shift_held = pressed;
+                        }
                         KeyCode::ControlLeft | KeyCode::ControlRight => {
+                            self.ctrl_held = pressed;
                             self.runtime.dispatch(UiAction::HoldSkip(pressed));
                         }
                         KeyCode::Space | KeyCode::Enter if pressed && !event.repeat => {
+                            #[cfg(not(target_os = "android"))]
+                            if self.video.is_playing() {
+                                if self.video.is_skippable() {
+                                    self.video.stop();
+                                    self.audio.set_host_paused(false);
+                                    self.runtime.notify_video_finished();
+                                }
+                                return;
+                            }
                             self.runtime.dispatch(UiAction::Advance);
                         }
                         KeyCode::Escape | KeyCode::BrowserBack if pressed && !event.repeat => {
@@ -1127,6 +1816,18 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                         KeyCode::KeyB if pressed && !event.repeat => {
                             self.runtime.dispatch(UiAction::ToggleBilingual);
                         }
+                        #[cfg(not(target_os = "android"))]
+                        KeyCode::KeyC if pressed && !event.repeat => {
+                            if self.shift_held {
+                                self.toggle_auto_copy_hook();
+                            } else if !self.ctrl_held {
+                                self.copy_current_dialogue(true);
+                            }
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        KeyCode::KeyP if pressed && !event.repeat => {
+                            self.capture_and_save_screenshot();
+                        }
                         KeyCode::F11 if pressed && !event.repeat => {
                             if let Some(win) = &self.window {
                                 if win.fullscreen().is_some() {
@@ -1143,9 +1844,7 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             WindowEvent::RedrawRequested => {
                 self.tick_and_render();
                 if self.should_quit {
-                    self.runtime.flush_pending_saves();
-                    self.process_commands();
-                    self.storage.flush();
+                    self.save_and_flush_on_exit();
                     event_loop.exit();
                 }
             }
@@ -1158,18 +1857,30 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         for ended_ch in self.audio.poll_ended() {
             self.runtime.notify_audio_ended(ended_ch);
         }
+        #[cfg(not(target_os = "android"))]
+        if self.video.poll_finished() {
+            self.audio.set_host_paused(false);
+            self.runtime.notify_video_finished();
+        }
+        let now = Instant::now();
+        self.update_idle_cursor(now);
+
         // NOTE: Do NOT poll while waiting on `pending_decodes` — background workers wake us
         // immediately via `EventLoopProxy::send_event(UserEvent::ImageDecoded)`!
-        let now = Instant::now();
-        let next_delay_us = match (
-            self.runtime.next_wakeup_delay_us(),
-            self.audio.next_wakeup_delay_us(),
-        ) {
+        let mut next_delay_us = self.runtime.next_wakeup_delay_us();
+        let merge_delay = |cur: Option<u64>, add: Option<u64>| match (cur, add) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
+        next_delay_us = merge_delay(next_delay_us, self.audio.next_wakeup_delay_us());
+        next_delay_us = merge_delay(next_delay_us, self.idle_cursor_wakeup_us(now));
+        #[cfg(not(target_os = "android"))]
+        if self.video.is_playing() {
+            next_delay_us = merge_delay(next_delay_us, Some(150_000));
+        }
+
         if self.runtime.dirty {
             self.next_wakeup_at = None;
             if let Some(win) = &self.window {
@@ -1203,7 +1914,7 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
             } else {
-                // Sleep precisely until next Auto / Toast / Typewriter / Audio / Timer event (0% CPU between wakes!)
+                // Sleep precisely until next Auto / Toast / Typewriter / Audio / Cursor / Timer event
                 let target = self
                     .next_wakeup_at
                     .unwrap_or_else(|| now + Duration::from_micros(delay_us.min(6_000_000)));

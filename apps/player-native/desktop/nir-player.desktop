@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NIR Player
+GenericName=Visual Novel Player
+Comment=High-performance NIR v2 visual novel player
+Exec=player-native %f
+Terminal=false
+Categories=Game;AdventureGame;
+MimeType=application/x-nirpak;
+StartupNotify=true

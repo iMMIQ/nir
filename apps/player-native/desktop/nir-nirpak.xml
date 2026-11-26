@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-nirpak">
+    <comment>NIR v2 Visual Novel Package</comment>
+    <comment xml:lang="zh_CN">NIR v2 视觉小说游戏包</comment>
+    <magic priority="60">
+      <match value="NIRP" type="string" offset="0"/>
+    </magic>
+    <glob pattern="*.nirpak"/>
+  </mime-type>
+</mime-info>

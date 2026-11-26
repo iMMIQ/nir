@@ -127,6 +127,20 @@ fn main() -> Result<()> {
                 format!("target/release/{bin}"),
                 format!("dist/sdk/native/{bin}"),
             )?;
+            if !cfg!(windows) {
+                for name in ["nir-player.desktop", "nir-nirpak.xml", "install-desktop.sh"] {
+                    let src = format!("apps/player-native/desktop/{name}");
+                    let dst = format!("dist/sdk/native/{name}");
+                    if Path::new(&src).is_file() {
+                        fs::copy(&src, &dst)?;
+                        #[cfg(unix)]
+                        if name == "install-desktop.sh" {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+                        }
+                    }
+                }
+            }
 
             // 3. Optional Android cdylib cross-compile when NDK is present
             if let Some((ndk_root, tools)) = android_ndk_tools() {

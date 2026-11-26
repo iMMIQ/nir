@@ -104,6 +104,11 @@ impl PakArchive {
         nirpak_asset_slice(self.backing.as_slice(), self.media_base, meta).ok()
     }
 
+    /// Original file path on disk (when opened from filesystem rather than APK fd/bytes).
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
     /// Returns `Some(new_archive)` if the backing file on disk has been modified (hot-reload).
     pub fn check_reloaded(&self) -> Option<Arc<Self>> {
         let path = self.source_path.as_ref()?;

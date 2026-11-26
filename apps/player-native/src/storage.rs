@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use nir_ir::Preferences;
 use nir_ui::SlotSummary;
 use nir_vm::{ProfileData, SaveSnapshot};
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 
@@ -17,8 +17,12 @@ enum WriteOp {
 }
 
 pub struct LocalStorage {
+    nir_root: PathBuf,
     dir: PathBuf,
     index: Mutex<BTreeMap<u32, SlotSummary>>,
+    thumbs: Mutex<HashMap<String, String>>,
+    _lock_file: Option<File>,
+    concurrent_instance: bool,
     writer_tx: Option<mpsc::Sender<WriteOp>>,
     writer_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -36,9 +40,12 @@ impl LocalStorage {
             })
             .collect();
         let base = base_override.unwrap_or_else(default_data_dir);
-        let dir = base.join("nir").join(safe_id);
+        let nir_root = base.join("nir");
+        let dir = nir_root.join(safe_id);
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating save directory `{}`", dir.display()))?;
+
+        let (lock_file, concurrent_instance) = try_acquire_instance_lock(&dir);
 
         let (tx, rx) = mpsc::channel::<WriteOp>();
         let handle = std::thread::Builder::new()
@@ -63,19 +70,57 @@ impl LocalStorage {
             .ok();
 
         Ok(Self {
+            nir_root,
             dir,
             index: Mutex::new(BTreeMap::new()),
+            thumbs: Mutex::new(HashMap::new()),
+            _lock_file: lock_file,
+            concurrent_instance,
             writer_tx: handle.as_ref().map(|_| tx),
             writer_handle: handle,
         })
     }
 
+    pub fn is_concurrent_instance(&self) -> bool {
+        self.concurrent_instance
+    }
+
+    pub fn patches_dir(&self) -> PathBuf {
+        self.dir.join("patches")
+    }
+
+    pub fn screenshots_dir(&self) -> PathBuf {
+        #[cfg(not(target_os = "android"))]
+        {
+            if let Some(pic) = std::env::var_os("XDG_PICTURES_DIR") {
+                let p = PathBuf::from(pic);
+                if p.is_absolute() {
+                    return p.join("NIR");
+                }
+            }
+            if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+            {
+                let pics = PathBuf::from(home).join("Pictures");
+                if pics.is_dir() {
+                    return pics.join("NIR");
+                }
+            }
+        }
+        self.dir.join("screenshots")
+    }
+
+    /// Loads game-specific preferences, automatically inheriting cross-game `global_prefs.json`
+    /// on first launch (matching Web player global user preferences).
     pub fn load_preferences(&self) -> Preferences {
-        read_json(&self.dir.join("prefs.json")).unwrap_or_default()
+        if let Some(local) = read_json(&self.dir.join("prefs.json")) {
+            return local;
+        }
+        read_json(&self.nir_root.join("global_prefs.json")).unwrap_or_default()
     }
 
     pub fn save_preferences(&self, prefs: &Preferences) -> Result<()> {
         let data = serde_json::to_vec(prefs)?;
+        let _ = self.enqueue_write(self.nir_root.join("global_prefs.json"), data.clone());
         self.enqueue_write(self.dir.join("prefs.json"), data)
     }
 
@@ -91,12 +136,18 @@ impl LocalStorage {
     pub fn save_slot(&self, slot: u32, snap: &SaveSnapshot) -> Result<()> {
         let data = serde_json::to_vec(snap)?;
         self.enqueue_write(self.slot_path(slot), data)?;
+        let has_thumb = snap.thumbnail.is_some();
+        if let Some(t) = &snap.thumbnail {
+            if let Ok(mut guard) = self.thumbs.lock() {
+                guard.insert(format!("slot_{slot}"), t.clone());
+            }
+        }
         let summary = SlotSummary {
             slot,
             exists: true,
             saved_at_unix: snap.saved_at_unix,
             summary: snap.summary.clone(),
-            has_thumb: false,
+            has_thumb,
         };
         let index_bytes = {
             let mut map = self.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -117,6 +168,9 @@ impl LocalStorage {
 
     pub fn delete_slot(&self, slot: u32) -> Result<()> {
         self.enqueue_remove(self.slot_path(slot))?;
+        if let Ok(mut guard) = self.thumbs.lock() {
+            guard.remove(&format!("slot_{slot}"));
+        }
         let index_bytes = {
             let mut map = self.index.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&slot);
@@ -127,6 +181,11 @@ impl LocalStorage {
 
     pub fn save_named(&self, name: &str, snap: &SaveSnapshot) -> Result<()> {
         let data = serde_json::to_vec(snap)?;
+        if let Some(t) = &snap.thumbnail {
+            if let Ok(mut guard) = self.thumbs.lock() {
+                guard.insert(name.to_owned(), t.clone());
+            }
+        }
         self.enqueue_write(self.dir.join(format!("{name}.json")), data)
     }
 
@@ -140,13 +199,59 @@ impl LocalStorage {
 
     pub fn named_summary(&self, name: &str, virtual_slot: u32) -> Option<SlotSummary> {
         let snap = self.load_named(name).ok()?;
+        let has_thumb = snap.thumbnail.is_some();
+        if let Some(t) = snap.thumbnail {
+            if let Ok(mut guard) = self.thumbs.lock() {
+                guard.insert(name.to_owned(), t);
+            }
+        }
         Some(SlotSummary {
             slot: virtual_slot,
             exists: true,
             saved_at_unix: snap.saved_at_unix,
             summary: snap.summary,
-            has_thumb: false,
+            has_thumb,
         })
+    }
+
+    /// Lazily retrieves all stored save thumbnails (`(key, data_url)` where key is
+    /// `"autosave"`, `"quicksave"`, or `"slot_<n>"`) when the player opens the Saves screen.
+    pub fn collect_all_thumbnails(&self, slot_count: u32) -> Vec<(String, String)> {
+        self.flush();
+        let mut out = Vec::new();
+        let mut cache = self.thumbs.lock().unwrap_or_else(|e| e.into_inner());
+
+        for name in ["autosave", "quicksave"] {
+            if let Some(url) = cache.get(name) {
+                out.push((name.to_owned(), url.clone()));
+            } else if let Some(snap) =
+                read_json::<SaveSnapshot>(&self.dir.join(format!("{name}.json")))
+            {
+                if let Some(url) = snap.thumbnail {
+                    cache.insert(name.to_owned(), url.clone());
+                    out.push((name.to_owned(), url));
+                }
+            }
+        }
+
+        let existing_slots: Vec<u32> = {
+            let idx = self.index.lock().unwrap_or_else(|e| e.into_inner());
+            (0..slot_count)
+                .filter(|s| idx.get(s).is_some_and(|e| e.exists))
+                .collect()
+        };
+        for slot in existing_slots {
+            let key = format!("slot_{slot}");
+            if let Some(url) = cache.get(&key) {
+                out.push((key, url.clone()));
+            } else if let Some(snap) = read_json::<SaveSnapshot>(&self.slot_path(slot)) {
+                if let Some(url) = snap.thumbnail {
+                    cache.insert(key.clone(), url.clone());
+                    out.push((key, url));
+                }
+            }
+        }
+        out
     }
 
     /// Reads lightweight `slots_index.json` in a single I/O operation (O(1) cold start!).
@@ -161,6 +266,12 @@ impl LocalStorage {
                 let path = self.slot_path(slot);
                 if path.is_file() {
                     if let Ok(snap) = self.load_slot(slot) {
+                        let has_thumb = snap.thumbnail.is_some();
+                        if let Some(t) = snap.thumbnail {
+                            if let Ok(mut guard) = self.thumbs.lock() {
+                                guard.insert(format!("slot_{slot}"), t);
+                            }
+                        }
                         scanned.insert(
                             slot,
                             SlotSummary {
@@ -168,7 +279,7 @@ impl LocalStorage {
                                 exists: true,
                                 saved_at_unix: snap.saved_at_unix,
                                 summary: snap.summary,
-                                has_thumb: false,
+                                has_thumb,
                             },
                         );
                     }
@@ -287,6 +398,32 @@ fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Acquires a non-blocking advisory lock on `<game_dir>/.lock` to detect concurrent instances
+/// playing the same game (matching Web player's Web Locks warning).
+fn try_acquire_instance_lock(dir: &Path) -> (Option<File>, bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = dir.join(".lock");
+        if let Ok(file) = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return (Some(file), false);
+            }
+            return (None, true);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    (None, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +481,84 @@ mod tests {
         st2.flush();
         let st3 = LocalStorage::open("org.nir.storetest", Some(dir.clone())).unwrap();
         assert!(!st3.list_slot_summaries(4)[2].exists);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_inherits_global_prefs_tracks_thumbnails_and_detects_concurrent_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "nir-storage-global-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let st_a = LocalStorage::open("org.nir.game_a", Some(dir.clone())).unwrap();
+        assert!(!st_a.is_concurrent_instance());
+        // Opening the same game while st_a holds the flock reports concurrent instance on Unix.
+        let st_a2 = LocalStorage::open("org.nir.game_a", Some(dir.clone())).unwrap();
+        #[cfg(unix)]
+        assert!(st_a2.is_concurrent_instance());
+        drop(st_a2);
+
+        let prefs = Preferences {
+            master_volume: 0.42,
+            eco_mode: true,
+            ..Default::default()
+        };
+        st_a.save_preferences(&prefs).unwrap();
+        st_a.flush();
+
+        // A brand-new game inherits global preferences automatically.
+        let st_b = LocalStorage::open("org.nir.game_b", Some(dir.clone())).unwrap();
+        let inherited = st_b.load_preferences();
+        assert!((inherited.master_volume - 0.42).abs() < 1e-4);
+        assert!(inherited.eco_mode);
+
+        // Save with embedded thumbnail sets has_thumb=true and is retrievable via collect_all_thumbnails.
+        let mut snap = SaveSnapshot {
+            format: nir_vm::SAVE_FORMAT_VERSION,
+            game_id: "org.nir.game_b".into(),
+            version: "1.0".into(),
+            saved_at_unix: 1_700_000_001,
+            summary: "Thumb test".into(),
+            pc: 0,
+            last_label: None,
+            vars: BTreeMap::new(),
+            frames: vec![],
+            layers: vec![],
+            dialogue_visible: true,
+            dialogue: None,
+            dialogue_portrait: None,
+            dialogue_style: 0,
+            choice: None,
+            wait: nir_vm::WaitReason::None,
+            audio: vec![],
+            audio_paused: [false; 3],
+            timelines: vec![],
+            history: vec![],
+            locale: "en".into(),
+            rng_word_pos: 0,
+            outcome: None,
+            thumbnail: Some("data:image/webp;base64,AAAA".into()),
+        };
+        st_b.save_slot(1, &snap).unwrap();
+        snap.summary = "Auto thumb".into();
+        st_b.save_named("autosave", &snap).unwrap();
+        st_b.flush();
+
+        let summaries = st_b.list_slot_summaries(4);
+        assert!(summaries[1].has_thumb);
+        let thumbs = st_b.collect_all_thumbnails(4);
+        assert!(thumbs
+            .iter()
+            .any(|(k, v)| k == "slot_1" && v == "data:image/webp;base64,AAAA"));
+        assert!(thumbs
+            .iter()
+            .any(|(k, v)| k == "autosave" && v == "data:image/webp;base64,AAAA"));
+
+        drop(st_a);
+        drop(st_b);
         let _ = fs::remove_dir_all(&dir);
     }
 }
