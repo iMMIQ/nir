@@ -385,6 +385,8 @@ pub fn run_desktop_with_options(pak_path: &Path, opts: DesktopOptions) -> Result
         event_loop,
         #[cfg(target_os = "android")]
         None,
+        #[cfg(target_os = "android")]
+        false,
     )
 }
 
@@ -423,13 +425,16 @@ pub fn run_desktop_shelf(shelf_dir: Option<&Path>, opts: DesktopOptions) -> Resu
         event_loop,
         #[cfg(target_os = "android")]
         None,
+        #[cfg(target_os = "android")]
+        false,
     )
 }
 
-/// Runs the unified native player on Android (`NativeActivity`):
-/// - Single-game APK: memory-maps 16 KiB-aligned STORED `assets/game.nirpak` directly via `mmap`!
-/// - Universal Player APK (no bundled `assets/game.nirpak`): launches the built-in touch Shelf
-///   scanning `<external_data_path>/games/*.nirpak` so users can play any `.nirpak`!
+/// Runs the unified native player on Android (`GameActivity`):
+/// - Launched from native Material 3 `ShelfActivity` (`EXTRA_PAK_PATH`): memory-maps the selected
+///   `.nirpak` directly via zero-copy `mmap` and wires "返回书架" back to `ShelfActivity`!
+/// - Single-game APK: memory-maps uncompressed `assets/game.nirpak` directly from APK via `mmap`!
+/// - Fallback (no intent pak & no bundled pak): launches the built-in GPU touch Shelf.
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
     use std::ffi::CString;
@@ -438,42 +443,71 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
 
     let data_dir = android_app.internal_data_path();
     let ext_dir = android_app.external_data_path();
+    let has_native_shelf = android_host::has_native_shelf(&android_app);
 
-    let name = CString::new("game.nirpak").unwrap();
-    let bundled_pak = if let Some(mut asset) = android_app.asset_manager().open(&name) {
-        // Zero-copy mmap directly from APK fd when stored uncompressed & page-aligned (16 KiB)!
-        let pak = match asset.open_file_descriptor() {
-            Ok(opened) => {
-                let file = File::from(opened.fd);
-                match PakArchive::from_fd_region(&file, opened.offset as u64, opened.size) {
-                    Ok(mapped) => {
-                        android_host::log_info(&format!(
-                            "game.nirpak zero-copy mmap ready (offset={}, size={})",
-                            opened.offset, opened.size
-                        ));
-                        Arc::new(mapped)
-                    }
-                    Err(e) => {
-                        android_host::log_warn(&format!(
-                            "game.nirpak mmap failed ({e:#}); falling back to heap buffer (check 16 KiB APK alignment)"
-                        ));
-                        Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
-                    }
-                }
+    let intent_pak = android_host::initial_pak_path(&android_app).and_then(|path| {
+        match PakArchive::open_file(&path) {
+            Ok(pak) => {
+                android_host::log_info(&format!(
+                    "Opened .nirpak from native Shelf intent: {}",
+                    path.display()
+                ));
+                let storage_root = data_dir
+                    .clone()
+                    .unwrap_or_else(storage::default_data_dir);
+                let recent_file = storage_root.join("nir").join("recent_games.json");
+                shelf::record_recent_game(&recent_file, &path);
+                Some(Arc::new(pak))
             }
             Err(e) => {
-                android_host::log_warn(&format!(
-                    "AssetManager::open_file_descriptor failed ({e:?}); falling back to heap buffer"
+                android_host::log_error(&format!(
+                    "Failed to open intent .nirpak `{}`: {e:#}",
+                    path.display()
                 ));
-                Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+                None
             }
-        };
+        }
+    });
+
+    let bundled_pak = if let Some(pak) = intent_pak {
         Some(pak)
     } else {
-        android_host::log_info(
-            "No bundled assets/game.nirpak; launching Universal Android NIR Shelf mode",
-        );
-        None
+        let name = CString::new("game.nirpak").unwrap();
+        if let Some(mut asset) = android_app.asset_manager().open(&name) {
+            // Zero-copy mmap directly from APK fd (auto-aligns offset down to OS page boundary)!
+            let pak = match asset.open_file_descriptor() {
+                Ok(opened) => {
+                    let file = File::from(opened.fd);
+                    match PakArchive::from_fd_region(&file, opened.offset as u64, opened.size) {
+                        Ok(mapped) => {
+                            android_host::log_info(&format!(
+                                "game.nirpak zero-copy mmap ready (offset={}, size={})",
+                                opened.offset, opened.size
+                            ));
+                            Arc::new(mapped)
+                        }
+                        Err(e) => {
+                            android_host::log_warn(&format!(
+                                "game.nirpak mmap failed ({e:#}); falling back to heap buffer"
+                            ));
+                            Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+                        }
+                    }
+                }
+                Err(e) => {
+                    android_host::log_warn(&format!(
+                        "AssetManager::open_file_descriptor failed ({e:?}); falling back to heap buffer"
+                    ));
+                    Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+                }
+            };
+            Some(pak)
+        } else {
+            android_host::log_info(
+                "No bundled assets/game.nirpak; launching GPU fallback Android NIR Shelf mode",
+            );
+            None
+        }
     };
 
     let shelf_state = if bundled_pak.is_none() {
@@ -505,6 +539,7 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
         DesktopOptions::default(),
         event_loop,
         Some(app_handle),
+        has_native_shelf,
     )
 }
 
@@ -640,9 +675,13 @@ fn run_with_event_loop(
     opts: DesktopOptions,
     event_loop: EventLoop<UserEvent>,
     #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
+    #[cfg(target_os = "android")] has_native_shelf: bool,
 ) -> Result<()> {
     let showing_shelf = initial_pak.is_none();
     let pak = initial_pak.unwrap_or_else(|| Arc::new(PakArchive::empty_placeholder()));
+    #[cfg(target_os = "android")]
+    let has_shelf = shelf.is_some() || has_native_shelf;
+    #[cfg(not(target_os = "android"))]
     let has_shelf = shelf.is_some();
 
     let (storage, prefs, profile, slots, imported_backup_count) = if !showing_shelf {
@@ -819,6 +858,8 @@ fn run_with_event_loop(
         host_in_background: false,
         #[cfg(target_os = "android")]
         audio_focus_paused: false,
+        #[cfg(target_os = "android")]
+        has_native_shelf,
     };
     event_loop.run_app(&mut app).context("winit event loop")?;
     #[cfg(target_os = "android")]
@@ -897,6 +938,8 @@ struct NativeApp {
     host_in_background: bool,
     #[cfg(target_os = "android")]
     audio_focus_paused: bool,
+    #[cfg(target_os = "android")]
+    has_native_shelf: bool,
 }
 
 impl NativeApp {
@@ -1411,6 +1454,9 @@ impl NativeApp {
             }
         };
         new_rt.set_tz_offset_mins(local_tz_offset_mins());
+        #[cfg(target_os = "android")]
+        new_rt.set_host_has_shelf(self.shelf.is_some() || self.has_native_shelf);
+        #[cfg(not(target_os = "android"))]
         new_rt.set_host_has_shelf(self.shelf.is_some());
         new_rt.set_autosave_summary(new_storage.named_summary("autosave", u32::MAX));
         new_rt.set_quicksave_summary(new_storage.named_summary("quicksave", u32::MAX - 1));
@@ -1468,6 +1514,17 @@ impl NativeApp {
     }
 
     fn enter_shelf_mode(&mut self) {
+        #[cfg(target_os = "android")]
+        if self.has_native_shelf {
+            self.save_and_flush_on_exit();
+            self.audio.stop_all();
+            self.audio.clear_cache();
+            if let Some(app) = &self.android_app {
+                android_host::finish_to_shelf(app);
+            }
+            self.should_quit = true;
+            return;
+        }
         if self.shelf.is_none() {
             self.should_quit = true;
             return;
@@ -1880,6 +1937,11 @@ impl NativeApp {
             return;
         }
         if self.runtime.screen == nir_ui::Screen::Title && cfg!(target_os = "android") {
+            #[cfg(target_os = "android")]
+            if self.has_native_shelf {
+                self.enter_shelf_mode();
+                return;
+            }
             if self.shelf.is_some() {
                 self.enter_shelf_mode();
                 return;

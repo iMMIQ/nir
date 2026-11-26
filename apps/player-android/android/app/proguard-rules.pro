@@ -1,3 +1,4 @@
 -keep class org.nir.player.NirHostBridge { *; }
 -keep class org.nir.player.NirGameActivity { *; }
+-keep class org.nir.player.ShelfActivity { *; }
 -keep class com.google.androidgamesdk.** { *; }

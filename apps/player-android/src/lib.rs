@@ -9,7 +9,7 @@
 
 use android_activity::AndroidApp;
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE};
+use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use std::path::PathBuf;
 
@@ -97,5 +97,51 @@ pub extern "system" fn Java_org_nir_player_NirHostBridge_nativeOnToastMessage(
         player_native::android_host::push_host_event(
             player_native::android_host::AndroidHostEvent::Toast(msg),
         );
+    }
+}
+
+/// Scans `.nirpak` directories using Rust's zero-copy `mmap` header/cover parser and returns a
+/// JSON array string for the native Material 3 `ShelfActivity`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_nir_player_NirHostBridge_nativeScanShelfJson(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    scan_dirs_lines: JString<'_>,
+    storage_root: JString<'_>,
+    cover_cache_dir: JString<'_>,
+) -> jstring {
+    let dirs_str = jstring_to_rust(&mut env, scan_dirs_lines).unwrap_or_default();
+    let root_str = jstring_to_rust(&mut env, storage_root).unwrap_or_default();
+    let cache_str = jstring_to_rust(&mut env, cover_cache_dir).unwrap_or_default();
+    let scan_dirs: Vec<PathBuf> = dirs_str
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let json = player_native::shelf::scan_shelf_entries_json(
+        &scan_dirs,
+        &PathBuf::from(root_str),
+        &PathBuf::from(cache_str),
+    );
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Removes a `.nirpak` entry from `recent_games.json` when deleted from the native Shelf.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_nir_player_NirHostBridge_nativeRemoveRecentGame(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    storage_root: JString<'_>,
+    pak_path: JString<'_>,
+) {
+    if let (Some(root), Some(pak)) = (
+        jstring_to_rust(&mut env, storage_root),
+        jstring_to_rust(&mut env, pak_path),
+    ) {
+        let recent_file = PathBuf::from(root).join("nir").join("recent_games.json");
+        player_native::shelf::remove_recent_game(&recent_file, &PathBuf::from(pak));
     }
 }

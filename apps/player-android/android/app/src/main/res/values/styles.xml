@@ -1,5 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <style name="Theme.Nir.Shelf" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/nir_primary</item>
+        <item name="colorOnPrimary">@color/nir_on_primary</item>
+        <item name="colorPrimaryContainer">@color/nir_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/nir_on_primary_container</item>
+        <item name="colorSurface">@color/nir_surface</item>
+        <item name="colorOnSurface">@color/nir_text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/nir_text_secondary</item>
+        <item name="android:colorBackground">@color/nir_bg</item>
+        <item name="android:windowBackground">@color/nir_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
     <style name="Theme.Nir.Fullscreen" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowNoTitle">true</item>

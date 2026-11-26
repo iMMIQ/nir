@@ -78,10 +78,13 @@ jobs:
             "$ZIPALIGN" -c -v -P 16 4 "$apk"
             badging=$("$AAPT2" dump badging "$apk")
             echo "$badging"
-            echo "$badging" | grep -q "NirGameActivity"
             echo "$badging" | grep -q "application-icon"
             "$APKSIGNER" verify --verbose "$apk"
           done
+          shelf_badging=$("$AAPT2" dump badging target/android-sample/dist/nir-player.apk)
+          game_badging=$("$AAPT2" dump badging target/android-sample/dist/Game.apk)
+          echo "$shelf_badging" | grep -q "org.nir.player.ShelfActivity"
+          echo "$game_badging" | grep -q "org.nir.player.NirGameActivity"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

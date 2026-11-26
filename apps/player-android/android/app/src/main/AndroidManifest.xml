@@ -14,31 +14,26 @@
     <application
         android:allowBackup="true"
         android:appCategory="game"
-        android:extractNativeLibs="false"
         android:icon="@mipmap/ic_launcher"
         android:label="${nirAppLabel}"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Nir.Fullscreen">
+        android:theme="@style/Theme.Nir.Shelf">
 
+        <!-- Native Material 3 Library / Shelf Activity (Universal NIR Player entry) -->
         <activity
-            android:name="org.nir.player.NirGameActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|fontScale|locale|layoutDirection"
+            android:name="org.nir.player.ShelfActivity"
             android:exported="true"
-            android:launchMode="singleTask"
+            android:launchMode="singleTop"
             android:resizeableActivity="true"
-            android:screenOrientation="${nirScreenOrientation}">
-
-            <meta-data
-                android:name="android.app.lib_name"
-                android:value="player" />
+            android:theme="@style/Theme.Nir.Shelf">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Allow opening `.nirpak` game packages directly from Files / Downloads / Messengers -->
+            <!-- Allow opening `.nirpak` packages directly from Files / Downloads / Messengers -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -56,6 +51,21 @@
                 <data android:scheme="content" />
                 <data android:mimeType="application/octet-stream" />
             </intent-filter>
+        </activity>
+
+        <!-- Jetpack GameActivity runtime (renders Rust/wgpu visual novel stage) -->
+        <activity
+            android:name="org.nir.player.NirGameActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|fontScale|locale|layoutDirection"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:screenOrientation="${nirScreenOrientation}"
+            android:theme="@style/Theme.Nir.Fullscreen">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="player" />
         </activity>
     </application>
 </manifest>

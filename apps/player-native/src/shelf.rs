@@ -573,6 +573,80 @@ fn point_in_rect(x: f32, y: f32, r: [f32; 4]) -> bool {
 }
 
 /// Persists a recently opened `.nirpak` path at the front of `recent_games.json`.
+/// Removes a `.nirpak` path from `recent_games.json` (used when a user removes a game from Shelf).
+pub fn remove_recent_game(recent_file: &Path, pak_path: &Path) {
+    let target = pak_path.to_string_lossy();
+    let mut list = load_recent_games(recent_file);
+    let orig_len = list.len();
+    list.retain(|p| p != target.as_ref());
+    if list.len() != orig_len {
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = fs::write(recent_file, json);
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeShelfItemJson {
+    path: String,
+    game_id: String,
+    title: String,
+    version: String,
+    locales: Vec<String>,
+    file_size_bytes: u64,
+    save_count: usize,
+    cover_path: Option<String>,
+}
+
+/// Scans `.nirpak` packages across `scan_dirs`, caches decoded `title_bg` cover thumbnails as
+/// PNGs under `cover_cache_dir`, and returns a JSON array string for native UI hosts (e.g.
+/// Android Material 3 `ShelfActivity`). Zero `.nirpak` format duplication in Kotlin!
+pub fn scan_shelf_entries_json(
+    scan_dirs: &[PathBuf],
+    storage_root: &Path,
+    cover_cache_dir: &Path,
+) -> String {
+    for dir in scan_dirs {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::create_dir_all(cover_cache_dir);
+    let recent_file = storage_root.join("nir").join("recent_games.json");
+    let entries = scan_shelf_entries(scan_dirs, &recent_file, storage_root);
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let cover_path = if let Some((w, h, rgba)) = entry.cover_rgba {
+            let safe_id: String = entry
+                .game_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let cache_file = cover_cache_dir.join(format!("{safe_id}_{}.png", entry.file_size_bytes));
+            let ready = if cache_file.is_file() {
+                true
+            } else if let Ok(png) = nir_render::encode_png_rgba(&rgba, w, h) {
+                fs::write(&cache_file, png).is_ok()
+            } else {
+                false
+            };
+            ready.then(|| cache_file.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        items.push(NativeShelfItemJson {
+            path: entry.path.to_string_lossy().into_owned(),
+            game_id: entry.game_id,
+            title: entry.title,
+            version: entry.version,
+            locales: entry.locales,
+            file_size_bytes: entry.file_size_bytes,
+            save_count: entry.save_count,
+            cover_path,
+        });
+    }
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_owned())
+}
+
 pub fn record_recent_game(recent_file: &Path, pak_path: &Path) {
     let canonical = fs::canonicalize(pak_path).unwrap_or_else(|_| pak_path.to_path_buf());
     let mut list = load_recent_games(recent_file);
@@ -787,6 +861,17 @@ mod tests {
             .texts
             .iter()
             .any(|t| t.text.contains("尚未发现")));
+
+        // Native Material 3 shelf JSON scanner & remove_recent_game round-trip
+        let cache_dir = tmp.join("cover-cache");
+        let json_str = scan_shelf_entries_json(std::slice::from_ref(&games_dir), &tmp, &cache_dir);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["title"], "Shelf Test Novel");
+        assert_eq!(arr[0]["gameId"], "org.nir.shelf_demo");
+        remove_recent_game(&shelf.recent_file, &pak_path);
+        assert!(load_recent_games(&shelf.recent_file).is_empty());
 
         let _ = fs::remove_dir_all(&tmp);
     }

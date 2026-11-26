@@ -3,10 +3,14 @@ package org.nir.player
 import androidx.annotation.Keep
 
 /**
- * JNI bridge for Kotlin -> Rust asynchronous host callbacks implemented in `apps/player-android`.
+ * JNI bridge for Kotlin <-> Rust calls implemented in `apps/player-android`.
  */
 @Keep
 object NirHostBridge {
+    init {
+        System.loadLibrary("player")
+    }
+
     @JvmStatic
     external fun nativeOnPakImported(path: String, launchNow: Boolean)
 
@@ -21,4 +25,14 @@ object NirHostBridge {
 
     @JvmStatic
     external fun nativeOnToastMessage(message: String)
+
+    @JvmStatic
+    external fun nativeScanShelfJson(
+        scanDirsLines: String,
+        storageRoot: String,
+        coverCacheDir: String
+    ): String
+
+    @JvmStatic
+    external fun nativeRemoveRecentGame(storageRoot: String, pakPath: String)
 }

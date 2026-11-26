@@ -322,6 +322,42 @@ mod imp {
             Ok(())
         });
     }
+
+    /// Reads an explicit `.nirpak` path passed via Intent extra from the native Material 3 `ShelfActivity`.
+    pub fn initial_pak_path(app: &AndroidApp) -> Option<std::path::PathBuf> {
+        with_activity(app, |env, activity| {
+            let obj = env
+                .call_method(activity, "getInitialPakPath", "()Ljava/lang/String;", &[])?
+                .l()?;
+            if obj.is_null() {
+                return Ok(None);
+            }
+            let jstr = jni::objects::JString::from(obj);
+            let s: String = env.get_string(&jstr)?.into();
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(std::path::PathBuf::from(s)))
+            }
+        })
+        .flatten()
+    }
+
+    /// Returns `true` when `NirGameActivity` was launched from the native Material 3 `ShelfActivity`.
+    pub fn has_native_shelf(app: &AndroidApp) -> bool {
+        with_activity(app, |env, activity| {
+            env.call_method(activity, "hasNativeShelf", "()Z", &[])?.z()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Finishes `NirGameActivity` cleanly so Android pops back to the native Material 3 `ShelfActivity`.
+    pub fn finish_to_shelf(app: &AndroidApp) {
+        let _ = with_activity(app, |env, activity| {
+            env.call_method(activity, "finishToShelf", "()V", &[])?;
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_os = "android")]

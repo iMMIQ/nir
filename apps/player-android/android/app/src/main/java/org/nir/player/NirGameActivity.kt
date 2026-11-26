@@ -55,6 +55,8 @@ class NirGameActivity : GameActivity() {
 
     companion object {
         private const val TAG = "NirGameActivity"
+        const val EXTRA_PAK_PATH = "org.nir.player.EXTRA_PAK_PATH"
+        const val EXTRA_HAS_SHELF = "org.nir.player.EXTRA_HAS_SHELF"
         private val NIRPAK_MAGIC = byteArrayOf(
             'N'.code.toByte(),
             'I'.code.toByte(),
@@ -506,5 +508,18 @@ class NirGameActivity : GameActivity() {
             NirHostBridge.nativeOnSafeInsetsChanged(insets[0], insets[1], insets[2], insets[3])
         }
         flushPendingLaunchUri()
+    }
+
+    @Keep
+    fun getInitialPakPath(): String? = intent?.getStringExtra(EXTRA_PAK_PATH)
+
+    @Keep
+    fun hasNativeShelf(): Boolean = intent?.getBooleanExtra(EXTRA_HAS_SHELF, false) ?: false
+
+    @Keep
+    fun finishToShelf() {
+        runOnUiThread {
+            finish()
+        }
     }
 }

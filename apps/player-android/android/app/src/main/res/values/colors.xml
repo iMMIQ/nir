@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nir_bg">#0A0F1A</color>
+    <color name="nir_surface">#121A2C</color>
+    <color name="nir_surface_elevated">#19243C</color>
+    <color name="nir_card_stroke">#2C3E66</color>
+    <color name="nir_primary">#6CB4FF</color>
+    <color name="nir_on_primary">#071729</color>
+    <color name="nir_primary_container">#1E3860</color>
+    <color name="nir_on_primary_container">#DCEBFF</color>
+    <color name="nir_text_primary">#EFF5FF</color>
+    <color name="nir_text_secondary">#99ACC9</color>
+    <color name="nir_badge_bg">#B80B1220</color>
+    <color name="nir_badge_accent_bg">#D41E4074</color>
+</resources>
