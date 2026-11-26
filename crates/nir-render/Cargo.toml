@@ -16,6 +16,7 @@ ktx2.workspace = true
 bcdec_rs.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles", "dx12", "metal"] }
 image.workspace = true
 webp.workspace = true
 

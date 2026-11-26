@@ -164,6 +164,83 @@ impl TextEngine {
         !self.families.is_empty() || !self.fallback_families.is_empty()
     }
 
+    /// Lazily loads OS system fonts as fallback AFTER any game-bundled fonts when
+    /// `missing_glyphs` is detected (e.g. a subsetted game font missing UI/locale glyphs).
+    /// Returns `true` if system fonts were loaded for the first time and buffers were invalidated.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ensure_system_fallback_fonts(&mut self) -> bool {
+        if self.system_fonts_loaded {
+            return false;
+        }
+        let before: HashSet<_> = self.fonts.db().faces().map(|f| f.id).collect();
+        self.fonts.db_mut().load_system_fonts();
+        self.system_fonts_loaded = true;
+
+        let mut added: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for face in self.fonts.db().faces() {
+            if before.contains(&face.id) {
+                continue;
+            }
+            if let Some((name, _)) = face.families.first() {
+                if seen.insert(name.clone()) {
+                    added.push(name.clone());
+                }
+            }
+        }
+        // Prioritize clean CJK / Pan-Unicode sans-serif system families ahead of niche fonts.
+        added.sort_by_key(|name| {
+            let lower = name.to_ascii_lowercase();
+            let rank: u8 = if lower.contains("noto sans cjk sc")
+                || lower.contains("source han sans cn")
+            {
+                0
+            } else if lower.contains("noto sans cjk jp") || lower.contains("source han sans jp") {
+                1
+            } else if lower.contains("noto sans cjk tc") || lower.contains("source han sans tw") {
+                2
+            } else if lower.contains("noto sans cjk") || lower.contains("source han sans") {
+                3
+            } else if lower.contains("wenquanyi")
+                || lower.contains("pingfang")
+                || lower.contains("microsoft yahei")
+            {
+                4
+            } else if lower.contains("hiragino")
+                || lower.contains("yu gothic")
+                || lower.contains("meiryo")
+            {
+                5
+            } else if lower == "noto sans"
+                || lower == "dejavu sans"
+                || lower == "liberation sans"
+                || lower == "roboto"
+                || lower == "ubuntu"
+                || lower == "segoe ui"
+            {
+                6
+            } else if lower.contains("noto sans") && lower.contains("symbol") {
+                7
+            } else if lower.contains("sans") {
+                8
+            } else {
+                9
+            };
+            (rank, name.clone())
+        });
+        for name in added.into_iter().take(24) {
+            let interned = intern_family(&name);
+            if !self.fallback_families.contains(&interned) {
+                self.fallback_families.push(interned);
+            }
+        }
+        self.buffers.clear();
+        self.recency.clear();
+        self.missing_glyphs = false;
+        self.fallback_dirty = true;
+        true
+    }
+
     pub fn line_offsets(text: &str, rich: bool) -> Vec<usize> {
         let mut offsets: Vec<_> = if !rich {
             cosmic_text::LineIter::new(text)
@@ -501,5 +578,18 @@ mod tests {
             "auto_fit should bring dialogue height near box height (got {})",
             entry.content_height
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn system_fallback_loads_once_and_invalidates_missing_glyphs() {
+        let mut engine = TextEngine {
+            missing_glyphs: true,
+            ..Default::default()
+        };
+        assert!(engine.ensure_system_fallback_fonts());
+        assert!(!engine.missing_glyphs);
+        // Second call is an idempotent no-op.
+        assert!(!engine.ensure_system_fallback_fonts());
     }
 }

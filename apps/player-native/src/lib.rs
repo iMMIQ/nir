@@ -382,6 +382,85 @@ pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
     run_with_event_loop(pak, data_dir, false, event_loop, Some(app_handle))
 }
 
+/// Returns the host's local UTC offset in minutes (e.g. `+480` for UTC+8) so save timestamps
+/// render in local time instead of UTC.
+fn local_tz_offset_mins() -> i32 {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let now = libc::time(std::ptr::null_mut());
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&now, &mut tm).is_null() {
+                return (tm.tm_gmtoff / 60) as i32;
+            }
+        }
+    }
+    0
+}
+
+/// Initializes a native GPU renderer, preferring the platform's primary API
+/// (Vulkan on Linux/Android, DX12 on Windows, Metal on macOS) and falling back
+/// to OpenGL/GLES when primary initialization fails.
+fn create_native_renderer(
+    win: &Arc<Window>,
+    width: u32,
+    height: u32,
+) -> Result<(wgpu::Instance, Renderer)> {
+    let primary_backend = if cfg!(target_os = "windows") {
+        RendererBackend::Dx12
+    } else if cfg!(target_os = "macos") {
+        RendererBackend::Metal
+    } else {
+        RendererBackend::Vulkan
+    };
+
+    let primary_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
+    });
+    let primary_err = match primary_instance.create_surface(win.clone()) {
+        Ok(surface) => match pollster::block_on(Renderer::new(
+            primary_instance.clone(),
+            surface,
+            width,
+            height,
+            primary_backend,
+        )) {
+            Ok(renderer) => return Ok((primary_instance, renderer)),
+            Err(e) => format!("{primary_backend:?} renderer init failed: {e}"),
+        },
+        Err(e) => format!("{primary_backend:?} surface creation failed: {e}"),
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let gl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        match gl_instance.create_surface(win.clone()) {
+            Ok(surface) => match pollster::block_on(Renderer::new(
+                gl_instance.clone(),
+                surface,
+                width,
+                height,
+                RendererBackend::Gles,
+            )) {
+                Ok(renderer) => Ok((gl_instance, renderer)),
+                Err(gl_err) => {
+                    anyhow::bail!("{primary_err}; GLES fallback failed: {gl_err}");
+                }
+            },
+            Err(gl_err) => {
+                anyhow::bail!("{primary_err}; GLES fallback surface failed: {gl_err}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    anyhow::bail!("{primary_err}")
+}
+
 fn run_with_event_loop(
     pak: Arc<PakArchive>,
     storage_base: Option<PathBuf>,
@@ -397,6 +476,7 @@ fn run_with_event_loop(
     let audio = AudioHost::new(&prefs);
     let mut runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
         .map_err(|e| anyhow::anyhow!("initializing runtime: {e}"))?;
+    runtime.set_tz_offset_mins(local_tz_offset_mins());
     runtime.set_autosave_summary(storage.named_summary("autosave", u32::MAX));
     runtime.set_quicksave_summary(storage.named_summary("quicksave", u32::MAX - 1));
     if cfg!(target_os = "android") {
@@ -426,9 +506,11 @@ fn run_with_event_loop(
         was_idle_sleeping: false,
         watch_hot_reload,
         cursor_logical: [0.0, 0.0],
+        left_mouse_down: false,
         scale_factor: 1.0,
         window_size: [1280, 720],
         should_quit: false,
+        init_error: None,
         #[cfg(target_os = "android")]
         android_app,
         #[cfg(target_os = "android")]
@@ -438,6 +520,9 @@ fn run_with_event_loop(
     app.runtime.flush_pending_saves();
     app.process_commands();
     app.storage.flush();
+    if let Some(err) = app.init_error.take() {
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -461,9 +546,11 @@ struct NativeApp {
     was_idle_sleeping: bool,
     watch_hot_reload: bool,
     cursor_logical: [f32; 2],
+    left_mouse_down: bool,
     scale_factor: f32,
     window_size: [u32; 2],
     should_quit: bool,
+    init_error: Option<anyhow::Error>,
     #[cfg(target_os = "android")]
     android_app: Option<android_activity::AndroidApp>,
     #[cfg(target_os = "android")]
@@ -689,8 +776,11 @@ impl NativeApp {
                         );
                     }
                 }
-                HostCommand::StopAudio { channel, .. } => {
-                    self.audio.stop(channel);
+                HostCommand::StopAudio {
+                    channel,
+                    fade_out_us,
+                } => {
+                    self.audio.stop(channel, fade_out_us);
                 }
                 HostCommand::SetAudioGain { channel, gain } => {
                     self.audio.set_channel_gain(channel, gain);
@@ -803,6 +893,9 @@ impl NativeApp {
         if let Some(packet) = self.runtime.prepare_frame(lw, lh) {
             if let Some(renderer) = &mut self.renderer {
                 let _ = renderer.render(packet, self.scale_factor);
+                if renderer.has_missing_glyphs() && renderer.ensure_system_fallback_fonts() {
+                    self.runtime.mark_fonts_changed();
+                }
             }
         }
     }
@@ -830,32 +923,31 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             let attrs = Window::default_attributes()
                 .with_title(&self.pak.program.meta.title)
                 .with_inner_size(LogicalSize::new(sw.max(640) as f64, sh.max(360) as f64));
-            let Ok(win) = event_loop.create_window(attrs) else {
-                event_loop.exit();
-                return;
+            let win = match event_loop.create_window(attrs) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    let err = anyhow::anyhow!("creating window failed: {e}");
+                    eprintln!("player-native: {err:#}");
+                    self.init_error = Some(err);
+                    event_loop.exit();
+                    return;
+                }
             };
-            let win = Arc::new(win);
             let phys = win.inner_size();
             self.window_size = [phys.width.max(1), phys.height.max(1)];
             self.scale_factor = win.scale_factor() as f32;
 
-            let backend = if cfg!(target_os = "windows") {
-                RendererBackend::Dx12
-            } else if cfg!(target_os = "macos") {
-                RendererBackend::Metal
-            } else {
-                RendererBackend::Vulkan
-            };
-            if let Ok(surface) = self.instance.create_surface(win.clone()) {
-                if let Ok(renderer) = pollster::block_on(Renderer::new(
-                    self.instance.clone(),
-                    surface,
-                    self.window_size[0],
-                    self.window_size[1],
-                    backend,
-                )) {
+            match create_native_renderer(&win, self.window_size[0], self.window_size[1]) {
+                Ok((instance, renderer)) => {
+                    self.instance = instance;
                     self.renderer = Some(renderer);
                     self.upload_all_fonts();
+                }
+                Err(err) => {
+                    eprintln!("player-native: GPU initialization failed: {err:#}");
+                    self.init_error = Some(err);
+                    event_loop.exit();
+                    return;
                 }
             }
             self.window = Some(win);
@@ -901,6 +993,11 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.left_mouse_down = false;
+                    self.runtime.pointer_cancel();
+                    self.runtime.dispatch(UiAction::HoldSkip(false));
+                }
                 if cfg!(target_os = "android") {
                     self.runtime.set_host_paused(!focused);
                     self.audio.set_host_paused(!focused);
@@ -939,22 +1036,37 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     position.x as f32 / self.scale_factor,
                     position.y as f32 / self.scale_factor,
                 ];
-                self.runtime
-                    .set_hover(self.cursor_logical[0], self.cursor_logical[1]);
-                if let Some(win) = &self.window {
-                    win.set_cursor(if self.runtime.has_hovered_hit() {
-                        winit::window::CursorIcon::Pointer
-                    } else {
-                        winit::window::CursorIcon::Default
-                    });
+                if self.left_mouse_down {
+                    self.runtime
+                        .pointer_drag(self.cursor_logical[0], self.cursor_logical[1]);
+                } else {
+                    self.runtime
+                        .set_hover(self.cursor_logical[0], self.cursor_logical[1]);
+                    if let Some(win) = &self.window {
+                        win.set_cursor(if self.runtime.has_hovered_hit() {
+                            winit::window::CursorIcon::Pointer
+                        } else {
+                            winit::window::CursorIcon::Default
+                        });
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if !self.left_mouse_down {
+                    self.runtime.set_hover(-1.0, -1.0);
+                    if let Some(win) = &self.window {
+                        win.set_cursor(winit::window::CursorIcon::Default);
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    self.left_mouse_down = true;
                     self.runtime
                         .pointer_down(self.cursor_logical[0], self.cursor_logical[1]);
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    self.left_mouse_down = false;
                     self.runtime
                         .pointer_up(self.cursor_logical[0], self.cursor_logical[1]);
                 }
@@ -1043,42 +1155,55 @@ impl ApplicationHandler<UserEvent> for NativeApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_decoded_images();
+        for ended_ch in self.audio.poll_ended() {
+            self.runtime.notify_audio_ended(ended_ch);
+        }
         // NOTE: Do NOT poll while waiting on `pending_decodes` — background workers wake us
         // immediately via `EventLoopProxy::send_event(UserEvent::ImageDecoded)`!
         let now = Instant::now();
+        let next_delay_us = match (
+            self.runtime.next_wakeup_delay_us(),
+            self.audio.next_wakeup_delay_us(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         if self.runtime.dirty {
             self.next_wakeup_at = None;
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
-            if let Some(delay_us) = self.runtime.next_wakeup_delay_us() {
+            if let Some(delay_us) = next_delay_us {
                 let wait_us = delay_us.max(16_000);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    now + Duration::from_micros(wait_us),
-                ));
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(now + Duration::from_micros(wait_us)));
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             return;
         }
 
-        if let Some(delay_us) = self.runtime.next_wakeup_delay_us() {
+        if let Some(delay_us) = next_delay_us {
             self.was_idle_sleeping = false;
             if delay_us <= 16_000 {
                 self.next_wakeup_at = None;
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
             } else if self.next_wakeup_at.is_some_and(|at| now >= at) {
                 // Exact timer deadline reached -> run one tick now!
                 self.next_wakeup_at = None;
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
             } else {
-                // Sleep precisely until next Auto / Toast / Typewriter / Timer event (0% CPU between wakes!)
+                // Sleep precisely until next Auto / Toast / Typewriter / Audio / Timer event (0% CPU between wakes!)
                 let target = self
                     .next_wakeup_at
                     .unwrap_or_else(|| now + Duration::from_micros(delay_us.min(6_000_000)));
@@ -1096,5 +1221,46 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             self.was_idle_sleeping = true;
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_timezone_offset_is_within_valid_range() {
+        let mins = local_tz_offset_mins();
+        assert!(
+            (-720..=840).contains(&mins),
+            "unexpected timezone offset: {mins} mins"
+        );
+    }
+
+    #[test]
+    fn native_wgpu_backends_are_compiled_in() {
+        let enabled = wgpu::Instance::enabled_backend_features();
+        #[cfg(target_os = "macos")]
+        assert!(
+            enabled.contains(wgpu::Backends::METAL),
+            "macOS build must enable wgpu Metal backend (enabled: {enabled:?})"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            enabled.contains(wgpu::Backends::DX12) || enabled.contains(wgpu::Backends::VULKAN),
+            "Windows build must enable wgpu DX12/Vulkan backend (enabled: {enabled:?})"
+        );
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert!(
+            enabled.contains(wgpu::Backends::VULKAN) && enabled.contains(wgpu::Backends::GL),
+            "Linux/Android build must enable wgpu Vulkan + GLES backends (enabled: {enabled:?})"
+        );
+
+        // Verify a native Instance can be constructed without panicking and enumerate adapters cleanly.
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let _adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY | wgpu::Backends::GL);
     }
 }

@@ -12,7 +12,7 @@ use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -269,15 +269,31 @@ struct StreamJob {
     cache_short: Option<(Arc<Mutex<AudioCache>>, AssetId)>,
 }
 
+/// Suspend idle ALSA/PipeWire/WASAPI/CoreAudio output stream after 5s of silence (0% audio CPU!).
+const AUDIO_IDLE_SUSPEND_DELAY: Duration = Duration::from_secs(5);
+/// Fade-out volume update cadence (~60 Hz while a channel is fading out).
+const FADE_TICK_US: u64 = 16_000;
+
 struct ActiveChannel {
     sink: Sink,
     bus: AudioBus,
     base_gain: f32,
 }
 
+struct FadingChannel {
+    sink: Sink,
+    bus: AudioBus,
+    start_gain: f32,
+    started_at: Instant,
+    duration: Duration,
+}
+
 pub struct AudioHost {
     stream: Option<OutputStream>,
+    stream_unavailable: bool,
+    idle_since: Option<Instant>,
     channels: HashMap<ChannelId, ActiveChannel>,
+    fading_out: Vec<FadingChannel>,
     bus_gains: [f32; 4], // [master, bgm, voice, sfx]
     bus_paused: [bool; 3],
     host_paused: bool,
@@ -288,7 +304,6 @@ pub struct AudioHost {
 
 impl AudioHost {
     pub fn new(prefs: &Preferences) -> Self {
-        let stream = OutputStreamBuilder::open_default_stream().ok();
         let cache = Arc::new(Mutex::new(AudioCache::new()));
         let (prefetch_tx, prefetch_rx) = mpsc::channel::<PrefetchJob>();
         let worker_cache = Arc::clone(&cache);
@@ -326,8 +341,12 @@ impl AudioHost {
         }
 
         let mut host = Self {
-            stream,
+            // Open lazily on first `play()` so silent title screens / idle periods use 0 audio CPU!
+            stream: None,
+            stream_unavailable: false,
+            idle_since: None,
             channels: HashMap::new(),
+            fading_out: Vec::new(),
             bus_gains: [1.0; 4],
             bus_paused: [false; 3],
             host_paused: false,
@@ -337,6 +356,25 @@ impl AudioHost {
         };
         host.apply_preferences(prefs);
         host
+    }
+
+    fn ensure_stream(&mut self) -> Option<&OutputStream> {
+        if self.stream.is_none() && !self.stream_unavailable {
+            match OutputStreamBuilder::open_default_stream() {
+                Ok(s) => {
+                    self.stream = Some(s);
+                    self.idle_since = None;
+                }
+                Err(_) => {
+                    self.stream_unavailable = true;
+                }
+            }
+        }
+        self.stream.as_ref()
+    }
+
+    pub fn is_stream_open(&self) -> bool {
+        self.stream.is_some()
     }
 
     pub fn clear_cache(&mut self) {
@@ -357,7 +395,7 @@ impl AudioHost {
 
     /// Asynchronously pre-decodes short Voice/SFX assets into the PCM16 LRU cache (lookahead!).
     pub fn prefetch(&self, pak: &Arc<PakArchive>, id: AssetId, ext: &'static str) {
-        if self.stream.is_none() {
+        if self.stream_unavailable {
             return;
         }
         let Some((start, len)) = pak.asset_range(id) else {
@@ -396,23 +434,25 @@ impl AudioHost {
         fade_in_us: u64,
         loop_region: Option<AudioLoopRegion>,
     ) {
-        self.stop(channel);
-        let Some(stream) = &self.stream else {
-            return;
-        };
+        self.stop(channel, 0);
         let Some((start, len)) = pak.asset_range(asset) else {
             return;
         };
         if len == 0 {
             return;
         }
+        let vol = self.effective_gain(bus, gain);
+        let paused = self.host_paused || self.bus_paused[bus_index(bus)];
+        let Some(stream) = self.ensure_stream() else {
+            return;
+        };
 
         let sink = Sink::connect_new(stream.mixer());
-        let vol = self.effective_gain(bus, gain);
         sink.set_volume(vol);
-        if self.host_paused || self.bus_paused[bus_index(bus)] {
+        if paused {
             sink.pause();
         }
+        self.idle_since = None;
 
         // Fast path 1: Already decoded in PCM16 LRU cache (0ms startup, zero-copy Arc share!)
         let cached = {
@@ -471,9 +511,19 @@ impl AudioHost {
         );
     }
 
-    pub fn stop(&mut self, channel: ChannelId) {
+    pub fn stop(&mut self, channel: ChannelId, fade_out_us: u64) {
         if let Some(ch) = self.channels.remove(&channel) {
-            ch.sink.stop();
+            if fade_out_us > 0 && !ch.sink.empty() && !self.host_paused {
+                self.fading_out.push(FadingChannel {
+                    sink: ch.sink,
+                    bus: ch.bus,
+                    start_gain: ch.base_gain,
+                    started_at: Instant::now(),
+                    duration: Duration::from_micros(fade_out_us),
+                });
+            } else {
+                ch.sink.stop();
+            }
         }
     }
 
@@ -500,6 +550,15 @@ impl AudioHost {
                 }
             }
         }
+        for f in &self.fading_out {
+            if f.bus == bus {
+                if eff_paused {
+                    f.sink.pause();
+                } else {
+                    f.sink.play();
+                }
+            }
+        }
     }
 
     /// Global lifecycle pause/resume (e.g. Android `suspended` / focus lost) preserving per-bus pauses.
@@ -508,6 +567,12 @@ impl AudioHost {
             return;
         }
         self.host_paused = paused;
+        if paused {
+            // Immediately finalize any in-flight fade-outs when backgrounded.
+            for f in self.fading_out.drain(..) {
+                f.sink.stop();
+            }
+        }
         for ch in self.channels.values() {
             if paused || self.bus_paused[bus_index(ch.bus)] {
                 ch.sink.pause();
@@ -515,10 +580,32 @@ impl AudioHost {
                 ch.sink.play();
             }
         }
+        if paused && self.channels.is_empty() && self.fading_out.is_empty() {
+            self.stream = None;
+            self.idle_since = None;
+        }
     }
 
-    /// Returns channel IDs that have naturally finished playing since last poll.
+    /// Advances active fade-outs, suspends the OS audio output stream after idle silence,
+    /// and returns channel IDs that have naturally finished playing since last poll.
     pub fn poll_ended(&mut self) -> Vec<ChannelId> {
+        let now = Instant::now();
+        let bus_gains = self.bus_gains;
+        self.fading_out.retain(|f| {
+            if f.sink.empty() {
+                return false;
+            }
+            let elapsed = now.saturating_duration_since(f.started_at);
+            if elapsed >= f.duration {
+                f.sink.stop();
+                return false;
+            }
+            let frac = (1.0 - elapsed.as_secs_f32() / f.duration.as_secs_f32()).clamp(0.0, 1.0);
+            let vol = effective_gain_with(&bus_gains, f.bus, f.start_gain * frac);
+            f.sink.set_volume(vol);
+            true
+        });
+
         let mut ended = Vec::new();
         self.channels.retain(|&id, ch| {
             if ch.sink.empty() {
@@ -528,24 +615,73 @@ impl AudioHost {
                 true
             }
         });
+
+        if self.channels.is_empty() && self.fading_out.is_empty() {
+            if self.stream.is_some() {
+                match self.idle_since {
+                    None => self.idle_since = Some(now),
+                    Some(since)
+                        if now.saturating_duration_since(since) >= AUDIO_IDLE_SUSPEND_DELAY =>
+                    {
+                        self.stream = None;
+                        self.idle_since = None;
+                    }
+                    Some(_) => {}
+                }
+            }
+        } else {
+            self.idle_since = None;
+        }
         ended
     }
 
+    /// Exact microseconds until the audio host next needs a wakeup (fade-out step or idle auto-suspend).
+    pub fn next_wakeup_delay_us(&self) -> Option<u64> {
+        if !self.fading_out.is_empty() {
+            return Some(FADE_TICK_US);
+        }
+        if self.channels.is_empty() && self.stream.is_some() {
+            let now = Instant::now();
+            if let Some(since) = self.idle_since {
+                let elapsed = now.saturating_duration_since(since);
+                let rem = AUDIO_IDLE_SUSPEND_DELAY.saturating_sub(elapsed);
+                return Some(rem.as_micros().max(1_000) as u64);
+            }
+            return Some(AUDIO_IDLE_SUSPEND_DELAY.as_micros() as u64);
+        }
+        None
+    }
+
     fn effective_gain(&self, bus: AudioBus, base_gain: f32) -> f32 {
-        let b = match bus {
-            AudioBus::Bgm => self.bus_gains[1],
-            AudioBus::Voice => self.bus_gains[2],
-            AudioBus::Sfx => self.bus_gains[3],
-        };
-        (self.bus_gains[0] * b * base_gain).clamp(0.0, 2.0)
+        effective_gain_with(&self.bus_gains, bus, base_gain)
     }
 
     fn refresh_volumes(&self) {
+        let now = Instant::now();
         for ch in self.channels.values() {
             ch.sink
                 .set_volume(self.effective_gain(ch.bus, ch.base_gain));
         }
+        for f in &self.fading_out {
+            let elapsed = now.saturating_duration_since(f.started_at);
+            let frac = if f.duration.is_zero() {
+                0.0
+            } else {
+                (1.0 - elapsed.as_secs_f32() / f.duration.as_secs_f32()).clamp(0.0, 1.0)
+            };
+            f.sink
+                .set_volume(self.effective_gain(f.bus, f.start_gain * frac));
+        }
     }
+}
+
+fn effective_gain_with(bus_gains: &[f32; 4], bus: AudioBus, base_gain: f32) -> f32 {
+    let b = match bus {
+        AudioBus::Bgm => bus_gains[1],
+        AudioBus::Voice => bus_gains[2],
+        AudioBus::Sfx => bus_gains[3],
+    };
+    (bus_gains[0] * b * base_gain).clamp(0.0, 2.0)
 }
 
 fn bus_index(bus: AudioBus) -> usize {
@@ -1223,5 +1359,12 @@ mod tests {
         assert_eq!(cache.bytes, 80);
         assert!(cache.get(AssetId(1)).is_some());
         assert!(cache.get(AssetId(2)).is_some());
+    }
+
+    #[test]
+    fn audio_host_starts_lazy_with_no_open_stream_or_wakeup() {
+        let host = AudioHost::new(&Preferences::default());
+        assert!(!host.is_stream_open());
+        assert!(host.next_wakeup_delay_us().is_none());
     }
 }

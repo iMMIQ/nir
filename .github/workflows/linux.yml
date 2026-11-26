@@ -24,6 +24,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake
       - uses: ./.github/actions/build-sdk
+      - name: Verify native player tests and GPU backends
+        run: cargo test --locked -p player-native -p nir-render -p nir-ui
       - name: Package independent sample
         run: |
           rm -rf target/linux-sample

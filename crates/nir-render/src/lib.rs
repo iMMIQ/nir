@@ -1094,6 +1094,19 @@ impl Renderer {
         self.text.missing_glyphs
     }
 
+    /// Lazily loads OS system fallback fonts on native platforms when bundled/subsetted fonts
+    /// lack glyphs (e.g. UI locale switch or unsubsetted symbols).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ensure_system_fallback_fonts(&mut self) -> bool {
+        if self.text.ensure_system_fallback_fonts() {
+            self.text_font_epoch = self.text_font_epoch.wrapping_add(1);
+            self.last_text_sig = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set_texture_cache_limit(&mut self, bytes: u64) {
         self.texture_limit = bytes.max(24 * 1024 * 1024);
         self.evict_lru_keeping(None);
