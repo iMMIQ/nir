@@ -3075,6 +3075,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "base64",
+ "jni 0.21.1",
  "libc",
  "memmap2",
  "nir-ir",

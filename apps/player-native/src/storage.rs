@@ -312,6 +312,80 @@ impl LocalStorage {
         out
     }
 
+    /// Exports all saves (slots + autosave + quicksave), profile, and preferences into a single
+    /// portable JSON backup file (compatible for cross-device migration without root on Android!).
+    pub fn export_backup_json(&self, game_id: &str, slot_count: u32, dest: &Path) -> Result<usize> {
+        self.flush();
+        let mut slots = BTreeMap::<String, SaveSnapshot>::new();
+        for name in ["autosave", "quicksave"] {
+            if let Ok(snap) = self.load_named(name) {
+                slots.insert(name.to_owned(), snap);
+            }
+        }
+        for slot in 0..slot_count {
+            if let Ok(snap) = self.load_slot(slot) {
+                slots.insert(format!("slot_{slot:02}"), snap);
+            }
+        }
+        let count = slots.len();
+        let payload = serde_json::json!({
+            "format": "nir-backup-v1",
+            "game_id": game_id,
+            "preferences": self.load_preferences(),
+            "profile": self.load_profile(),
+            "saves": slots,
+        });
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(&payload)?;
+        write_bytes_atomic(dest, &data)?;
+        Ok(count)
+    }
+
+    /// Imports saves/profile/preferences from a portable JSON backup file produced by `export_backup_json`.
+    pub fn import_backup_json(&self, expected_game_id: &str, src: &Path) -> Result<usize> {
+        let text = fs::read_to_string(src)
+            .with_context(|| format!("reading save backup `{}`", src.display()))?;
+        let val: serde_json::Value = serde_json::from_str(&text)?;
+        if let Some(gid) = val.get("game_id").and_then(|v| v.as_str()) {
+            if !gid.is_empty() && gid != expected_game_id {
+                anyhow::bail!("backup game_id `{gid}` does not match `{expected_game_id}`");
+            }
+        }
+        if let Some(p) = val.get("preferences") {
+            if let Ok(prefs) = serde_json::from_value::<Preferences>(p.clone()) {
+                let _ = self.save_preferences(&prefs);
+            }
+        }
+        if let Some(pr) = val.get("profile") {
+            if let Ok(profile) = serde_json::from_value::<ProfileData>(pr.clone()) {
+                let _ = self.save_profile(&profile);
+            }
+        }
+        let mut imported = 0usize;
+        if let Some(map) = val.get("saves").and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                let Ok(snap) = serde_json::from_value::<SaveSnapshot>(v.clone()) else {
+                    continue;
+                };
+                if k == "autosave" || k == "quicksave" {
+                    if self.save_named(k, &snap).is_ok() {
+                        imported += 1;
+                    }
+                } else if let Some(rest) = k.strip_prefix("slot_") {
+                    if let Ok(slot) = rest.parse::<u32>() {
+                        if self.save_slot(slot, &snap).is_ok() {
+                            imported += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.flush();
+        Ok(imported)
+    }
+
     /// Blocks until all queued background writes have safely completed on disk.
     pub fn flush(&self) {
         if let Some(tx) = &self.writer_tx {
@@ -559,6 +633,78 @@ mod tests {
 
         drop(st_a);
         drop(st_b);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_export_and_import_roundtrips_saves_and_preferences() {
+        let dir = std::env::temp_dir().join(format!(
+            "nir-storage-backup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = dir.join("src");
+        let dst_dir = dir.join("dst");
+        let backup_path = dir.join("saves-backup.json");
+
+        let st_src = LocalStorage::open("org.nir.backup_demo", Some(src_dir)).unwrap();
+        let prefs = Preferences {
+            master_volume: 0.77,
+            eco_mode: true,
+            ..Default::default()
+        };
+        st_src.save_preferences(&prefs).unwrap();
+        let snap = SaveSnapshot {
+            format: nir_vm::SAVE_FORMAT_VERSION,
+            game_id: "org.nir.backup_demo".into(),
+            version: "1.0".into(),
+            saved_at_unix: 1_700_000_050,
+            summary: "Portable Save".into(),
+            pc: 7,
+            last_label: None,
+            vars: BTreeMap::new(),
+            frames: vec![],
+            layers: vec![],
+            dialogue_visible: true,
+            dialogue: None,
+            dialogue_portrait: None,
+            dialogue_style: 0,
+            choice: None,
+            wait: nir_vm::WaitReason::None,
+            audio: vec![],
+            audio_paused: [false; 3],
+            timelines: vec![],
+            history: vec![],
+            locale: "zh-Hans".into(),
+            rng_word_pos: 0,
+            outcome: None,
+            thumbnail: None,
+        };
+        st_src.save_slot(3, &snap).unwrap();
+        st_src.save_named("autosave", &snap).unwrap();
+
+        let exported = st_src
+            .export_backup_json("org.nir.backup_demo", 8, &backup_path)
+            .unwrap();
+        assert_eq!(exported, 2);
+
+        let st_dst = LocalStorage::open("org.nir.backup_demo", Some(dst_dir)).unwrap();
+        // Reject mismatched game_id backups cleanly.
+        assert!(st_dst
+            .import_backup_json("org.nir.other_game", &backup_path)
+            .is_err());
+        let imported = st_dst
+            .import_backup_json("org.nir.backup_demo", &backup_path)
+            .unwrap();
+        assert_eq!(imported, 2);
+        assert_eq!(st_dst.load_slot(3).unwrap().summary, "Portable Save");
+        assert_eq!(st_dst.load_named("autosave").unwrap().pc, 7);
+        assert!(st_dst.load_preferences().eco_mode);
+
+        drop(st_src);
+        drop(st_dst);
         let _ = fs::remove_dir_all(&dir);
     }
 }

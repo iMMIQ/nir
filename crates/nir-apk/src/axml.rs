@@ -41,6 +41,7 @@ const NO_INDEX: u32 = 0xffff_ffff;
 const FRAMEWORK_ATTRIBUTES: &[(&str, u32)] = &[
     ("theme", 0x0101_0000),
     ("label", 0x0101_0001),
+    ("icon", 0x0101_0002),
     ("name", 0x0101_0003),
     ("hasCode", 0x0101_000c),
     ("exported", 0x0101_0010),
@@ -53,6 +54,7 @@ const FRAMEWORK_ATTRIBUTES: &[(&str, u32)] = &[
     ("versionName", 0x0101_021c),
     ("targetSdkVersion", 0x0101_0270),
     ("extractNativeLibs", 0x0101_04ea),
+    ("appCategory", 0x0101_0545),
 ];
 
 fn framework_id(name: &str) -> Option<u32> {

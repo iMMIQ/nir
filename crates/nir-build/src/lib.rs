@@ -83,20 +83,27 @@ pub struct ThemeSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AndroidSection {
+    /// Optional custom Java package name (e.g. `com.studio.story`); defaults to `org.nir.g<game_id>`.
+    pub package: Option<String>,
     pub version_code: u32,
     pub min_sdk: u32,
     pub target_sdk: u32,
     /// Optional Android screen orientation (`sensorLandscape`, `fullSensor`, `landscape`, `portrait`).
     pub orientation: Option<String>,
+    /// Optional custom launcher icon path relative to project root (PNG/WebP/JPG);
+    /// automatically falls back to `title_bg` or a generated emblem when omitted.
+    pub icon: Option<String>,
 }
 
 impl Default for AndroidSection {
     fn default() -> Self {
         Self {
+            package: None,
             version_code: 1,
             min_sdk: 26,
             target_sdk: 34,
             orientation: None,
+            icon: None,
         }
     }
 }
@@ -744,8 +751,88 @@ pub fn package_native(
     Ok(())
 }
 
-/// Packages a zero-Gradle signed Android APK with `assets/game.nirpak` stored uncompressed
-/// (page-aligned for direct zero-extraction `AAsset` / `mmap` access!).
+/// Generates a square 192×192 PNG launcher icon for Android APKs from:
+/// 1) `manifest.android.icon` file if configured,
+/// 2) the game's `title_bg` asset inside `built`, or
+/// 3) a clean built-in dark-indigo gradient emblem fallback.
+fn build_android_launcher_icon_png(
+    root: &Path,
+    manifest: &ProjectManifest,
+    built: &BuiltBundle,
+) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+
+    const ICON_SZ: u32 = 192;
+    let source_rgba: Option<(u32, u32, Vec<u8>)> = manifest
+        .android
+        .icon
+        .as_deref()
+        .and_then(|rel| {
+            let p = root.join(rel);
+            let raw = fs::read(&p).ok()?;
+            let (_, codec) =
+                detect_asset_kind_and_codec(&p).unwrap_or((AssetKind::Image, MediaCodec::Png));
+            decode_to_rgba(&raw, codec).map(|(w, h, rgba, _)| (w, h, rgba))
+        })
+        .or_else(|| {
+            let title_id = built
+                .program
+                .ui
+                .title_screen
+                .as_ref()
+                .and_then(|s| s.background)
+                .or(built.program.meta.title_bg)?;
+            let meta = built.program.asset(title_id)?;
+            let raw = built.media_blobs.get(title_id.0 as usize)?;
+            decode_to_rgba(raw, meta.codec).map(|(w, h, rgba, _)| (w, h, rgba))
+        });
+
+    let rgba: Vec<u8> = if let Some((w, h, px)) = source_rgba {
+        let img = image::RgbaImage::from_raw(w, h, px)?;
+        let side = w.min(h).max(1);
+        let cx = (w.saturating_sub(side)) / 2;
+        let cy =
+            (((h.saturating_sub(side)) as f32 * 0.32).round() as u32).min(h.saturating_sub(side));
+        let cropped = image::imageops::crop_imm(&img, cx, cy, side, side).to_image();
+        image::imageops::resize(
+            &cropped,
+            ICON_SZ,
+            ICON_SZ,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_raw()
+    } else {
+        // Minimal clean rounded-gradient emblem fallback (never ships generic green Android robot!).
+        let mut buf = vec![0u8; (ICON_SZ * ICON_SZ * 4) as usize];
+        let half = ICON_SZ as f32 * 0.5;
+        for y in 0..ICON_SZ {
+            for x in 0..ICON_SZ {
+                let fy = y as f32 / ICON_SZ as f32;
+                let fx = x as f32 / ICON_SZ as f32;
+                let dx = (x as f32 - half) / half;
+                let dy = (y as f32 - half) / half;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let glow = (1.0 - (dist * 0.95).clamp(0.0, 1.0)).powf(2.0);
+                let r = (24.0 + fx * 34.0 + glow * 72.0).clamp(0.0, 255.0) as u8;
+                let g = (34.0 + fy * 48.0 + glow * 116.0).clamp(0.0, 255.0) as u8;
+                let b = (62.0 + (1.0 - fy) * 58.0 + glow * 140.0).clamp(0.0, 255.0) as u8;
+                let off = ((y * ICON_SZ + x) * 4) as usize;
+                buf[off..off + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        buf
+    };
+
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    enc.write_image(&rgba, ICON_SZ, ICON_SZ, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
+}
+
+/// Packages a zero-Gradle signed Android APK with `assets/game.nirpak` and `lib/*/libplayer.so`
+/// stored uncompressed and 16 KiB-aligned (Android 15+ 16 KB page-size compatible!) plus
+/// auto-generated `resources.arsc` + launcher icon (`@mipmap/ic_launcher`).
 pub fn package_android(
     root: &Path,
     built: &BuiltBundle,
@@ -768,31 +855,60 @@ pub fn package_android(
         nir_apk::key::SigningIdentity::load(&key_path)?
     };
 
-    let entries = [
-        (
-            "lib/arm64-v8a/libplayer.so",
-            nir_apk::EntryRef::File(libplayer_so),
-        ),
-        (
-            "assets/game.nirpak",
-            nir_apk::EntryRef::Bytes(&built.nirpak),
-        ),
-    ];
+    let package_name = if let Some(custom) = manifest
+        .android
+        .package
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        custom.to_owned()
+    } else {
+        let pkg_suffix: String = built
+            .program
+            .meta
+            .game_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("org.nir.g{pkg_suffix}")
+    };
 
-    let pkg_suffix: String = built
-        .program
-        .meta
-        .game_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let package_name = format!("org.nir.g{pkg_suffix}");
+    const ICON_APK_PATH: &str = "res/mipmap-xxxhdpi/ic_launcher.png";
+    let icon_png = build_android_launcher_icon_png(root, &manifest, built);
+    let arsc_bytes = icon_png
+        .as_ref()
+        .and_then(|_| nir_apk::arsc::encode_launcher_icon(&package_name, ICON_APK_PATH).ok());
+
+    // Optionally include sibling `x86_64/libplayer.so` if present in the SDK alongside `arm64-v8a`.
+    let x86_64_so = libplayer_so
+        .parent()
+        .and_then(Path::parent)
+        .map(|lib_dir| lib_dir.join("x86_64/libplayer.so"))
+        .filter(|p| p.is_file());
+
+    let mut entries: Vec<(&str, nir_apk::EntryRef<'_>)> = Vec::with_capacity(5);
+    if let (Some(arsc), Some(png)) = (arsc_bytes.as_deref(), icon_png.as_deref()) {
+        entries.push(("resources.arsc", nir_apk::EntryRef::Bytes(arsc)));
+        entries.push((ICON_APK_PATH, nir_apk::EntryRef::Bytes(png)));
+    }
+    entries.push((
+        "lib/arm64-v8a/libplayer.so",
+        nir_apk::EntryRef::File(libplayer_so),
+    ));
+    if let Some(ref x86) = x86_64_so {
+        entries.push(("lib/x86_64/libplayer.so", nir_apk::EntryRef::File(x86)));
+    }
+    entries.push((
+        "assets/game.nirpak",
+        nir_apk::EntryRef::Bytes(&built.nirpak),
+    ));
 
     let apk_spec = nir_apk::ManifestSpec {
         package: package_name,
@@ -807,6 +923,10 @@ pub fn package_android(
             .orientation
             .as_deref()
             .and_then(nir_apk::ScreenOrientation::parse),
+        icon_res: arsc_bytes.as_ref().map(|_| nir_apk::arsc::ICON_RES_ID),
+        extract_native_libs: false,
+        app_category_game: true,
+        vibrate_permission: true,
     };
     if let Some(parent) = out_apk.parent() {
         fs::create_dir_all(parent)?;
@@ -1080,10 +1200,11 @@ fn run_delta_pass(
         if meta.kind == AssetKind::Image && meta.codec != MediaCodec::Ktx2 && meta.delta.is_none() {
             if let Some(t) = meta.trim {
                 if t.orig_w >= 128 && t.orig_h >= 128 && t.w >= 64 && t.h >= 64 {
-                    trim_buckets
-                        .entry((t.orig_w, t.orig_h))
-                        .or_default()
-                        .push((program.str(meta.name).to_owned(), idx, t));
+                    trim_buckets.entry((t.orig_w, t.orig_h)).or_default().push((
+                        program.str(meta.name).to_owned(),
+                        idx,
+                        t,
+                    ));
                 }
             }
         }
@@ -1319,9 +1440,7 @@ fn run_delta_pass(
                 } else {
                     None
                 };
-                let new_base_len = reencoded_base
-                    .as_ref()
-                    .map_or(base_orig_size, Vec::len);
+                let new_base_len = reencoded_base.as_ref().map_or(base_orig_size, Vec::len);
 
                 let orig_group_bytes: usize = base_orig_size
                     + group_deltas
@@ -1447,7 +1566,8 @@ fn run_auto_embed_font_pass(
     for c in ' '..='~' {
         chars.insert(c);
     }
-    for c in "　「」『』（）【】《》、。！？…—・～：；％＋－×÷".chars() {
+    for c in "　「」『』（）【】《》、。！？…—・～：；％＋－×÷".chars()
+    {
         chars.insert(c);
     }
     let Some((font_bytes, codec)) = build_embedded_game_cjk_font(&chars, opt, cache_dir) else {
@@ -2216,12 +2336,13 @@ fn compute_reachable_ops(program: &NirProgram) -> Vec<bool> {
         return visited;
     }
     let mut queue = std::collections::VecDeque::new();
-    let enqueue = |pc: usize, visited: &mut [bool], queue: &mut std::collections::VecDeque<usize>| {
-        if pc < visited.len() && !visited[pc] {
-            visited[pc] = true;
-            queue.push_back(pc);
-        }
-    };
+    let enqueue =
+        |pc: usize, visited: &mut [bool], queue: &mut std::collections::VecDeque<usize>| {
+            if pc < visited.len() && !visited[pc] {
+                visited[pc] = true;
+                queue.push_back(pc);
+            }
+        };
 
     if let Some(f) = program.funcs.get(program.meta.entry_func.0 as usize) {
         enqueue(f.entry_pc as usize, &mut visited, &mut queue);
@@ -3082,8 +3203,8 @@ label ending:
             lossless_images: true,
             ..OptimizeConfig::default()
         };
-        let built = build_direct_program(prog.clone(), raw_assets, &BTreeSet::new(), &cache, &opt)
-            .unwrap();
+        let built =
+            build_direct_program(prog.clone(), raw_assets, &BTreeSet::new(), &cache, &opt).unwrap();
         // CFG pruning must drop dead/unreachable (AssetId(3))!
         assert_eq!(built.summary.packed_assets, 3);
         assert_eq!(built.summary.pruned_assets, 1);
@@ -3103,7 +3224,10 @@ label ending:
             if let Some(d) = &a.delta {
                 delta_count += 1;
                 let base = dec.asset(d.base).unwrap();
-                assert_eq!(a.trim, base.trim, "delta child & base must share union trim");
+                assert_eq!(
+                    a.trim, base.trim,
+                    "delta child & base must share union trim"
+                );
                 assert_eq!((a.width, a.height), (base.width, base.height));
                 assert!(!d.tile_mask.is_empty());
             }
@@ -3117,8 +3241,8 @@ label ending:
             mk_src("char/a_03", sp2),
             mk_src("dead/unreachable", make_sprite(0)),
         ];
-        let cached = build_direct_program(prog, raw_assets2, &BTreeSet::new(), &cache, &opt)
-            .unwrap();
+        let cached =
+            build_direct_program(prog, raw_assets2, &BTreeSet::new(), &cache, &opt).unwrap();
         assert_eq!(cached.summary.delta_patched, built.summary.delta_patched);
     }
 

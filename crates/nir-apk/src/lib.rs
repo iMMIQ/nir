@@ -14,6 +14,10 @@
 //!     target_sdk: 29,
 //!     lib_name: "player".to_owned(),
 //!     screen_orientation: None,
+//!     icon_res: None,
+//!     extract_native_libs: false,
+//!     app_category_game: true,
+//!     vibrate_permission: true,
 //! };
 //! let entries = vec![(
 //!     "lib/arm64-v8a/libplayer.so".to_owned(),
@@ -26,6 +30,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod arsc;
 pub mod axml;
 pub(crate) mod der;
 pub mod key;
@@ -36,8 +41,11 @@ use anyhow::{ensure, Context, Result};
 use axml::{Attr, AttrValue, Element};
 use std::path::{Path, PathBuf};
 
-/// Native library alignment for STORED `lib/**` entries (page size).
-const LIB_ALIGNMENT: u16 = 4096;
+/// Native library & `.nirpak` alignment for STORED entries (16 KiB: satisfies both 4 KiB
+/// and Android 15+ 16 KiB page-size devices for direct `dlopen` / `mmap` from the APK!).
+pub const PAGE_ALIGNMENT: u16 = 16384;
+/// Required 4-byte alignment for uncompressed `resources.arsc` (Android 11+ / API 30+).
+const ARSC_ALIGNMENT: u16 = 4;
 
 /// Optional Android `android:screenOrientation` enum values (matches `ActivityInfo.SCREEN_ORIENTATION_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +93,15 @@ pub struct ManifestSpec {
     pub lib_name: String,
     /// Optional `android:screenOrientation` lock/hint (omitted when `None`).
     pub screen_orientation: Option<ScreenOrientation>,
+    /// Optional `android:icon` resource reference (e.g. `Some(arsc::ICON_RES_ID)` when `resources.arsc` is bundled).
+    pub icon_res: Option<u32>,
+    /// `android:extractNativeLibs` (`false` lets Android `mmap` 16 KB-aligned `.so` directly from the APK).
+    pub extract_native_libs: bool,
+    /// When `true`, emits `android:appCategory="0"` (`CATEGORY_GAME`) for OS game-mode optimizations.
+    pub app_category_game: bool,
+    /// When `true`, emits normal `<uses-permission android:name="android.permission.VIBRATE" />`
+    /// so Android haptic feedback (`VibrationEffect`) works without runtime prompts.
+    pub vibrate_permission: bool,
 }
 
 /// Content source for one APK entry; `File` streams from disk so large games
@@ -210,18 +227,31 @@ fn assemble(
     let file = std::fs::File::create(temporary)
         .with_context(|| format!("E_APK_OUTPUT: {}", temporary.display()))?;
     let mut writer = zip::ZipWriter::new(file);
-    writer.add_bytes("AndroidManifest.xml", zip::Method::Store, manifest_xml)?;
+    writer.add_bytes_aligned(
+        "AndroidManifest.xml",
+        zip::Method::Store,
+        manifest_xml,
+        ARSC_ALIGNMENT,
+    )?;
     for (name, source) in entries {
         let is_lib = name.starts_with("lib/");
         let is_pak = name.ends_with(".nirpak");
-        let method = if is_lib || is_pak {
+        let is_arsc = *name == "resources.arsc";
+        let method = if is_lib || is_pak || is_arsc {
             zip::Method::Store
         } else {
             zip::Method::Deflate
         };
-        // Page-align both native libs AND `.nirpak` so Android `AAsset::open_file_descriptor`
-        // can directly `mmap()` the `.nirpak` out of the APK with zero extraction!
-        let alignment = if is_lib || is_pak { LIB_ALIGNMENT } else { 0 };
+        // 16 KiB-align native libs AND `.nirpak` (compatible with both 4 KiB and Android 15+ 16 KiB
+        // page-size devices so `dlopen` / `AAsset::open_file_descriptor` + `mmap()` never fail!),
+        // and 4-byte-align uncompressed `resources.arsc` (required on Android 11+ / API 30+).
+        let alignment = if is_lib || is_pak {
+            PAGE_ALIGNMENT
+        } else if is_arsc {
+            ARSC_ALIGNMENT
+        } else {
+            0
+        };
         match source {
             EntryRef::Bytes(bytes) => writer.add_bytes_aligned(name, method, bytes, alignment)?,
             EntryRef::File(path) => {
@@ -384,16 +414,27 @@ fn manifest_element(manifest: &ManifestSpec) -> Element {
         "label",
         AttrValue::String(manifest.label.clone()),
     ));
+    if let Some(icon_id) = manifest.icon_res {
+        application
+            .attrs
+            .push(Attr::android("icon", AttrValue::Reference(icon_id)));
+    }
     application
         .attrs
         .push(Attr::android("hasCode", AttrValue::Bool(false)));
-    application
-        .attrs
-        .push(Attr::android("extractNativeLibs", AttrValue::Bool(true)));
+    application.attrs.push(Attr::android(
+        "extractNativeLibs",
+        AttrValue::Bool(manifest.extract_native_libs),
+    ));
     application.attrs.push(Attr::android(
         "theme",
         AttrValue::Reference(THEME_DEVICE_DEFAULT_NO_ACTION_BAR_FULLSCREEN),
     ));
+    if manifest.app_category_game {
+        application
+            .attrs
+            .push(Attr::android("appCategory", AttrValue::IntDec(0)));
+    }
     application.children.push(activity);
     let mut root = Element::new("manifest");
     root.attrs.push(Attr::plain(
@@ -409,6 +450,14 @@ fn manifest_element(manifest: &ManifestSpec) -> Element {
         AttrValue::String(manifest.version_name.clone()),
     ));
     root.children.push(uses_sdk);
+    if manifest.vibrate_permission {
+        let mut perm = Element::new("uses-permission");
+        perm.attrs.push(Attr::android(
+            "name",
+            AttrValue::String("android.permission.VIBRATE".to_owned()),
+        ));
+        root.children.push(perm);
+    }
     root.children.push(application);
     root
 }
@@ -437,6 +486,10 @@ mod tests {
                 target_sdk: 29,
                 lib_name: "player".to_owned(),
                 screen_orientation: None,
+                icon_res: None,
+                extract_native_libs: true,
+                app_category_game: false,
+                vibrate_permission: false,
             };
             assert!(validate_manifest(&manifest).is_err(), "{package}");
         }
@@ -475,6 +528,10 @@ mod tests {
             target_sdk: 29,
             lib_name: "player".to_owned(),
             screen_orientation: None,
+            icon_res: None,
+            extract_native_libs: true,
+            app_category_game: false,
+            vibrate_permission: false,
         };
         let encoded = axml::encode(&manifest_element(&manifest)).unwrap();
         let decoded = axml::decode(&encoded).unwrap();
@@ -502,10 +559,36 @@ mod tests {
             target_sdk: 34,
             lib_name: "player".to_owned(),
             screen_orientation: ScreenOrientation::parse("sensorLandscape"),
+            icon_res: Some(arsc::ICON_RES_ID),
+            extract_native_libs: false,
+            app_category_game: true,
+            vibrate_permission: true,
         };
         let encoded = axml::encode(&manifest_element(&manifest)).unwrap();
         let decoded = axml::decode(&encoded).unwrap();
-        let activity = &decoded.root.children[1].children[0];
+        assert_eq!(decoded.root.children[1].name, "uses-permission");
+        let application = &decoded.root.children[2];
+        let icon = application
+            .attrs
+            .iter()
+            .find(|a| a.name == "icon")
+            .expect("icon attr emitted");
+        assert_eq!(icon.resource_id, Some(0x0101_0002));
+        assert_eq!(icon.value, axml::DecodedValue::Reference(arsc::ICON_RES_ID));
+        let cat = application
+            .attrs
+            .iter()
+            .find(|a| a.name == "appCategory")
+            .expect("appCategory attr emitted");
+        assert_eq!(cat.resource_id, Some(0x0101_0545));
+        assert_eq!(cat.value, axml::DecodedValue::IntDec(0));
+        let extract = application
+            .attrs
+            .iter()
+            .find(|a| a.name == "extractNativeLibs")
+            .expect("extractNativeLibs attr emitted");
+        assert_eq!(extract.value, axml::DecodedValue::Bool(false));
+        let activity = &application.children[0];
         let orient = activity
             .attrs
             .iter()

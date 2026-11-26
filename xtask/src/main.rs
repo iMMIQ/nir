@@ -143,44 +143,66 @@ fn main() -> Result<()> {
             }
 
             // 3. Optional Android cdylib cross-compile when NDK is present
+            // Always link with 16 KiB ELF max-page-size for Android 15+ compatibility!
             if let Some((ndk_root, tools)) = android_ndk_tools() {
-                let clang = tools.join(android_tool("aarch64-linux-android26-clang"));
-                let clangxx = tools.join(android_tool("aarch64-linux-android26-clang++"));
-                let mut build = Command::new("cargo");
-                build
-                    .args([
-                        "build",
-                        "-p",
-                        "player-android",
-                        "--target",
-                        "aarch64-linux-android",
-                        "--release",
-                    ])
-                    .env("ANDROID_NDK_ROOT", &ndk_root)
-                    .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", &clang)
-                    .env("CC_aarch64_linux_android", &clang)
-                    .env("CXX_aarch64_linux_android", &clangxx);
-                let ar = tools.join(android_tool("llvm-ar"));
-                if ar.is_file() {
-                    build
-                        .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_AR", &ar)
-                        .env("AR_aarch64_linux_android", &ar);
-                }
-                let ranlib = tools.join(android_tool("llvm-ranlib"));
-                if ranlib.is_file() {
-                    build.env("RANLIB_aarch64_linux_android", &ranlib);
-                }
-                if cfg!(windows)
-                    && std::env::var_os("CMAKE_GENERATOR_aarch64_linux_android").is_none()
-                {
-                    build.env("CMAKE_GENERATOR_aarch64_linux_android", "Ninja");
-                }
-                run(&mut build)?;
-                fs::create_dir_all("dist/sdk/android/lib/arm64-v8a")?;
-                fs::copy(
-                    "target/aarch64-linux-android/release/libplayer_android.so",
-                    "dist/sdk/android/lib/arm64-v8a/libplayer.so",
+                let build_android_abi =
+                    |triple: &str, clang_prefix: &str, abi_dir: &str| -> Result<()> {
+                        let clang = tools.join(android_tool(&format!("{clang_prefix}26-clang")));
+                        let clangxx =
+                            tools.join(android_tool(&format!("{clang_prefix}26-clang++")));
+                        let env_triple = triple.replace('-', "_");
+                        let env_triple_upper = env_triple.to_ascii_uppercase();
+                        let mut build = Command::new("cargo");
+                        build
+                            .args([
+                                "build",
+                                "-p",
+                                "player-android",
+                                "--target",
+                                triple,
+                                "--release",
+                            ])
+                            .env("ANDROID_NDK_ROOT", &ndk_root)
+                            .env(format!("CARGO_TARGET_{env_triple_upper}_LINKER"), &clang)
+                            .env(
+                                format!("CARGO_TARGET_{env_triple_upper}_RUSTFLAGS"),
+                                "-C link-arg=-Wl,-z,max-page-size=16384",
+                            )
+                            .env(format!("CC_{env_triple}"), &clang)
+                            .env(format!("CXX_{env_triple}"), &clangxx);
+                        let ar = tools.join(android_tool("llvm-ar"));
+                        if ar.is_file() {
+                            build
+                                .env(format!("CARGO_TARGET_{env_triple_upper}_AR"), &ar)
+                                .env(format!("AR_{env_triple}"), &ar);
+                        }
+                        let ranlib = tools.join(android_tool("llvm-ranlib"));
+                        if ranlib.is_file() {
+                            build.env(format!("RANLIB_{env_triple}"), &ranlib);
+                        }
+                        if cfg!(windows)
+                            && std::env::var_os(format!("CMAKE_GENERATOR_{env_triple}")).is_none()
+                        {
+                            build.env(format!("CMAKE_GENERATOR_{env_triple}"), "Ninja");
+                        }
+                        run(&mut build)?;
+                        let out_dir = format!("dist/sdk/android/lib/{abi_dir}");
+                        fs::create_dir_all(&out_dir)?;
+                        fs::copy(
+                            format!("target/{triple}/release/libplayer_android.so"),
+                            format!("{out_dir}/libplayer.so"),
+                        )?;
+                        Ok(())
+                    };
+
+                build_android_abi(
+                    "aarch64-linux-android",
+                    "aarch64-linux-android",
+                    "arm64-v8a",
                 )?;
+                if std::env::var_os("NIR_BUILD_ANDROID_X86_64").is_some() {
+                    build_android_abi("x86_64-linux-android", "x86_64-linux-android", "x86_64")?;
+                }
             } else {
                 println!("SDK: Android player skipped (ANDROID_NDK_HOME not set)");
             }

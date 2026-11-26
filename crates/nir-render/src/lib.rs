@@ -277,8 +277,12 @@ pub fn encode_thumbnail_webp(
         (0, 0, width, height)
     };
     let cropped = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
-    let resized =
-        image::imageops::resize(&cropped, target_w, target_h, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(
+        &cropped,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
     let encoded = webp::Encoder::from_rgba(resized.as_raw(), target_w, target_h).encode(72.0);
     Ok(encoded.to_vec())
 }
@@ -1826,12 +1830,58 @@ impl Renderer {
     }
 
     /// Renders `p` offscreen and reads back the cropped `stage_rect` region as canonical sRGB RGBA8
-    /// (zero letterbox bars!). Used strictly on-demand for save thumbnails and `KeyP` screenshots.
+    /// (zero letterbox bars!). Used strictly on-demand for `KeyP` full-resolution screenshots.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_stage_rgba(&mut self, p: &DrawPacket, dpr: f32) -> Result<(u32, u32, Vec<u8>)> {
         let w = self.config.width.max(1);
         let h = self.config.height.max(1);
-        let prepared = self.prepare_render_passes(p, dpr)?;
+        self.capture_stage_rgba_at(p, w, h, dpr)
+    }
+
+    /// Low-cost offscreen capture for save thumbnails: renders directly into a compact target
+    /// (`<= max_dim` pixels along the longest edge, e.g. 320px) so mobile/high-DPI devices avoid
+    /// allocating & synchronously reading back a 10+ MB full-screen texture on the UI thread!
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_stage_thumbnail_rgba(
+        &mut self,
+        p: &DrawPacket,
+        dpr: f32,
+        max_dim: u32,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        let full_w = self.config.width.max(1);
+        let full_h = self.config.height.max(1);
+        let cap = max_dim.max(64);
+        let longest = full_w.max(full_h);
+        if longest <= cap {
+            return self.capture_stage_rgba_at(p, full_w, full_h, dpr);
+        }
+        let scale = cap as f32 / longest as f32;
+        let w = ((full_w as f32 * scale).round() as u32).max(16);
+        let h = ((full_h as f32 * scale).round() as u32).max(16);
+        let scaled_dpr = (dpr * scale).max(0.1);
+        self.capture_stage_rgba_at(p, w, h, scaled_dpr)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn capture_stage_rgba_at(
+        &mut self,
+        p: &DrawPacket,
+        w: u32,
+        h: u32,
+        dpr: f32,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        let saved_w = self.config.width;
+        let saved_h = self.config.height;
+        self.config.width = w;
+        self.config.height = h;
+        let prepared = self.prepare_render_passes(p, dpr);
+        self.config.width = saved_w;
+        self.config.height = saved_h;
+        if w != saved_w || h != saved_h {
+            self.last_viewport = [0, 0];
+            self.last_text_sig = None;
+        }
+        let prepared = prepared?;
 
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("stage_capture"),
@@ -1853,7 +1903,14 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("nir_capture"),
             });
-        self.encode_passes(&mut encoder, &view, p, &prepared)?;
+        // Temporarily override `config.{width,height}` so `encode_passes` computes scissors
+        // against the capture target dimensions rather than the swapchain dimensions!
+        self.config.width = w;
+        self.config.height = h;
+        let encode_res = self.encode_passes(&mut encoder, &view, p, &prepared);
+        self.config.width = saved_w;
+        self.config.height = saved_h;
+        encode_res?;
 
         // Compute cropped physical `stage_rect` bounds (fallback to full viewport if degenerate).
         let (sx, sy, sw, sh) = if p.stage_rect[2] > 16.0 && p.stage_rect[3] > 16.0 {
@@ -1921,7 +1978,12 @@ impl Renderer {
             let src = &mapped[src_off..src_off + unpadded_bpr as usize];
             let dst = &mut out[dst_off..dst_off + unpadded_bpr as usize];
             if is_bgra {
-                for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0)
+                {
                     d[0] = s[2];
                     d[1] = s[1];
                     d[2] = s[0];
@@ -2162,12 +2224,7 @@ impl Renderer {
         verts.clear();
         let premul = |c: [f32; 4]| -> [f32; 4] {
             let a = c[3];
-            [
-                linear(c[0]) * a,
-                linear(c[1]) * a,
-                linear(c[2]) * a,
-                a,
-            ]
+            [linear(c[0]) * a, linear(c[1]) * a, linear(c[2]) * a, a]
         };
         let [s0, s1] = p.stage_quad_range;
         let stage_slice = if s0 < s1 && s1 <= p.quads.len() {
@@ -2175,70 +2232,76 @@ impl Renderer {
         } else {
             &[][..]
         };
-        let has_blur_target =
-            p.needs_blur && !stage_slice.is_empty() && p.stage_rect[2] > 2.0 && p.stage_rect[3] > 2.0;
+        let has_blur_target = p.needs_blur
+            && !stage_slice.is_empty()
+            && p.stage_rect[2] > 2.0
+            && p.stage_rect[3] > 2.0;
 
-        let append_in = |verts: &mut Vec<Vertex>, quads: &[Quad], ox: f32, oy: f32, vw: f32, vh: f32| {
-            let inv_w = 2.0 / vw.max(1.0);
-            let inv_h = 2.0 / vh.max(1.0);
-            let local_uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-            for q in quads {
-                let [x, y, w, h] = q.rect;
-                let (c0, c1) = if q.special == SpecialQuad::StageTransition {
-                    let sp = p.transition.shader_params(p.transition_progress);
-                    (sp, sp)
-                } else {
-                    let start = premul(q.color);
-                    let end = q.color_end.map_or(start, premul);
-                    (start, end)
-                };
-                let vcols = if q.gradient_horizontal {
-                    [c0, c1, c0, c1]
-                } else {
-                    [c0, c0, c1, c1]
-                };
-                let corners = q
-                    .corners
-                    .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
-                let [u0, v0, u1, v1] = q.uv;
-                let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
-                let rect_params = if q.corner_radius > 0.0
-                    || q.border_width > 0.0
-                    || q.special == SpecialQuad::SoftShadow
-                    || q.glass_rim > 0.01
-                {
-                    [w.max(1.0), h.max(1.0), q.corner_radius, q.border_width]
-                } else {
-                    [w.max(1.0), h.max(1.0), 0.0, 0.0]
-                };
-                let (fx_param, fx_mode) = match q.special {
-                    SpecialQuad::SoftShadow => (q.shadow_blur.max(3.0), 1.0),
-                    SpecialQuad::FrostedPanel if has_blur_target => (q.glass_rim, 2.0),
-                    _ => (q.glass_rim, 0.0),
-                };
-                let border_color = if q.border_width > 0.0 && q.border_color[3] > 0.0 {
-                    premul(q.border_color)
-                } else if q.sharpen > 0.01 && q.asset.is_some() && q.special == SpecialQuad::None {
-                    // Sentinel border_color.a < -0.5 enables CAS-lite edge sharpening in quad.wgsl!
-                    [q.sharpen.clamp(0.0, 1.0), 0.0, 0.0, -1.0]
-                } else {
-                    [0.0; 4]
-                };
-                for idx in 0..4 {
-                    verts.push(Vertex {
-                        pos: [
-                            (corners[idx][0] - ox) * inv_w - 1.0,
-                            1.0 - (corners[idx][1] - oy) * inv_h,
-                        ],
-                        uv: uvs[idx],
-                        color: vcols[idx],
-                        rect_params,
-                        border_color,
-                        extra: [local_uvs[idx][0], local_uvs[idx][1], fx_param, fx_mode],
-                    });
+        let append_in =
+            |verts: &mut Vec<Vertex>, quads: &[Quad], ox: f32, oy: f32, vw: f32, vh: f32| {
+                let inv_w = 2.0 / vw.max(1.0);
+                let inv_h = 2.0 / vh.max(1.0);
+                let local_uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+                for q in quads {
+                    let [x, y, w, h] = q.rect;
+                    let (c0, c1) = if q.special == SpecialQuad::StageTransition {
+                        let sp = p.transition.shader_params(p.transition_progress);
+                        (sp, sp)
+                    } else {
+                        let start = premul(q.color);
+                        let end = q.color_end.map_or(start, premul);
+                        (start, end)
+                    };
+                    let vcols = if q.gradient_horizontal {
+                        [c0, c1, c0, c1]
+                    } else {
+                        [c0, c0, c1, c1]
+                    };
+                    let corners =
+                        q.corners
+                            .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
+                    let [u0, v0, u1, v1] = q.uv;
+                    let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
+                    let rect_params = if q.corner_radius > 0.0
+                        || q.border_width > 0.0
+                        || q.special == SpecialQuad::SoftShadow
+                        || q.glass_rim > 0.01
+                    {
+                        [w.max(1.0), h.max(1.0), q.corner_radius, q.border_width]
+                    } else {
+                        [w.max(1.0), h.max(1.0), 0.0, 0.0]
+                    };
+                    let (fx_param, fx_mode) = match q.special {
+                        SpecialQuad::SoftShadow => (q.shadow_blur.max(3.0), 1.0),
+                        SpecialQuad::FrostedPanel if has_blur_target => (q.glass_rim, 2.0),
+                        _ => (q.glass_rim, 0.0),
+                    };
+                    let border_color = if q.border_width > 0.0 && q.border_color[3] > 0.0 {
+                        premul(q.border_color)
+                    } else if q.sharpen > 0.01
+                        && q.asset.is_some()
+                        && q.special == SpecialQuad::None
+                    {
+                        // Sentinel border_color.a < -0.5 enables CAS-lite edge sharpening in quad.wgsl!
+                        [q.sharpen.clamp(0.0, 1.0), 0.0, 0.0, -1.0]
+                    } else {
+                        [0.0; 4]
+                    };
+                    for idx in 0..4 {
+                        verts.push(Vertex {
+                            pos: [
+                                (corners[idx][0] - ox) * inv_w - 1.0,
+                                1.0 - (corners[idx][1] - oy) * inv_h,
+                            ],
+                            uv: uvs[idx],
+                            color: vcols[idx],
+                            rect_params,
+                            border_color,
+                            extra: [local_uvs[idx][0], local_uvs[idx][1], fx_param, fx_mode],
+                        });
+                    }
                 }
-            }
-        };
+            };
         append_in(&mut verts, &p.quads, 0.0, 0.0, p.width, p.height);
         let inline_quad_start = verts.len() / 4;
         if !inline_quads.is_empty() {
@@ -2268,7 +2331,14 @@ impl Renderer {
                 if self.scratch_from_sig != Some(from_sig) {
                     render_from = true;
                     tr_from_quad_start = verts.len() / 4;
-                    append_in(&mut verts, &p.transition_from, 0.0, 0.0, sw as f32, sh as f32);
+                    append_in(
+                        &mut verts,
+                        &p.transition_from,
+                        0.0,
+                        0.0,
+                        sw as f32,
+                        sh as f32,
+                    );
                     self.scratch_from_sig = Some(from_sig);
                 }
                 if self.scratch_to_sig != Some(to_sig) {
@@ -2411,7 +2481,12 @@ impl Renderer {
         if prep.render_from || prep.render_to {
             if let Some((src, dst, sw, sh)) = &self.scratch {
                 for (need, target, quads, qstart) in [
-                    (prep.render_from, src, &p.transition_from, prep.tr_from_quad_start),
+                    (
+                        prep.render_from,
+                        src,
+                        &p.transition_from,
+                        prep.tr_from_quad_start,
+                    ),
                     (prep.render_to, dst, &p.transition_to, prep.tr_to_quad_start),
                 ] {
                     if !need {
@@ -2531,7 +2606,16 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             let phys = [self.config.width, self.config.height];
-            self.paint_quads(&mut pass, &p.quads, 0, [0.0, 0.0], p.width, p.height, phys, p);
+            self.paint_quads(
+                &mut pass,
+                &p.quads,
+                0,
+                [0.0, 0.0],
+                p.width,
+                p.height,
+                phys,
+                p,
+            );
             if !self.cached_inline_quads.is_empty() {
                 self.paint_quads(
                     &mut pass,
@@ -2915,8 +2999,8 @@ mod tests {
         let Ok((device, _queue)) = poll_sync(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wgsl_validate"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits:
+                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
         })) else {

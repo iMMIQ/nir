@@ -29,6 +29,10 @@ fn manifest_spec() -> ManifestSpec {
         target_sdk: 29,
         lib_name: "player".to_owned(),
         screen_orientation: None,
+        icon_res: None,
+        extract_native_libs: true,
+        app_category_game: false,
+        vibrate_permission: false,
     }
 }
 
@@ -166,14 +170,14 @@ fn full_build_round_trips() {
         .find(|e| e.name == "lib/arm64-v8a/libplayer.so")
         .unwrap();
     assert_eq!(lib_entry.method, 0);
-    // Page-aligned uncompressed native code.
+    // 16 KiB page-aligned uncompressed native code (Android 15+ compatible).
     let extra_len = u16::from_le_bytes(
         apk[lib_entry.local_offset as usize + 28..lib_entry.local_offset as usize + 30]
             .try_into()
             .unwrap(),
     ) as usize;
     let data_start = lib_entry.local_offset as usize + 30 + lib_entry.name.len() + extra_len;
-    assert_eq!(data_start % 4096, 0);
+    assert_eq!(data_start % 16384, 0);
     assert_eq!(
         zip::extract_entry(&apk, lib_entry).unwrap(),
         std::fs::read(scratch("rt-libplayer.so")).unwrap()
@@ -461,4 +465,58 @@ fn deterministic_builds_for_the_same_inputs() {
         std::fs::read(&second).unwrap(),
         "identical inputs must produce byte-identical APKs"
     );
+}
+
+#[test]
+fn nirpak_16kb_alignment_and_arsc_launcher_icon() {
+    let key = SigningIdentity::from_seed(&[0x49; 32]).unwrap();
+    let out = scratch("nirpak-16kb-icon.apk");
+    let mut spec = manifest_spec();
+    spec.icon_res = Some(nir_apk::arsc::ICON_RES_ID);
+    spec.extract_native_libs = false;
+    spec.app_category_game = true;
+
+    let arsc =
+        nir_apk::arsc::encode_launcher_icon(&spec.package, "res/mipmap-xxxhdpi/ic_launcher.png")
+            .unwrap();
+    let entries = vec![
+        ("resources.arsc".to_owned(), EntrySource::Bytes(arsc)),
+        (
+            "res/mipmap-xxxhdpi/ic_launcher.png".to_owned(),
+            EntrySource::Bytes(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        ),
+        (
+            "lib/arm64-v8a/libplayer.so".to_owned(),
+            EntrySource::Bytes(vec![0x7f, b'E', b'L', b'F', 0, 0, 0, 0]),
+        ),
+        (
+            "assets/game.nirpak".to_owned(),
+            EntrySource::Bytes(vec![b'N', b'I', b'R', b'P', 0, 0, 0, 0]),
+        ),
+    ];
+    build_apk(&out, &spec, &entries, &key).unwrap();
+    let apk = std::fs::read(&out).unwrap();
+    let parsed = zip::read_entries(&apk).unwrap();
+
+    for (name, expected_align) in [
+        ("resources.arsc", 4usize),
+        ("lib/arm64-v8a/libplayer.so", 16384usize),
+        ("assets/game.nirpak", 16384usize),
+    ] {
+        let entry = parsed.iter().find(|e| e.name == name).unwrap();
+        assert_eq!(entry.method, 0, "{name} must be STORED");
+        let extra_len = u16::from_le_bytes(
+            apk[entry.local_offset as usize + 28..entry.local_offset as usize + 30]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let data_start = entry.local_offset as usize + 30 + entry.name.len() + extra_len;
+        assert_eq!(
+            data_start % expected_align,
+            0,
+            "{name} data_start={data_start} not aligned to {expected_align}"
+        );
+    }
+    let verified = sign::verify_apk(&out).unwrap();
+    assert_eq!(verified.signers, 1);
 }

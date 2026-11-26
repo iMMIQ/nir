@@ -6,7 +6,9 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use nir_render::{decode_image, encode_thumbnail_webp};
+#[cfg(not(target_os = "android"))]
 use std::path::PathBuf;
+#[cfg(not(target_os = "android"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Encodes a stage RGBA8 capture as a compact 160x90 WebP DataURL (100% compatible with Web saves!).

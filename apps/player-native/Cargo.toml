@@ -43,3 +43,4 @@ libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity.workspace = true
+jni = "0.21"

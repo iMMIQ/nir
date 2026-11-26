@@ -11,7 +11,10 @@ use ogg::reading::PacketReader;
 use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -269,15 +272,33 @@ struct StreamJob {
     cache_short: Option<(Arc<Mutex<AudioCache>>, AssetId)>,
 }
 
-/// Suspend idle ALSA/PipeWire/WASAPI/CoreAudio output stream after 5s of silence (0% audio CPU!).
+/// Suspend idle ALSA/PipeWire/WASAPI/CoreAudio/AAudio output stream after 5s of silence (0% audio CPU!).
 const AUDIO_IDLE_SUSPEND_DELAY: Duration = Duration::from_secs(5);
+/// Minimum backoff between audio device reopen attempts after transient failure / disconnect.
+const AUDIO_REOPEN_COOLDOWN: Duration = Duration::from_secs(2);
 /// Fade-out volume update cadence (~60 Hz while a channel is fading out).
 const FADE_TICK_US: u64 = 16_000;
+
+/// Lightweight descriptor retained for active channels so looping BGM can cleanly release
+/// the Android AAudio stream on suspend (0% background drain) and recover from route disconnects!
+#[derive(Clone)]
+struct ChannelSpec {
+    pak: Arc<PakArchive>,
+    asset: AssetId,
+    bus: AudioBus,
+    ext_hint: &'static str,
+    meta_sample_rate: u32,
+    meta_channels: u16,
+    gain: f32,
+    looped: bool,
+    loop_region: Option<AudioLoopRegion>,
+}
 
 struct ActiveChannel {
     sink: Sink,
     bus: AudioBus,
     base_gain: f32,
+    spec: ChannelSpec,
 }
 
 struct FadingChannel {
@@ -290,9 +311,11 @@ struct FadingChannel {
 
 pub struct AudioHost {
     stream: Option<OutputStream>,
-    stream_unavailable: bool,
+    stream_failed: Arc<AtomicBool>,
+    last_stream_fail: Option<Instant>,
     idle_since: Option<Instant>,
     channels: HashMap<ChannelId, ActiveChannel>,
+    suspended_loops: HashMap<ChannelId, ChannelSpec>,
     fading_out: Vec<FadingChannel>,
     bus_gains: [f32; 4], // [master, bgm, voice, sfx]
     bus_paused: [bool; 3],
@@ -343,9 +366,11 @@ impl AudioHost {
         let mut host = Self {
             // Open lazily on first `play()` so silent title screens / idle periods use 0 audio CPU!
             stream: None,
-            stream_unavailable: false,
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            last_stream_fail: None,
             idle_since: None,
             channels: HashMap::new(),
+            suspended_loops: HashMap::new(),
             fading_out: Vec::new(),
             bus_gains: [1.0; 4],
             bus_paused: [false; 3],
@@ -359,18 +384,79 @@ impl AudioHost {
     }
 
     fn ensure_stream(&mut self) -> Option<&OutputStream> {
-        if self.stream.is_none() && !self.stream_unavailable {
-            match OutputStreamBuilder::open_default_stream() {
-                Ok(s) => {
+        if self.stream.is_some() && self.stream_failed.load(Ordering::Acquire) {
+            self.drop_broken_stream();
+        }
+        if self.stream.is_none() {
+            if let Some(prev) = self.last_stream_fail {
+                if prev.elapsed() < AUDIO_REOPEN_COOLDOWN {
+                    return None;
+                }
+            }
+            let failed_flag = Arc::clone(&self.stream_failed);
+            failed_flag.store(false, Ordering::Release);
+            let opened = OutputStreamBuilder::from_default_device().and_then(|builder| {
+                builder
+                    .with_error_callback(move |_err| {
+                        failed_flag.store(true, Ordering::Release);
+                    })
+                    .open_stream()
+            });
+            match opened {
+                Ok(mut s) => {
+                    s.log_on_drop(false);
                     self.stream = Some(s);
+                    self.last_stream_fail = None;
                     self.idle_since = None;
                 }
                 Err(_) => {
-                    self.stream_unavailable = true;
+                    self.last_stream_fail = Some(Instant::now());
                 }
             }
         }
         self.stream.as_ref()
+    }
+
+    fn drop_broken_stream(&mut self) {
+        self.stream_failed.store(false, Ordering::Release);
+        for (id, ch) in self.channels.drain() {
+            ch.sink.stop();
+            if ch.spec.looped {
+                self.suspended_loops.insert(id, ch.spec);
+            }
+        }
+        for f in self.fading_out.drain(..) {
+            f.sink.stop();
+        }
+        self.stream = None;
+        self.idle_since = None;
+    }
+
+    fn resume_suspended_loops(&mut self) {
+        if self.suspended_loops.is_empty() || self.host_paused {
+            return;
+        }
+        let pending: Vec<(ChannelId, ChannelSpec)> = self.suspended_loops.drain().collect();
+        for (channel, spec) in pending {
+            self.play(
+                &spec.pak,
+                spec.asset,
+                channel,
+                spec.bus,
+                spec.ext_hint,
+                spec.meta_sample_rate,
+                spec.meta_channels,
+                spec.gain,
+                spec.looped,
+                120_000, // Gentle 120ms anti-click fade-in when resuming BGM after suspend/route change
+                spec.loop_region,
+            );
+        }
+    }
+
+    /// Forces a clean audio stream retry (e.g. after returning from Android background).
+    pub fn reset_stream_backoff(&mut self) {
+        self.last_stream_fail = None;
     }
 
     pub fn is_stream_open(&self) -> bool {
@@ -395,9 +481,6 @@ impl AudioHost {
 
     /// Asynchronously pre-decodes short Voice/SFX assets into the PCM16 LRU cache (lookahead!).
     pub fn prefetch(&self, pak: &Arc<PakArchive>, id: AssetId, ext: &'static str) {
-        if self.stream_unavailable {
-            return;
-        }
         let Some((start, len)) = pak.asset_range(id) else {
             return;
         };
@@ -441,9 +524,29 @@ impl AudioHost {
         if len == 0 {
             return;
         }
+        let spec = ChannelSpec {
+            pak: Arc::clone(pak),
+            asset,
+            bus,
+            ext_hint,
+            meta_sample_rate,
+            meta_channels,
+            gain,
+            looped,
+            loop_region,
+        };
+        if self.host_paused && cfg!(target_os = "android") {
+            if looped {
+                self.suspended_loops.insert(channel, spec);
+            }
+            return;
+        }
         let vol = self.effective_gain(bus, gain);
         let paused = self.host_paused || self.bus_paused[bus_index(bus)];
         let Some(stream) = self.ensure_stream() else {
+            if looped {
+                self.suspended_loops.insert(channel, spec);
+            }
             return;
         };
 
@@ -472,6 +575,7 @@ impl AudioHost {
                     sink,
                     bus,
                     base_gain: gain,
+                    spec,
                 },
             );
             return;
@@ -507,11 +611,13 @@ impl AudioHost {
                 sink,
                 bus,
                 base_gain: gain,
+                spec,
             },
         );
     }
 
     pub fn stop(&mut self, channel: ChannelId, fade_out_us: u64) {
+        self.suspended_loops.remove(&channel);
         if let Some(ch) = self.channels.remove(&channel) {
             if fade_out_us > 0 && !ch.sink.empty() && !self.host_paused {
                 self.fading_out.push(FadingChannel {
@@ -528,12 +634,16 @@ impl AudioHost {
     }
 
     pub fn set_channel_gain(&mut self, channel: ChannelId, gain: f32) {
+        if let Some(spec) = self.suspended_loops.get_mut(&channel) {
+            spec.gain = gain;
+        }
         let vol = self
             .channels
             .get(&channel)
             .map(|c| self.effective_gain(c.bus, gain));
         if let (Some(ch), Some(v)) = (self.channels.get_mut(&channel), vol) {
             ch.base_gain = gain;
+            ch.spec.gain = gain;
             ch.sink.set_volume(v);
         }
     }
@@ -562,6 +672,8 @@ impl AudioHost {
     }
 
     /// Global lifecycle pause/resume (e.g. Android `suspended` / focus lost) preserving per-bus pauses.
+    /// On Android, fully releases the AAudio output stream while backgrounded (0% audio hardware
+    /// drain) and seamlessly resumes looping BGM upon return!
     pub fn set_host_paused(&mut self, paused: bool) {
         if self.host_paused == paused {
             return;
@@ -572,6 +684,19 @@ impl AudioHost {
             for f in self.fading_out.drain(..) {
                 f.sink.stop();
             }
+            if cfg!(target_os = "android") {
+                for (id, ch) in self.channels.drain() {
+                    ch.sink.stop();
+                    if ch.spec.looped {
+                        self.suspended_loops.insert(id, ch.spec);
+                    }
+                }
+                self.stream = None;
+                self.idle_since = None;
+                return;
+            }
+        } else {
+            self.last_stream_fail = None;
         }
         for ch in self.channels.values() {
             if paused || self.bus_paused[bus_index(ch.bus)] {
@@ -583,12 +708,21 @@ impl AudioHost {
         if paused && self.channels.is_empty() && self.fading_out.is_empty() {
             self.stream = None;
             self.idle_since = None;
+        } else if !paused {
+            self.resume_suspended_loops();
         }
     }
 
-    /// Advances active fade-outs, suspends the OS audio output stream after idle silence,
-    /// and returns channel IDs that have naturally finished playing since last poll.
+    /// Advances active fade-outs, recovers from AAudio/device disconnects, suspends idle OS output
+    /// streams after silence, and returns channel IDs that naturally finished playing.
     pub fn poll_ended(&mut self) -> Vec<ChannelId> {
+        if self.stream_failed.load(Ordering::Acquire) {
+            self.drop_broken_stream();
+        }
+        if !self.suspended_loops.is_empty() && !self.host_paused {
+            self.resume_suspended_loops();
+        }
+
         let now = Instant::now();
         let bus_gains = self.bus_gains;
         self.fading_out.retain(|f| {

@@ -36,6 +36,7 @@ jobs:
             echo "ANDROID_NDK_ROOT=$ndk"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tools/aarch64-linux-android26-clang"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$tools/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384"
             echo "CC_aarch64_linux_android=$tools/aarch64-linux-android26-clang"
             echo "CXX_aarch64_linux_android=$tools/aarch64-linux-android26-clang++"
             echo "AR_aarch64_linux_android=$tools/llvm-ar"
@@ -45,6 +46,7 @@ jobs:
           {
             echo "APKSIGNER=$build_tools/apksigner"
             echo "AAPT2=$build_tools/aapt2"
+            echo "ZIPALIGN=$build_tools/zipalign"
             echo "NIR_APK_APKSIGNER=$build_tools/apksigner"
             echo "NIR_APK_AAPT2=$build_tools/aapt2"
           } >> "$GITHUB_ENV"
@@ -54,10 +56,11 @@ jobs:
           cargo clippy --locked -p player-native -p player-android --target aarch64-linux-android --all-targets -- -D warnings
           cargo test --locked -p nir-apk
       - uses: ./.github/actions/build-sdk
-      - name: Verify Android SDK artifact
+      - name: Verify Android SDK artifact (AArch64 + 16 KB ELF alignment)
         run: |
           test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
-          readelf -h dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -q 'AArch64'
+          LC_ALL=C readelf -h dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -q 'AArch64'
+          LC_ALL=C readelf -lW dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -E 'LOAD.*0x4000'
       - name: Package independent sample
         run: |
           rm -rf target/android-sample
@@ -65,7 +68,10 @@ jobs:
           ./dist/novelc check target/android-sample
           ./dist/novelc build target/android-sample --target android --out target/android-sample/dist/Game.apk
           test -s target/android-sample/dist/Game.apk
-          "$AAPT2" dump badging target/android-sample/dist/Game.apk
+          "$ZIPALIGN" -c -v -P 16 4 target/android-sample/dist/Game.apk
+          badging=$("$AAPT2" dump badging target/android-sample/dist/Game.apk)
+          echo "$badging"
+          echo "$badging" | grep -q "application-icon"
           "$APKSIGNER" verify --verbose target/android-sample/dist/Game.apk
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()

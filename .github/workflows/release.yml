@@ -35,6 +35,7 @@ jobs:
             echo "ANDROID_NDK_ROOT=$ndk"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tools/aarch64-linux-android26-clang"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$tools/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384"
             echo "CC_aarch64_linux_android=$tools/aarch64-linux-android26-clang"
             echo "CXX_aarch64_linux_android=$tools/aarch64-linux-android26-clang++"
             echo "AR_aarch64_linux_android=$tools/llvm-ar"
@@ -72,6 +73,7 @@ jobs:
           test "$(dist/novelc --version)" = "novelc $VERSION"
           test -x dist/sdk/native/player-native
           test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
+          LC_ALL=C readelf -lW dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -E 'LOAD.*0x4000'
           python3 scripts/package.py
           (cd dist && sha256sum --check SHA256SUMS)
           readelf -l dist/bundle/novelc | grep 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'

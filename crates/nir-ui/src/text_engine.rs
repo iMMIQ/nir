@@ -76,6 +76,111 @@ impl Default for TextEngine {
     }
 }
 
+/// Prioritized system font filenames on Android (`/system/fonts`, `/product/fonts`, `/vendor/fonts`).
+/// `fontdb 0.16`'s `load_system_fonts()` is a no-op on `target_os = "android"`, so we explicitly
+/// load key CJK / Latin / Symbol fonts on demand to avoid tofu glyphs on Android devices.
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "android", test)))]
+const ANDROID_PRIORITY_FONTS: &[&str] = &[
+    "NotoSansCJK-Regular.ttc",
+    "NotoSansCJKsc-Regular.otf",
+    "NotoSerifCJK-Regular.ttc",
+    "DroidSansFallback.ttf",
+    "MiSans-Regular.ttf",
+    "HarmonyOS_Sans_SC_Regular.ttf",
+    "Roboto-Regular.ttf",
+    "NotoSans-Regular.ttf",
+    "NotoSansSymbols-Regular-Subsetted.ttf",
+    "NotoSansSymbols-Regular-Subsetted2.ttf",
+    "NotoColorEmoji.ttf",
+];
+
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "android", test)))]
+fn load_android_system_fonts_from_dirs(
+    db: &mut cosmic_text::fontdb::Database,
+    dirs: &[&std::path::Path],
+) -> usize {
+    let mut loaded = 0usize;
+    let mut seen_files: HashSet<std::path::PathBuf> = HashSet::new();
+
+    // Pass 1: Load well-known CJK / Latin / Symbol faces first (fast, avoids scanning hundreds of fonts).
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for name in ANDROID_PRIORITY_FONTS {
+            let path = dir.join(name);
+            if path.is_file() && seen_files.insert(path.clone()) && db.load_font_file(&path).is_ok()
+            {
+                loaded += 1;
+            }
+        }
+    }
+
+    // Pass 2: If OEM ROM uses custom CJK/sans font filenames, opportunistically scan matching files.
+    if loaded < 2 {
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut entries: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for path in entries {
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+                    continue;
+                }
+                let fname = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let interesting = fname.contains("cjk")
+                    || fname.contains("noto")
+                    || fname.contains("roboto")
+                    || fname.contains("sans")
+                    || fname.contains("fallback");
+                if interesting
+                    && seen_files.insert(path.clone())
+                    && db.load_font_file(&path).is_ok()
+                {
+                    loaded += 1;
+                    if loaded >= 12 {
+                        return loaded;
+                    }
+                }
+            }
+        }
+    }
+    loaded
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_platform_system_fonts(db: &mut cosmic_text::fontdb::Database) {
+    #[cfg(target_os = "android")]
+    {
+        use std::path::Path;
+        load_android_system_fonts_from_dirs(
+            db,
+            &[
+                Path::new("/system/fonts"),
+                Path::new("/product/fonts"),
+                Path::new("/vendor/fonts"),
+            ],
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        db.load_system_fonts();
+    }
+}
+
 impl TextEngine {
     pub fn add_font_asset(&mut self, id: AssetId, bytes: Vec<u8>) -> Result<(), String> {
         if self.families.contains_key(&id) {
@@ -173,7 +278,7 @@ impl TextEngine {
             return false;
         }
         let before: HashSet<_> = self.fonts.db().faces().map(|f| f.id).collect();
-        self.fonts.db_mut().load_system_fonts();
+        load_platform_system_fonts(self.fonts.db_mut());
         self.system_fonts_loaded = true;
 
         let mut added: Vec<String> = Vec::new();
@@ -291,7 +396,7 @@ impl TextEngine {
             && self.fallback_families.is_empty()
             && !self.system_fonts_loaded
         {
-            self.fonts.db_mut().load_system_fonts();
+            load_platform_system_fonts(self.fonts.db_mut());
             self.system_fonts_loaded = true;
         }
     }
@@ -591,5 +696,24 @@ mod tests {
         assert!(!engine.missing_glyphs);
         // Second call is an idempotent no-op.
         assert!(!engine.ensure_system_fallback_fonts());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn android_system_font_loader_discovers_priority_fonts_from_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("nir-android-fonts-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_font = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../templates/minimal/assets/fonts/NotoSansCJKsc-Regular.otf");
+        if src_font.is_file() {
+            std::fs::copy(&src_font, dir.join("NotoSansCJKsc-Regular.otf")).unwrap();
+            let mut db = cosmic_text::fontdb::Database::new();
+            let loaded = load_android_system_fonts_from_dirs(&mut db, &[dir.as_path()]);
+            assert_eq!(loaded, 1);
+            assert!(db.faces().next().is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
