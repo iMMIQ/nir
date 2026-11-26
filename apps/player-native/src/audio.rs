@@ -317,6 +317,7 @@ pub struct AudioHost {
     channels: HashMap<ChannelId, ActiveChannel>,
     suspended_loops: HashMap<ChannelId, ChannelSpec>,
     fading_out: Vec<FadingChannel>,
+    video_sink: Option<Sink>,
     bus_gains: [f32; 4], // [master, bgm, voice, sfx]
     bus_paused: [bool; 3],
     host_paused: bool,
@@ -372,6 +373,7 @@ impl AudioHost {
             channels: HashMap::new(),
             suspended_loops: HashMap::new(),
             fading_out: Vec::new(),
+            video_sink: None,
             bus_gains: [1.0; 4],
             bus_paused: [false; 3],
             host_paused: false,
@@ -428,8 +430,62 @@ impl AudioHost {
         for f in self.fading_out.drain(..) {
             f.sink.stop();
         }
+        if let Some(vs) = self.video_sink.take() {
+            vs.stop();
+        }
         self.stream = None;
         self.idle_since = None;
+    }
+
+    /// Stops every active channel, suspended loop, fade-out, and video audio stream (e.g. returning to Shelf).
+    pub fn stop_all(&mut self) {
+        self.suspended_loops.clear();
+        for (_, ch) in self.channels.drain() {
+            ch.sink.stop();
+        }
+        for f in self.fading_out.drain(..) {
+            f.sink.stop();
+        }
+        if let Some(vs) = self.video_sink.take() {
+            vs.stop();
+        }
+    }
+
+    /// Attaches a streaming f32 PCM channel (used by native video audio decoding) to the output mixer.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn start_video_pcm_stream(
+        &mut self,
+        sample_rate: u32,
+        channels: u16,
+        rx: mpsc::Receiver<Vec<f32>>,
+    ) -> bool {
+        self.stop_video_audio();
+        let Some(stream) = self.ensure_stream() else {
+            return false;
+        };
+        let sink = Sink::connect_new(stream.mixer());
+        sink.set_volume(self.bus_gains[0]);
+        sink.append(StreamingAudioSource {
+            rx,
+            current: Vec::new(),
+            pos: 0,
+            sample_rate: sample_rate.max(8_000),
+            channels: channels.clamp(1, 8),
+        });
+        if self.host_paused {
+            sink.pause();
+        }
+        self.video_sink = Some(sink);
+        self.idle_since = None;
+        true
+    }
+
+    /// Stops any active video PCM stream.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn stop_video_audio(&mut self) {
+        if let Some(vs) = self.video_sink.take() {
+            vs.stop();
+        }
     }
 
     fn resume_suspended_loops(&mut self) {
@@ -691,12 +747,19 @@ impl AudioHost {
                         self.suspended_loops.insert(id, ch.spec);
                     }
                 }
-                self.stream = None;
-                self.idle_since = None;
+                if let Some(vs) = &self.video_sink {
+                    vs.pause();
+                } else {
+                    self.stream = None;
+                    self.idle_since = None;
+                }
                 return;
             }
         } else {
             self.last_stream_fail = None;
+            if let Some(vs) = &self.video_sink {
+                vs.play();
+            }
         }
         for ch in self.channels.values() {
             if paused || self.bus_paused[bus_index(ch.bus)] {
@@ -705,11 +768,24 @@ impl AudioHost {
                 ch.sink.play();
             }
         }
-        if paused && self.channels.is_empty() && self.fading_out.is_empty() {
+        if paused && self.channels.is_empty() && self.fading_out.is_empty() && self.video_sink.is_none() {
             self.stream = None;
             self.idle_since = None;
         } else if !paused {
             self.resume_suspended_loops();
+        }
+    }
+
+    /// Pauses or resumes game audio channels while keeping the audio output stream alive for
+    /// embedded video playback (`video_sink`).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn set_game_paused_for_video(&mut self, paused: bool) {
+        for ch in self.channels.values() {
+            if paused || self.host_paused || self.bus_paused[bus_index(ch.bus)] {
+                ch.sink.pause();
+            } else {
+                ch.sink.play();
+            }
         }
     }
 
@@ -750,7 +826,13 @@ impl AudioHost {
             }
         });
 
-        if self.channels.is_empty() && self.fading_out.is_empty() {
+        if let Some(vs) = &self.video_sink {
+            if vs.empty() {
+                self.video_sink = None;
+            }
+        }
+
+        if self.channels.is_empty() && self.fading_out.is_empty() && self.video_sink.is_none() {
             if self.stream.is_some() {
                 match self.idle_since {
                     None => self.idle_since = Some(now),

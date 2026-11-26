@@ -83,6 +83,18 @@ impl PakArchive {
         })
     }
 
+    /// Lightweight in-memory empty placeholder archive used while the built-in Shelf is displayed
+    /// before any `.nirpak` game has been selected.
+    pub fn empty_placeholder() -> Self {
+        Self {
+            source_path: None,
+            last_modified: None,
+            backing: Backing::Bytes(Vec::new()),
+            media_base: 0,
+            program: Arc::new(NirProgram::empty_placeholder()),
+        }
+    }
+
     /// Full backing slice (for zero-copy sub-slice readers).
     #[inline]
     pub fn raw_slice(&self) -> &[u8] {

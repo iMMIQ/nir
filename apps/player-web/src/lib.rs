@@ -104,6 +104,8 @@ pub enum JsHostCommand {
     SavePreferences {
         prefs: Preferences,
     },
+    ExportSaves,
+    ImportSaves,
     ReturnToShelf,
 }
 
@@ -259,6 +261,8 @@ fn convert_host_command(
             profile_json: serde_json::to_string(&profile).unwrap_or_default(),
         }),
         HostCommand::SavePreferences(prefs) => Some(JsHostCommand::SavePreferences { prefs }),
+        HostCommand::ExportSaves => Some(JsHostCommand::ExportSaves),
+        HostCommand::ImportSaves => Some(JsHostCommand::ImportSaves),
         HostCommand::ReturnToShelf => Some(JsHostCommand::ReturnToShelf),
         HostCommand::Quit => None,
     }
@@ -845,6 +849,32 @@ mod wasm_host {
             if let Ok(snap) = serde_json::from_str::<SaveSnapshot>(snapshot_json) {
                 self.runtime.apply_loaded_snapshot(snap);
             }
+        }
+
+        #[wasm_bindgen]
+        pub fn reload_storage_state_json(
+            &mut self,
+            prefs_json: &str,
+            profile_json: &str,
+            slots_json: &str,
+            autosave_json: &str,
+            quicksave_json: &str,
+        ) {
+            let prefs = (!prefs_json.is_empty())
+                .then(|| serde_json::from_str::<Preferences>(prefs_json).ok())
+                .flatten();
+            let profile = (!profile_json.is_empty())
+                .then(|| serde_json::from_str::<ProfileData>(profile_json).ok())
+                .flatten();
+            let slots: Vec<SlotSummary> = serde_json::from_str(slots_json).unwrap_or_default();
+            let autosave = (!autosave_json.is_empty())
+                .then(|| serde_json::from_str::<SlotSummary>(autosave_json).ok())
+                .flatten();
+            let quicksave = (!quicksave_json.is_empty())
+                .then(|| serde_json::from_str::<SlotSummary>(quicksave_json).ok())
+                .flatten();
+            self.runtime
+                .reload_storage_state(prefs, profile, slots, autosave, quicksave);
         }
 
         #[wasm_bindgen]

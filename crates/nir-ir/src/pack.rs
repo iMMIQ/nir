@@ -173,6 +173,47 @@ pub struct NirProgram {
 }
 
 impl NirProgram {
+    /// Constructs a minimal valid empty `NirProgram` (used for host Shelf placeholder & unit tests).
+    pub fn empty_placeholder() -> Self {
+        let mut texts = BTreeMap::new();
+        texts.insert("zh-Hans".to_owned(), Vec::new());
+        Self {
+            features: 0,
+            meta: GameMeta {
+                game_id: "org.nir.placeholder".to_owned(),
+                title: "NIR Player".to_owned(),
+                version: "0.0.0".to_owned(),
+                stage_width: 1280,
+                stage_height: 720,
+                default_locale: "zh-Hans".to_owned(),
+                locales: vec!["zh-Hans".to_owned()],
+                entry_func: FuncId(0),
+                save_slots: 24,
+                default_reveal_us: 25_000,
+                title_bg: None,
+                title_bgm: None,
+                ui_fonts: Vec::new(),
+                text_fonts: Vec::new(),
+            },
+            strings: vec!["main".to_owned()],
+            vars: Vec::new(),
+            funcs: vec![FuncMeta {
+                name: StrId(0),
+                entry_pc: 0,
+                param_count: 0,
+                local_count: 0,
+            }],
+            labels: Vec::new(),
+            ops: Vec::new(),
+            texts,
+            ui: UiTheme::default(),
+            assets: Vec::new(),
+            asset_lookup: BTreeMap::new(),
+            timelines: Vec::new(),
+            menus: Vec::new(),
+        }
+    }
+
     #[inline]
     pub fn str(&self, id: StrId) -> &str {
         self.strings.get(id.0 as usize).map_or("", String::as_str)

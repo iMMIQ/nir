@@ -212,4 +212,7 @@ pub enum UiAction {
     ToggleTextOutline,
     CycleUiStyleMode,
     ToggleEcoMode,
+    // Portable cross-platform backup actions (appended to preserve postcard enum discriminants!)
+    ExportSaves,
+    ImportSaves,
 }

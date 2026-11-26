@@ -181,6 +181,17 @@ enum Cmd {
         #[arg(long)]
         face_index: Option<u32>,
     },
+    /// Package a standalone Universal Android `.nirpak` Player APK (built-in Shelf, zero bundled game)
+    AndroidPlayer {
+        /// Output APK path (default: `dist/nir-player.apk`)
+        #[arg(long, default_value = "dist/nir-player.apk")]
+        out: PathBuf,
+        /// Optional EC P-256 signing key PEM path (generated automatically if absent)
+        #[arg(long, default_value = "dist/android-player-signing.pem")]
+        key: PathBuf,
+        #[arg(long)]
+        sdk: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +322,23 @@ fn main() -> Result<()> {
                 out.display(),
                 bytes.len() as f64 / (1024.0 * 1024.0),
                 src_path.display()
+            );
+            Ok(())
+        }
+        Cmd::AndroidPlayer { out, key, sdk } => {
+            let sdk_dir = resolve_sdk_dir(sdk.as_deref());
+            let so_path = sdk_dir.join("android/lib/arm64-v8a/libplayer.so");
+            if !so_path.is_file() {
+                bail!(
+                    "Android SDK missing `{}`. Run `cargo xtask sdk` with ANDROID_NDK_HOME set.",
+                    so_path.display()
+                );
+            }
+            nir_build::package_android_player(&so_path, &out, &key)?;
+            println!(
+                "Built Universal Android NIR Player APK: {} ({:.2} MiB)",
+                out.display(),
+                fs::metadata(&out).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
             );
             Ok(())
         }

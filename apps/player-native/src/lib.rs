@@ -5,11 +5,13 @@
 //! streaming/LRU background `rodio`/`symphonia` audio + async indexed local saves.
 
 pub mod android_host;
+pub mod android_video;
 pub mod audio;
 pub mod desktop;
 pub mod gamepad;
 pub mod linux_dbus;
 pub mod pak;
+pub mod shelf;
 pub mod storage;
 
 use anyhow::{Context, Result};
@@ -53,6 +55,8 @@ enum UserEvent {
     ImageDecoded,
     GamepadInput,
     MediaKey,
+    #[cfg(target_os = "android")]
+    VideoFrame,
 }
 
 enum DecodedImage {
@@ -366,11 +370,14 @@ pub fn run_desktop(pak_path: &Path, watch_hot_reload: bool) -> Result<()> {
 /// Runs the unified native player on Desktop with CLI options (`--watch`, `--resume`, `--patch`).
 pub fn run_desktop_with_options(pak_path: &Path, opts: DesktopOptions) -> Result<()> {
     let pak = Arc::new(PakArchive::open_file(pak_path)?);
+    let recent_file = storage::default_data_dir().join("nir").join("recent_games.json");
+    shelf::record_recent_game(&recent_file, pak_path);
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("creating winit event loop")?;
     run_with_event_loop(
-        pak,
+        Some(pak),
+        None,
         None,
         opts,
         event_loop,
@@ -379,56 +386,119 @@ pub fn run_desktop_with_options(pak_path: &Path, opts: DesktopOptions) -> Result
     )
 }
 
-/// Runs the unified native player on Android (`NativeActivity`), memory-mapping
-/// 16 KiB page-aligned STORED `assets/game.nirpak` directly from the APK via `open_file_descriptor`!
+/// Runs the built-in universal `.nirpak` Shelf on Desktop (Windows / Linux / macOS).
+pub fn run_desktop_shelf(shelf_dir: Option<&Path>, opts: DesktopOptions) -> Result<()> {
+    let data_root = storage::default_data_dir();
+    let mut scan_dirs = Vec::new();
+    if let Some(dir) = shelf_dir {
+        scan_dirs.push(dir.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let exe_games = parent.join("games");
+            if exe_games.is_dir() {
+                scan_dirs.push(exe_games);
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_games = cwd.join("games");
+        if cwd_games.is_dir() {
+            scan_dirs.push(cwd_games);
+        }
+    }
+    scan_dirs.push(data_root.join("nir").join("games"));
+
+    let shelf_state = shelf::ShelfState::new(scan_dirs, data_root, false, false);
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("creating winit event loop")?;
+    run_with_event_loop(
+        None,
+        Some(shelf_state),
+        None,
+        opts,
+        event_loop,
+        #[cfg(target_os = "android")]
+        None,
+    )
+}
+
+/// Runs the unified native player on Android (`NativeActivity`):
+/// - Single-game APK: memory-maps 16 KiB-aligned STORED `assets/game.nirpak` directly via `mmap`!
+/// - Universal Player APK (no bundled `assets/game.nirpak`): launches the built-in touch Shelf
+///   scanning `<external_data_path>/games/*.nirpak` so users can play any `.nirpak`!
 #[cfg(target_os = "android")]
 pub fn run_android(android_app: android_activity::AndroidApp) -> Result<()> {
     use std::ffi::CString;
     use std::fs::File;
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
-    let name = CString::new("game.nirpak").unwrap();
-    let mut asset = android_app
-        .asset_manager()
-        .open(&name)
-        .context("opening assets/game.nirpak from APK AssetManager")?;
+    let data_dir = android_app.internal_data_path();
+    let ext_dir = android_app.external_data_path();
 
-    // Zero-copy mmap directly from APK fd when stored uncompressed & page-aligned (16 KiB)!
-    let pak = match asset.open_file_descriptor() {
-        Ok(opened) => {
-            let file = File::from(opened.fd);
-            match PakArchive::from_fd_region(&file, opened.offset as u64, opened.size) {
-                Ok(mapped) => {
-                    android_host::log_info(&format!(
-                        "game.nirpak zero-copy mmap ready (offset={}, size={})",
-                        opened.offset, opened.size
-                    ));
-                    Arc::new(mapped)
-                }
-                Err(e) => {
-                    android_host::log_warn(&format!(
-                        "game.nirpak mmap failed ({e:#}); falling back to heap buffer (check 16 KiB APK alignment)"
-                    ));
-                    Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+    let name = CString::new("game.nirpak").unwrap();
+    let bundled_pak = if let Some(mut asset) = android_app.asset_manager().open(&name) {
+        // Zero-copy mmap directly from APK fd when stored uncompressed & page-aligned (16 KiB)!
+        let pak = match asset.open_file_descriptor() {
+            Ok(opened) => {
+                let file = File::from(opened.fd);
+                match PakArchive::from_fd_region(&file, opened.offset as u64, opened.size) {
+                    Ok(mapped) => {
+                        android_host::log_info(&format!(
+                            "game.nirpak zero-copy mmap ready (offset={}, size={})",
+                            opened.offset, opened.size
+                        ));
+                        Arc::new(mapped)
+                    }
+                    Err(e) => {
+                        android_host::log_warn(&format!(
+                            "game.nirpak mmap failed ({e:#}); falling back to heap buffer (check 16 KiB APK alignment)"
+                        ));
+                        Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+                    }
                 }
             }
-        }
-        Err(e) => {
-            android_host::log_warn(&format!(
-                "AssetManager::open_file_descriptor failed ({e:?}); falling back to heap buffer"
-            ));
-            Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
-        }
+            Err(e) => {
+                android_host::log_warn(&format!(
+                    "AssetManager::open_file_descriptor failed ({e:?}); falling back to heap buffer"
+                ));
+                Arc::new(PakArchive::from_bytes(asset.buffer()?.to_vec())?)
+            }
+        };
+        Some(pak)
+    } else {
+        android_host::log_info(
+            "No bundled assets/game.nirpak; launching Universal Android NIR Shelf mode",
+        );
+        None
     };
 
-    let data_dir = android_app.internal_data_path();
+    let shelf_state = if bundled_pak.is_none() {
+        let storage_root = data_dir
+            .clone()
+            .unwrap_or_else(storage::default_data_dir);
+        let mut scan_dirs = Vec::new();
+        if let Some(ext) = &ext_dir {
+            scan_dirs.push(ext.join("games"));
+            scan_dirs.push(ext.clone());
+        }
+        if let Some(int) = &data_dir {
+            scan_dirs.push(int.join("games"));
+        }
+        Some(shelf::ShelfState::new(scan_dirs, storage_root, true, true))
+    } else {
+        None
+    };
+
     let app_handle = android_app.clone();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_android_app(android_app)
         .build()
         .context("creating Android event loop")?;
     run_with_event_loop(
-        pak,
+        bundled_pak,
+        shelf_state,
         data_dir,
         DesktopOptions::default(),
         event_loop,
@@ -562,50 +632,79 @@ fn load_startup_patches(
 }
 
 fn run_with_event_loop(
-    pak: Arc<PakArchive>,
+    initial_pak: Option<Arc<PakArchive>>,
+    shelf: Option<shelf::ShelfState>,
     storage_base: Option<PathBuf>,
     opts: DesktopOptions,
     event_loop: EventLoop<UserEvent>,
     #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
 ) -> Result<()> {
-    let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base.clone())?;
-    #[cfg(target_os = "android")]
-    let mut imported_backup_count = 0usize;
-    #[cfg(target_os = "android")]
-    if let Some(ext_dir) = android_app.as_ref().and_then(|a| a.external_data_path()) {
-        let import_path = ext_dir.join("saves-import.json");
-        if import_path.is_file() {
-            match storage.import_backup_json(&pak.program.meta.game_id, &import_path) {
-                Ok(n) => {
-                    imported_backup_count = n;
-                    let _ = std::fs::rename(&import_path, ext_dir.join("saves-imported.json"));
-                    android_host::log_info(&format!("Imported {n} saves from external backup"));
-                }
-                Err(e) => {
-                    android_host::log_warn(&format!("Failed to import saves-import.json: {e:#}"));
+    let showing_shelf = initial_pak.is_none();
+    let pak = initial_pak.unwrap_or_else(|| Arc::new(PakArchive::empty_placeholder()));
+    let has_shelf = shelf.is_some();
+
+    let (storage, prefs, profile, slots, imported_backup_count) = if !showing_shelf {
+        let storage = LocalStorage::open(&pak.program.meta.game_id, storage_base.clone())?;
+        #[cfg(target_os = "android")]
+        let mut imported_count = 0usize;
+        #[cfg(not(target_os = "android"))]
+        let imported_count = 0usize;
+        #[cfg(target_os = "android")]
+        if let Some(ext_dir) = android_app.as_ref().and_then(|a| a.external_data_path()) {
+            let import_path = ext_dir.join("saves-import.json");
+            if import_path.is_file() {
+                match storage.import_backup_json(&pak.program.meta.game_id, &import_path) {
+                    Ok(n) => {
+                        imported_count = n;
+                        let _ = std::fs::rename(&import_path, ext_dir.join("saves-imported.json"));
+                        android_host::log_info(&format!(
+                            "Imported {n} saves from external backup"
+                        ));
+                    }
+                    Err(e) => {
+                        android_host::log_warn(&format!(
+                            "Failed to import saves-import.json: {e:#}"
+                        ));
+                    }
                 }
             }
         }
-    }
-
-    let prefs = storage.load_preferences();
-    let profile = storage.load_profile();
-    let slots = storage.list_slot_summaries(pak.program.meta.save_slots);
+        let prefs = storage.load_preferences();
+        let profile = storage.load_profile();
+        let slots = storage.list_slot_summaries(pak.program.meta.save_slots);
+        (Some(storage), prefs, profile, slots, imported_count)
+    } else {
+        (
+            None,
+            nir_ir::Preferences::default(),
+            nir_vm::ProfileData::default(),
+            Vec::new(),
+            0usize,
+        )
+    };
 
     let audio = AudioHost::new(&prefs);
     let mut runtime = Runtime::new(pak.program.clone(), prefs, profile, slots)
         .map_err(|e| anyhow::anyhow!("initializing runtime: {e}"))?;
     runtime.set_tz_offset_mins(local_tz_offset_mins());
-    runtime.set_autosave_summary(storage.named_summary("autosave", u32::MAX));
-    runtime.set_quicksave_summary(storage.named_summary("quicksave", u32::MAX - 1));
-    load_startup_patches(&mut runtime, &pak, &storage, &opts.patches);
+    runtime.set_host_has_shelf(has_shelf);
+    if let Some(st) = &storage {
+        runtime.set_autosave_summary(st.named_summary("autosave", u32::MAX));
+        runtime.set_quicksave_summary(st.named_summary("quicksave", u32::MAX - 1));
+        load_startup_patches(&mut runtime, &pak, st, &opts.patches);
+        if st.is_concurrent_instance() {
+            runtime.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
+        }
+    }
     #[cfg(target_os = "android")]
     {
         runtime.set_input_mode(nir_ui::InputMode::Touch);
         if let Some(app) = &android_app {
             runtime.set_low_power_hint(android_host::read_low_power_hint(app));
-            if let Some(ext_dir) = app.external_data_path() {
-                let _ = load_patch_dir(&mut runtime, &ext_dir.join("patches"));
+            if !showing_shelf {
+                if let Some(ext_dir) = app.external_data_path() {
+                    let _ = load_patch_dir(&mut runtime, &ext_dir.join("patches"));
+                }
             }
         }
         if imported_backup_count > 0 {
@@ -617,23 +716,27 @@ fn run_with_event_loop(
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = imported_backup_count;
         runtime.set_low_power_hint(desktop::read_low_battery_hint());
     }
-    if opts.resume_latest {
+    if !showing_shelf && opts.resume_latest {
         let _ = runtime.try_resume_latest();
     }
-    if storage.is_concurrent_instance() {
-        runtime.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
-    }
 
+    let event_proxy = event_loop.create_proxy();
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
-    let decode_pool = DecodePool::spawn(res_tx, event_loop.create_proxy());
-    let gp_proxy = event_loop.create_proxy();
+    let decode_pool = DecodePool::spawn(res_tx, event_proxy.clone());
+    let gp_proxy = event_proxy.clone();
     let gamepad = GamepadHost::spawn(move || {
         let _ = gp_proxy.send_event(UserEvent::GamepadInput);
     });
-    let dbus_proxy = event_loop.create_proxy();
-    let dbus = LinuxDbusHost::spawn(pak.program.meta.title.clone(), move || {
+    let dbus_proxy = event_proxy.clone();
+    let dbus_title = if showing_shelf {
+        "NIR Player".to_owned()
+    } else {
+        pak.program.meta.title.clone()
+    };
+    let dbus = LinuxDbusHost::spawn(dbus_title, move || {
         let _ = dbus_proxy.send_event(UserEvent::MediaKey);
     });
 
@@ -644,8 +747,14 @@ fn run_with_event_loop(
         delta_bases,
         runtime,
         storage,
-        #[cfg(not(target_os = "android"))]
         storage_base,
+        shelf,
+        showing_shelf,
+        shelf_touch_id: None,
+        shelf_touch_start: [0.0, 0.0],
+        shelf_touch_last_y: 0.0,
+        shelf_touch_dragged: false,
+        event_proxy,
         audio,
         gamepad,
         dbus,
@@ -685,6 +794,8 @@ fn run_with_event_loop(
         #[cfg(not(target_os = "android"))]
         video: desktop::DesktopVideoPlayer::new(),
         #[cfg(target_os = "android")]
+        android_video: android_video::AndroidVideoPlayer::new(),
+        #[cfg(target_os = "android")]
         android_app,
         #[cfg(target_os = "android")]
         keep_screen_on: false,
@@ -705,9 +816,16 @@ struct NativeApp {
     pak: Arc<PakArchive>,
     delta_bases: Arc<HashSet<AssetId>>,
     runtime: Runtime,
-    storage: LocalStorage,
-    #[cfg(not(target_os = "android"))]
+    storage: Option<LocalStorage>,
     storage_base: Option<PathBuf>,
+    shelf: Option<shelf::ShelfState>,
+    showing_shelf: bool,
+    shelf_touch_id: Option<u64>,
+    shelf_touch_start: [f32; 2],
+    shelf_touch_last_y: f32,
+    shelf_touch_dragged: bool,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    event_proxy: EventLoopProxy<UserEvent>,
     audio: AudioHost,
     gamepad: GamepadHost,
     dbus: LinuxDbusHost,
@@ -747,6 +865,8 @@ struct NativeApp {
     clipboard: desktop::DesktopClipboard,
     #[cfg(not(target_os = "android"))]
     video: desktop::DesktopVideoPlayer,
+    #[cfg(target_os = "android")]
+    android_video: android_video::AndroidVideoPlayer,
     #[cfg(target_os = "android")]
     android_app: Option<android_activity::AndroidApp>,
     #[cfg(target_os = "android")]
@@ -789,6 +909,10 @@ impl NativeApp {
                 bottom: (bottom_px as f32) / scale,
             };
             self.runtime.set_safe_insets(insets);
+            if let Some(shelf) = &mut self.shelf {
+                shelf.safe_insets = insets;
+                shelf.dirty = true;
+            }
         }
     }
 
@@ -809,13 +933,17 @@ impl NativeApp {
 
     #[cfg(target_os = "android")]
     fn export_android_external_backup(&self) {
-        if let Some(ext_dir) = self
-            .android_app
-            .as_ref()
-            .and_then(|a| a.external_data_path())
-        {
+        if self.showing_shelf {
+            return;
+        }
+        if let (Some(storage), Some(ext_dir)) = (
+            self.storage.as_ref(),
+            self.android_app
+                .as_ref()
+                .and_then(|a| a.external_data_path()),
+        ) {
             let dest = ext_dir.join("saves-backup.json");
-            let _ = self.storage.export_backup_json(
+            let _ = storage.export_backup_json(
                 &self.pak.program.meta.game_id,
                 self.pak.program.meta.save_slots,
                 &dest,
@@ -1005,9 +1133,10 @@ impl NativeApp {
             return;
         }
         self.thumbs_uploaded = true;
-        let thumbs = self
-            .storage
-            .collect_all_thumbnails(self.pak.program.meta.save_slots);
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        let thumbs = storage.collect_all_thumbnails(self.pak.program.meta.save_slots);
         for (key, url) in thumbs {
             self.upload_thumb_data_url(&key, &url);
         }
@@ -1016,6 +1145,11 @@ impl NativeApp {
     fn save_and_flush_on_exit(&mut self) {
         #[cfg(not(target_os = "android"))]
         self.video.stop();
+        #[cfg(target_os = "android")]
+        self.android_video.stop(&mut self.audio);
+        if self.showing_shelf || self.storage.is_none() {
+            return;
+        }
         if self.runtime.is_story_reading() && self.clean_story_thumb.is_none() {
             if let Some(t) = self.capture_stage_thumb() {
                 self.clean_story_thumb = Some(t);
@@ -1024,7 +1158,9 @@ impl NativeApp {
         self.runtime.emit_autosave();
         self.runtime.flush_pending_saves();
         self.process_commands();
-        self.storage.flush();
+        if let Some(st) = &self.storage {
+            st.flush();
+        }
         #[cfg(target_os = "android")]
         self.export_android_external_backup();
     }
@@ -1094,7 +1230,8 @@ impl NativeApp {
                 .as_ref()
                 .and_then(|a| a.external_data_path())
                 .map(|d| d.join("screenshots"))
-                .unwrap_or_else(|| self.storage.screenshots_dir());
+                .or_else(|| self.storage.as_ref().map(LocalStorage::screenshots_dir))
+                .unwrap_or_else(|| PathBuf::from("screenshots"));
             let fname = filename.clone();
             let _ = std::thread::Builder::new()
                 .name("nir-screenshot".into())
@@ -1111,7 +1248,9 @@ impl NativeApp {
         }
         #[cfg(not(target_os = "android"))]
         {
-            let dir = self.storage.screenshots_dir();
+            let Some(dir) = self.storage.as_ref().map(LocalStorage::screenshots_dir) else {
+                return;
+            };
             let path = dir.join(&filename);
             let _ = std::thread::Builder::new()
                 .name("nir-screenshot".into())
@@ -1134,14 +1273,23 @@ impl NativeApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if ext == "json" {
-            let locale = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("en")
-                .to_owned();
-            match std::fs::read_to_string(&path) {
-                Ok(text) => match self.runtime.load_translation_patch(&locale, &text) {
+        if ext == "nirpak" {
+            self.switch_pak_file(&path);
+            return;
+        }
+        if ext == "json" && !self.showing_shelf {
+            // Detect portable `nir-backup-v1` save backup JSON before falling back to translation patch!
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains("nir-backup-v1") {
+                    self.import_backup_from_path(&path);
+                    return;
+                }
+                let locale = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("en")
+                    .to_owned();
+                match self.runtime.load_translation_patch(&locale, &text) {
                     Ok(count) => {
                         self.runtime
                             .show_toast(format!("已加载翻译补丁 [{locale}]：{count} 条"), 2800);
@@ -1150,26 +1298,25 @@ impl NativeApp {
                         self.runtime
                             .show_toast(format!("翻译补丁解析失败：{e}"), 3200);
                     }
-                },
-                Err(e) => {
-                    self.runtime
-                        .show_toast(format!("无法读取补丁文件：{e}"), 3200);
                 }
+            } else {
+                self.runtime.show_toast("无法读取拖入的 JSON 文件", 2800);
             }
-            return;
-        }
-        if ext == "nirpak" {
-            self.switch_pak_file(&path);
         }
     }
 
-    #[cfg(not(target_os = "android"))]
     fn switch_pak_file(&mut self, path: &Path) {
         let new_pak = match PakArchive::open_file(path) {
             Ok(p) => Arc::new(p),
             Err(e) => {
-                self.runtime
-                    .show_toast(format!("无法打开 .nirpak：{e}"), 3500);
+                if self.showing_shelf {
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.show_toast(format!("无法打开 .nirpak：{e}"), 3500);
+                    }
+                } else {
+                    self.runtime
+                        .show_toast(format!("无法打开 .nirpak：{e}"), 3500);
+                }
                 return;
             }
         };
@@ -1177,14 +1324,52 @@ impl NativeApp {
             match LocalStorage::open(&new_pak.program.meta.game_id, self.storage_base.clone()) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.runtime
-                        .show_toast(format!("无法初始化存档目录：{e}"), 3500);
+                    if self.showing_shelf {
+                        if let Some(shelf) = &mut self.shelf {
+                            shelf.show_toast(format!("无法初始化存档目录：{e}"), 3500);
+                        }
+                    } else {
+                        self.runtime
+                            .show_toast(format!("无法初始化存档目录：{e}"), 3500);
+                    }
                     return;
                 }
             };
 
         // Persist current game before switching
         self.save_and_flush_on_exit();
+        self.audio.stop_all();
+
+        if let Some(shelf) = &self.shelf {
+            shelf.record_recent(path);
+        } else {
+            let recent = self
+                .storage_base
+                .clone()
+                .unwrap_or_else(storage::default_data_dir)
+                .join("nir")
+                .join("recent_games.json");
+            shelf::record_recent_game(&recent, path);
+        }
+
+        #[cfg(target_os = "android")]
+        let mut imported_count = 0usize;
+        #[cfg(target_os = "android")]
+        if let Some(ext_dir) = self
+            .android_app
+            .as_ref()
+            .and_then(|a| a.external_data_path())
+        {
+            let import_path = ext_dir.join("saves-import.json");
+            if import_path.is_file() {
+                if let Ok(n) =
+                    new_storage.import_backup_json(&new_pak.program.meta.game_id, &import_path)
+                {
+                    imported_count = n;
+                    let _ = std::fs::rename(&import_path, ext_dir.join("saves-imported.json"));
+                }
+            }
+        }
 
         let prefs = new_storage.load_preferences();
         let profile = new_storage.load_profile();
@@ -1193,19 +1378,42 @@ impl NativeApp {
         {
             Ok(rt) => rt,
             Err(e) => {
-                self.runtime.show_toast(format!("无法启动作品：{e}"), 3500);
+                if self.showing_shelf {
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.show_toast(format!("无法启动作品：{e}"), 3500);
+                    }
+                } else {
+                    self.runtime.show_toast(format!("无法启动作品：{e}"), 3500);
+                }
                 return;
             }
         };
         new_rt.set_tz_offset_mins(local_tz_offset_mins());
+        new_rt.set_host_has_shelf(self.shelf.is_some());
         new_rt.set_autosave_summary(new_storage.named_summary("autosave", u32::MAX));
         new_rt.set_quicksave_summary(new_storage.named_summary("quicksave", u32::MAX - 1));
         load_startup_patches(&mut new_rt, &new_pak, &new_storage, &[]);
-        new_rt.set_low_power_hint(desktop::read_low_battery_hint());
-        if new_storage.is_concurrent_instance() {
-            new_rt.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
-        } else {
-            new_rt.show_toast(format!("已切换作品：{}", new_pak.program.meta.title), 2600);
+        #[cfg(target_os = "android")]
+        {
+            new_rt.set_input_mode(nir_ui::InputMode::Touch);
+            if let Some(app) = &self.android_app {
+                new_rt.set_low_power_hint(android_host::read_low_power_hint(app));
+                if let Some(ext_dir) = app.external_data_path() {
+                    let _ = load_patch_dir(&mut new_rt, &ext_dir.join("patches"));
+                }
+            }
+            if imported_count > 0 {
+                new_rt.show_toast(format!("已导入 {imported_count} 个外部存档"), 2800);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            new_rt.set_low_power_hint(desktop::read_low_battery_hint());
+            if new_storage.is_concurrent_instance() {
+                new_rt.show_toast("检测到另一窗口正在运行本作，请注意避免存档覆盖", 4200);
+            } else {
+                new_rt.show_toast(format!("已切换作品：{}", new_pak.program.meta.title), 2600);
+            }
         }
 
         self.audio.apply_preferences(&prefs);
@@ -1217,8 +1425,9 @@ impl NativeApp {
         }
         self.delta_bases = collect_delta_bases(&new_pak);
         self.pak = new_pak;
-        self.storage = new_storage;
+        self.storage = Some(new_storage);
         self.runtime = new_rt;
+        self.showing_shelf = false;
         self.icon_applied = false;
         self.prev_story_reading = false;
         self.clean_story_thumb = None;
@@ -1228,8 +1437,254 @@ impl NativeApp {
         if let Some(win) = &self.window {
             win.set_title(&self.pak.program.meta.title);
         }
+        self.sync_android_insets();
         self.upload_all_fonts();
         self.process_commands();
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    fn enter_shelf_mode(&mut self) {
+        if self.shelf.is_none() {
+            self.should_quit = true;
+            return;
+        }
+        self.save_and_flush_on_exit();
+        self.audio.stop_all();
+        self.audio.clear_cache();
+        self.pending_decodes.clear();
+        self.decode_pool.clear_pending();
+        self.storage = None;
+        self.showing_shelf = true;
+        self.thumbs_uploaded = false;
+        self.wake_cursor();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.clear_textures();
+            renderer.ensure_system_fallback_fonts();
+        }
+        if let Some(shelf) = &mut self.shelf {
+            shelf.rescan();
+        }
+        if let Some(win) = &self.window {
+            win.set_title("NIR 书架");
+            win.request_redraw();
+        }
+    }
+
+    fn handle_shelf_action(&mut self, action: shelf::ShelfAction) {
+        match action {
+            shelf::ShelfAction::Launch(path) => {
+                self.switch_pak_file(&path);
+            }
+            shelf::ShelfAction::Rescan => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.clear_textures();
+                }
+                if let Some(shelf) = &mut self.shelf {
+                    shelf.rescan();
+                    let n = shelf.entries.len();
+                    shelf.show_toast(format!("已扫描完成：发现 {n} 部 .nirpak 作品"), 2200);
+                }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+            shelf::ShelfAction::OpenFilePicker => {
+                #[cfg(not(target_os = "android"))]
+                {
+                    if let Some(picked) = rfd::FileDialog::new()
+                        .set_title("Open NIR Game Package (.nirpak)")
+                        .add_filter("NIR Game Package", &["nirpak"])
+                        .pick_file()
+                    {
+                        self.switch_pak_file(&picked);
+                    }
+                }
+            }
+        }
+    }
+
+    fn export_saves_via_host(&mut self) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        let game_id = self.pak.program.meta.game_id.clone();
+        let slot_count = self.pak.program.meta.save_slots;
+
+        #[cfg(target_os = "android")]
+        let dest = self
+            .android_app
+            .as_ref()
+            .and_then(|a| a.external_data_path())
+            .map(|d| d.join("saves-backup.json"))
+            .unwrap_or_else(|| storage.screenshots_dir().join("saves-backup.json"));
+
+        #[cfg(not(target_os = "android"))]
+        let dest = {
+            let stem = desktop::safe_filename_stem(&game_id);
+            let default_name = format!("{stem}-saves-backup.json");
+            match rfd::FileDialog::new()
+                .set_title("导出跨端存档备份 (nir-backup-v1)")
+                .set_file_name(&default_name)
+                .add_filter("NIR Save Backup", &["json"])
+                .save_file()
+            {
+                Some(p) => p,
+                None => return,
+            }
+        };
+
+        match storage.export_backup_json(&game_id, slot_count, &dest) {
+            Ok(n) => {
+                let name = dest
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("saves-backup.json");
+                self.runtime
+                    .show_toast(format!("已导出 {n} 个存档至 {name}"), 3000);
+            }
+            Err(e) => {
+                self.runtime.show_toast(format!("导出失败：{e}"), 3200);
+            }
+        }
+    }
+
+    fn import_saves_via_host(&mut self) {
+        #[cfg(target_os = "android")]
+        let src = {
+            let Some(ext_dir) = self
+                .android_app
+                .as_ref()
+                .and_then(|a| a.external_data_path())
+            else {
+                self.runtime.show_toast("外部存储目录不可用", 2600);
+                return;
+            };
+            let import_file = ext_dir.join("saves-import.json");
+            let backup_file = ext_dir.join("saves-backup.json");
+            if import_file.is_file() {
+                import_file
+            } else if backup_file.is_file() {
+                backup_file
+            } else {
+                self.runtime.show_toast(
+                    "请将 nir-backup-v1 放入外部目录 saves-import.json 或 saves-backup.json",
+                    3600,
+                );
+                return;
+            }
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let src = match rfd::FileDialog::new()
+            .set_title("导入跨端存档备份 (nir-backup-v1)")
+            .add_filter("NIR Save Backup", &["json"])
+            .pick_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+
+        self.import_backup_from_path(&src);
+    }
+
+    fn import_backup_from_path(&mut self, src: &Path) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        let game_id = self.pak.program.meta.game_id.clone();
+        let slot_count = self.pak.program.meta.save_slots;
+        match storage.import_backup_json(&game_id, src) {
+            Ok(n) => {
+                let prefs = storage.load_preferences();
+                let profile = storage.load_profile();
+                let slots = storage.list_slot_summaries(slot_count);
+                let auto = storage.named_summary("autosave", u32::MAX);
+                let quick = storage.named_summary("quicksave", u32::MAX - 1);
+                self.audio.apply_preferences(&prefs);
+                self.runtime
+                    .reload_storage_state(Some(prefs), Some(profile), slots, auto, quick);
+                self.thumbs_uploaded = false;
+                self.ensure_thumbs_uploaded();
+                self.runtime
+                    .show_toast(format!("已导入并合并 {n} 个存档备份"), 3000);
+            }
+            Err(e) => {
+                self.runtime.show_toast(format!("导入失败：{e}"), 3400);
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn render_android_video_frame(&mut self, lw: f32, lh: f32) {
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        let [vw, vh] = self.android_video.last_frame_dims();
+        let aspect = (vw as f32 / vh.max(1) as f32).clamp(0.25, 4.0);
+        let view_aspect = lw / lh.max(1.0);
+        let (dw, dh) = if view_aspect > aspect {
+            (lh * aspect, lh)
+        } else {
+            (lw, lw / aspect)
+        };
+        let dx = (lw - dw) * 0.5;
+        let dy = (lh - dh) * 0.5;
+        let mut pkt = nir_ui::DrawPacket {
+            width: lw,
+            height: lh,
+            stage_rect: [dx, dy, dw, dh],
+            ..Default::default()
+        };
+        pkt.quads
+            .push(nir_ui::Quad::solid([0.0, 0.0, lw, lh], [0.0, 0.0, 0.0, 1.0]));
+        pkt.quads.push(nir_ui::Quad::image(
+            [dx, dy, dw, dh],
+            android_video::VIDEO_FRAME_ASSET_ID,
+        ));
+        if self.android_video.is_skippable() {
+            let safe = self.runtime.safe_insets.rect(lw, lh);
+            let pw = 112.0;
+            let ph = 32.0;
+            let px = safe[0] + safe[2] - pw - 16.0;
+            let py = safe[1] + safe[3] - ph - 14.0;
+            pkt.quads.push(nir_ui::Quad::panel(
+                [px, py, pw, ph],
+                [0.05, 0.07, 0.12, 0.72],
+                None,
+                [0.65, 0.78, 0.96, 0.45],
+                1.0,
+                16.0,
+            ));
+            let mut tr = nir_ui::TextRun {
+                text: "点击跳过".into(),
+                visible_bytes: None,
+                x: px + 8.0,
+                y: py,
+                width: pw - 16.0,
+                height: ph,
+                size: 13.0,
+                line_height: 17.0,
+                color: [0.92, 0.96, 1.0, 0.90],
+                emphasis: Vec::new(),
+                color_spans: Vec::new(),
+                ruby_spans: Vec::new(),
+                shadow: None,
+                outline: None,
+                scroll: 0.0,
+                clip: Some([px, py, pw, ph]),
+                font_assets: Vec::new(),
+                align: nir_ir::TextAlign::Center,
+                valign_center: true,
+                auto_fit: true,
+                inline_images: Vec::new(),
+                cache_key: 0,
+            };
+            tr.compute_key();
+            pkt.texts.push(tr);
+        }
+        let _ = renderer.render(&pkt, self.scale_factor);
     }
 
     fn maybe_apply_window_icon(&mut self, id: AssetId, width: u32, height: u32, rgba: &[u8]) {
@@ -1258,6 +1713,23 @@ impl NativeApp {
     }
 
     fn handle_back_action(&mut self) {
+        if self.showing_shelf {
+            if cfg!(target_os = "android") {
+                let now = Instant::now();
+                if self
+                    .last_back_press
+                    .is_some_and(|prev| now.duration_since(prev) <= Duration::from_millis(2500))
+                {
+                    self.should_quit = true;
+                } else {
+                    self.last_back_press = Some(now);
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.show_toast("再按一次返回键退出", 2200);
+                    }
+                }
+            }
+            return;
+        }
         #[cfg(not(target_os = "android"))]
         if self.video.is_playing() {
             if self.video.is_skippable() {
@@ -1267,7 +1739,21 @@ impl NativeApp {
             }
             return;
         }
+        #[cfg(target_os = "android")]
+        if self.android_video.is_playing() {
+            if self.android_video.is_skippable() {
+                self.android_video.stop(&mut self.audio);
+                self.audio.set_game_paused_for_video(false);
+                self.runtime.notify_video_finished();
+                self.runtime.dirty = true;
+            }
+            return;
+        }
         if self.runtime.screen == nir_ui::Screen::Title && cfg!(target_os = "android") {
+            if self.shelf.is_some() {
+                self.enter_shelf_mode();
+                return;
+            }
             let now = Instant::now();
             if self
                 .last_back_press
@@ -1507,71 +1993,142 @@ impl NativeApp {
                     }
                     #[cfg(target_os = "android")]
                     {
-                        let _ = (asset, skippable);
-                        self.runtime
-                            .show_toast("Android 端暂不支持内嵌影片，已自动跳过", 2400);
-                        self.runtime.notify_video_finished();
+                        let temp_dir = self
+                            .android_app
+                            .as_ref()
+                            .and_then(|a| a.internal_data_path())
+                            .unwrap_or_else(|| PathBuf::from("/data/local/tmp"));
+                        let proxy = self.event_proxy.clone();
+                        let played = if let (Some(meta), Some(bytes)) =
+                            (self.pak.program.asset(asset), self.pak.asset_bytes(asset))
+                        {
+                            self.android_video.play(
+                                bytes,
+                                meta.codec.ext(),
+                                skippable,
+                                &temp_dir,
+                                &mut self.audio,
+                                move || {
+                                    let _ = proxy.send_event(UserEvent::VideoFrame);
+                                },
+                            )
+                        } else {
+                            Err("video asset missing from nirpak".into())
+                        };
+                        match played {
+                            Ok(()) => {
+                                self.audio.set_game_paused_for_video(true);
+                            }
+                            Err(err) => {
+                                android_host::log_warn(&format!(
+                                    "Android video playback fallback: {err}"
+                                ));
+                                self.runtime.show_toast(
+                                    "设备不支持该影片编码，已自动跳过",
+                                    2400,
+                                );
+                                self.runtime.notify_video_finished();
+                            }
+                        }
                     }
                 }
-                HostCommand::StopVideo =>
-                {
+                HostCommand::StopVideo => {
                     #[cfg(not(target_os = "android"))]
                     if self.video.is_playing() {
                         self.video.stop();
                         self.audio.set_host_paused(false);
+                    }
+                    #[cfg(target_os = "android")]
+                    if self.android_video.is_playing() {
+                        self.android_video.stop(&mut self.audio);
+                        self.audio.set_game_paused_for_video(false);
                     }
                 }
                 HostCommand::SaveSlot { slot, mut snapshot } => {
                     if snapshot.thumbnail.is_none() {
                         snapshot.thumbnail = captured_thumb.clone();
                     }
-                    if let Err(e) = self.storage.save_slot(slot, &snapshot) {
-                        self.runtime.show_toast(format!("Save failed: {e}"), 3000);
-                    } else if let Some(t) = &snapshot.thumbnail {
-                        self.upload_thumb_data_url(&format!("slot_{slot}"), t);
+                    if let Some(storage) = &self.storage {
+                        if let Err(e) = storage.save_slot(slot, &snapshot) {
+                            self.runtime.show_toast(format!("Save failed: {e}"), 3000);
+                        } else if let Some(t) = &snapshot.thumbnail {
+                            self.upload_thumb_data_url(&format!("slot_{slot}"), t);
+                        }
                     }
                 }
-                HostCommand::RequestLoadSlot(slot) => match self.storage.load_slot(slot) {
-                    Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
-                    Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
-                },
+                HostCommand::RequestLoadSlot(slot) => {
+                    if let Some(storage) = &self.storage {
+                        match storage.load_slot(slot) {
+                            Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
+                            Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
+                        }
+                    }
+                }
                 HostCommand::DeleteSlot(slot) => {
-                    let _ = self.storage.delete_slot(slot);
+                    if let Some(storage) = &self.storage {
+                        let _ = storage.delete_slot(slot);
+                    }
                 }
                 HostCommand::SaveAuto { mut snapshot } => {
                     if snapshot.thumbnail.is_none() {
                         snapshot.thumbnail = captured_thumb.clone();
                     }
-                    let _ = self.storage.save_named("autosave", &snapshot);
+                    if let Some(storage) = &self.storage {
+                        let _ = storage.save_named("autosave", &snapshot);
+                    }
                     if let Some(t) = &snapshot.thumbnail {
                         self.upload_thumb_data_url("autosave", t);
                     }
                 }
-                HostCommand::RequestLoadAuto => match self.storage.load_named("autosave") {
-                    Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
-                    Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
-                },
+                HostCommand::RequestLoadAuto => {
+                    if let Some(storage) = &self.storage {
+                        match storage.load_named("autosave") {
+                            Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
+                            Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
+                        }
+                    }
+                }
                 HostCommand::SaveQuick { mut snapshot } => {
                     if snapshot.thumbnail.is_none() {
                         snapshot.thumbnail = captured_thumb.clone();
                     }
-                    let _ = self.storage.save_named("quicksave", &snapshot);
+                    if let Some(storage) = &self.storage {
+                        let _ = storage.save_named("quicksave", &snapshot);
+                    }
                     if let Some(t) = &snapshot.thumbnail {
                         self.upload_thumb_data_url("quicksave", t);
                     }
                 }
-                HostCommand::RequestLoadQuick => match self.storage.load_named("quicksave") {
-                    Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
-                    Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
-                },
+                HostCommand::RequestLoadQuick => {
+                    if let Some(storage) = &self.storage {
+                        match storage.load_named("quicksave") {
+                            Ok(snap) => self.runtime.apply_loaded_snapshot(snap),
+                            Err(e) => self.runtime.show_toast(format!("Load failed: {e}"), 3000),
+                        }
+                    }
+                }
                 HostCommand::SaveProfile(profile) => {
-                    let _ = self.storage.save_profile(&profile);
+                    if let Some(storage) = &self.storage {
+                        let _ = storage.save_profile(&profile);
+                    }
                 }
                 HostCommand::SavePreferences(prefs) => {
                     self.audio.apply_preferences(&prefs);
-                    let _ = self.storage.save_preferences(&prefs);
+                    if let Some(storage) = &self.storage {
+                        let _ = storage.save_preferences(&prefs);
+                    }
                 }
-                HostCommand::ReturnToShelf | HostCommand::Quit => {
+                HostCommand::ExportSaves => {
+                    self.export_saves_via_host();
+                }
+                HostCommand::ImportSaves => {
+                    self.import_saves_via_host();
+                }
+                HostCommand::ReturnToShelf => {
+                    self.enter_shelf_mode();
+                    break;
+                }
+                HostCommand::Quit => {
                     self.should_quit = true;
                 }
             }
@@ -1579,6 +2136,18 @@ impl NativeApp {
     }
 
     fn tick_and_render(&mut self) {
+        if self.showing_shelf {
+            let lw = (self.window_size[0] as f32 / self.scale_factor).max(1.0);
+            let lh = (self.window_size[1] as f32 / self.scale_factor).max(1.0);
+            if let (Some(shelf), Some(renderer)) = (&mut self.shelf, &mut self.renderer) {
+                let _ = renderer.ensure_system_fallback_fonts();
+                shelf.ensure_covers_uploaded(renderer);
+                let packet = shelf.project_draw_packet(lw, lh);
+                let _ = renderer.render(&packet, self.scale_factor);
+            }
+            return;
+        }
+
         let now = Instant::now();
         let delta_us = if self.was_idle_sleeping {
             self.was_idle_sleeping = false;
@@ -1590,6 +2159,33 @@ impl NativeApp {
         };
         self.last_frame = now;
         self.next_wakeup_at = None;
+
+        #[cfg(target_os = "android")]
+        {
+            match self.android_video.poll_frame() {
+                android_video::VideoPoll::Playing(frame_opt) => {
+                    if let (Some(frame), Some(renderer)) = (frame_opt, &mut self.renderer) {
+                        let _ = renderer.upload_rgba_premultiplied(
+                            android_video::VIDEO_FRAME_ASSET_ID,
+                            frame.width,
+                            frame.height,
+                            &frame.rgba,
+                        );
+                    }
+                    let lw = (self.window_size[0] as f32 / self.scale_factor).max(1.0);
+                    let lh = (self.window_size[1] as f32 / self.scale_factor).max(1.0);
+                    self.render_android_video_frame(lw, lh);
+                    return;
+                }
+                android_video::VideoPoll::Finished => {
+                    self.audio.stop_video_audio();
+                    self.audio.set_game_paused_for_video(false);
+                    self.runtime.notify_video_finished();
+                    self.runtime.dirty = true;
+                }
+                android_video::VideoPoll::Idle => {}
+            }
+        }
 
         // Capture a clean (overlay-free) Story thumbnail RIGHT BEFORE rendering a newly opened Menu/Saves overlay!
         let pre_story_reading = self.runtime.is_story_reading();
@@ -1740,6 +2336,8 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         let should_redraw = match event {
             UserEvent::ImageDecoded => self.drain_decoded_images(),
             UserEvent::GamepadInput | UserEvent::MediaKey => self.drain_gamepad_and_media_events(),
+            #[cfg(target_os = "android")]
+            UserEvent::VideoFrame => true,
         };
         if should_redraw {
             if let Some(win) = &self.window {
@@ -1752,12 +2350,21 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         self.runtime.set_host_paused(false);
         self.audio.reset_stream_backoff();
         self.audio.set_host_paused(false);
+        #[cfg(target_os = "android")]
+        self.android_video.set_paused(false);
         if self.window.is_none() {
-            let sw = self.pak.program.meta.stage_width;
-            let sh = self.pak.program.meta.stage_height;
+            let (title, sw, sh) = if self.showing_shelf {
+                ("NIR 书架", 1080u32, 680u32)
+            } else {
+                (
+                    self.pak.program.meta.title.as_str(),
+                    self.pak.program.meta.stage_width.max(640),
+                    self.pak.program.meta.stage_height.max(360),
+                )
+            };
             let attrs = Window::default_attributes()
-                .with_title(&self.pak.program.meta.title)
-                .with_inner_size(LogicalSize::new(sw.max(640) as f64, sh.max(360) as f64));
+                .with_title(title)
+                .with_inner_size(LogicalSize::new(sw as f64, sh as f64));
             let win = match event_loop.create_window(attrs) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
@@ -1784,7 +2391,13 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     self.instance = instance;
                     self.renderer = Some(renderer);
                     self.sync_android_gpu_budget();
-                    self.upload_all_fonts();
+                    if self.showing_shelf {
+                        if let Some(r) = &mut self.renderer {
+                            let _ = r.ensure_system_fallback_fonts();
+                        }
+                    } else {
+                        self.upload_all_fonts();
+                    }
                 }
                 Err(err) => {
                     android_host::log_error(&format!("GPU initialization failed: {err:#}"));
@@ -1795,8 +2408,13 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             }
             self.window = Some(win);
             self.sync_android_insets();
+            if let Some(shelf) = &mut self.shelf {
+                shelf.dirty = true;
+            }
             self.runtime.dirty = true;
-            self.process_commands();
+            if !self.showing_shelf {
+                self.process_commands();
+            }
         } else if let Some(win) = self.window.clone() {
             let phys = win.inner_size();
             self.window_size = [phys.width.max(1), phys.height.max(1)];
@@ -1811,8 +2429,13 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             }
             self.sync_android_gpu_budget();
             self.sync_android_insets();
+            if let Some(shelf) = &mut self.shelf {
+                shelf.dirty = true;
+            }
             self.runtime.dirty = true;
-            self.process_commands();
+            if !self.showing_shelf {
+                self.process_commands();
+            }
             win.request_redraw();
         }
     }
@@ -1820,13 +2443,19 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.runtime.set_host_paused(true);
         self.audio.set_host_paused(true);
-        self.sync_wake_lock();
-        self.runtime.emit_autosave();
-        self.runtime.flush_pending_saves();
-        self.process_commands();
-        self.storage.flush();
         #[cfg(target_os = "android")]
-        self.export_android_external_backup();
+        self.android_video.set_paused(true);
+        self.sync_wake_lock();
+        if !self.showing_shelf {
+            self.runtime.emit_autosave();
+            self.runtime.flush_pending_saves();
+            self.process_commands();
+            if let Some(st) = &self.storage {
+                st.flush();
+            }
+            #[cfg(target_os = "android")]
+            self.export_android_external_backup();
+        }
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
@@ -1859,12 +2488,14 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                 if cfg!(target_os = "android") {
                     self.runtime.set_host_paused(!focused);
                     self.audio.set_host_paused(!focused);
+                    #[cfg(target_os = "android")]
+                    self.android_video.set_paused(!focused);
                     self.sync_wake_lock();
-                    if !focused {
+                    if !focused && !self.showing_shelf {
                         self.runtime.emit_autosave();
                         self.runtime.flush_pending_saves();
+                        self.process_commands();
                     }
-                    self.process_commands();
                 }
             }
             WindowEvent::DroppedFile(path) => {
@@ -1884,16 +2515,69 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     renderer.resize(self.window_size[0], self.window_size[1]);
                 }
                 self.sync_android_insets();
+                if let Some(shelf) = &mut self.shelf {
+                    shelf.dirty = true;
+                }
                 self.runtime.dirty = true;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor as f32;
                 self.sync_android_insets();
+                if let Some(shelf) = &mut self.shelf {
+                    shelf.dirty = true;
+                }
                 self.runtime.dirty = true;
             }
             WindowEvent::Touch(touch) => {
                 let lx = touch.location.x as f32 / self.scale_factor;
                 let ly = touch.location.y as f32 / self.scale_factor;
+                if self.showing_shelf {
+                    match touch.phase {
+                        TouchPhase::Started => {
+                            self.shelf_touch_id = Some(touch.id);
+                            self.shelf_touch_start = [lx, ly];
+                            self.shelf_touch_last_y = ly;
+                            self.shelf_touch_dragged = false;
+                        }
+                        TouchPhase::Moved if self.shelf_touch_id == Some(touch.id) => {
+                            let dy = self.shelf_touch_last_y - ly;
+                            self.shelf_touch_last_y = ly;
+                            if (lx - self.shelf_touch_start[0]).abs() > 10.0
+                                || (ly - self.shelf_touch_start[1]).abs() > 10.0
+                            {
+                                self.shelf_touch_dragged = true;
+                            }
+                            if let Some(shelf) = &mut self.shelf {
+                                shelf.scroll(dy);
+                            }
+                        }
+                        TouchPhase::Ended if self.shelf_touch_id == Some(touch.id) => {
+                            self.shelf_touch_id = None;
+                            if !self.shelf_touch_dragged {
+                                if let Some(action) =
+                                    self.shelf.as_ref().and_then(|s| s.hit_test(lx, ly))
+                                {
+                                    self.handle_shelf_action(action);
+                                }
+                            }
+                        }
+                        TouchPhase::Cancelled => {
+                            self.shelf_touch_id = None;
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                #[cfg(target_os = "android")]
+                if self.android_video.is_playing() {
+                    if touch.phase == TouchPhase::Ended && self.android_video.is_skippable() {
+                        self.android_video.stop(&mut self.audio);
+                        self.audio.set_game_paused_for_video(false);
+                        self.runtime.notify_video_finished();
+                        self.runtime.dirty = true;
+                    }
+                    return;
+                }
                 match touch.phase {
                     TouchPhase::Started => self.runtime.touch_start(touch.id, lx, ly),
                     TouchPhase::Moved => self.runtime.touch_move(touch.id, lx, ly),
@@ -1907,6 +2591,19 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     position.x as f32 / self.scale_factor,
                     position.y as f32 / self.scale_factor,
                 ];
+                if self.showing_shelf {
+                    let over = self.shelf.as_mut().is_some_and(|s| {
+                        s.set_hover(self.cursor_logical[0], self.cursor_logical[1])
+                    });
+                    if let Some(win) = &self.window {
+                        win.set_cursor(if over {
+                            winit::window::CursorIcon::Pointer
+                        } else {
+                            winit::window::CursorIcon::Default
+                        });
+                    }
+                    return;
+                }
                 if self.left_mouse_down {
                     self.runtime
                         .pointer_drag(self.cursor_logical[0], self.cursor_logical[1]);
@@ -1924,6 +2621,12 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.wake_cursor();
+                if self.showing_shelf {
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.set_hover(-1.0, -1.0);
+                    }
+                    return;
+                }
                 if !self.left_mouse_down {
                     self.runtime.set_hover(-1.0, -1.0);
                     if let Some(win) = &self.window {
@@ -1933,6 +2636,18 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 self.wake_cursor();
+                if self.showing_shelf {
+                    if button == MouseButton::Left && state == ElementState::Released {
+                        if let Some(action) = self
+                            .shelf
+                            .as_ref()
+                            .and_then(|s| s.hit_test(self.cursor_logical[0], self.cursor_logical[1]))
+                        {
+                            self.handle_shelf_action(action);
+                        }
+                    }
+                    return;
+                }
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         self.left_mouse_down = true;
@@ -1955,6 +2670,12 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 30.0,
                 };
+                if self.showing_shelf {
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.scroll(-dy * 48.0);
+                    }
+                    return;
+                }
                 if dy.abs() > 0.2 {
                     // winit +y = scroll up (matches browser -deltaY)
                     self.runtime.scroll_wheel(-dy);
@@ -1962,6 +2683,47 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                if self.showing_shelf {
+                    if pressed && !event.repeat {
+                        if matches!(
+                            event.logical_key,
+                            Key::Named(NamedKey::GoBack | NamedKey::BrowserBack)
+                        ) {
+                            self.handle_back_action();
+                        } else if let PhysicalKey::Code(code) = event.physical_key {
+                            match code {
+                                KeyCode::ArrowLeft | KeyCode::ArrowUp => {
+                                    if let Some(s) = &mut self.shelf {
+                                        s.move_selection(-1);
+                                    }
+                                }
+                                KeyCode::ArrowRight | KeyCode::ArrowDown => {
+                                    if let Some(s) = &mut self.shelf {
+                                        s.move_selection(1);
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Space => {
+                                    if let Some(path) =
+                                        self.shelf.as_ref().and_then(|s| s.selected_path())
+                                    {
+                                        self.switch_pak_file(&path);
+                                    }
+                                }
+                                KeyCode::KeyR | KeyCode::F5 => {
+                                    self.handle_shelf_action(shelf::ShelfAction::Rescan);
+                                }
+                                KeyCode::KeyO => {
+                                    self.handle_shelf_action(shelf::ShelfAction::OpenFilePicker);
+                                }
+                                KeyCode::Escape | KeyCode::BrowserBack => {
+                                    self.handle_back_action();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return;
+                }
                 if pressed
                     && !event.repeat
                     && matches!(
@@ -1986,6 +2748,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                                     self.video.stop();
                                     self.audio.set_host_paused(false);
                                     self.runtime.notify_video_finished();
+                                }
+                                return;
+                            }
+                            #[cfg(target_os = "android")]
+                            if self.android_video.is_playing() {
+                                if self.android_video.is_skippable() {
+                                    self.android_video.stop(&mut self.audio);
+                                    self.audio.set_game_paused_for_video(false);
+                                    self.runtime.notify_video_finished();
+                                    self.runtime.dirty = true;
                                 }
                                 return;
                             }
@@ -2052,6 +2824,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                         Key::Named(NamedKey::Select | NamedKey::Enter | NamedKey::Execute)
                             if !event.repeat =>
                         {
+                            #[cfg(target_os = "android")]
+                            if self.android_video.is_playing() {
+                                if self.android_video.is_skippable() {
+                                    self.android_video.stop(&mut self.audio);
+                                    self.audio.set_game_paused_for_video(false);
+                                    self.runtime.notify_video_finished();
+                                    self.runtime.dirty = true;
+                                }
+                                return;
+                            }
                             self.runtime.dispatch(UiAction::Advance);
                         }
                         Key::Named(NamedKey::Escape | NamedKey::Cancel) if !event.repeat => {
@@ -2088,6 +2870,27 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.showing_shelf {
+            let wake_us = self
+                .shelf
+                .as_mut()
+                .and_then(|s| s.next_wakeup_delay_us());
+            let dirty = self.shelf.as_ref().is_some_and(|s| s.dirty);
+            if dirty {
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+            if let Some(us) = wake_us {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_micros(us.max(16_000)),
+                ));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            return;
+        }
+
         self.drain_decoded_images();
         for ended_ch in self.audio.poll_ended() {
             self.runtime.notify_audio_ended(ended_ch);
@@ -2114,6 +2917,10 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         #[cfg(not(target_os = "android"))]
         if self.video.is_playing() {
             next_delay_us = merge_delay(next_delay_us, Some(150_000));
+        }
+        #[cfg(target_os = "android")]
+        if self.android_video.is_playing() {
+            next_delay_us = merge_delay(next_delay_us, Some(33_000));
         }
 
         if self.runtime.dirty {

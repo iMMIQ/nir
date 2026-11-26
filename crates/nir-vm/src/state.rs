@@ -383,3 +383,61 @@ pub struct ProfileData {
     pub values: BTreeMap<String, Value>,
     pub read_texts: BTreeSet<u32>,
 }
+
+impl ProfileData {
+    /// Non-destructively merges another profile (e.g. from cross-platform backup/sync)
+    /// by taking the union of read texts & unlocked flags and filling/updating values.
+    pub fn merge_from(&mut self, other: &ProfileData) {
+        self.flags.extend(other.flags.iter().cloned());
+        self.read_texts.extend(other.read_texts.iter().copied());
+        for (k, v) in &other.values {
+            self.values.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Canonical cross-platform portable save backup format identifier shared by Desktop, Android, and Web.
+pub const SAVE_BACKUP_FORMAT: &str = "nir-backup-v1";
+
+/// Portable single-file save backup bundle (`nir-backup-v1`) interoperable across Desktop, Android, and Web.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SaveBackupBundle {
+    pub format: String,
+    pub game_id: String,
+    #[serde(default)]
+    pub preferences: Option<Preferences>,
+    #[serde(default)]
+    pub profile: Option<ProfileData>,
+    #[serde(default)]
+    pub saves: BTreeMap<String, SaveSnapshot>,
+}
+
+impl SaveBackupBundle {
+    pub fn new(
+        game_id: impl Into<String>,
+        preferences: Option<Preferences>,
+        profile: Option<ProfileData>,
+        saves: BTreeMap<String, SaveSnapshot>,
+    ) -> Self {
+        Self {
+            format: SAVE_BACKUP_FORMAT.to_owned(),
+            game_id: game_id.into(),
+            preferences,
+            profile,
+            saves,
+        }
+    }
+
+    pub fn validate_for(&self, expected_game_id: &str) -> std::result::Result<(), String> {
+        if !self.format.is_empty() && self.format != SAVE_BACKUP_FORMAT {
+            return Err(format!("unsupported backup format `{}`", self.format));
+        }
+        if !self.game_id.is_empty() && self.game_id != expected_game_id {
+            return Err(format!(
+                "backup game_id `{}` does not match `{expected_game_id}`",
+                self.game_id
+            ));
+        }
+        Ok(())
+    }
+}

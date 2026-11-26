@@ -85,6 +85,8 @@ pub enum HostCommand {
     RequestLoadQuick,
     SaveProfile(ProfileData),
     SavePreferences(Preferences),
+    ExportSaves,
+    ImportSaves,
     ReturnToShelf,
     Quit,
 }
@@ -511,6 +513,44 @@ impl Runtime {
 
     pub fn set_quicksave_summary(&mut self, summary: Option<SlotSummary>) {
         self.quicksave = summary;
+        self.dirty = true;
+    }
+
+    /// Replaces in-memory save summaries, profile, and preferences after an external backup import
+    /// or cross-platform sync so Saves / Gallery / Settings update immediately without restart.
+    pub fn reload_storage_state(
+        &mut self,
+        prefs: Option<Preferences>,
+        profile: Option<ProfileData>,
+        slots: Vec<SlotSummary>,
+        autosave: Option<SlotSummary>,
+        quicksave: Option<SlotSummary>,
+    ) {
+        if let Some(mut p) = prefs {
+            p.sanitize();
+            if !self.program.meta.locales.contains(&p.text_locale) {
+                p.text_locale = self.program.meta.default_locale.clone();
+            }
+            self.prefs = p;
+        }
+        if let Some(pr) = profile {
+            self.vm.set_profile(pr);
+        }
+        let slot_count = self.program.meta.save_slots.clamp(1, 64) as usize;
+        let mut norm_slots = Vec::with_capacity(slot_count);
+        for i in 0..slot_count as u32 {
+            if let Some(existing) = slots.iter().find(|s| s.slot == i) {
+                norm_slots.push(existing.clone());
+            } else {
+                norm_slots.push(SlotSummary {
+                    slot: i,
+                    ..Default::default()
+                });
+            }
+        }
+        self.slots = norm_slots;
+        self.autosave = autosave;
+        self.quicksave = quicksave;
         self.dirty = true;
     }
 
@@ -1722,6 +1762,13 @@ impl Runtime {
                 self.flush_pending_saves();
                 self.stop_all_audio();
                 self.commands.push(HostCommand::ReturnToShelf);
+            }
+            UiAction::ExportSaves => {
+                self.flush_pending_saves();
+                self.commands.push(HostCommand::ExportSaves);
+            }
+            UiAction::ImportSaves => {
+                self.commands.push(HostCommand::ImportSaves);
             }
             UiAction::StartReplay(func) => {
                 if self.frozen_vm.is_some() {

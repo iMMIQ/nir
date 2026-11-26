@@ -3269,6 +3269,48 @@ fn project_saves_overlay(
     let title = messages.get(loc, if save_mode { "save" } else { "load" });
     let mut area = overlay_shell(b, ctx, title, messages, loc);
     let touch = b.is_touch();
+    // Portable cross-platform backup buttons (`nir-backup-v1`) tucked neatly in the Saves header
+    // to the left of `Back`, so Desktop / Android / Web all share one unified UI!
+    if let Some([px, py, pw, ph]) = b.pkt.overlay_panel_rect {
+        let pad = (pw * 0.035).clamp(12.0, 24.0);
+        let hdr_h = if touch {
+            (ph * 0.11).clamp(46.0, 58.0)
+        } else {
+            (ph * 0.11).clamp(36.0, 56.0)
+        };
+        let back_w = (pw * 0.20).clamp(if touch { 76.0 } else { 68.0 }, 108.0);
+        let btn_h = if touch {
+            (hdr_h * 0.82).clamp(38.0, 44.0)
+        } else {
+            (hdr_h * 0.72).clamp(28.0, 38.0)
+        };
+        let btn_y = py + (hdr_h - btn_h) * 0.5;
+        let btn_gap = 6.0;
+        let avail_w = pw - pad * 2.0 - back_w - 86.0;
+        if avail_w >= 148.0 {
+            let act_w = ((avail_w - btn_gap * 2.0) * 0.5).clamp(70.0, 108.0);
+            let import_x = px + pw - pad - back_w - btn_gap - act_w;
+            let export_x = import_x - btn_gap - act_w;
+            b.button_variant(
+                [export_x, btn_y, act_w, btn_h],
+                messages.get(loc, "export"),
+                UiAction::ExportSaves,
+                true,
+                ButtonVariant::Ghost,
+                0.92,
+                TextAlign::Center,
+            );
+            b.button_variant(
+                [import_x, btn_y, act_w, btn_h],
+                messages.get(loc, "import"),
+                UiAction::ImportSaves,
+                true,
+                ButtonVariant::Ghost,
+                0.92,
+                TextAlign::Center,
+            );
+        }
+    }
     let gap = (area[3] * 0.022).clamp(6.0, 10.0);
 
     // On Load screen, surface Auto-Save & Quick-Save right at the top for 1-tap resume!

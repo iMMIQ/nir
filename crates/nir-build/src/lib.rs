@@ -935,6 +935,99 @@ pub fn package_android(
     Ok(())
 }
 
+fn encode_default_android_emblem_png() -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+    const ICON_SZ: u32 = 192;
+    let mut buf = vec![0u8; (ICON_SZ * ICON_SZ * 4) as usize];
+    let half = ICON_SZ as f32 * 0.5;
+    for y in 0..ICON_SZ {
+        for x in 0..ICON_SZ {
+            let fy = y as f32 / ICON_SZ as f32;
+            let fx = x as f32 / ICON_SZ as f32;
+            let dx = (x as f32 - half) / half;
+            let dy = (y as f32 - half) / half;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let glow = (1.0 - (dist * 0.95).clamp(0.0, 1.0)).powf(2.0);
+            let r = (24.0 + fx * 34.0 + glow * 72.0).clamp(0.0, 255.0) as u8;
+            let g = (34.0 + fy * 48.0 + glow * 116.0).clamp(0.0, 255.0) as u8;
+            let b = (62.0 + (1.0 - fy) * 58.0 + glow * 140.0).clamp(0.0, 255.0) as u8;
+            let off = ((y * ICON_SZ + x) * 4) as usize;
+            buf[off..off + 4].copy_from_slice(&[r, g, b, 255]);
+        }
+    }
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    enc.write_image(&buf, ICON_SZ, ICON_SZ, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
+}
+
+/// Packages a standalone zero-Gradle **Universal NIR Android Player APK** (`org.nir.player`)
+/// containing NO bundled `assets/game.nirpak`. On launch, it opens the built-in touch Shelf
+/// scanning `Android/data/org.nir.player/files/games/*.nirpak` so users can play any `.nirpak`!
+pub fn package_android_player(
+    libplayer_so: &Path,
+    out_apk: &Path,
+    key_path: &Path,
+) -> Result<()> {
+    let key = if key_path.is_file() {
+        nir_apk::key::SigningIdentity::load(key_path)?
+    } else {
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let k = nir_apk::key::SigningIdentity::generate()?;
+        k.save_new(key_path)?;
+        nir_apk::key::SigningIdentity::load(key_path)?
+    };
+
+    let package_name = "org.nir.player".to_owned();
+    const ICON_APK_PATH: &str = "res/mipmap-xxxhdpi/ic_launcher.png";
+    let icon_png = encode_default_android_emblem_png();
+    let arsc_bytes = icon_png
+        .as_ref()
+        .and_then(|_| nir_apk::arsc::encode_launcher_icon(&package_name, ICON_APK_PATH).ok());
+
+    let x86_64_so = libplayer_so
+        .parent()
+        .and_then(Path::parent)
+        .map(|lib_dir| lib_dir.join("x86_64/libplayer.so"))
+        .filter(|p| p.is_file());
+
+    let mut entries: Vec<(&str, nir_apk::EntryRef<'_>)> = Vec::with_capacity(4);
+    if let (Some(arsc), Some(png)) = (arsc_bytes.as_deref(), icon_png.as_deref()) {
+        entries.push(("resources.arsc", nir_apk::EntryRef::Bytes(arsc)));
+        entries.push((ICON_APK_PATH, nir_apk::EntryRef::Bytes(png)));
+    }
+    entries.push((
+        "lib/arm64-v8a/libplayer.so",
+        nir_apk::EntryRef::File(libplayer_so),
+    ));
+    if let Some(ref x86) = x86_64_so {
+        entries.push(("lib/x86_64/libplayer.so", nir_apk::EntryRef::File(x86)));
+    }
+
+    let apk_spec = nir_apk::ManifestSpec {
+        package: package_name,
+        label: "NIR Player".into(),
+        version_code: 1,
+        version_name: env!("CARGO_PKG_VERSION").to_owned(),
+        min_sdk: 26,
+        target_sdk: 35,
+        lib_name: "player".into(),
+        screen_orientation: None,
+        icon_res: arsc_bytes.as_ref().map(|_| nir_apk::arsc::ICON_RES_ID),
+        extract_native_libs: false,
+        app_category_game: true,
+        vibrate_permission: true,
+    };
+    if let Some(parent) = out_apk.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    nir_apk::build_apk_borrowed(out_apk, &apk_spec, &entries, &key)?;
+    Ok(())
+}
+
 /// Backing storage for one optimized media asset during build (disk cache file OR small in-RAM buffer).
 enum BlobBacking {
     Cache(CachedPayloadRef),

@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use nir_ir::Preferences;
 use nir_ui::SlotSummary;
-use nir_vm::{ProfileData, SaveSnapshot};
+use nir_vm::{ProfileData, SaveBackupBundle, SaveSnapshot};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -313,71 +313,72 @@ impl LocalStorage {
     }
 
     /// Exports all saves (slots + autosave + quicksave), profile, and preferences into a single
-    /// portable JSON backup file (compatible for cross-device migration without root on Android!).
+    /// portable `nir-backup-v1` JSON file (100% interoperable across Desktop, Android, and Web!).
     pub fn export_backup_json(&self, game_id: &str, slot_count: u32, dest: &Path) -> Result<usize> {
         self.flush();
-        let mut slots = BTreeMap::<String, SaveSnapshot>::new();
+        let mut saves = BTreeMap::<String, SaveSnapshot>::new();
         for name in ["autosave", "quicksave"] {
             if let Ok(snap) = self.load_named(name) {
-                slots.insert(name.to_owned(), snap);
+                saves.insert(name.to_owned(), snap);
             }
         }
         for slot in 0..slot_count {
             if let Ok(snap) = self.load_slot(slot) {
-                slots.insert(format!("slot_{slot:02}"), snap);
+                saves.insert(format!("slot_{slot:02}"), snap);
             }
         }
-        let count = slots.len();
-        let payload = serde_json::json!({
-            "format": "nir-backup-v1",
-            "game_id": game_id,
-            "preferences": self.load_preferences(),
-            "profile": self.load_profile(),
-            "saves": slots,
-        });
+        let count = saves.len();
+        let bundle = SaveBackupBundle::new(
+            game_id,
+            Some(self.load_preferences()),
+            Some(self.load_profile()),
+            saves,
+        );
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec_pretty(&payload)?;
+        let data = serde_json::to_vec_pretty(&bundle)?;
         write_bytes_atomic(dest, &data)?;
         Ok(count)
     }
 
-    /// Imports saves/profile/preferences from a portable JSON backup file produced by `export_backup_json`.
+    /// Imports saves/profile/preferences from a portable `nir-backup-v1` JSON file with smart
+    /// non-destructive profile union merging and timestamp-aware slot updates (keeps newer local saves
+    /// unless the backup is at least as recent).
     pub fn import_backup_json(&self, expected_game_id: &str, src: &Path) -> Result<usize> {
         let text = fs::read_to_string(src)
             .with_context(|| format!("reading save backup `{}`", src.display()))?;
-        let val: serde_json::Value = serde_json::from_str(&text)?;
-        if let Some(gid) = val.get("game_id").and_then(|v| v.as_str()) {
-            if !gid.is_empty() && gid != expected_game_id {
-                anyhow::bail!("backup game_id `{gid}` does not match `{expected_game_id}`");
-            }
+        let bundle: SaveBackupBundle = serde_json::from_str(&text)
+            .with_context(|| format!("parsing save backup `{}`", src.display()))?;
+        bundle
+            .validate_for(expected_game_id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(prefs) = &bundle.preferences {
+            let _ = self.save_preferences(prefs);
         }
-        if let Some(p) = val.get("preferences") {
-            if let Ok(prefs) = serde_json::from_value::<Preferences>(p.clone()) {
-                let _ = self.save_preferences(&prefs);
-            }
-        }
-        if let Some(pr) = val.get("profile") {
-            if let Ok(profile) = serde_json::from_value::<ProfileData>(pr.clone()) {
-                let _ = self.save_profile(&profile);
-            }
+        if let Some(incoming_profile) = &bundle.profile {
+            let mut merged = self.load_profile();
+            merged.merge_from(incoming_profile);
+            let _ = self.save_profile(&merged);
         }
         let mut imported = 0usize;
-        if let Some(map) = val.get("saves").and_then(|v| v.as_object()) {
-            for (k, v) in map {
-                let Ok(snap) = serde_json::from_value::<SaveSnapshot>(v.clone()) else {
-                    continue;
-                };
-                if k == "autosave" || k == "quicksave" {
-                    if self.save_named(k, &snap).is_ok() {
+        for (k, snap) in &bundle.saves {
+            if k == "autosave" || k == "quicksave" {
+                let existing_ts = self
+                    .load_named(k)
+                    .map(|s| s.saved_at_unix)
+                    .unwrap_or(0);
+                if snap.saved_at_unix >= existing_ts && self.save_named(k, snap).is_ok() {
+                    imported += 1;
+                }
+            } else if let Some(rest) = k.strip_prefix("slot_") {
+                if let Ok(slot) = rest.parse::<u32>() {
+                    let existing_ts = self
+                        .load_slot(slot)
+                        .map(|s| s.saved_at_unix)
+                        .unwrap_or(0);
+                    if snap.saved_at_unix >= existing_ts && self.save_slot(slot, snap).is_ok() {
                         imported += 1;
-                    }
-                } else if let Some(rest) = k.strip_prefix("slot_") {
-                    if let Ok(slot) = rest.parse::<u32>() {
-                        if self.save_slot(slot, &snap).is_ok() {
-                            imported += 1;
-                        }
                     }
                 }
             }
@@ -442,7 +443,7 @@ impl Drop for LocalStorage {
     }
 }
 
-fn default_data_dir() -> PathBuf {
+pub(crate) fn default_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(p) = std::env::var_os("APPDATA") {
         return PathBuf::from(p);

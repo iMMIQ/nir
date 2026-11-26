@@ -930,6 +930,100 @@ class SaveStore {
       quicksave: this.quicksaveSummary,
     };
   }
+  /** Exports all saves, profile, and preferences in the canonical `nir-backup-v1` JSON format (compatible with Desktop & Android!). */
+  async exportBackupJson(gameId, slotCount = 64) {
+    const parseOpt = (raw) => {
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch { return null; }
+    };
+    const prefs = parseOpt(await this.get('prefs'));
+    const profile = parseOpt(await this.get('profile'));
+    const saves = {};
+    for (const name of ['autosave', 'quicksave']) {
+      const snap = parseOpt(await this.get(name));
+      if (snap) saves[name] = snap;
+    }
+    for (let slot = 0; slot < slotCount; slot++) {
+      const snap = parseOpt(await this.get(`slot_${slot}`));
+      if (snap) {
+        saves[`slot_${String(slot).padStart(2, '0')}`] = snap;
+      }
+    }
+    return {
+      count: Object.keys(saves).length,
+      json: JSON.stringify(
+        {
+          format: 'nir-backup-v1',
+          game_id: gameId || '',
+          preferences: prefs,
+          profile,
+          saves,
+        },
+        null,
+        2,
+      ),
+    };
+  }
+  /** Imports a canonical `nir-backup-v1` JSON backup from Desktop / Android / Web with non-destructive merge. */
+  async importBackupJson(expectedGameId, text, slotCount = 24) {
+    const bundle = JSON.parse(text);
+    if (!bundle || typeof bundle !== 'object') {
+      throw new Error('无效的备份 JSON');
+    }
+    if (bundle.format && bundle.format !== 'nir-backup-v1') {
+      throw new Error(`不支持的备份格式: ${bundle.format}`);
+    }
+    if (bundle.game_id && expectedGameId && bundle.game_id !== expectedGameId) {
+      throw new Error(`备份归属游戏不匹配 (${bundle.game_id})`);
+    }
+    let prefsJson = '';
+    if (bundle.preferences && typeof bundle.preferences === 'object') {
+      prefsJson = JSON.stringify(bundle.preferences);
+      await this.set('prefs', prefsJson);
+      this.saveGlobalPrefs(bundle.preferences);
+    }
+    let profileJson = '';
+    if (bundle.profile && typeof bundle.profile === 'object') {
+      const localProfile = await this.get('profile');
+      profileJson = SaveStore._mergeProfile(localProfile, JSON.stringify(bundle.profile)) || JSON.stringify(bundle.profile);
+      await this.set('profile', profileJson);
+    }
+    let imported = 0;
+    const saves = bundle.saves && typeof bundle.saves === 'object' ? bundle.saves : {};
+    for (const [key, snap] of Object.entries(saves)) {
+      if (!snap || typeof snap !== 'object') continue;
+      const rTs = Number(snap.saved_at_unix ?? 0);
+      const raw = JSON.stringify(snap);
+      if (key === 'autosave' || key === 'quicksave') {
+        const cur = key === 'autosave' ? this.autosaveSummary : this.quicksaveSummary;
+        if (!cur || rTs >= Number(cur.saved_at_unix ?? 0)) {
+          await this.saveNamed(key, raw, typeof snap.thumbnail === 'string' ? snap.thumbnail : null);
+          imported += 1;
+        }
+      } else {
+        const m = /^slot_(\d+)$/.exec(key);
+        if (!m) continue;
+        const slot = Number(m[1]);
+        const lTs = Number(this.slotIndex[slot]?.saved_at_unix ?? 0);
+        if (!this.slotIndex[slot]?.exists || rTs >= lTs) {
+          await this.saveSlot(slot, raw, typeof snap.thumbnail === 'string' ? snap.thumbnail : null);
+          imported += 1;
+        }
+      }
+    }
+    const slots = [];
+    for (let slot = 0; slot < slotCount; slot++) {
+      slots.push(this.slotIndex[slot] ?? { slot, exists: false, saved_at_unix: 0, summary: '', has_thumb: false });
+    }
+    return {
+      imported,
+      prefsJson,
+      profileJson,
+      slots,
+      autosave: this.autosaveSummary,
+      quicksave: this.quicksaveSummary,
+    };
+  }
 }
 
 // --- Zero-Reencode Ogg Opus -> CoreAudio CAF v1 Remuxer (enables native Opus on iOS Safari!) ---
@@ -3075,6 +3169,62 @@ async function main() {
         store.set('prefs', JSON.stringify(cmd.prefs));
         store.saveGlobalPrefs(cmd.prefs);
         break;
+      case 'export_saves':
+        store
+          .exportBackupJson(engine.game_id(), 64)
+          .then(({ count, json }) => {
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const stem = (engine.game_id() || 'nir-game').replace(/[^a-zA-Z0-9._-]+/g, '_');
+            a.href = url;
+            a.download = `${stem}-saves-backup.json`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+            engine.show_toast(`已导出 ${count} 个存档备份 (nir-backup-v1)`, 2800);
+            scheduleFrame();
+          })
+          .catch(() => {
+            engine.show_toast('导出存档备份失败', 2600);
+            scheduleFrame();
+          });
+        break;
+      case 'import_saves': {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          try {
+            const text = await file.text();
+            const res = await store.importBackupJson(engine.game_id(), text, 64);
+            if (typeof engine.reload_storage_state_json === 'function') {
+              engine.reload_storage_state_json(
+                res.prefsJson || '',
+                res.profileJson || '',
+                JSON.stringify(res.slots),
+                res.autosave ? JSON.stringify(res.autosave) : '',
+                res.quicksave ? JSON.stringify(res.quicksave) : '',
+              );
+            }
+            if (res.prefsJson) {
+              try { audio.applyPreferences(JSON.parse(res.prefsJson)); } catch { /* ignore */ }
+            }
+            for (const [k, url] of store.thumbnails.entries()) {
+              uploadThumbDataUrl(k, url);
+            }
+            engine.show_toast(`已导入 ${res.imported} 个存档备份`, 2800);
+          } catch (err) {
+            engine.show_toast(`导入失败: ${err?.message || err}`, 3200);
+          }
+          scheduleFrame();
+        };
+        input.click();
+        break;
+      }
       case 'return_to_shelf':
         if (shelfUrl) {
           location.href = shelfUrl;
