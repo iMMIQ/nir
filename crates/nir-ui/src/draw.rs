@@ -11,6 +11,10 @@ pub enum SpecialQuad {
     AmbientBackdrop,
     /// Blurred stage backdrop behind modal overlays (frosted glass depth).
     FrostedBackdrop,
+    /// Localized real-time frosted-glass UI panel sampling exact stage-aligned blur UV.
+    FrostedPanel,
+    /// True GPU SDF Gaussian-feathered drop shadow (eliminates hard-edged shadow boxes).
+    SoftShadow,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +41,10 @@ pub struct Quad {
     pub border_color: [f32; 4],
     /// Optional CAS-lite edge sharpening strength (`0.0..=1.0`) for upscaled classic CGs.
     pub sharpen: f32,
+    /// Soft SDF shadow feather radius in logical px (used when `special == SpecialQuad::SoftShadow`).
+    pub shadow_blur: f32,
+    /// Subtle top-edge specular glass rim strength (`0.0..=1.0`) for modern elevated panels.
+    pub glass_rim: f32,
 }
 
 impl Quad {
@@ -56,6 +64,8 @@ impl Quad {
             border_width: 0.0,
             border_color: [0.0; 4],
             sharpen: 0.0,
+            shadow_blur: 0.0,
+            glass_rim: 0.0,
         }
     }
 
@@ -96,6 +106,46 @@ impl Quad {
             border_width: if border[3] > 0.01 { border_width } else { 0.0 },
             border_color: border,
             ..Self::solid(rect, fill_top)
+        }
+    }
+
+    pub fn frosted_panel(
+        rect: [f32; 4],
+        blur_uv: [f32; 4],
+        tint_top: [f32; 4],
+        tint_bottom: Option<[f32; 4]>,
+        border: [f32; 4],
+        border_width: f32,
+        corner_radius: f32,
+        glass_rim: f32,
+    ) -> Self {
+        Self {
+            uv: blur_uv,
+            special: SpecialQuad::FrostedPanel,
+            glass_rim,
+            ..Self::panel(rect, tint_top, tint_bottom, border, border_width, corner_radius)
+        }
+    }
+
+    pub fn soft_shadow(
+        rect: [f32; 4],
+        color: [f32; 4],
+        corner_radius: f32,
+        blur_px: f32,
+        offset_y: f32,
+    ) -> Self {
+        let blur = blur_px.clamp(3.0, 32.0);
+        let expanded = [
+            rect[0] - blur,
+            rect[1] - blur + offset_y,
+            rect[2] + blur * 2.0,
+            rect[3] + blur * 2.0,
+        ];
+        Self {
+            special: SpecialQuad::SoftShadow,
+            corner_radius,
+            shadow_blur: blur,
+            ..Self::solid(expanded, color)
         }
     }
 

@@ -1887,6 +1887,45 @@ async function main() {
 
   const decodeWorker = new ImageDecodeWorkerPool(deviceProfile.maxBaseBitmaps);
 
+  // Shared 48x48 adaptive style DNA sampler: probes ONLY title_bg / dialogue_bg / active BG (<0.3ms)
+  // so legacy .nirpak titles automatically inherit their original color palette & composition!
+  const styleProbeCanvas = document.createElement('canvas');
+  styleProbeCanvas.width = 48;
+  styleProbeCanvas.height = 48;
+  const styleProbeCtx = styleProbeCanvas.getContext('2d', { willReadFrequently: true });
+  let lastSyncedThemeVer = -1;
+  const syncHostThemeVars = () => {
+    if (typeof engine.theme_version !== 'function') return;
+    const ver = engine.theme_version();
+    if (ver === lastSyncedThemeVer) return;
+    lastSyncedThemeVer = ver;
+    try {
+      const vars = JSON.parse(engine.theme_css_json() || '{}');
+      const rootStyle = document.documentElement.style;
+      for (const [k, v] of Object.entries(vars)) {
+        rootStyle.setProperty(k, String(v));
+      }
+    } catch {}
+  };
+  const uploadBitmapWithStyle = (assetId, bmp) => {
+    if (contextLost) return;
+    if (styleProbeCtx && typeof engine.wants_style_sample === 'function' && engine.wants_style_sample(assetId)) {
+      try {
+        const sw = Math.max(16, Math.min(48, bmp.width || 48));
+        const sh = Math.max(16, Math.min(48, bmp.height || 48));
+        styleProbeCanvas.width = sw;
+        styleProbeCanvas.height = sh;
+        styleProbeCtx.clearRect(0, 0, sw, sh);
+        styleProbeCtx.drawImage(bmp, 0, 0, sw, sh);
+        const imgData = styleProbeCtx.getImageData(0, 0, sw, sh);
+        engine.submit_style_sample(assetId, sw, sh, imgData.data);
+        syncHostThemeVars();
+      } catch {}
+    }
+    engine.upload_image_bitmap(assetId, bmp);
+  };
+  syncHostThemeVars();
+
   const dispatchImageDecode = (cmd, isPrefetch) => {
     if (inflightImages.has(cmd.id) || contextLost) return;
     inflightImages.add(cmd.id);
@@ -1911,7 +1950,7 @@ async function main() {
         )
         .then((bmp) => {
           inflightImages.delete(cmd.id);
-          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
+          uploadBitmapWithStyle(cmd.id, bmp);
           bmp.close();
           scheduleFrame();
         });
@@ -1927,7 +1966,7 @@ async function main() {
           try {
             const composited = await compositeDeltaBitmap(baseBmp, patchBmp, d);
             inflightImages.delete(cmd.id);
-            if (!contextLost) engine.upload_image_bitmap(cmd.id, composited);
+            uploadBitmapWithStyle(cmd.id, composited);
             composited.close();
             scheduleFrame();
           } finally {
@@ -1939,7 +1978,7 @@ async function main() {
         .then((bytes) => decodeWorker.decode(bytes, cmd.mime))
         .then((bmp) => {
           inflightImages.delete(cmd.id);
-          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
+          uploadBitmapWithStyle(cmd.id, bmp);
           bmp.close();
           scheduleFrame();
         });
@@ -1951,7 +1990,7 @@ async function main() {
         })
         .then((bmp) => {
           inflightImages.delete(cmd.id);
-          if (!contextLost) engine.upload_image_bitmap(cmd.id, bmp);
+          uploadBitmapWithStyle(cmd.id, bmp);
           bmp.close();
           scheduleFrame();
         });

@@ -339,6 +339,53 @@ pub fn import_direct(
     ui.dialogue_styles = dialogue_styles;
     ui.gallery = gallery;
 
+    // Auto-derive harmonious per-game OKLCH palette from original dialogue skin & title cover art
+    // and bake into existing UiTheme 6-color slots (zero .nirpak schema change!).
+    let decode_rgba_for_theme = |id: AssetId| -> Option<(u32, u32, Vec<u8>)> {
+        let raw_asset = c.raw_assets.get(id.0 as usize)?;
+        if let Some(res) = raw_asset.data.load_pixels() {
+            match res.ok()? {
+                nir_import_core::DecodedPixels::Rgba {
+                    width,
+                    height,
+                    data,
+                } => Some((width, height, data)),
+                nir_import_core::DecodedPixels::Rgb {
+                    width,
+                    height,
+                    data,
+                } => {
+                    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+                    for px in data.chunks_exact(3) {
+                        rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                    Some((width, height, rgba))
+                }
+            }
+        } else {
+            let bytes = raw_asset.data.load().ok()?;
+            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            Some((img.width(), img.height(), img.into_raw()))
+        }
+    };
+    let skin_sample = ui.dialogue_bg.and_then(|id| {
+        let (w, h, rgba) = decode_rgba_for_theme(id)?;
+        nir_ir::analyze_dialogue_skin_rgba(w, h, &rgba)
+    });
+    let title_sample = title_bg.and_then(|id| {
+        let (w, h, rgba) = decode_rgba_for_theme(id)?;
+        nir_ir::analyze_title_rgba(w, h, &rgba)
+    });
+    if skin_sample.is_some() || title_sample.is_some() {
+        let resolved = nir_ir::synthesize_resolved_style(
+            &ui,
+            title_sample.as_ref(),
+            skin_sample.as_ref(),
+            None,
+        );
+        nir_ir::apply_derived_palette_to_theme(&mut ui, &resolved);
+    }
+
     c.report.statements_emitted = c.ops.len();
     c.report.assets_converted = c.raw_assets.len();
 

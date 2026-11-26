@@ -69,6 +69,8 @@ struct Vertex {
     color: [f32; 4],
     rect_params: [f32; 4],
     border_color: [f32; 4],
+    /// `[local_u, local_v, param (glass_rim | shadow_blur), mode (0=std, 1=shadow, 2=frosted)]`
+    extra: [f32; 4],
 }
 
 struct GpuTexture {
@@ -715,7 +717,7 @@ impl Renderer {
         let vlayout = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
         }];
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -816,6 +818,7 @@ impl Renderer {
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
                 border_color: [0.0; 4],
+                extra: [0.0, 0.0, 0.0, 0.0],
             },
             Vertex {
                 pos: [1.0, 1.0],
@@ -823,6 +826,7 @@ impl Renderer {
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
                 border_color: [0.0; 4],
+                extra: [1.0, 0.0, 0.0, 0.0],
             },
             Vertex {
                 pos: [-1.0, -1.0],
@@ -830,6 +834,7 @@ impl Renderer {
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
                 border_color: [0.0; 4],
+                extra: [0.0, 1.0, 0.0, 0.0],
             },
             Vertex {
                 pos: [1.0, -1.0],
@@ -837,6 +842,7 @@ impl Renderer {
                 color: [1.0; 4],
                 rect_params: [0.0; 4],
                 border_color: [0.0; 4],
+                extra: [1.0, 1.0, 0.0, 0.0],
             },
         ];
         let mip_vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1775,9 +1781,19 @@ impl Renderer {
                 a,
             ]
         };
+        let [s0, s1] = p.stage_quad_range;
+        let stage_slice = if s0 < s1 && s1 <= p.quads.len() {
+            &p.quads[s0..s1]
+        } else {
+            &[][..]
+        };
+        let has_blur_target =
+            p.needs_blur && !stage_slice.is_empty() && p.stage_rect[2] > 2.0 && p.stage_rect[3] > 2.0;
+
         let append_in = |verts: &mut Vec<Vertex>, quads: &[Quad], ox: f32, oy: f32, vw: f32, vh: f32| {
             let inv_w = 2.0 / vw.max(1.0);
             let inv_h = 2.0 / vh.max(1.0);
+            let local_uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
             for q in quads {
                 let [x, y, w, h] = q.rect;
                 let (c0, c1) = if q.special == SpecialQuad::StageTransition {
@@ -1798,10 +1814,19 @@ impl Renderer {
                     .unwrap_or([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]);
                 let [u0, v0, u1, v1] = q.uv;
                 let uvs = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
-                let rect_params = if q.corner_radius > 0.0 || q.border_width > 0.0 {
+                let rect_params = if q.corner_radius > 0.0
+                    || q.border_width > 0.0
+                    || q.special == SpecialQuad::SoftShadow
+                    || q.glass_rim > 0.01
+                {
                     [w.max(1.0), h.max(1.0), q.corner_radius, q.border_width]
                 } else {
                     [w.max(1.0), h.max(1.0), 0.0, 0.0]
+                };
+                let (fx_param, fx_mode) = match q.special {
+                    SpecialQuad::SoftShadow => (q.shadow_blur.max(3.0), 1.0),
+                    SpecialQuad::FrostedPanel if has_blur_target => (q.glass_rim, 2.0),
+                    _ => (q.glass_rim, 0.0),
                 };
                 let border_color = if q.border_width > 0.0 && q.border_color[3] > 0.0 {
                     premul(q.border_color)
@@ -1821,6 +1846,7 @@ impl Renderer {
                         color: vcols[idx],
                         rect_params,
                         border_color,
+                        extra: [local_uvs[idx][0], local_uvs[idx][1], fx_param, fx_mode],
                     });
                 }
             }
@@ -1866,20 +1892,13 @@ impl Renderer {
             }
         }
 
-        // Optional 1/8-res 2-Pass Kawase Blur of the pure stage for AmbientBackdrop & FrostedBackdrop!
+        // Optional 1/8-res 2-Pass Kawase Blur of the pure stage for AmbientBackdrop, FrostedBackdrop & FrostedPanel!
         // Cached by stage quad signature so static scenes pay 0 blur passes!
         let mut run_blur = false;
         let mut blur_stage_quad_start = verts.len() / 4;
         let mut blur_pass1_quad = 0usize;
         let mut blur_pass2_quad = 0usize;
-        let [s0, s1] = p.stage_quad_range;
-        let stage_slice = if s0 < s1 && s1 <= p.quads.len() {
-            &p.quads[s0..s1]
-        } else {
-            &[][..]
-        };
-        if p.needs_blur && !stage_slice.is_empty() && p.stage_rect[2] > 2.0 && p.stage_rect[3] > 2.0
-        {
+        if has_blur_target {
             let bw = (p.stage_size[0].max(160) / 6).clamp(112, 224);
             let bh = (p.stage_size[1].max(90) / 6).clamp(64, 150);
             let need_alloc = !self
@@ -1917,6 +1936,7 @@ impl Renderer {
                             color: [1.0; 4],
                             rect_params: rp,
                             border_color: [0.0; 4],
+                            extra: [uv[0], uv[1], 0.0, 0.0],
                         });
                     }
                     qidx
@@ -2220,22 +2240,29 @@ impl Renderer {
 
             if matches!(
                 q.special,
-                SpecialQuad::AmbientBackdrop | SpecialQuad::FrostedBackdrop
+                SpecialQuad::AmbientBackdrop
+                    | SpecialQuad::FrostedBackdrop
+                    | SpecialQuad::FrostedPanel
             ) {
                 flush(pass, &mut batch);
-                if let Some((blur_a, _, _, _)) = &self.blur_pair {
-                    let pl_id = q.blend as u8;
-                    if cur_pipeline != Some(pl_id) {
-                        pass.set_pipeline(&self.pipelines[q.blend as usize]);
-                        cur_pipeline = Some(pl_id);
-                    }
-                    if cur_scissor != Some(scissor) {
-                        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-                        cur_scissor = Some(scissor);
-                    }
-                    pass.set_bind_group(0, &blur_a.bind, &[]);
-                    pass.draw_indexed(is..ie, 0, 0..1);
+                let bind = if let Some((blur_a, _, _, _)) = &self.blur_pair {
+                    &blur_a.bind
+                } else if q.special == SpecialQuad::FrostedPanel {
+                    &self.white_tex.bind
+                } else {
+                    continue;
+                };
+                let pl_id = q.blend as u8;
+                if cur_pipeline != Some(pl_id) {
+                    pass.set_pipeline(&self.pipelines[q.blend as usize]);
+                    cur_pipeline = Some(pl_id);
                 }
+                if cur_scissor != Some(scissor) {
+                    pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                    cur_scissor = Some(scissor);
+                }
+                pass.set_bind_group(0, bind, &[]);
+                pass.draw_indexed(is..ie, 0, 0..1);
                 continue;
             }
 
@@ -2485,7 +2512,7 @@ mod tests {
         let vlayout = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
         }];
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,

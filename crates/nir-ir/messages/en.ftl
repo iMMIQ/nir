@@ -135,3 +135,7 @@ dialogue-opacity = Box opacity
 ambient-backdrop = Ambient & glass blur
 image-sharpening = Crisp CG upscaling
 text-outline = Text outline
+ui-style-mode = Interface style
+ui-style-hybrid = Auto Hybrid
+ui-style-modern = Modern Glass
+ui-style-classic = Classic Original

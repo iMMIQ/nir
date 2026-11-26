@@ -210,4 +210,5 @@ pub enum UiAction {
     ToggleAmbientBackdrop,
     ToggleImageSharpening,
     ToggleTextOutline,
+    CycleUiStyleMode,
 }

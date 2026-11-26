@@ -135,3 +135,7 @@ dialogue-opacity = 对话框不透明度
 ambient-backdrop = 沉浸氛围与毛玻璃
 image-sharpening = 经典画质锐化
 text-outline = 字幕柔和描边
+ui-style-mode = 界面风格
+ui-style-hybrid = 自适应融合
+ui-style-modern = 现代毛玻璃
+ui-style-classic = 经典原味

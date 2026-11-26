@@ -125,6 +125,12 @@ pub struct UiContext<'a> {
     pub host_top_left_pad: f32,
     /// Extra top-right logical px clearance reserved for host chrome (e.g. Web `#fs-btn`).
     pub host_top_right_pad: f32,
+    /// Optional artwork-derived adaptive style DNA computed by `nir-runtime`.
+    pub resolved_style: Option<&'a ResolvedStyle>,
+    /// Smooth 0..1 hover highlight transition (`1.0` when static or `reduced_motion`).
+    pub hover_anim: f32,
+    /// Smooth 0..1 staggered entrance animation for story choices (`1.0` when static).
+    pub choice_anim: f32,
 }
 
 /// Pure-Rust civil date/time formatter (`YYYY-MM-DD HH:MM`) using Howard Hinnant's algorithm.
@@ -659,13 +665,36 @@ fn shade_color(c: [f32; 4], mult: f32) -> [f32; 4] {
     ]
 }
 
+fn mix_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonVariant {
+    Primary,
+    Tonal,
+    Ghost,
+    Destructive,
+    DockItem,
+    Editorial,
+}
+
 struct Builder<'a> {
     pkt: DrawPacket,
     theme: &'a UiTheme,
+    style: ResolvedStyle,
     ui_fonts: Vec<AssetId>,
     text_fonts: Vec<AssetId>,
     hovered: Option<u32>,
     pressed: Option<u32>,
+    hover_anim: f32,
+    can_frost: bool,
     input_mode: InputMode,
     safe: [f32; 4],
     next_hit_id: u32,
@@ -681,37 +710,115 @@ impl<'a> Builder<'a> {
         self.pkt.texts.push(run);
     }
 
-    /// Single-pass DPI-adaptive SDF rounded panel with subtle top-lit vertical gradient & crisp stroke.
-    fn rounded_panel(&mut self, rect: [f32; 4], fill: [f32; 4], border: [f32; 4], radius: f32) {
-        let r = radius.min(rect[2].min(rect[3]) * 0.48);
-        let top = shade_color(fill, 1.10);
-        let bot = shade_color(fill, 0.90);
-        self.pkt.quads.push(Quad::panel(
-            rect,
-            top,
-            Some(bot),
-            border,
-            if border[3] > 0.01 { 1.0 } else { 0.0 },
-            r,
-        ));
+    /// Maps any screen-space rectangle to exact UV coordinates on the blurred stage texture.
+    fn stage_blur_uv(&self, rect: [f32; 4]) -> [f32; 4] {
+        let [srx, sry, srw, srh] = self.pkt.stage_rect;
+        if srw <= 2.0 || srh <= 2.0 {
+            return [0.02, 0.02, 0.98, 0.98];
+        }
+        let u0 = ((rect[0] - srx) / srw).clamp(0.01, 0.99);
+        let v0 = ((rect[1] - sry) / srh).clamp(0.01, 0.99);
+        let u1 = ((rect[0] + rect[2] - srx) / srw).clamp(0.01, 0.99);
+        let v1 = ((rect[1] + rect[3] - sry) / srh).clamp(0.01, 0.99);
+        if (u1 - u0).abs() < 0.01 || (v1 - v0).abs() < 0.01 {
+            // Panel sits outside stage (e.g. Portrait Docked Reader below stage): sample stretched bottom slice!
+            let cu = cover_uv(srw, srh, self.pkt.width.max(1.0), self.pkt.height.max(1.0));
+            let su0 = cu[0] + (cu[2] - cu[0]) * (rect[0] / self.pkt.width.max(1.0)).clamp(0.0, 1.0);
+            let sv0 = cu[1] + (cu[3] - cu[1]) * (rect[1] / self.pkt.height.max(1.0)).clamp(0.0, 1.0);
+            let su1 = cu[0]
+                + (cu[2] - cu[0])
+                    * ((rect[0] + rect[2]) / self.pkt.width.max(1.0)).clamp(0.0, 1.0);
+            let sv1 = cu[1]
+                + (cu[3] - cu[1])
+                    * ((rect[1] + rect[3]) / self.pkt.height.max(1.0)).clamp(0.0, 1.0);
+            [
+                su0.clamp(0.01, 0.98),
+                sv0.clamp(0.01, 0.98),
+                su1.clamp(0.02, 0.99),
+                sv1.clamp(0.02, 0.99),
+            ]
+        } else {
+            [u0.min(u1), v0.min(v1), u0.max(u1), v0.max(v1)]
+        }
     }
 
-    /// Soft grounded drop-shadow behind elevated cards & modal dialogs.
+    /// Single-pass DPI-adaptive SDF rounded panel with subtle top-lit gradient, glass bevel & stroke.
+    fn rounded_panel(&mut self, rect: [f32; 4], fill: [f32; 4], border: [f32; 4], radius: f32) {
+        self.glass_panel(rect, fill, border, radius, false);
+    }
+
+    /// Elevated modern panel: optionally samples localized blurred stage glass + archetype glass rim + classic hairline.
+    fn glass_panel(
+        &mut self,
+        rect: [f32; 4],
+        fill: [f32; 4],
+        border: [f32; 4],
+        radius: f32,
+        frosted: bool,
+    ) {
+        let r = radius.min(rect[2].min(rect[3]) * 0.48);
+        let top = shade_color(fill, 1.08);
+        let bot = shade_color(fill, 0.92);
+        let rim = if rect[3] >= 24.0 {
+            self.style.archetype.glass_rim_strength() * fill[3].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let bw = if border[3] > 0.01 { 1.0 } else { 0.0 };
+        if frosted && self.can_frost {
+            let uv = self.stage_blur_uv(rect);
+            self.pkt.quads.push(Quad::frosted_panel(
+                rect,
+                uv,
+                top,
+                Some(bot),
+                border,
+                bw,
+                r,
+                rim,
+            ));
+            self.pkt.needs_blur = true;
+        } else {
+            let mut q = Quad::panel(rect, top, Some(bot), border, bw, r);
+            q.glass_rim = rim * 0.72;
+            self.pkt.quads.push(q);
+        }
+        // Subtle literary double-hairline inner frame for ClassicPaper archetype on larger surfaces
+        if self.style.archetype == StyleArchetype::ClassicPaper
+            && rect[2] >= 180.0
+            && rect[3] >= 72.0
+            && border[3] > 0.12
+        {
+            let inset = 4.0;
+            let inner = [
+                rect[0] + inset,
+                rect[1] + inset,
+                (rect[2] - inset * 2.0).max(8.0),
+                (rect[3] - inset * 2.0).max(8.0),
+            ];
+            self.pkt.quads.push(Quad::panel(
+                inner,
+                [0.0; 4],
+                None,
+                [border[0], border[1], border[2], border[3] * 0.40],
+                1.0,
+                (r - 2.0).max(2.0),
+            ));
+        }
+    }
+
+    /// True GPU SDF Gaussian-feathered drop shadow behind elevated cards & modal dialogs.
     fn soft_shadow(&mut self, rect: [f32; 4], radius: f32, alpha: f32) {
         if alpha <= 0.01 {
             return;
         }
-        let spread = 6.0;
-        let srect = [
-            rect[0] - spread * 0.5,
-            rect[1] + 4.0,
-            rect[2] + spread,
-            rect[3] + spread * 0.6,
-        ];
-        self.pkt.quads.push(Quad::rounded(
-            srect,
-            [0.01, 0.02, 0.04, (0.36 * alpha).clamp(0.0, 0.6)],
-            (radius + 3.0).min(srect[2].min(srect[3]) * 0.45),
+        let r = radius.min(rect[2].min(rect[3]) * 0.48);
+        self.pkt.quads.push(Quad::soft_shadow(
+            rect,
+            [0.01, 0.015, 0.03, (0.44 * alpha).clamp(0.0, 0.62)],
+            r,
+            13.0,
+            4.5,
         ));
     }
 
@@ -723,88 +830,183 @@ impl<'a> Builder<'a> {
         enabled: bool,
         primary: bool,
     ) {
-        self.button_styled(rect, label, action, enabled, primary, 1.0);
+        self.button_variant(
+            rect,
+            label,
+            action,
+            enabled,
+            if primary {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Tonal
+            },
+            1.0,
+            TextAlign::Center,
+        );
     }
 
-    /// Styled rounded button supporting subtle ghost-mode opacity (`opacity_mult < 1.0`) for Story HUD.
-    fn button_styled(
+    /// Semantic modern button supporting Primary / Tonal / Ghost / Destructive / DockItem / Editorial.
+    #[allow(clippy::too_many_arguments)]
+    fn button_variant(
         &mut self,
         rect: [f32; 4],
         label: String,
         action: UiAction,
         enabled: bool,
-        primary: bool,
+        variant: ButtonVariant,
         opacity_mult: f32,
+        align: TextAlign,
     ) {
         let id = self.next_hit_id;
         self.next_hit_id += 1;
         let is_pressed = enabled && self.pressed == Some(id);
         let is_hover = enabled && !self.is_touch() && self.hovered == Some(id);
-        let eff_alpha = if is_hover || is_pressed || primary {
+        let ht = if is_pressed {
+            1.0
+        } else if is_hover {
+            ease_out_cubic(self.hover_anim)
+        } else {
+            0.0
+        };
+        let accent = self.style.accent;
+        let destructive_col = [0.88, 0.34, 0.38, 1.0];
+
+        let eff_alpha = if is_hover || is_pressed || variant == ButtonVariant::Primary {
             1.0
         } else {
-            opacity_mult.clamp(0.25, 1.0)
+            opacity_mult.clamp(0.28, 1.0)
         };
-        let mut bg = if !enabled {
-            [0.12, 0.15, 0.20, 0.44]
-        } else if is_pressed {
-            [
-                (self.theme.accent[0] * 1.06).min(1.0),
-                (self.theme.accent[1] * 1.06).min(1.0),
-                (self.theme.accent[2] * 1.06).min(1.0),
-                0.96,
-            ]
-        } else if is_hover {
-            [
-                self.theme.accent[0] * 0.90,
-                self.theme.accent[1] * 0.90,
-                self.theme.accent[2] * 0.90,
-                0.94,
-            ]
-        } else if primary {
-            [
-                self.theme.accent[0] * 0.46,
-                self.theme.accent[1] * 0.46,
-                self.theme.accent[2] * 0.46,
-                0.92,
-            ]
-        } else {
-            self.theme.panel
-        };
-        bg[3] *= eff_alpha;
-        let mut border = if !enabled {
-            [0.32, 0.40, 0.52, 0.22]
-        } else if is_pressed || is_hover {
-            [
-                (self.theme.accent[0] * 1.15).min(1.0),
-                (self.theme.accent[1] * 1.15).min(1.0),
-                (self.theme.accent[2] * 1.15).min(1.0),
-                0.95,
-            ]
-        } else if primary {
-            [
-                self.theme.accent[0],
-                self.theme.accent[1],
-                self.theme.accent[2],
-                0.84,
-            ]
-        } else {
-            self.theme.panel_border
-        };
-        border[3] *= eff_alpha;
-        let radius = (rect[3] * 0.24).clamp(6.0, 11.0);
-        self.rounded_panel(rect, bg, border, radius);
 
-        let size = (rect[3] * 0.44).clamp(11.0, 21.0);
-        let pad_x = (rect[2] * 0.08).clamp(4.0, 14.0);
-        let mut text_color = if !enabled {
-            self.theme.muted
-        } else if is_pressed || is_hover {
-            [0.04, 0.06, 0.09, 1.0]
-        } else {
-            self.theme.text
+        let radius = match variant {
+            ButtonVariant::DockItem => (rect[3] * 0.34).clamp(6.0, 14.0),
+            ButtonVariant::Editorial => (rect[3] * 0.24).clamp(6.0, 12.0),
+            _ => self.style.archetype.button_radius(rect[3]),
         };
-        text_color[3] *= eff_alpha.max(0.62);
+
+        let (base_bg, hover_bg, base_border, hover_border, text_base, text_hover) = if !enabled {
+            (
+                [self.style.panel[0], self.style.panel[1], self.style.panel[2], 0.36],
+                [self.style.panel[0], self.style.panel[1], self.style.panel[2], 0.36],
+                [self.style.panel_border[0], self.style.panel_border[1], self.style.panel_border[2], 0.18],
+                [self.style.panel_border[0], self.style.panel_border[1], self.style.panel_border[2], 0.18],
+                self.style.muted,
+                self.style.muted,
+            )
+        } else {
+            match variant {
+                ButtonVariant::Primary => {
+                    let dark_on_accent =
+                        relative_luminance([accent[0], accent[1], accent[2]]) > 0.34;
+                    let hover_txt = if dark_on_accent {
+                        [0.05, 0.06, 0.09, 1.0]
+                    } else {
+                        [0.98, 0.98, 1.0, 1.0]
+                    };
+                    (
+                        [accent[0] * 0.42, accent[1] * 0.42, accent[2] * 0.42, 0.92],
+                        [accent[0] * 0.94, accent[1] * 0.94, accent[2] * 0.94, 0.97],
+                        [accent[0], accent[1], accent[2], 0.86],
+                        [(accent[0] * 1.15).min(1.0), (accent[1] * 1.15).min(1.0), (accent[2] * 1.15).min(1.0), 0.98],
+                        self.style.text,
+                        hover_txt,
+                    )
+                }
+                ButtonVariant::Tonal => {
+                    let dark_on_accent =
+                        relative_luminance([accent[0], accent[1], accent[2]]) > 0.34;
+                    let hover_txt = if dark_on_accent {
+                        [0.05, 0.06, 0.09, 1.0]
+                    } else {
+                        [0.98, 0.98, 1.0, 1.0]
+                    };
+                    (
+                        self.style.panel,
+                        [accent[0] * 0.88, accent[1] * 0.88, accent[2] * 0.88, 0.95],
+                        self.style.panel_border,
+                        [accent[0], accent[1], accent[2], 0.94],
+                        self.style.text,
+                        hover_txt,
+                    )
+                }
+                ButtonVariant::Ghost => (
+                    [self.style.panel[0], self.style.panel[1], self.style.panel[2], 0.22],
+                    [accent[0] * 0.28, accent[1] * 0.28, accent[2] * 0.28, 0.86],
+                    [self.style.panel_border[0], self.style.panel_border[1], self.style.panel_border[2], 0.28],
+                    [accent[0], accent[1], accent[2], 0.78],
+                    self.style.text,
+                    self.style.text,
+                ),
+                ButtonVariant::Destructive => (
+                    [destructive_col[0] * 0.44, destructive_col[1] * 0.34, destructive_col[2] * 0.36, 0.90],
+                    [destructive_col[0] * 0.92, destructive_col[1] * 0.85, destructive_col[2] * 0.85, 0.96],
+                    [destructive_col[0], destructive_col[1], destructive_col[2], 0.85],
+                    [1.0, 0.56, 0.58, 0.98],
+                    [0.99, 0.94, 0.95, 1.0],
+                    [0.99, 0.97, 0.97, 1.0],
+                ),
+                ButtonVariant::DockItem => (
+                    [0.0, 0.0, 0.0, 0.0],
+                    [accent[0] * 0.34, accent[1] * 0.34, accent[2] * 0.34, 0.86],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [accent[0], accent[1], accent[2], 0.65],
+                    self.style.text,
+                    self.style.text,
+                ),
+                ButtonVariant::Editorial => (
+                    [self.style.surface[0], self.style.surface[1], self.style.surface[2], 0.24],
+                    [accent[0] * 0.30, accent[1] * 0.30, accent[2] * 0.30, 0.84],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [accent[0], accent[1], accent[2], 0.72],
+                    self.style.text,
+                    [1.0, 1.0, 1.0, 1.0],
+                ),
+            }
+        };
+
+        let mut bg = mix_rgba(base_bg, hover_bg, ht);
+        if is_pressed && enabled {
+            bg = shade_color(bg, 1.08);
+        }
+        bg[3] *= eff_alpha;
+        let mut border = mix_rgba(base_border, hover_border, ht);
+        border[3] *= eff_alpha;
+
+        if bg[3] > 0.015 || border[3] > 0.015 {
+            self.rounded_panel(rect, bg, border, radius);
+        }
+
+        // Editorial accent indicator bar on the aligned side when hovered or primary!
+        if variant == ButtonVariant::Editorial && enabled && ht > 0.05 {
+            let bar_h = (rect[3] * 0.54).clamp(12.0, 26.0);
+            let bar_x = if align == TextAlign::Right {
+                rect[0] + rect[2] - 6.0
+            } else {
+                rect[0] + 3.0
+            };
+            self.pkt.quads.push(Quad::rounded(
+                [bar_x, rect[1] + (rect[3] - bar_h) * 0.5, 3.0, bar_h],
+                [accent[0], accent[1], accent[2], 0.95 * ht],
+                1.5,
+            ));
+        }
+
+        let size = match variant {
+            ButtonVariant::Editorial => (rect[3] * 0.46).clamp(14.0, 22.0),
+            ButtonVariant::DockItem => (rect[3] * 0.42).clamp(10.5, 16.0),
+            _ => (rect[3] * 0.44).clamp(11.0, 21.0),
+        };
+        let pad_x = match variant {
+            ButtonVariant::Editorial => 16.0,
+            ButtonVariant::DockItem => (rect[2] * 0.06).clamp(3.0, 8.0),
+            _ => (rect[2] * 0.08).clamp(4.0, 14.0),
+        };
+        let mut text_color = mix_rgba(text_base, text_hover, ht);
+        text_color[3] *= eff_alpha.max(0.68);
+        let text_shadow = if variant == ButtonVariant::Editorial {
+            self.theme.text_shadow
+        } else {
+            None
+        };
         self.push_text(TextRun {
             text: label.clone(),
             visible_bytes: None,
@@ -818,12 +1020,12 @@ impl<'a> Builder<'a> {
             emphasis: Vec::new(),
             color_spans: Vec::new(),
             ruby_spans: Vec::new(),
-            shadow: None,
+            shadow: text_shadow,
             outline: None,
             scroll: 0.0,
             clip: Some(rect),
             font_assets: self.ui_fonts.clone(),
-            align: TextAlign::Center,
+            align,
             valign_center: true,
             auto_fit: true,
             inline_images: Vec::new(),
@@ -854,29 +1056,10 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
     };
     let loc = &ctx.prefs.ui_locale;
 
-    let mut b = Builder {
-        pkt: DrawPacket {
-            width,
-            height,
-            stage_size: [prog.meta.stage_width, prog.meta.stage_height],
-            stage_rect,
-            ..Default::default()
-        },
-        theme: &prog.ui,
-        ui_fonts: prog.meta.ui_fonts.clone(),
-        text_fonts: prog.meta.text_fonts.clone(),
-        hovered: ctx.hovered_hit,
-        pressed: ctx.pressed_hit,
-        input_mode: ctx.input_mode,
-        safe,
-        next_hit_id: 1,
-    };
-
-    // Determine whether letterbox margins / portrait bottom area need an Ambient Backdrop
-    let has_margins = (stage_rect[0] > 2.0)
-        || (stage_rect[1] > 2.0)
-        || (stage_rect[0] + stage_rect[2] < width - 2.0)
-        || (stage_rect[1] + stage_rect[3] < height - 2.0);
+    let resolved_style = ctx
+        .resolved_style
+        .cloned()
+        .unwrap_or_else(|| ResolvedStyle::from_theme(&prog.ui));
     let has_stage_art = if ctx.screen == Screen::Title {
         prog.ui
             .title_screen
@@ -887,9 +1070,44 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
     } else {
         ctx.vm.transition.is_some() || !ctx.vm.layers.is_empty()
     };
+
+    let mut b = Builder {
+        pkt: DrawPacket {
+            width,
+            height,
+            stage_size: [prog.meta.stage_width, prog.meta.stage_height],
+            stage_rect,
+            ..Default::default()
+        },
+        theme: &prog.ui,
+        style: resolved_style,
+        ui_fonts: prog.meta.ui_fonts.clone(),
+        text_fonts: prog.meta.text_fonts.clone(),
+        hovered: ctx.hovered_hit,
+        pressed: ctx.pressed_hit,
+        hover_anim: ctx.hover_anim,
+        can_frost: ctx.prefs.ambient_backdrop && has_stage_art,
+        input_mode: ctx.input_mode,
+        safe,
+        next_hit_id: 1,
+    };
+
+    // Determine whether letterbox margins / portrait bottom area need an Ambient Backdrop
+    let has_margins = (stage_rect[0] > 2.0)
+        || (stage_rect[1] > 2.0)
+        || (stage_rect[0] + stage_rect[2] < width - 2.0)
+        || (stage_rect[1] + stage_rect[3] < height - 2.0);
     let use_ambient = ctx.prefs.ambient_backdrop && has_margins && has_stage_art;
     if use_ambient {
-        let mut amb = Quad::solid([0.0, 0.0, width, height], [0.26, 0.29, 0.36, 1.0]);
+        let mut amb = Quad::solid(
+            [0.0, 0.0, width, height],
+            [
+                (b.style.surface[0] * 1.45 + 0.14).min(0.42),
+                (b.style.surface[1] * 1.45 + 0.14).min(0.42),
+                (b.style.surface[2] * 1.45 + 0.14).min(0.42),
+                1.0,
+            ],
+        );
         amb.uv = cover_uv(stage_rect[2], stage_rect[3], width, height);
         amb.special = SpecialQuad::AmbientBackdrop;
         b.pkt.quads.push(amb);
@@ -1017,11 +1235,12 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             lw,
             lh,
         ];
-        b.rounded_panel(
+        b.glass_panel(
             lrect,
-            [0.06, 0.09, 0.14, 0.88],
-            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.55],
-            9.0,
+            [b.style.surface[0], b.style.surface[1], b.style.surface[2], 0.86],
+            [b.style.accent[0], b.style.accent[1], b.style.accent[2], 0.55],
+            b.style.archetype.card_radius(),
+            true,
         );
         b.push_text(TextRun {
             text: messages.get(loc, "loading-assets"),
@@ -1032,7 +1251,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             height: lh - 2.0,
             size: 13.0,
             line_height: 17.0,
-            color: b.theme.muted,
+            color: b.style.muted,
             emphasis: Vec::new(),
             color_spans: Vec::new(),
             ruby_spans: Vec::new(),
@@ -1063,19 +1282,21 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
             tw,
             th,
         ];
-        b.soft_shadow(rect, 11.0, t_ease);
-        b.rounded_panel(
+        let toast_r = b.style.archetype.panel_radius().max(10.0);
+        b.soft_shadow(rect, toast_r, t_ease);
+        b.glass_panel(
             rect,
-            [0.08, 0.11, 0.17, 0.94 * t_ease],
+            [b.style.surface[0], b.style.surface[1], b.style.surface[2], 0.90 * t_ease],
             [
-                b.theme.accent[0],
-                b.theme.accent[1],
-                b.theme.accent[2],
-                0.85 * t_ease,
+                b.style.accent[0],
+                b.style.accent[1],
+                b.style.accent[2],
+                0.82 * t_ease,
             ],
-            11.0,
+            toast_r,
+            true,
         );
-        let mut tc = b.theme.text;
+        let mut tc = b.style.text;
         tc[3] *= t_ease;
         b.push_text(TextRun {
             text: msg.to_owned(),
@@ -1122,57 +1343,14 @@ fn project_title(
         return;
     }
 
-    // Sleek cinematic built-in title screen: left horizontal gradient scrim preserves vibrant cover art on the right!
+    // Adaptive cinematic built-in title screen: automatically anchors to the calmest region of `title_bg`
+    // (Left / Right / BottomBar) so characters & cover logos are never occluded!
     let w = b.pkt.width;
     let h = b.pkt.height;
     let [sx, sy, sw, sh] = b.safe;
-    let scrim_w = (w * if b.is_touch() { 0.82 } else { 0.62 }).max(320.0).min(w);
-    b.pkt.quads.push(Quad::gradient_h(
-        [0.0, 0.0, scrim_w, h],
-        [0.03, 0.05, 0.09, 0.84],
-        [0.03, 0.05, 0.09, 0.0],
-    ));
-    b.pkt.quads.push(Quad::gradient_v(
-        [0.0, h * 0.72, w, h * 0.28],
-        [0.02, 0.03, 0.06, 0.0],
-        [0.02, 0.03, 0.06, 0.56],
-    ));
-
-    let title_size = (sh * 0.072).clamp(22.0, 56.0);
-    let title_y = sy + (sh * 0.14).clamp(18.0, sh * 0.20);
-    let title_h = (title_size * 2.05).min(sh * 0.26);
-    let title_x = sx + sw * 0.07;
-    let title_w = (sw * if b.is_touch() { 0.84 } else { 0.56 }).max(220.0);
-    b.push_text(TextRun {
-        text: prog.meta.title.clone(),
-        visible_bytes: None,
-        x: title_x,
-        y: title_y,
-        width: title_w,
-        height: title_h,
-        size: title_size,
-        line_height: title_size * 1.24,
-        color: b.theme.text,
-        emphasis: Vec::new(),
-        color_spans: Vec::new(),
-        ruby_spans: Vec::new(),
-        shadow: b.theme.text_shadow,
-        outline: Some([0.02, 0.03, 0.06, 0.65]),
-        scroll: 0.0,
-        clip: Some([title_x, title_y, title_w, title_h]),
-        font_assets: b.ui_fonts.clone(),
-        align: TextAlign::Left,
-        valign_center: false,
-        auto_fit: true,
-        inline_images: Vec::new(),
-        cache_key: 0,
-    });
-    // Accent rule under title
-    b.pkt.quads.push(Quad::gradient_h(
-        [title_x, title_y + title_h + 2.0, (title_w * 0.36).clamp(64.0, 180.0), 2.5],
-        b.theme.accent,
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.0],
-    ));
+    let accent = b.style.accent;
+    let surf = b.style.surface;
+    let scrim_rgb = [surf[0] * 0.45, surf[1] * 0.45, surf[2] * 0.45];
 
     let has_any_save = ctx.autosave.is_some_and(|s| s.exists)
         || ctx.quicksave.is_some_and(|s| s.exists)
@@ -1223,21 +1401,207 @@ fn project_title(
     }
 
     let btn_count = btns.len();
-    let bw = (sw * if b.is_touch() { 0.56 } else { 0.28 })
-        .clamp(196.0, 340.0)
+    let use_bottom_bar =
+        b.style.title_anchor == TitleAnchor::BottomBar && sw >= 620.0 && !b.is_touch();
+    let anchor_right = b.style.title_anchor == TitleAnchor::Right && !use_bottom_bar;
+
+    if use_bottom_bar {
+        // Soft bottom cinematic scrim + floating frosted horizontal dock bar!
+        let scrim_h = (h * 0.40).max(200.0).min(h);
+        b.pkt.quads.push(Quad::gradient_v(
+            [0.0, h - scrim_h, w, scrim_h],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.0],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.86],
+        ));
+
+        let bar_h = 52.0_f32.min(sh * 0.14).max(40.0);
+        let pad_in = 8.0;
+        let gap = 8.0;
+        let max_bar_w = (sw - 36.0).min(860.0).max(320.0);
+        let btn_w = ((max_bar_w - pad_in * 2.0 - gap * (btn_count - 1) as f32) / btn_count as f32)
+            .clamp(78.0, 148.0);
+        let bar_w = btn_w * btn_count as f32 + gap * (btn_count - 1) as f32 + pad_in * 2.0;
+        let bar_x = sx + (sw - bar_w) * 0.5;
+        let bar_y = sy + sh - bar_h - (sh * 0.06).clamp(16.0, 42.0);
+        let dock_r = (bar_h * 0.42).min(b.style.archetype.panel_radius() + 4.0);
+        b.soft_shadow([bar_x, bar_y, bar_w, bar_h], dock_r, 0.92);
+        b.glass_panel(
+            [bar_x, bar_y, bar_w, bar_h],
+            [surf[0], surf[1], surf[2], 0.78],
+            [b.style.panel_border[0], b.style.panel_border[1], b.style.panel_border[2], 0.56],
+            dock_r,
+            true,
+        );
+
+        // Compact refined title badge above the bottom bar (kept subtle if cover already embeds a logo)
+        let title_size = if b.style.title_has_embedded_logo {
+            (sh * 0.036).clamp(18.0, 28.0)
+        } else {
+            (sh * 0.064).clamp(24.0, 50.0)
+        };
+        let title_h = (title_size * 1.45).min(sh * 0.18);
+        let title_w = (sw * 0.76).min(780.0);
+        let title_x = sx + (sw - title_w) * 0.5;
+        let title_y = (bar_y - title_h - 14.0).max(sy + 18.0);
+        b.push_text(TextRun {
+            text: prog.meta.title.clone(),
+            visible_bytes: None,
+            x: title_x,
+            y: title_y,
+            width: title_w,
+            height: title_h,
+            size: title_size,
+            line_height: title_size * 1.22,
+            color: b.style.text,
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: b.theme.text_shadow,
+            outline: Some([0.02, 0.03, 0.06, 0.72]),
+            scroll: 0.0,
+            clip: Some([title_x, title_y, title_w, title_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Center,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+
+        let mut bx = bar_x + pad_in;
+        let by = bar_y + 6.0;
+        let bh = bar_h - 12.0;
+        for (label, action, enabled, primary) in btns {
+            b.button_variant(
+                [bx, by, btn_w, bh],
+                label,
+                action,
+                enabled,
+                if primary {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::DockItem
+                },
+                1.0,
+                TextAlign::Center,
+            );
+            bx += btn_w + gap;
+        }
+        return;
+    }
+
+    let scrim_w = (w * if b.is_touch() { 0.80 } else { 0.56 }).max(300.0).min(w);
+    if anchor_right {
+        b.pkt.quads.push(Quad::gradient_h(
+            [w - scrim_w, 0.0, scrim_w, h],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.0],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.84],
+        ));
+    } else {
+        b.pkt.quads.push(Quad::gradient_h(
+            [0.0, 0.0, scrim_w, h],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.84],
+            [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.0],
+        ));
+    }
+    b.pkt.quads.push(Quad::gradient_v(
+        [0.0, h * 0.74, w, h * 0.26],
+        [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.0],
+        [scrim_rgb[0], scrim_rgb[1], scrim_rgb[2], 0.52],
+    ));
+
+    let title_size = if b.style.title_has_embedded_logo {
+        (sh * 0.044).clamp(18.0, 34.0)
+    } else {
+        (sh * 0.070).clamp(22.0, 54.0)
+    };
+    let title_y = sy + (sh * 0.14).clamp(18.0, sh * 0.20);
+    let title_h = (title_size * 1.95).min(sh * 0.25);
+    let title_w = (sw * if b.is_touch() { 0.84 } else { 0.50 }).max(220.0);
+    let title_x = if anchor_right {
+        sx + sw - sw * 0.07 - title_w
+    } else {
+        sx + sw * 0.07
+    };
+    let title_align = if anchor_right {
+        TextAlign::Right
+    } else {
+        TextAlign::Left
+    };
+    b.push_text(TextRun {
+        text: prog.meta.title.clone(),
+        visible_bytes: None,
+        x: title_x,
+        y: title_y,
+        width: title_w,
+        height: title_h,
+        size: title_size,
+        line_height: title_size * 1.24,
+        color: b.style.text,
+        emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
+        shadow: b.theme.text_shadow,
+        outline: Some([0.02, 0.03, 0.06, 0.68]),
+        scroll: 0.0,
+        clip: Some([title_x, title_y, title_w, title_h]),
+        font_assets: b.ui_fonts.clone(),
+        align: title_align,
+        valign_center: false,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    // Accent rule under title (fades outward toward artwork)
+    let rule_w = (title_w * 0.36).clamp(64.0, 180.0);
+    let rule_x = if anchor_right {
+        title_x + title_w - rule_w
+    } else {
+        title_x
+    };
+    let (rule_l, rule_r) = if anchor_right {
+        ([accent[0], accent[1], accent[2], 0.0], accent)
+    } else {
+        (accent, [accent[0], accent[1], accent[2], 0.0])
+    };
+    b.pkt.quads.push(Quad::gradient_h(
+        [rule_x, title_y + title_h + 2.0, rule_w, 2.5],
+        rule_l,
+        rule_r,
+    ));
+
+    let bw = (sw * if b.is_touch() { 0.56 } else { 0.27 })
+        .clamp(196.0, 320.0)
         .min((sw * 0.84).max(160.0));
-    let bx = sx + sw * 0.08;
-    let start_y = (title_y + title_h + 14.0).max(sy + sh * 0.36);
-    let avail_h = (sy + sh - start_y - 16.0).max(120.0);
-    let gap = (avail_h * 0.04).clamp(7.0, 12.0);
-    let min_bh = if b.is_touch() { 40.0 } else { 32.0 };
+    let bx = if anchor_right {
+        sx + sw - sw * 0.075 - bw
+    } else {
+        sx + sw * 0.075
+    };
+    let start_y = (title_y + title_h + 18.0).max(sy + sh * 0.37);
+    let avail_h = (sy + sh - start_y - 18.0).max(120.0);
+    let gap = (avail_h * 0.038).clamp(6.0, 11.0);
+    let min_bh = if b.is_touch() { 40.0 } else { 34.0 };
     let max_bh = if b.is_touch() { 50.0 } else { 46.0 };
     let bh = ((avail_h - gap * (btn_count - 1) as f32) / btn_count as f32).clamp(min_bh, max_bh);
     let total_h = bh * btn_count as f32 + gap * (btn_count - 1) as f32;
-    let mut by = start_y.min((sy + sh - total_h - 12.0).max(sy + 12.0));
+    let mut by = start_y.min((sy + sh - total_h - 14.0).max(sy + 14.0));
 
+    // Sleek editorial title menu: translucent glass primary pill + lightweight editorial rows
     for (label, action, enabled, primary) in btns {
-        b.button([bx, by, bw, bh], label, action, enabled, primary);
+        b.button_variant(
+            [bx, by, bw, bh],
+            label,
+            action,
+            enabled,
+            if primary {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Editorial
+            },
+            1.0,
+            if primary { TextAlign::Center } else { title_align },
+        );
         by += bh + gap;
     }
 }
@@ -1394,16 +1758,17 @@ fn project_story_hud(
             pill_w,
             pill_h,
         ];
-        b.rounded_panel(
+        b.glass_panel(
             pill_rect,
             [
-                b.theme.accent[0] * 0.28,
-                b.theme.accent[1] * 0.28,
-                b.theme.accent[2] * 0.28,
-                0.88,
+                b.style.accent[0] * 0.28,
+                b.style.accent[1] * 0.28,
+                b.style.accent[2] * 0.28,
+                0.86,
             ],
-            [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
-            pill_h * 0.45,
+            [b.style.accent[0], b.style.accent[1], b.style.accent[2], 0.85],
+            pill_h * 0.48,
+            true,
         );
         b.push_text(TextRun {
             text: mode_label,
@@ -1414,7 +1779,7 @@ fn project_story_hud(
             height: pill_h - 3.0,
             size: 13.0,
             line_height: 16.0,
-            color: b.theme.text,
+            color: b.style.text,
             emphasis: Vec::new(),
             color_spans: Vec::new(),
             ruby_spans: Vec::new(),
@@ -1512,32 +1877,67 @@ fn project_story_hud(
             };
 
             let box_opacity = ctx.prefs.dialogue_opacity.clamp(0.45, 1.0);
-            if !portrait_docked {
+            let style_mode = ctx.prefs.ui_style_mode;
+            let use_original_skin =
+                !portrait_docked && dlg_bg_cfg.is_some() && style_mode != UiStyleMode::Modern;
+            let panel_r = b.style.archetype.panel_radius();
+            let speaker_accent = dlg
+                .speaker_color
+                .or_else(|| {
+                    (!dlg.speaker.is_empty()).then(|| {
+                        speaker_palette_color(
+                            &dlg.speaker,
+                            b.style.accent,
+                            use_original_skin && b.style.dialogue_is_light,
+                        )
+                    })
+                })
+                .unwrap_or(b.style.accent);
+
+            if use_original_skin {
+                // Hybrid mode adds a subtle soft contrast scrim beneath overly translucent original boxes
+                if style_mode == UiStyleMode::Hybrid && b.style.dialogue_alpha_avg < 0.74 {
+                    let mut back = b.style.surface;
+                    back[3] = (0.42 * box_opacity) * alpha;
+                    b.rounded_panel(box_rect, back, [0.0; 4], panel_r);
+                }
                 if let Some(bg) = dlg_bg_cfg {
                     let mut q = Quad::image(box_rect, bg);
                     q.color[3] = alpha * box_opacity;
                     b.pkt.quads.push(q);
-                } else {
-                    let mut panel = b.theme.panel;
-                    panel[3] = (panel[3].max(0.86) * box_opacity) * alpha;
-                    let mut border = b.theme.panel_border;
-                    border[3] *= alpha * (0.65 + 0.35 * box_opacity);
-                    b.soft_shadow(box_rect, 12.0, alpha * box_opacity);
-                    b.rounded_panel(box_rect, panel, border, 12.0);
-                    // Subtle top edge specular highlight for refined depth
-                    b.pkt.quads.push(Quad::gradient_h(
-                        [box_rect[0] + 14.0, box_rect[1] + 1.0, (box_rect[2] - 28.0).max(16.0), 1.5],
-                        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.0],
-                        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.42 * alpha * box_opacity],
-                    ));
                 }
+            } else if !portrait_docked {
+                let mut panel = b.style.panel;
+                panel[3] = (panel[3].max(0.76) * box_opacity) * alpha;
+                let mut border = b.style.panel_border;
+                border[3] *= alpha * (0.65 + 0.35 * box_opacity);
+                let frosted = style_mode != UiStyleMode::Classic;
+                b.soft_shadow(box_rect, panel_r, alpha * box_opacity);
+                b.glass_panel(box_rect, panel, border, panel_r, frosted);
+                // Subtle speaker/theme-tinted specular highlight along the top edge
+                b.pkt.quads.push(Quad::gradient_h(
+                    [
+                        box_rect[0] + panel_r.max(12.0),
+                        box_rect[1] + 1.0,
+                        (box_rect[2] - panel_r.max(12.0) * 2.0).max(16.0),
+                        1.8,
+                    ],
+                    [
+                        speaker_accent[0],
+                        speaker_accent[1],
+                        speaker_accent[2],
+                        0.52 * alpha * box_opacity,
+                    ],
+                    [speaker_accent[0], speaker_accent[1], speaker_accent[2], 0.0],
+                ));
             } else {
-                let mut panel = b.theme.panel;
-                panel[3] = (panel[3].max(0.92) * box_opacity) * alpha;
-                let mut border = b.theme.accent;
-                border[3] *= 0.62 * alpha;
-                b.soft_shadow(box_rect, 13.0, alpha * 0.7);
-                b.rounded_panel(box_rect, panel, border, 13.0);
+                let mut panel = b.style.panel;
+                panel[3] = (panel[3].max(0.86) * box_opacity) * alpha;
+                let mut border = b.style.accent;
+                border[3] *= 0.54 * alpha;
+                let dock_r = (panel_r + 1.0).clamp(8.0, 16.0);
+                b.soft_shadow(box_rect, dock_r, alpha * 0.72);
+                b.glass_panel(box_rect, panel, border, dock_r, style_mode != UiStyleMode::Classic);
             }
 
             // 2. Dialogue-bound face portrait decoration (fitted inside box_rect when auto-placed,
@@ -1670,10 +2070,10 @@ fn project_story_hud(
                 .text_outline
                 .then_some([0.02, 0.03, 0.06, 0.86]);
 
-            // 4. Speaker nameplate (never overlaps subtitles, stage art in portrait mode, or face portrait!)
+            // 4. Speaker nameplate (auto-matched to original light/dark skin & archetype!)
             let mut speaker_top_pill_rect: Option<[f32; 4]> = None;
             if !dlg.speaker.is_empty() {
-                let mut sc = dlg.speaker_color.unwrap_or(b.theme.accent);
+                let mut sc = speaker_accent;
                 sc[3] *= alpha;
                 let sp_size = if portrait_docked {
                     (16.0 * ctx.prefs.font_scale).clamp(13.0, 26.0)
@@ -1765,21 +2165,46 @@ fn project_story_hud(
                         let tab_x =
                             box_rect[0].clamp(sx + 4.0, (sright - tab_w - 4.0).max(sx + 4.0));
                         let tab_rect = [tab_x, tab_y, tab_w, tab_h];
+                        let light_np = use_original_skin && b.style.dialogue_is_light;
+                        let mut np_bg = if light_np {
+                            b.style.nameplate_bg
+                        } else {
+                            [
+                                b.style.surface[0],
+                                b.style.surface[1],
+                                b.style.surface[2],
+                                0.86,
+                            ]
+                        };
+                        np_bg[3] *= alpha * box_opacity.max(0.76);
                         let mut accent_bar = sc;
-                        accent_bar[3] *= 0.72;
-                        b.rounded_panel(
+                        accent_bar[3] *= if light_np { 0.82 } else { 0.72 };
+                        let np_r = if b.style.archetype == StyleArchetype::Soft {
+                            tab_h * 0.48
+                        } else {
+                            b.style.archetype.card_radius().min(tab_h * 0.45)
+                        };
+                        b.soft_shadow(tab_rect, np_r, alpha * 0.55);
+                        b.glass_panel(
                             tab_rect,
-                            [0.06, 0.09, 0.14, 0.90 * alpha * box_opacity.max(0.75)],
+                            np_bg,
                             accent_bar,
-                            8.0,
+                            np_r,
+                            !light_np && style_mode != UiStyleMode::Classic,
                         );
                         // Crisp character-color accent strip inside the left edge of the nameplate
                         let strip_h = (tab_h - 10.0).max(8.0);
                         b.pkt.quads.push(Quad::rounded(
-                            [tab_rect[0] + 5.0, tab_rect[1] + (tab_h - strip_h) * 0.5, 3.0, strip_h],
+                            [tab_rect[0] + 6.0, tab_rect[1] + (tab_h - strip_h) * 0.5, 3.0, strip_h],
                             sc,
                             1.5,
                         ));
+                        let np_text_col = if light_np {
+                            let c = b.style.nameplate_text;
+                            [c[0], c[1], c[2], c[3] * alpha]
+                        } else {
+                            sc
+                        };
                         b.push_text(TextRun {
                             text: dlg.speaker.clone(),
                             visible_bytes: None,
@@ -1789,12 +2214,12 @@ fn project_story_hud(
                             height: (tab_rect[3] - 3.0).max(14.0),
                             size: sp_size,
                             line_height: sp_size * 1.22,
-                            color: sc,
+                            color: np_text_col,
                             emphasis: Vec::new(),
                             color_spans: Vec::new(),
                             ruby_spans: Vec::new(),
-                            shadow: scaled_shadow,
-                            outline: text_outline,
+                            shadow: if light_np { None } else { scaled_shadow },
+                            outline: if light_np { None } else { text_outline },
                             scroll: 0.0,
                             clip: Some(tab_rect),
                             font_assets: b.text_fonts.clone(),
@@ -1972,40 +2397,47 @@ fn project_story_hud(
                 });
             }
 
-            // Breathing click-to-continue indicator (distinguishes inline click-pause vs end-of-line!)
+            // Breathing click-to-continue indicator with soft luminous halo!
             let waiting_click = (dlg.finished || dlg.paused_for_click)
                 && ctx.vm.choice.is_none()
                 && !ctx.auto
                 && !ctx.skip
                 && !ctx.hold_skip;
             if waiting_click {
-                let ind_sz = (fsize * 0.72).clamp(11.0, 18.0);
+                let ind_sz = (fsize * 0.70).clamp(11.0, 17.0);
+                let phase = (ctx.ui_time_s * 4.4).sin();
                 let bob = if ctx.prefs.reduced_motion {
                     0.0
                 } else {
-                    (ctx.ui_time_s * 5.0).sin() * 2.2
+                    phase * 2.0
                 };
                 let pulse = if ctx.prefs.reduced_motion {
                     0.92
                 } else {
-                    0.72 + 0.28 * (ctx.ui_time_s * 5.0).sin().abs()
+                    0.68 + 0.32 * phase.abs()
                 };
-                let ix = box_rect[0] + box_rect[2] - ind_sz - 10.0;
-                let iy = box_rect[1] + box_rect[3] - ind_sz - 7.0 + bob;
-                let mut ic = b.theme.accent;
+                let ix = box_rect[0] + box_rect[2] - ind_sz - 12.0;
+                let iy = box_rect[1] + box_rect[3] - ind_sz - 8.0 + bob;
+                let mut ic = speaker_accent;
                 ic[3] *= alpha * pulse;
+                // Subtle glowing dot behind indicator for modern refinement
+                b.pkt.quads.push(Quad::rounded(
+                    [ix - 2.0, iy - 1.0, ind_sz + 6.0, ind_sz + 5.0],
+                    [ic[0], ic[1], ic[2], 0.16 * alpha * pulse],
+                    (ind_sz + 5.0) * 0.5,
+                ));
                 let glyph = if dlg.paused_for_click && !dlg.finished {
                     "…"
                 } else {
-                    "▼"
+                    "▾"
                 };
                 b.push_text(TextRun {
                     text: glyph.into(),
                     visible_bytes: None,
                     x: ix,
                     y: iy,
-                    width: ind_sz + 4.0,
-                    height: ind_sz + 4.0,
+                    width: ind_sz + 2.0,
+                    height: ind_sz + 2.0,
                     size: ind_sz,
                     line_height: ind_sz + 2.0,
                     color: ic,
@@ -2027,21 +2459,22 @@ fn project_story_hud(
 
             // Optional inline voice-replay pill when the current line has voice (touch-sized to avoid mis-taps!)
             if dlg.voice.is_some() && ctx.vm.choice.is_none() {
-                let vw = if touch { 72.0 } else { 48.0 };
-                let vh = if touch { 40.0 } else { 22.0 };
+                let vw = if touch { 72.0 } else { 52.0 };
+                let vh = if touch { 40.0 } else { 24.0 };
                 let vx = box_rect[0] + box_rect[2] - vw - 8.0;
                 let vy = box_rect[1] + 6.0;
-                b.button_styled(
+                b.button_variant(
                     [vx, vy, vw, vh],
-                    messages.get(loc, "replay-voice"),
+                    format!("▶ {}", messages.get(loc, "replay-voice")),
                     UiAction::ReplayVoice,
                     true,
-                    false,
-                    if touch { 0.90 } else { 0.65 },
+                    ButtonVariant::Ghost,
+                    if touch { 0.92 } else { 0.72 },
+                    TextAlign::Center,
                 );
             }
 
-            // 6. Responsive non-overlapping quick-action toolbar strictly within safe area!
+            // 6. Unified floating frosted-glass capsule Dock (strictly within safe area!)
             //    Narrow touch phones (< 460px) condense to 5 wide thumb-friendly buttons incl. 1-tap Q.Save;
             //    landscape phones, tablets & desktop keep the full 7-button strip.
             let compact_touch_bar = touch && sw < 460.0;
@@ -2083,13 +2516,14 @@ fn project_story_hud(
             };
             let n = buttons_storage.len() as f32;
             let min_btn_w = if compact_touch_bar {
-                58.0
+                60.0
             } else if touch {
                 44.0
             } else {
                 34.0
             };
-            let min_comfortable_w = n * min_btn_w + (n - 1.0) * gap;
+            let dock_gap = if compact_touch_bar { 3.0 } else { (gap * 0.65).clamp(2.0, 4.0) };
+            let min_comfortable_w = n * min_btn_w + (n - 1.0) * dock_gap;
 
             let top_y = box_rect[1] - bar_h - margin;
             let top_min_l = speaker_top_pill_rect.map_or(box_rect[0].max(sx + 4.0), |sr| {
@@ -2114,7 +2548,7 @@ fn project_story_hud(
             };
 
             let avail_w = (bar_max_r - bar_min_l).max(120.0);
-            let max_btn_w = ((avail_w - gap * (n - 1.0)) / n).max(16.0);
+            let max_btn_w = ((avail_w - dock_gap * (n - 1.0)) / n).max(16.0);
             let cap_btn_w = if compact_touch_bar {
                 86.0
             } else if touch {
@@ -2123,33 +2557,81 @@ fn project_story_hud(
                 (64.0 * ui_s).clamp(40.0, 74.0)
             };
             let btn_w = max_btn_w.min(cap_btn_w);
-            let total_w = btn_w * n + gap * (n - 1.0);
+            let total_w = btn_w * n + dock_gap * (n - 1.0);
             let mut bx = if bar_centered {
                 bar_min_l + ((avail_w - total_w) * 0.5).max(0.0)
             } else {
                 (bar_max_r - total_w).max(bar_min_l)
             };
 
-            // Ghost pill bar: subtly receded during quiet reading on desktop, brightens on hover or active mode!
+            // Unified floating glass dock capsule: recedes gracefully during quiet desktop reading!
             let toolbar_opacity = if touch || ctx.hud_toolbar_hovered || ctx.auto || ctx.skip || ctx.hold_skip {
                 0.94
             } else {
                 0.56
             };
-            for (key, action, active) in buttons_storage {
+            let dock_pad = 3.0;
+            let dock_rect = [
+                (bx - dock_pad).max(sx),
+                (bar_y - dock_pad * 0.5).max(sy),
+                (total_w + dock_pad * 2.0).min(sright - (bx - dock_pad).max(sx)),
+                (bar_h + dock_pad).min(sbottom - (bar_y - dock_pad * 0.5).max(sy)),
+            ];
+            let dock_r = (dock_rect[3] * 0.44).min(b.style.archetype.panel_radius() + 3.0);
+            let dock_bg = [
+                b.style.surface[0],
+                b.style.surface[1],
+                b.style.surface[2],
+                0.82 * toolbar_opacity * alpha,
+            ];
+            let dock_border = [
+                b.style.panel_border[0],
+                b.style.panel_border[1],
+                b.style.panel_border[2],
+                0.56 * toolbar_opacity * alpha,
+            ];
+            b.soft_shadow(dock_rect, dock_r, toolbar_opacity * alpha * 0.58);
+            b.glass_panel(
+                dock_rect,
+                dock_bg,
+                dock_border,
+                dock_r,
+                style_mode != UiStyleMode::Classic,
+            );
+
+            let btn_total = buttons_storage.len();
+            for (idx, (key, action, active)) in buttons_storage.into_iter().enumerate() {
                 let enabled = !matches!(
                     action,
                     UiAction::OpenSaves { save_mode: true } | UiAction::QuickSave
                 ) || !ctx.replay_active;
-                b.button_styled(
+                b.button_variant(
                     [bx, bar_y, btn_w, bar_h],
                     messages.get(loc, key),
                     action,
                     enabled,
-                    active,
+                    if active {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::DockItem
+                    },
                     toolbar_opacity,
+                    TextAlign::Center,
                 );
-                bx += btn_w + gap;
+                if idx + 1 < btn_total {
+                    let div_x = bx + btn_w + dock_gap * 0.5;
+                    let div_h = (bar_h * 0.44).max(8.0);
+                    b.pkt.quads.push(Quad::solid(
+                        [div_x, bar_y + (bar_h - div_h) * 0.5, 1.0, div_h],
+                        [
+                            b.style.panel_border[0],
+                            b.style.panel_border[1],
+                            b.style.panel_border[2],
+                            0.24 * toolbar_opacity * alpha,
+                        ],
+                    ));
+                }
+                bx += btn_w + dock_gap;
             }
 
             let mut top_bound = box_rect[1];
@@ -2253,13 +2735,35 @@ fn project_story_hud(
                     enabled: !item.disabled,
                 });
             } else {
-                b.button(
-                    rect,
+                // Modern frosted-glass choice card with staggered entrance + accent leading pip!
+                let stagger = (i as f32 * 0.11).min(0.45);
+                let c_ease = ease_out_cubic(((ctx.choice_anim - stagger) / (1.0 - stagger)).clamp(0.0, 1.0));
+                let slide = (1.0 - c_ease) * 9.0;
+                let crect = [rect[0], rect[1] + slide, rect[2], rect[3]];
+                let r = b.style.archetype.button_radius(crect[3]);
+                b.soft_shadow(crect, r, c_ease * 0.72);
+                b.button_variant(
+                    crect,
                     item.label.clone(),
                     UiAction::Choose(i as u16),
                     !item.disabled,
-                    false,
+                    ButtonVariant::Tonal,
+                    c_ease.max(0.32),
+                    TextAlign::Center,
                 );
+                if !item.disabled {
+                    let pip_h = (crect[3] * 0.44).clamp(10.0, 22.0);
+                    b.pkt.quads.push(Quad::rounded(
+                        [crect[0] + 6.0, crect[1] + (crect[3] - pip_h) * 0.5, 3.0, pip_h],
+                        [
+                            b.style.accent[0],
+                            b.style.accent[1],
+                            b.style.accent[2],
+                            0.82 * c_ease,
+                        ],
+                        1.5,
+                    ));
+                }
             }
         }
         if let Some((prev_asset, [px, py])) = hovered_preview {
@@ -2333,24 +2837,25 @@ fn overlay_shell(
     } else {
         (hdr_h * 0.72).clamp(28.0, 38.0)
     };
-    let mut surf = b.theme.surface;
+    let mut surf = b.style.surface;
     surf[3] *= anim;
     let border = [
-        b.theme.panel_border[0],
-        b.theme.panel_border[1],
-        b.theme.panel_border[2],
-        0.65 * anim,
+        b.style.panel_border[0],
+        b.style.panel_border[1],
+        b.style.panel_border[2],
+        0.62 * anim,
     ];
-    b.soft_shadow([px, py, pw, ph], 14.0, anim);
-    b.rounded_panel([px, py, pw, ph], surf, border, 14.0);
+    let shell_r = (b.style.archetype.panel_radius() + 2.0).clamp(7.0, 18.0);
+    b.soft_shadow([px, py, pw, ph], shell_r, anim);
+    b.glass_panel([px, py, pw, ph], surf, border, shell_r, true);
     b.pkt.overlay_panel_rect = Some([px, py, pw, ph]);
     b.pkt.quads.push(Quad::gradient_h(
-        [px + 16.0, py + 1.0, (pw - 32.0).max(20.0), 2.0],
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.90 * anim],
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.15 * anim],
+        [px + 18.0, py + 1.0, (pw - 36.0).max(20.0), 2.0],
+        [b.style.accent[0], b.style.accent[1], b.style.accent[2], 0.90 * anim],
+        [b.style.accent[0], b.style.accent[1], b.style.accent[2], 0.08 * anim],
     ));
     let title_size = (hdr_h * 0.46).clamp(16.0, 26.0);
-    let mut tc = b.theme.text;
+    let mut tc = b.style.text;
     tc[3] *= anim;
     b.push_text(TextRun {
         text: title,
@@ -2376,7 +2881,7 @@ fn overlay_shell(
         inline_images: Vec::new(),
         cache_key: 0,
     });
-    b.button(
+    b.button_variant(
         [
             px + pw - pad - back_w,
             py + (hdr_h - back_h) * 0.5,
@@ -2386,7 +2891,9 @@ fn overlay_shell(
         messages.get(loc, "back"),
         UiAction::CloseOverlay,
         true,
-        false,
+        ButtonVariant::Ghost,
+        1.0,
+        TextAlign::Center,
     );
     [
         px + pad,
@@ -2485,32 +2992,34 @@ fn draw_slot_card(
     b.next_hit_id += 1;
     let is_pressed = enabled && b.pressed == Some(id);
     let is_hover = enabled && !b.is_touch() && b.hovered == Some(id);
+    let accent = b.style.accent;
     let bg = if !enabled {
-        [0.12, 0.15, 0.20, 0.50]
+        [b.style.panel[0], b.style.panel[1], b.style.panel[2], 0.44]
     } else if is_pressed {
-        [b.theme.accent[0] * 0.65, b.theme.accent[1] * 0.65, b.theme.accent[2] * 0.65, 0.94]
+        [accent[0] * 0.62, accent[1] * 0.62, accent[2] * 0.62, 0.94]
     } else if is_hover {
-        [b.theme.accent[0] * 0.32, b.theme.accent[1] * 0.32, b.theme.accent[2] * 0.32, 0.92]
+        [accent[0] * 0.30, accent[1] * 0.30, accent[2] * 0.30, 0.92]
     } else if primary {
-        [b.theme.accent[0] * 0.22, b.theme.accent[1] * 0.22, b.theme.accent[2] * 0.22, 0.90]
+        [accent[0] * 0.22, accent[1] * 0.22, accent[2] * 0.22, 0.90]
     } else {
-        b.theme.panel
+        b.style.panel
     };
     let border = if is_pressed || is_hover || primary {
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85]
+        [accent[0], accent[1], accent[2], 0.85]
     } else {
-        b.theme.panel_border
+        b.style.panel_border
     };
-    b.rounded_panel(rect, bg, border, 8.0);
+    let card_r = b.style.archetype.card_radius();
+    b.rounded_panel(rect, bg, border, card_r);
 
     let pad = 6.0;
     let mut tx = rect[0] + pad + 2.0;
     if let Some(asset) = thumb_asset {
         let th = (rect[3] - pad * 2.0).max(24.0);
-        let tw = (th * 16.0 / 9.0).min(rect[2] * 0.36);
+        let tw = (th * 16.0 / 9.0).min(rect[2] * 0.38);
         b.pkt
             .quads
-            .push(Quad::rounded_image([rect[0] + pad, rect[1] + pad, tw, th], asset, 5.0));
+            .push(Quad::rounded_image([rect[0] + pad, rect[1] + pad, tw, th], asset, (card_r - 3.0).max(3.0)));
         tx = rect[0] + pad + tw + 8.0;
     }
     let tw = (rect[0] + rect[2] - tx - pad).max(40.0);
@@ -2529,7 +3038,7 @@ fn draw_slot_card(
         height: top_h,
         size: (top_h * 0.68).clamp(11.0, 14.0),
         line_height: top_h,
-        color: if enabled { b.theme.accent } else { b.theme.muted },
+        color: if enabled { accent } else { b.style.muted },
         emphasis: Vec::new(),
         color_spans: Vec::new(),
         ruby_spans: Vec::new(),
@@ -2555,7 +3064,7 @@ fn draw_slot_card(
         height: sum_h,
         size: (sum_h * 0.60).clamp(12.0, 16.0),
         line_height: (sum_h * 0.72).clamp(14.0, 20.0),
-        color: if enabled { b.theme.text } else { b.theme.muted },
+        color: if enabled { b.style.text } else { b.style.muted },
         emphasis: Vec::new(),
         color_spans: Vec::new(),
         ruby_spans: Vec::new(),
@@ -2577,6 +3086,176 @@ fn draw_slot_card(
         label: format!("{badge} {summary}"),
         enabled,
     });
+}
+
+/// Modern 16:9 visual save card with full-bleed rounded screenshot, floating badge & bottom scrim.
+#[allow(clippy::too_many_arguments)]
+fn draw_visual_slot_card(
+    b: &mut Builder<'_>,
+    rect: [f32; 4],
+    badge: String,
+    timestamp: String,
+    summary: String,
+    thumb_asset: Option<AssetId>,
+    action: UiAction,
+    enabled: bool,
+    delete_slot: Option<u32>,
+) {
+    let id = b.next_hit_id;
+    b.next_hit_id += 1;
+    let is_pressed = enabled && b.pressed == Some(id);
+    let is_hover = enabled && !b.is_touch() && b.hovered == Some(id);
+    let accent = b.style.accent;
+    let card_r = b.style.archetype.card_radius();
+    let border = if is_pressed || is_hover {
+        [accent[0], accent[1], accent[2], 0.94]
+    } else if enabled {
+        b.style.panel_border
+    } else {
+        [b.style.panel_border[0], b.style.panel_border[1], b.style.panel_border[2], 0.24]
+    };
+    let bg = if !enabled {
+        [b.style.panel[0], b.style.panel[1], b.style.panel[2], 0.42]
+    } else if is_hover || is_pressed {
+        [accent[0] * 0.26, accent[1] * 0.26, accent[2] * 0.26, 0.92]
+    } else {
+        b.style.panel
+    };
+    if enabled && (is_hover || is_pressed) {
+        b.soft_shadow(rect, card_r, 0.72);
+    }
+    b.rounded_panel(rect, bg, border, card_r);
+
+    let inner = [rect[0] + 1.5, rect[1] + 1.5, (rect[2] - 3.0).max(16.0), (rect[3] - 3.0).max(16.0)];
+    let inner_r = (card_r - 1.5).max(3.0);
+    if let Some(asset) = thumb_asset {
+        b.pkt.quads.push(Quad::rounded_image(inner, asset, inner_r));
+        // Soft bottom readability gradient over screenshot
+        let scrim_h = (inner[3] * 0.56).clamp(32.0, 68.0);
+        b.pkt.quads.push(Quad::gradient_v(
+            [inner[0], inner[1] + inner[3] - scrim_h, inner[2], scrim_h],
+            [b.style.surface[0] * 0.5, b.style.surface[1] * 0.5, b.style.surface[2] * 0.5, 0.0],
+            [b.style.surface[0] * 0.45, b.style.surface[1] * 0.45, b.style.surface[2] * 0.45, 0.92],
+        ));
+    }
+
+    // Top-left slot number badge pill
+    let bw = (estimate_display_units(&badge) * 11.5 + 14.0).clamp(38.0, 74.0);
+    let bh = 21.0;
+    let badge_rect = [inner[0] + 6.0, inner[1] + 6.0, bw, bh];
+    b.rounded_panel(
+        badge_rect,
+        [b.style.surface[0], b.style.surface[1], b.style.surface[2], 0.84],
+        [accent[0], accent[1], accent[2], if enabled { 0.70 } else { 0.26 }],
+        bh * 0.45,
+    );
+    b.push_text(TextRun {
+        text: badge.clone(),
+        visible_bytes: None,
+        x: badge_rect[0] + 4.0,
+        y: badge_rect[1],
+        width: bw - 8.0,
+        height: bh,
+        size: 11.5,
+        line_height: bh,
+        color: if enabled { accent } else { b.style.muted },
+        emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
+        shadow: None,
+        outline: None,
+        scroll: 0.0,
+        clip: Some(badge_rect),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Center,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+
+    // Timestamp chip (clears optional top-right delete icon)
+    let del_reserve = if delete_slot.is_some() { 34.0 } else { 6.0 };
+    if !timestamp.is_empty() && inner[2] > bw + del_reserve + 58.0 {
+        let ts_x = badge_rect[0] + bw + 6.0;
+        let ts_w = (inner[0] + inner[2] - del_reserve - ts_x).max(32.0);
+        b.push_text(TextRun {
+            text: timestamp,
+            visible_bytes: None,
+            x: ts_x,
+            y: inner[1] + 6.0,
+            width: ts_w,
+            height: bh,
+            size: 11.0,
+            line_height: bh,
+            color: b.style.muted,
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: b.theme.text_shadow,
+            outline: None,
+            scroll: 0.0,
+            clip: Some([ts_x, inner[1] + 5.0, ts_w, bh + 2.0]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Right,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+
+    // Bottom summary text
+    let sum_h = (inner[3] * 0.36).clamp(24.0, 44.0);
+    let sum_y = inner[1] + inner[3] - sum_h - 5.0;
+    b.push_text(TextRun {
+        text: summary.clone(),
+        visible_bytes: None,
+        x: inner[0] + 8.0,
+        y: sum_y,
+        width: (inner[2] - 16.0).max(32.0),
+        height: sum_h,
+        size: 12.5,
+        line_height: 16.0,
+        color: if enabled { b.style.text } else { b.style.muted },
+        emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
+        shadow: b.theme.text_shadow,
+        outline: None,
+        scroll: 0.0,
+        clip: Some([inner[0] + 6.0, sum_y, (inner[2] - 12.0).max(28.0), sum_h]),
+        font_assets: b.text_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+
+    // Main card HitRegion FIRST so topmost delete button wins hit-test!
+    b.pkt.hits.push(HitRegion {
+        id,
+        rect,
+        action,
+        label: format!("{badge} {summary}"),
+        enabled,
+    });
+
+    if let Some(slot_num) = delete_slot {
+        let dsz = if b.is_touch() { 32.0 } else { 26.0 };
+        let dx = inner[0] + inner[2] - dsz - 5.0;
+        let dy = inner[1] + 5.0;
+        b.button_variant(
+            [dx, dy, dsz, dsz],
+            "×".into(),
+            UiAction::DeleteSlot(slot_num),
+            true,
+            ButtonVariant::Destructive,
+            0.84,
+            TextAlign::Center,
+        );
+    }
 }
 
 fn project_saves_overlay(
@@ -2635,9 +3314,19 @@ fn project_saves_overlay(
         }
     }
 
-    let cols = if area[2] >= 560.0 { 2 } else { 1 };
+    // Modern 16:9 visual screenshot card grid on spacious screens; ergonomic list cards on compact viewports!
+    let visual_grid = area[2] >= 540.0 && area[3] >= 300.0;
+    let cols = if visual_grid {
+        if area[2] >= 740.0 { 3 } else { 2 }
+    } else if area[2] >= 560.0 {
+        2
+    } else {
+        1
+    };
     let cell_w = (area[2] - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = if touch {
+    let cell_h = if visual_grid {
+        (cell_w * 0.56).clamp(112.0, 152.0)
+    } else if touch {
         (area[3] * 0.16).clamp(52.0, 68.0)
     } else {
         (area[3] * 0.165).clamp(48.0, 68.0)
@@ -2684,52 +3373,72 @@ fn project_saves_overlay(
             UiAction::LoadSlot(slot.slot)
         };
         let enabled = save_mode || slot.exists;
-        let show_delete = save_mode && slot.exists && cell_w > del_w + del_gap + 120.0;
-        let main_w = if show_delete {
-            cell_w - del_w - del_gap
-        } else {
-            cell_w
-        };
         let thumb_asset =
             (slot.exists && slot.has_thumb).then_some(AssetId(SAVE_THUMB_ASSET_BASE + slot.slot));
-        draw_slot_card(
-            b,
-            [x, y, main_w, cell_h],
-            badge,
-            ts,
-            summary,
-            thumb_asset,
-            action,
-            enabled,
-            false,
-        );
-        if show_delete {
-            b.button(
-                [x + main_w + del_gap, y, del_w, cell_h],
-                "×".into(),
-                UiAction::DeleteSlot(slot.slot),
-                true,
+        if visual_grid {
+            draw_visual_slot_card(
+                b,
+                [x, y, cell_w, cell_h],
+                badge,
+                ts,
+                summary,
+                thumb_asset,
+                action,
+                enabled,
+                (save_mode && slot.exists).then_some(slot.slot),
+            );
+        } else {
+            let show_delete = save_mode && slot.exists && cell_w > del_w + del_gap + 120.0;
+            let main_w = if show_delete {
+                cell_w - del_w - del_gap
+            } else {
+                cell_w
+            };
+            draw_slot_card(
+                b,
+                [x, y, main_w, cell_h],
+                badge,
+                ts,
+                summary,
+                thumb_asset,
+                action,
+                enabled,
                 false,
             );
+            if show_delete {
+                b.button_variant(
+                    [x + main_w + del_gap, y, del_w, cell_h],
+                    "×".into(),
+                    UiAction::DeleteSlot(slot.slot),
+                    true,
+                    ButtonVariant::Destructive,
+                    0.86,
+                    TextAlign::Center,
+                );
+            }
         }
     }
 
     if total_pages > 1 {
         let by = area[1] + area[3] - nav_h;
         let nav_w = ((area[2] - 80.0) * 0.5).clamp(76.0, 128.0);
-        b.button(
+        b.button_variant(
             [area[0], by, nav_w, nav_h],
             messages.get(loc, "scroll-back"),
             UiAction::SavesPage(-1),
             page > 0,
-            false,
+            ButtonVariant::Ghost,
+            1.0,
+            TextAlign::Center,
         );
-        b.button(
+        b.button_variant(
             [area[0] + area[2] - nav_w, by, nav_w, nav_h],
             messages.get(loc, "scroll-forward"),
             UiAction::SavesPage(1),
             page + 1 < total_pages,
-            false,
+            ButtonVariant::Ghost,
+            1.0,
+            TextAlign::Center,
         );
         let mid_x = area[0] + nav_w + 6.0;
         let mid_w = (area[2] - nav_w * 2.0 - 12.0).max(40.0);
@@ -2742,7 +3451,7 @@ fn project_saves_overlay(
             height: nav_h,
             size: 14.0,
             line_height: 18.0,
-            color: b.theme.muted,
+            color: b.style.muted,
             emphasis: Vec::new(),
             color_spans: Vec::new(),
             ruby_spans: Vec::new(),
@@ -2847,20 +3556,21 @@ fn push_slider_row(
         (bx, bw, y, row_h, mx, px)
     };
 
-    b.button([minus_x, ctrl_y, btn_w, ctrl_h], "−".into(), dec, true, false);
+    b.button_variant([minus_x, ctrl_y, btn_w, ctrl_h], "−".into(), dec, true, ButtonVariant::Ghost, 1.0, TextAlign::Center);
     // Continuous draggable slider track + glowing thumb pill
     let track_h = if touch { 10.0 } else { 8.0 };
     let track_y = ctrl_y + (ctrl_h - track_h) * 0.5;
+    let accent = b.style.accent;
     b.pkt.quads.push(Quad::rounded(
         [bar_x, track_y, bar_w, track_h],
-        [0.20, 0.25, 0.34, 0.88],
+        [b.style.panel[0] * 1.4, b.style.panel[1] * 1.4, b.style.panel[2] * 1.4, 0.90],
         track_h * 0.5,
     ));
     let fill_w = (bar_w * clamped_norm).max(0.0);
     if fill_w > 2.0 {
         b.pkt.quads.push(Quad::rounded(
             [bar_x, track_y, fill_w, track_h],
-            b.theme.accent,
+            accent,
             track_h * 0.5,
         ));
     }
@@ -2876,17 +3586,18 @@ fn push_slider_row(
     ];
     b.rounded_panel(
         thumb_rect,
-        [0.95, 0.98, 1.0, 0.98],
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.95],
+        [0.97, 0.98, 1.0, 0.98],
+        [accent[0], accent[1], accent[2], 0.95],
         thumb_d * 0.5,
     );
     b.pkt.sliders.push(SliderTrack {
         rect: [bar_x, ctrl_y, bar_w, ctrl_h],
         kind,
     });
-    b.button([plus_x, ctrl_y, btn_w, ctrl_h], "+".into(), inc, true, false);
+    b.button_variant([plus_x, ctrl_y, btn_w, ctrl_h], "+".into(), inc, true, ButtonVariant::Ghost, 1.0, TextAlign::Center);
 }
 
+/// Modern Pill Toggle Switch row (replaces boxy ON/OFF text buttons with tactile pill switches).
 fn push_toggle_row(
     b: &mut Builder<'_>,
     x: f32,
@@ -2899,12 +3610,13 @@ fn push_toggle_row(
     messages: &Messages,
     loc: &str,
 ) {
-    let toggle_w = (w * 0.26).clamp(84.0, 124.0);
-    let toggle_x = x + w - toggle_w;
-    let label_w = (toggle_x - x - 8.0).max(60.0);
+    let touch = b.is_touch();
+    let hit_w = (w * 0.28).clamp(84.0, 128.0);
+    let hit_x = x + w - hit_w;
+    let label_w = (hit_x - x - 8.0).max(60.0);
     let label_size = (row_h * 0.42).clamp(13.0, 17.0);
     b.push_text(TextRun {
-        text: label,
+        text: label.clone(),
         visible_bytes: None,
         x,
         y,
@@ -2912,7 +3624,7 @@ fn push_toggle_row(
         height: row_h,
         size: label_size,
         line_height: label_size * 1.25,
-        color: b.theme.text,
+        color: b.style.text,
         emphasis: Vec::new(),
         color_spans: Vec::new(),
         ruby_spans: Vec::new(),
@@ -2927,12 +3639,140 @@ fn push_toggle_row(
         inline_images: Vec::new(),
         cache_key: 0,
     });
-    b.button(
-        [toggle_x, y, toggle_w, row_h],
-        messages.get(loc, if active { "on" } else { "off" }),
+
+    let id = b.next_hit_id;
+    b.next_hit_id += 1;
+    let is_hover = !touch && b.hovered == Some(id);
+    let is_pressed = b.pressed == Some(id);
+    let accent = b.style.accent;
+
+    let track_h = (row_h * 0.68).clamp(24.0, 30.0);
+    let track_w = (track_h * 1.88).clamp(48.0, 58.0);
+    let track_x = x + w - track_w;
+    let track_y = y + (row_h - track_h) * 0.5;
+    let track_r = track_h * 0.5;
+
+    let state_txt = messages.get(loc, if active { "on" } else { "off" });
+    let state_w = (track_x - hit_x - 6.0).max(0.0);
+    if state_w >= 24.0 {
+        b.push_text(TextRun {
+            text: state_txt.clone(),
+            visible_bytes: None,
+            x: hit_x,
+            y,
+            width: state_w,
+            height: row_h,
+            size: 12.5,
+            line_height: 16.0,
+            color: if active { accent } else { b.style.muted },
+            emphasis: Vec::new(),
+            color_spans: Vec::new(),
+            ruby_spans: Vec::new(),
+            shadow: None,
+            outline: None,
+            scroll: 0.0,
+            clip: Some([hit_x, y, state_w, row_h]),
+            font_assets: b.ui_fonts.clone(),
+            align: TextAlign::Right,
+            valign_center: true,
+            auto_fit: true,
+            inline_images: Vec::new(),
+            cache_key: 0,
+        });
+    }
+
+    let track_bg = if active {
+        [
+            accent[0] * if is_hover || is_pressed { 1.0 } else { 0.84 },
+            accent[1] * if is_hover || is_pressed { 1.0 } else { 0.84 },
+            accent[2] * if is_hover || is_pressed { 1.0 } else { 0.84 },
+            0.94,
+        ]
+    } else {
+        [
+            b.style.panel[0] * if is_hover { 1.35 } else { 1.15 },
+            b.style.panel[1] * if is_hover { 1.35 } else { 1.15 },
+            b.style.panel[2] * if is_hover { 1.35 } else { 1.15 },
+            0.90,
+        ]
+    };
+    let track_border = if active || is_hover || is_pressed {
+        [accent[0], accent[1], accent[2], 0.90]
+    } else {
+        b.style.panel_border
+    };
+    b.rounded_panel([track_x, track_y, track_w, track_h], track_bg, track_border, track_r);
+
+    let knob_pad = 3.0;
+    let knob_d = (track_h - knob_pad * 2.0).max(14.0);
+    let knob_x = if active {
+        track_x + track_w - knob_d - knob_pad
+    } else {
+        track_x + knob_pad
+    };
+    let knob_y = track_y + knob_pad;
+    b.rounded_panel(
+        [knob_x, knob_y, knob_d, knob_d],
+        [0.98, 0.99, 1.0, 0.99],
+        [0.0, 0.0, 0.0, 0.14],
+        knob_d * 0.5,
+    );
+
+    b.pkt.hits.push(HitRegion {
+        id,
+        rect: [hit_x, y, hit_w, row_h],
+        action,
+        label: format!("{label} {state_txt}"),
+        enabled: true,
+    });
+}
+
+fn push_choice_row(
+    b: &mut Builder<'_>,
+    x: f32,
+    y: f32,
+    w: f32,
+    row_h: f32,
+    label: String,
+    value_label: String,
+    action: UiAction,
+) {
+    let val_w = (w * 0.38).clamp(112.0, 196.0);
+    let val_x = x + w - val_w;
+    let label_w = (val_x - x - 8.0).max(60.0);
+    let label_size = (row_h * 0.42).clamp(13.0, 17.0);
+    b.push_text(TextRun {
+        text: label,
+        visible_bytes: None,
+        x,
+        y,
+        width: label_w,
+        height: row_h,
+        size: label_size,
+        line_height: label_size * 1.25,
+        color: b.style.text,
+        emphasis: Vec::new(),
+        color_spans: Vec::new(),
+        ruby_spans: Vec::new(),
+        shadow: None,
+        outline: None,
+        scroll: 0.0,
+        clip: Some([x, y, label_w, row_h]),
+        font_assets: b.ui_fonts.clone(),
+        align: TextAlign::Left,
+        valign_center: true,
+        auto_fit: true,
+        inline_images: Vec::new(),
+        cache_key: 0,
+    });
+    b.button_variant(
+        [val_x, y, val_w, row_h],
+        format!("{value_label} ↻"),
         action,
         true,
-        active,
+        ButtonVariant::Primary,
+        1.0,
+        TextAlign::Center,
     );
 }
 
@@ -2944,16 +3784,38 @@ fn project_settings_overlay(
 ) {
     let area = overlay_shell(b, ctx, messages.get(loc, "settings"), messages, loc);
     let touch = b.is_touch();
-    let tab_h = if touch { 40.0 } else { 34.0 };
-    let tab_gap = 8.0;
-    let tab_w = ((area[2] - tab_gap * 2.0) / 3.0).min(184.0);
+    let tab_h: f32 = if touch { 42.0 } else { 36.0 };
+    let seg_w = area[2].min(540.0);
+    let seg_pad = 3.0;
+    let seg_r = (tab_h * 0.34).min(b.style.archetype.card_radius() + 2.0);
+    // Modern unified Segmented Control trough!
+    b.rounded_panel(
+        [area[0], area[1], seg_w, tab_h],
+        [b.style.panel[0] * 0.85, b.style.panel[1] * 0.85, b.style.panel[2] * 0.85, 0.82],
+        [b.style.panel_border[0], b.style.panel_border[1], b.style.panel_border[2], 0.36],
+        seg_r,
+    );
+    let inner_w = (seg_w - seg_pad * 2.0).max(90.0);
+    let tab_w = inner_w / 3.0;
     for (idx, key) in [(0u8, "tab-reading"), (1u8, "tab-visual"), (2u8, "tab-audio")] {
-        b.button(
-            [area[0] + idx as f32 * (tab_w + tab_gap), area[1], tab_w, tab_h],
+        let active = ctx.settings_tab == idx;
+        b.button_variant(
+            [
+                area[0] + seg_pad + idx as f32 * tab_w,
+                area[1] + seg_pad,
+                tab_w,
+                (tab_h - seg_pad * 2.0).max(24.0),
+            ],
             messages.get(loc, key),
             UiAction::SettingsTab(idx),
             true,
-            ctx.settings_tab == idx,
+            if active {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::DockItem
+            },
+            1.0,
+            TextAlign::Center,
         );
     }
 
@@ -2966,7 +3828,7 @@ fn project_settings_overlay(
             3usize,
             3 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2),
         ),
-        1 => (1, 3),
+        1 => (1, 4),
         _ => (4, 2),
     };
     let total_rows = slider_count + toggle_count;
@@ -3115,7 +3977,19 @@ fn project_settings_overlay(
             }
         }
     } else if ctx.settings_tab == 1 {
-        // Tab 1: Display & Visual Comfort
+        // Tab 1: Display, Adaptive Style Mode & Visual Comfort
+        push_choice_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "ui-style-mode"),
+            messages.get(loc, ctx.prefs.ui_style_mode.ftl_key()),
+            UiAction::CycleUiStyleMode,
+        );
+        y += row_h + gap;
+
         push_slider_row(
             b,
             area[0],
@@ -3273,32 +4147,37 @@ fn project_history_overlay(
         let card_h = row_h - 6.0;
         let card_rect = [area[0], y, area[2], card_h];
         let has_speaker = !entry.speaker.is_empty();
+        let sp_col = if has_speaker {
+            speaker_palette_color(&entry.speaker, b.style.accent, false)
+        } else {
+            b.style.accent
+        };
         let tint = if has_speaker {
             if idx % 2 == 0 {
-                [0.12, 0.16, 0.24, 0.62]
+                [b.style.panel[0] * 1.06, b.style.panel[1] * 1.06, b.style.panel[2] * 1.06, 0.64]
             } else {
-                [0.10, 0.14, 0.21, 0.48]
+                [b.style.panel[0] * 0.94, b.style.panel[1] * 0.94, b.style.panel[2] * 0.94, 0.50]
             }
         } else {
-            [0.08, 0.10, 0.15, 0.34]
+            [b.style.surface[0], b.style.surface[1], b.style.surface[2], 0.34]
         };
         let border = if has_speaker {
-            [b.theme.panel_border[0], b.theme.panel_border[1], b.theme.panel_border[2], 0.26]
+            [sp_col[0], sp_col[1], sp_col[2], 0.24]
         } else {
             [0.0; 4]
         };
-        b.rounded_panel(card_rect, tint, border, 8.0);
+        b.rounded_panel(card_rect, tint, border, b.style.archetype.card_radius());
 
         let has_v = entry.voice.is_some();
-        let left_x = area[0] + if has_speaker { 14.0 } else { 10.0 };
+        let left_x = area[0] + if has_speaker { 15.0 } else { 12.0 };
         let right_pad = if has_v { voice_btn_w + 16.0 } else { 10.0 };
         let text_w = (area[0] + area[2] - left_x - right_pad).max(60.0);
 
         if has_speaker {
-            // Crisp left character accent bar + dedicated speaker header line!
+            // Crisp per-character OKLCH accent bar + dedicated speaker header line!
             b.pkt.quads.push(Quad::rounded(
-                [area[0] + 4.0, y + 7.0, 3.0, (card_h - 14.0).max(12.0)],
-                b.theme.accent,
+                [area[0] + 5.0, y + 7.0, 3.0, (card_h - 14.0).max(12.0)],
+                sp_col,
                 1.5,
             ));
             let sp_h = (card_h * 0.32).clamp(15.0, 20.0);
@@ -3311,7 +4190,7 @@ fn project_history_overlay(
                 height: sp_h,
                 size: (sp_h * 0.72).clamp(11.5, 14.0),
                 line_height: sp_h,
-                color: b.theme.accent,
+                color: sp_col,
                 emphasis: Vec::new(),
                 color_spans: Vec::new(),
                 ruby_spans: Vec::new(),
@@ -3337,7 +4216,7 @@ fn project_history_overlay(
                 height: body_h,
                 size: fsize,
                 line_height: fsize * 1.32,
-                color: b.theme.text,
+                color: b.style.text,
                 emphasis: Vec::new(),
                 color_spans: Vec::new(),
                 ruby_spans: Vec::new(),
@@ -3355,9 +4234,9 @@ fn project_history_overlay(
         } else {
             // Narration row: subtly muted tone for immediate visual rhythm vs spoken dialogue
             let nar_col = [
-                b.theme.text[0] * 0.86,
-                b.theme.text[1] * 0.89,
-                b.theme.text[2] * 0.94,
+                b.style.text[0] * 0.86,
+                b.style.text[1] * 0.89,
+                b.style.text[2] * 0.94,
                 0.92,
             ];
             b.push_text(TextRun {
@@ -3806,13 +4685,15 @@ fn project_confirm_modal(
     let ch = 152.0;
     let cx = sx + (sw - cw) * 0.5;
     let cy = sy + (sh - ch) * 0.5 + (1.0 - anim) * 10.0;
-    b.soft_shadow([cx, cy, cw, ch], 13.0, anim);
-    b.rounded_panel(
-        [cx, cy, cw, ch],
-        b.theme.surface,
-        [b.theme.accent[0], b.theme.accent[1], b.theme.accent[2], 0.85],
-        13.0,
-    );
+    let modal_r = b.style.archetype.panel_radius().max(10.0);
+    let is_delete = matches!(confirm, ConfirmKind::DeleteSlot(_));
+    let border_col = if is_delete {
+        [0.90, 0.36, 0.40, 0.85]
+    } else {
+        [b.style.accent[0], b.style.accent[1], b.style.accent[2], 0.85]
+    };
+    b.soft_shadow([cx, cy, cw, ch], modal_r, anim);
+    b.glass_panel([cx, cy, cw, ch], b.style.surface, border_col, modal_r, true);
     let (msg, ok_label) = match confirm {
         ConfirmKind::OverwriteSlot(slot) => (
             format!("{} #{:02}?", messages.get(loc, "overwrite-slot"), slot + 1),
@@ -3832,7 +4713,7 @@ fn project_confirm_modal(
         height: 52.0,
         size: 17.0,
         line_height: 24.0,
-        color: b.theme.text,
+        color: b.style.text,
         emphasis: Vec::new(),
         color_spans: Vec::new(),
         ruby_spans: Vec::new(),
@@ -3851,19 +4732,27 @@ fn project_confirm_modal(
     let bw = (cw - 36.0 - btn_gap) * 0.5;
     let bh = if b.is_touch() { 44.0 } else { 38.0 };
     let by = cy + ch - bh - 18.0;
-    b.button(
+    b.button_variant(
         [cx + 18.0, by, bw, bh],
         messages.get(loc, "cancel"),
         UiAction::CancelPending,
         true,
-        false,
+        ButtonVariant::Ghost,
+        1.0,
+        TextAlign::Center,
     );
-    b.button(
+    b.button_variant(
         [cx + 18.0 + bw + btn_gap, by, bw, bh],
         ok_label,
         UiAction::ConfirmPending,
         true,
-        true,
+        if is_delete {
+            ButtonVariant::Destructive
+        } else {
+            ButtonVariant::Primary
+        },
+        1.0,
+        TextAlign::Center,
     );
 }
 
@@ -4059,6 +4948,9 @@ mod tests {
                 hud_toolbar_hovered: false,
                 host_top_left_pad: 0.0,
                 host_top_right_pad: 0.0,
+                resolved_style: None,
+                hover_anim: 1.0,
+                choice_anim: 1.0,
             };
             let pkt = project(&ctx, vw, vh, &msgs);
             let (_, scale) = fit_stage(800.0, 600.0, vw, vh);
@@ -4213,6 +5105,9 @@ mod tests {
             hud_toolbar_hovered: false,
             host_top_left_pad: 0.0,
             host_top_right_pad: 0.0,
+            resolved_style: None,
+            hover_anim: 1.0,
+            choice_anim: 1.0,
         };
         let pkt = project(&ctx, 800.0, 600.0, &msgs);
         // Only the LPM button hit exists — dialogue HUD & 7 buttons are suppressed!
@@ -4274,6 +5169,9 @@ mod tests {
             hud_toolbar_hovered: false,
             host_top_left_pad: 0.0,
             host_top_right_pad: 0.0,
+            resolved_style: None,
+            hover_anim: 1.0,
+            choice_anim: 1.0,
         };
         let pkt = project(&ctx, 390.0, 844.0, &msgs);
         // Stage docked at safe top (59px)
@@ -4371,6 +5269,9 @@ mod tests {
             hud_toolbar_hovered: false,
             host_top_left_pad: 0.0,
             host_top_right_pad: 0.0,
+            resolved_style: None,
+            hover_anim: 1.0,
+            choice_anim: 1.0,
         };
         let saves_pkt = project(&saves_ctx, 844.0, 390.0, &msgs);
         // Must have pagination buttons and stay inside safe horizontal/bottom insets!
@@ -4466,6 +5367,9 @@ mod tests {
             hud_toolbar_hovered: false,
             host_top_left_pad: 92.0,
             host_top_right_pad: 52.0,
+            resolved_style: None,
+            hover_anim: 1.0,
+            choice_anim: 1.0,
         };
         let spkt = project(&story_ctx, 1920.0, 1080.0, &msgs);
         assert!(spkt.needs_blur, "widescreen margins should enable blurred ambient backdrop");
@@ -4515,5 +5419,96 @@ mod tests {
             .hits
             .iter()
             .any(|h| matches!(h.action, UiAction::SetDialogueOpacity(_))));
+        assert!(epkt
+            .hits
+            .iter()
+            .any(|h| matches!(h.action, UiAction::CycleUiStyleMode)));
+    }
+
+    #[test]
+    fn adaptive_style_modes_title_anchor_frosted_panel_and_soft_shadow_work() {
+        let prog = livemaker_like_program();
+        let mut vm = Vm::new(prog.clone(), Some("zh-Hans".into())).unwrap();
+        vm.step(1000).unwrap();
+        vm.layers.push(LayerState {
+            id: LayerId(1),
+            parent: None,
+            asset: Some(AssetId(0)),
+            transform: Transform2D::default(),
+            shake_offset: [0.0, 0.0],
+            text: None,
+        });
+
+        let mut custom_style = ResolvedStyle::from_theme(&prog.ui);
+        custom_style.accent = [0.95, 0.56, 0.68, 1.0];
+        custom_style.archetype = StyleArchetype::Soft;
+        custom_style.title_anchor = TitleAnchor::Right;
+        custom_style.dialogue_is_light = true;
+
+        let mut prefs = Preferences::default();
+        prefs.ui_style_mode = UiStyleMode::Modern;
+        let msgs = Messages::default();
+
+        // 1. Modern mode produces localized FrostedPanel + true SoftShadow quads!
+        let story_ctx = UiContext {
+            vm: &vm,
+            screen: Screen::Story,
+            prefs: &prefs,
+            auto: false,
+            skip: false,
+            hold_skip: false,
+            interface_hidden: false,
+            replay_active: false,
+            slots: &[],
+            autosave: None,
+            quicksave: None,
+            saves_page: 0,
+            history_scroll: 0,
+            gallery_page: 0,
+            viewing_cg: None,
+            cg_zoom: 1.0,
+            cg_pan: [0.0, 0.0],
+            settings_tab: 0,
+            pending_confirm: None,
+            host_has_shelf: false,
+            loading_visible: false,
+            tz_offset_mins: 0,
+            hovered_hit: None,
+            pressed_hit: None,
+            safe_insets: SafeInsets::default(),
+            input_mode: InputMode::Pointer,
+            portrait_reader: false,
+            toast: None,
+            overlay_anim: 1.0,
+            toast_anim: 1.0,
+            dialogue_fade: 1.0,
+            ui_time_s: 0.0,
+            hud_toolbar_hovered: false,
+            host_top_left_pad: 0.0,
+            host_top_right_pad: 0.0,
+            resolved_style: Some(&custom_style),
+            hover_anim: 1.0,
+            choice_anim: 1.0,
+        };
+        let spkt = project(&story_ctx, 1280.0, 720.0, &msgs);
+        assert!(spkt.quads.iter().any(|q| q.special == SpecialQuad::FrostedPanel));
+        assert!(spkt.quads.iter().any(|q| q.special == SpecialQuad::SoftShadow));
+
+        // 2. Title screen anchored to Right places title buttons on the right half!
+        let title_ctx = UiContext {
+            screen: Screen::Title,
+            ..story_ctx
+        };
+        let tpkt = project(&title_ctx, 1280.0, 720.0, &msgs);
+        let new_btn = tpkt
+            .hits
+            .iter()
+            .find(|h| h.action == UiAction::NewGame)
+            .expect("new game button");
+        assert!(
+            new_btn.rect[0] > 640.0,
+            "TitleAnchor::Right should place menu on the right side, got {:?}",
+            new_btn.rect
+        );
     }
 }

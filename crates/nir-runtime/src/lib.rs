@@ -26,6 +26,8 @@ const LOADING_INDICATOR_DELAY_US: u64 = 150_000;
 const OVERLAY_ANIM_US: u64 = 165_000;
 const TOAST_FADE_US: u64 = 160_000;
 const DIALOGUE_FADE_US: u64 = 85_000;
+const HOVER_ANIM_US: u64 = 110_000;
+const CHOICE_ANIM_US: u64 = 220_000;
 
 /// Typed commands sent from `Runtime` to the platform host (Native / Web / Mobile).
 #[derive(Debug, Clone, PartialEq)]
@@ -128,10 +130,19 @@ pub struct Runtime {
     toast_elapsed_us: u64,
     overlay_anim_us: u64,
     dialogue_fade_us: u64,
+    hover_anim_us: u64,
+    choice_anim_us: u64,
+    last_choice_active: bool,
     last_dialogue_key: Option<(TextId, usize)>,
     ui_time_us: u64,
     host_top_left_pad: f32,
     host_top_right_pad: f32,
+    title_analysis: Option<TitleAnalysis>,
+    skin_analysis: Option<SkinSample>,
+    scene_tint: Option<[f32; 3]>,
+    style_sampled_bg: Option<AssetId>,
+    resolved_style: ResolvedStyle,
+    theme_version: u64,
     loaded_assets: BTreeSet<AssetId>,
     /// Tracks in-flight asset requests and whether they have already been promoted to `urgent`.
     requested_assets: BTreeMap<AssetId, bool>,
@@ -173,6 +184,7 @@ impl Runtime {
             }
         }
 
+        let initial_style = ResolvedStyle::from_theme(&program.ui);
         let mut rt = Self {
             program,
             vm,
@@ -217,10 +229,19 @@ impl Runtime {
             toast_elapsed_us: 0,
             overlay_anim_us: OVERLAY_ANIM_US,
             dialogue_fade_us: DIALOGUE_FADE_US,
+            hover_anim_us: HOVER_ANIM_US,
+            choice_anim_us: CHOICE_ANIM_US,
+            last_choice_active: false,
             last_dialogue_key: None,
             ui_time_us: 0,
             host_top_left_pad: 0.0,
             host_top_right_pad: 0.0,
+            title_analysis: None,
+            skin_analysis: None,
+            scene_tint: None,
+            style_sampled_bg: None,
+            resolved_style: initial_style,
+            theme_version: 1,
             loaded_assets: BTreeSet::new(),
             requested_assets: BTreeMap::new(),
             commands: Vec::new(),
@@ -783,7 +804,13 @@ impl Runtime {
             if self.overlay_anim_us < OVERLAY_ANIM_US {
                 return true;
             }
+            if self.hover_anim_us < HOVER_ANIM_US {
+                return true;
+            }
             if self.screen == Screen::Story && self.dialogue_fade_us < DIALOGUE_FADE_US {
+                return true;
+            }
+            if self.screen == Screen::Story && self.choice_anim_us < CHOICE_ANIM_US {
                 return true;
             }
             if self.is_waiting_dialogue_click() {
@@ -817,6 +844,9 @@ impl Runtime {
             )
         });
         if next != self.hovered_hit || is_toolbar_hit != self.hud_toolbar_hovered {
+            if next != self.hovered_hit && next.is_some() && !self.prefs.reduced_motion {
+                self.hover_anim_us = 0;
+            }
             self.hovered_hit = next;
             self.hud_toolbar_hovered = is_toolbar_hit;
             if is_choice_hit {
@@ -824,6 +854,100 @@ impl Runtime {
             }
             self.dirty = true;
         }
+    }
+
+    fn style_probe_ids(&self) -> (Option<AssetId>, Option<AssetId>) {
+        let title_id = self
+            .program
+            .ui
+            .title_screen
+            .as_ref()
+            .and_then(|s| s.background)
+            .or(self.program.meta.title_bg);
+        let skin_id = self
+            .program
+            .ui
+            .dialogue_styles
+            .get(self.vm.dialogue_style as usize)
+            .and_then(|s| s.dialogue_bg)
+            .or(self.program.ui.dialogue_bg);
+        (title_id, skin_id)
+    }
+
+    fn active_background_asset(&self) -> Option<AssetId> {
+        self.vm
+            .layers
+            .iter()
+            .filter(|l| l.asset.is_some() && l.transform.opacity > 0.2)
+            .min_by_key(|l| (l.transform.z_order, l.id.0))
+            .and_then(|l| l.asset)
+    }
+
+    /// Returns true when the host should supply a tiny RGBA sample of `id` to derive adaptive style DNA.
+    pub fn wants_style_sample(&self, id: AssetId) -> bool {
+        let (title_id, skin_id) = self.style_probe_ids();
+        if title_id == Some(id) && self.title_analysis.is_none() {
+            return true;
+        }
+        if skin_id == Some(id) && self.skin_analysis.is_none() {
+            return true;
+        }
+        if self.screen == Screen::Story
+            && self.active_background_asset() == Some(id)
+            && self.style_sampled_bg != Some(id)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Analyzes a small RGBA pixel sample from `title_bg`, `dialogue_bg`, or active story background
+    /// to automatically inherit the original game's visual DNA & ambient lighting (< 0.5ms).
+    pub fn analyze_asset_rgba(&mut self, id: AssetId, w: u32, h: u32, rgba: &[u8]) {
+        let (title_id, skin_id) = self.style_probe_ids();
+        let mut changed = false;
+        if title_id == Some(id) && self.title_analysis.is_none() {
+            if let Some(ta) = analyze_title_rgba(w, h, rgba) {
+                self.title_analysis = Some(ta);
+                changed = true;
+            }
+        }
+        if skin_id == Some(id) && self.skin_analysis.is_none() {
+            if let Some(sk) = analyze_dialogue_skin_rgba(w, h, rgba) {
+                self.skin_analysis = Some(sk);
+                changed = true;
+            }
+        }
+        if self.screen == Screen::Story && self.active_background_asset() == Some(id) {
+            self.style_sampled_bg = Some(id);
+            let tint = analyze_scene_tint_rgba(w, h, rgba);
+            if tint != self.scene_tint {
+                self.scene_tint = tint;
+                changed = true;
+            }
+        }
+        if changed {
+            self.resolved_style = synthesize_resolved_style(
+                &self.program.ui,
+                self.title_analysis.as_ref(),
+                self.skin_analysis.as_ref(),
+                self.scene_tint,
+            );
+            self.theme_version = self.theme_version.wrapping_add(1);
+            self.dirty = true;
+        }
+    }
+
+    pub fn resolved_style(&self) -> &ResolvedStyle {
+        &self.resolved_style
+    }
+
+    pub fn theme_version(&self) -> u64 {
+        self.theme_version
+    }
+
+    pub fn theme_css_json(&self) -> String {
+        self.resolved_style.to_web_css_vars_json()
     }
 
     fn play_choice_hover_se(&mut self) {
@@ -1468,6 +1592,15 @@ impl Runtime {
                 self.commands
                     .push(HostCommand::SavePreferences(self.prefs.clone()));
             }
+            UiAction::CycleUiStyleMode => {
+                self.prefs.ui_style_mode = self.prefs.ui_style_mode.next();
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+                let loc = self.prefs.ui_locale.clone();
+                let mode_name = self.messages.get(&loc, self.prefs.ui_style_mode.ftl_key());
+                let label = self.messages.get(&loc, "ui-style-mode");
+                self.show_toast(format!("{label}: {mode_name}"), 1800);
+            }
             UiAction::ReturnShelf => {
                 self.emit_autosave();
                 self.flush_pending_saves();
@@ -1729,6 +1862,32 @@ impl Runtime {
             self.dirty = true;
         }
 
+        if !self.prefs.reduced_motion && self.hover_anim_us < HOVER_ANIM_US {
+            self.hover_anim_us = self
+                .hover_anim_us
+                .saturating_add(delta_us)
+                .min(HOVER_ANIM_US);
+            self.dirty = true;
+        }
+
+        if !self.prefs.reduced_motion && self.screen == Screen::Story {
+            let has_choice = self.vm.choice.is_some();
+            if has_choice && !self.last_choice_active {
+                self.choice_anim_us = 0;
+                self.dirty = true;
+            }
+            self.last_choice_active = has_choice;
+            if self.choice_anim_us < CHOICE_ANIM_US {
+                self.choice_anim_us = self
+                    .choice_anim_us
+                    .saturating_add(delta_us)
+                    .min(CHOICE_ANIM_US);
+                self.dirty = true;
+            }
+        } else {
+            self.last_choice_active = self.vm.choice.is_some();
+        }
+
         if !self.prefs.reduced_motion && self.screen == Screen::Story {
             let cur_dlg = self.vm.dialogue.as_ref().map(|d| (d.text_id, d.full_text.len(), d.finished));
             let cur_key = cur_dlg.map(|(id, len, _)| (id, len));
@@ -1866,6 +2025,16 @@ impl Runtime {
         } else {
             (self.dialogue_fade_us as f32 / DIALOGUE_FADE_US as f32).clamp(0.0, 1.0)
         };
+        let hover_anim = if self.prefs.reduced_motion {
+            1.0
+        } else {
+            (self.hover_anim_us as f32 / HOVER_ANIM_US as f32).clamp(0.0, 1.0)
+        };
+        let choice_anim = if self.prefs.reduced_motion {
+            1.0
+        } else {
+            (self.choice_anim_us as f32 / CHOICE_ANIM_US as f32).clamp(0.0, 1.0)
+        };
         let ctx = UiContext {
             vm: &self.vm,
             screen: self.screen,
@@ -1902,6 +2071,9 @@ impl Runtime {
             hud_toolbar_hovered: self.hud_toolbar_hovered,
             host_top_left_pad: self.host_top_left_pad,
             host_top_right_pad: self.host_top_right_pad,
+            resolved_style: Some(&self.resolved_style),
+            hover_anim,
+            choice_anim,
         };
         let next = nir_ui::project(&ctx, width, height, &self.messages);
         let assets_updated = self.last_rendered_asset_epoch != self.asset_epoch;

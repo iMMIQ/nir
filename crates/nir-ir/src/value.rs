@@ -179,6 +179,9 @@ pub struct Preferences {
     /// Crisp 4-way soft text outline for legibility over bright/detailed CGs.
     #[serde(default = "default_true")]
     pub text_outline: bool,
+    /// Player-selectable UI visual style (`Hybrid` / `Modern` / `Classic`).
+    #[serde(default)]
+    pub ui_style_mode: crate::UiStyleMode,
     /// Per-character voice volume override (0.0 = muted, 1.0 = full).
     pub character_volumes: BTreeMap<String, f32>,
 }
@@ -214,6 +217,7 @@ impl Default for Preferences {
             ambient_backdrop: true,
             image_sharpening: true,
             text_outline: true,
+            ui_style_mode: crate::UiStyleMode::default(),
             character_volumes: BTreeMap::new(),
         }
     }

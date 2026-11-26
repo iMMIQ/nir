@@ -645,6 +645,26 @@ mod wasm_host {
         }
 
         #[wasm_bindgen]
+        pub fn wants_style_sample(&self, asset_id: u32) -> bool {
+            self.runtime.wants_style_sample(AssetId(asset_id))
+        }
+
+        #[wasm_bindgen]
+        pub fn submit_style_sample(&mut self, asset_id: u32, w: u32, h: u32, rgba: &[u8]) {
+            self.runtime.analyze_asset_rgba(AssetId(asset_id), w, h, rgba);
+        }
+
+        #[wasm_bindgen]
+        pub fn theme_version(&self) -> u32 {
+            self.runtime.theme_version() as u32
+        }
+
+        #[wasm_bindgen]
+        pub fn theme_css_json(&self) -> String {
+            self.runtime.theme_css_json()
+        }
+
+        #[wasm_bindgen]
         pub fn current_screen_name(&self) -> String {
             self.runtime.current_screen_name().to_owned()
         }

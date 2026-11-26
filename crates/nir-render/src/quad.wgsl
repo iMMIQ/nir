@@ -4,6 +4,7 @@ struct VertexIn {
     @location(2) color: vec4f,
     @location(3) rect_params: vec4f,
     @location(4) border_color: vec4f,
+    @location(5) extra: vec4f,
 }
 
 struct VertexOut {
@@ -12,6 +13,8 @@ struct VertexOut {
     @location(1) color: vec4f,
     @location(2) @interpolate(flat) rect_params: vec4f,
     @location(3) @interpolate(flat) border_color: vec4f,
+    @location(4) local_uv: vec2f,
+    @location(5) @interpolate(flat) fx_params: vec2f,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
@@ -25,6 +28,8 @@ fn vs(v: VertexIn) -> VertexOut {
     o.color = v.color;
     o.rect_params = v.rect_params;
     o.border_color = v.border_color;
+    o.local_uv = v.extra.xy;
+    o.fx_params = v.extra.zw;
     return o;
 }
 
@@ -33,15 +38,29 @@ fn fs(v: VertexOut) -> @location(0) vec4f {
     // Always evaluate textureSample & screen-space derivatives in uniform control flow!
     let base_sample = textureSample(image, image_sampler, v.uv);
     let size = max(v.rect_params.xy, vec2f(1.0));
-    let local_p = v.uv * size;
+    let local_p = v.local_uv * size;
     let px_w = max(length(dpdx(local_p)), length(dpdy(local_p)));
     let aa = clamp(px_w * 0.72, 0.25, 1.25);
+    let mode = v.fx_params.y;
+
+    // Mode 1: True GPU SDF Gaussian-feathered drop shadow (zero hard edges!)
+    if mode > 0.5 && mode < 1.5 {
+        let blur = max(v.fx_params.x, 2.5);
+        let half = size * 0.5;
+        let inner_half = max(half - vec2f(blur), vec2f(1.0));
+        let cr = min(max(v.rect_params.z, 0.0), min(inner_half.x, inner_half.y));
+        let p = abs(local_p - half) - (inner_half - vec2f(cr));
+        let d = length(max(p, vec2f(0.0))) + min(max(p.x, p.y), 0.0) - cr;
+        let t = clamp(d / blur, 0.0, 1.0);
+        let falloff = select(exp(-t * t * 3.5) * (1.0 - smoothstep(0.62, 1.0, t)), 1.0, d <= 0.0);
+        return v.color * falloff;
+    }
 
     var tex_col = base_sample;
 
     // Optional CAS-lite contrast-adaptive edge sharpening for upscaled classic CGs
-    // (sentinel: border_color.a < -0.5, strength in border_color.r).
-    if v.border_color.a < -0.5 {
+    // (sentinel: mode < 0.5 && border_color.a < -0.5, strength in border_color.r).
+    if mode < 0.5 && v.border_color.a < -0.5 {
         let strength = clamp(v.border_color.r, 0.0, 1.0);
         let dims = vec2f(textureDimensions(image));
         let inv = vec2f(1.0) / max(dims, vec2f(1.0));
@@ -65,15 +84,36 @@ fn fs(v: VertexOut) -> @location(0) vec4f {
 
     var col = tex_col * v.color;
 
-    // Single-pass DPI-adaptive SDF rounded rectangle + crisp non-overlapping border stroke!
+    // Mode 2: Localized Frosted Glass Panel (blurred backdrop refraction + tinted glass + micro-dither)
+    if mode > 1.5 {
+        let vis = clamp(v.color.a / 0.72, 0.0, 1.0);
+        let blur_trans = clamp(1.0 - v.color.a * 0.78, 0.14, 0.58) * vis;
+        // Subtle blue-noise-like screen dither (<0.4%) eliminates gradient banding on large panels!
+        let dither = (fract(sin(dot(v.pos.xy, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.004 * vis;
+        let glass_rgb = max(base_sample.rgb * blur_trans + v.color.rgb + vec3f(dither), vec3f(0.0));
+        let glass_a = clamp(max(v.color.a, vis * 0.94), 0.0, 1.0);
+        col = vec4f(glass_rgb, glass_a);
+    }
+
+    // Single-pass DPI-adaptive SDF rounded rectangle + top-edge glass rim + crisp non-overlapping stroke!
     let r = v.rect_params.z;
     let bw = v.rect_params.w;
-    if r > 0.0 || bw > 0.0 {
+    let rim = v.fx_params.x;
+    if r > 0.0 || bw > 0.0 || rim > 0.01 {
         let cr = min(max(r, 0.0), min(size.x, size.y) * 0.5);
         let half = size * 0.5;
         let p = abs(local_p - half) - (half - vec2f(cr));
         let d = length(max(p, vec2f(0.0))) + min(max(p.x, p.y), 0.0) - cr;
         let outer = 1.0 - smoothstep(-aa, aa, d);
+
+        // Subtle top-lit specular glass bevel inside the upper inner rim
+        if rim > 0.01 {
+            let edge_band = (1.0 - smoothstep(0.0, 2.2, abs(d + bw + 0.8))) * smoothstep(0.32, 0.0, v.local_uv.y);
+            let horiz_fade = sin(clamp(v.local_uv.x, 0.0, 1.0) * 3.14159265);
+            let spec = edge_band * horiz_fade * rim * col.a;
+            col = vec4f(col.rgb + vec3f(spec * 0.92, spec * 0.96, spec), col.a);
+        }
+
         if bw > 0.0 && v.border_color.a > 0.0 {
             let inner = 1.0 - smoothstep(-aa, aa, d + bw);
             let stroke = max(outer - inner, 0.0);

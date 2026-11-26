@@ -548,6 +548,9 @@ impl NativeApp {
                     rgba,
                 } => {
                     self.pending_decodes.remove(&id);
+                    if self.runtime.wants_style_sample(id) {
+                        self.runtime.analyze_asset_rgba(id, width, height, &rgba);
+                    }
                     if let Some(renderer) = &mut self.renderer {
                         let _ = renderer.upload_rgba_premultiplied(id, width, height, &rgba);
                         let evicted = renderer.take_evicted_assets();
