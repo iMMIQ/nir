@@ -31,11 +31,12 @@ const AUDIO_CACHE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const STREAM_CHUNK_SAMPLES: usize = 4096;
 /// Bounded streaming queue depth (8 * 16 KiB ≈ 128 KiB peak per active streaming track).
 const STREAM_QUEUE_DEPTH: usize = 8;
-/// Persistent streaming decoder worker threads (fewer threads on mobile to save stack RAM & wakeups).
+/// Persistent streaming decoder worker threads (lean count covers BGM + Voice + SFX concurrently
+/// while minimizing idle stack memory and OS thread overhead).
 #[cfg(target_os = "android")]
-const STREAM_POOL_WORKERS: usize = 3;
+const STREAM_POOL_WORKERS: usize = 2;
 #[cfg(not(target_os = "android"))]
-const STREAM_POOL_WORKERS: usize = 6;
+const STREAM_POOL_WORKERS: usize = 3;
 
 const INV_I16_SCALE: f32 = 1.0 / 32768.0;
 

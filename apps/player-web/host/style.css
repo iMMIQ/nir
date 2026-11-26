@@ -131,6 +131,12 @@ html, body {
 #quick-tools.chrome-idle {
   opacity: 0;
   pointer-events: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+#quick-tools.chrome-idle .tool-pill {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 #quick-tools {
   position: fixed;
@@ -182,6 +188,15 @@ html, body {
   color: #fff;
 }
 @media (pointer: coarse) {
+  /* Avoid expensive compositor backdrop-filter passes over WebGL/WebGPU canvas on mobile GPUs */
+  #shelf-btn,
+  #fs-btn,
+  .tool-pill,
+  #sync-pill {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: var(--nir-surface-hover, rgba(16, 22, 34, 0.86));
+  }
   #shelf-btn {
     min-height: 44px;
     padding: 0 14px;

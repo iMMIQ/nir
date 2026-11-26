@@ -173,6 +173,64 @@ impl Vm {
             || self.choice.as_ref().is_some_and(|c| c.timeout_us.is_some())
     }
 
+    /// Exact microseconds until the next visual or timer event inside the VM (`None` = true idle sleep!).
+    pub fn next_wakeup_delay_us(&self, text_speed: f32) -> Option<u64> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        let has_running_timeline = self.timelines.iter().any(|tl| {
+            let (fps, duration_frames) = self
+                .program
+                .timelines
+                .get(tl.timeline.0 as usize)
+                .map_or((60.0, 0), |t| (t.fps.max(1.0), t.duration_frames));
+            let total_us = ((duration_frames as f64 / fps as f64) * 1_000_000.0).ceil() as u64;
+            tl.elapsed_us < total_us
+        });
+        if !self.tweens.is_empty()
+            || !self.shakes.is_empty()
+            || has_running_timeline
+            || self.transition.is_some()
+            || self.window_reveal.is_some()
+            || matches!(self.wait, WaitReason::Timeline { .. })
+        {
+            return Some(0);
+        }
+
+        let mut soonest: Option<u64> = None;
+        let mut consider = |us: u64| {
+            soonest = Some(soonest.map_or(us, |cur| cur.min(us)));
+        };
+
+        if let Some(dlg) = &self.dialogue {
+            if !dlg.finished && !dlg.paused_for_click {
+                if dlg.pause_remaining_us > 0 {
+                    consider(dlg.pause_remaining_us);
+                } else if text_speed <= 0.0 || dlg.reveal_us == 0 {
+                    consider(0);
+                } else {
+                    let step_us = ((dlg.reveal_us as f64) / (text_speed as f64).max(0.1))
+                        .max(1000.0) as u64;
+                    consider(step_us.saturating_sub(dlg.elapsed_us).max(1_000));
+                }
+            }
+        }
+
+        if let WaitReason::Timer { remaining_us, .. } = self.wait {
+            consider(remaining_us);
+        }
+
+        if let Some(choice) = &self.choice {
+            if let Some(timeout) = choice.timeout_us {
+                let rem = timeout.saturating_sub(choice.elapsed_us);
+                // Choice countdown bar updates smoothly at ~20Hz without wasting 120Hz wakes.
+                consider(rem.min(50_000));
+            }
+        }
+
+        soonest
+    }
+
     pub fn is_current_dialogue_read(&self) -> bool {
         self.dialogue.as_ref().is_some_and(|d| d.already_read)
     }

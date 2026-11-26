@@ -364,6 +364,61 @@ mod wasm_host {
             self.runtime.dirty || self.runtime.needs_clock()
         }
 
+        /// Exact milliseconds until next visual/timer wakeup (`0` = immediate rAF, `-1` = deep idle sleep).
+        #[wasm_bindgen]
+        pub fn next_wakeup_delay_ms(&self) -> f64 {
+            if self.runtime.dirty {
+                return 0.0;
+            }
+            match self.runtime.next_wakeup_delay_us() {
+                Some(us) => us as f64 / 1000.0,
+                None => -1.0,
+            }
+        }
+
+        /// Packs high-frequency host status flags into one WASM call to eliminate per-frame bridge chatter:
+        /// bit0=device_lost, bit1=story_reading, bit2=interface_hidden, bit3=shaking,
+        /// bit4=missing_glyphs, bit5=wake_lock, bit6=eco_mode, bit7=saves_screen.
+        #[wasm_bindgen]
+        pub fn frame_flags(&self) -> u32 {
+            let mut f = 0u32;
+            if self.renderer.is_lost() {
+                f |= 1 << 0;
+            }
+            if self.runtime.is_story_reading() {
+                f |= 1 << 1;
+            }
+            if self.runtime.is_interface_hidden() {
+                f |= 1 << 2;
+            }
+            if self.runtime.is_shaking() {
+                f |= 1 << 3;
+            }
+            if self.renderer.has_missing_glyphs() {
+                f |= 1 << 4;
+            }
+            if self.runtime.is_auto_or_skip_active() {
+                f |= 1 << 5;
+            }
+            if self.runtime.is_eco_mode() {
+                f |= 1 << 6;
+            }
+            if matches!(self.runtime.screen, nir_ui::Screen::Saves { .. }) {
+                f |= 1 << 7;
+            }
+            f
+        }
+
+        #[wasm_bindgen]
+        pub fn dialogue_epoch(&self) -> u32 {
+            self.runtime.dialogue_epoch() as u32
+        }
+
+        #[wasm_bindgen]
+        pub fn set_low_power_hint(&mut self, low_power: bool) {
+            self.runtime.set_low_power_hint(low_power);
+        }
+
         /// Lists all bundled font asset byte ranges so JS can stream/slice and load them once.
         #[wasm_bindgen]
         pub fn font_assets_json(&self) -> String {
@@ -811,7 +866,7 @@ mod wasm_host {
 
         #[wasm_bindgen]
         pub fn tick_and_render(&mut self, delta_ms: f64, unix_secs: f64) -> String {
-            let delta_us = (delta_ms.clamp(0.0, 100.0) * 1000.0) as u64;
+            let delta_us = (delta_ms.clamp(0.0, 6000.0) * 1000.0) as u64;
             self.runtime.set_unix_time(unix_secs.max(0.0) as u64);
             self.runtime.tick(delta_us);
 

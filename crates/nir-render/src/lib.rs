@@ -89,6 +89,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     format: wgpu::TextureFormat,
     pipelines: [wgpu::RenderPipeline; 4],
+    plain_pipeline: wgpu::RenderPipeline,
     mix_pipeline: wgpu::RenderPipeline,
     mip_pipeline: wgpu::RenderPipeline,
     blur_pipeline: wgpu::RenderPipeline,
@@ -117,6 +118,10 @@ pub struct Renderer {
     text_renderer: TextRenderer,
     viewport: Viewport,
     last_viewport: [u32; 2],
+    last_text_sig: Option<u64>,
+    text_font_epoch: u64,
+    text_prepares: u64,
+    cached_inline_quads: Vec<Quad>,
     swash: SwashCache,
     pub submitted: u64,
     pub backend: RendererBackend,
@@ -489,6 +494,62 @@ fn build_quad_indices(quad_count: usize) -> Vec<u32> {
     idx
 }
 
+fn hash_text_runs(runs: &[TextRun], dpr: f32, vp: [u32; 2], font_epoch: u64) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    vp.hash(&mut h);
+    dpr.to_bits().hash(&mut h);
+    font_epoch.hash(&mut h);
+    runs.len().hash(&mut h);
+    for r in runs {
+        r.cache_key.hash(&mut h);
+        r.visible_bytes.hash(&mut h);
+        r.x.to_bits().hash(&mut h);
+        r.y.to_bits().hash(&mut h);
+        r.width.to_bits().hash(&mut h);
+        r.height.to_bits().hash(&mut h);
+        r.scroll.to_bits().hash(&mut h);
+        r.valign_center.hash(&mut h);
+        for c in r.color {
+            c.to_bits().hash(&mut h);
+        }
+        if let Some(s) = r.shadow {
+            1u8.hash(&mut h);
+            for o in s.offset {
+                o.to_bits().hash(&mut h);
+            }
+            for c in s.color {
+                c.to_bits().hash(&mut h);
+            }
+        } else {
+            0u8.hash(&mut h);
+        }
+        if let Some(oc) = r.outline {
+            1u8.hash(&mut h);
+            for c in oc {
+                c.to_bits().hash(&mut h);
+            }
+        } else {
+            0u8.hash(&mut h);
+        }
+        if let Some(cl) = r.clip {
+            1u8.hash(&mut h);
+            for f in cl {
+                f.to_bits().hash(&mut h);
+            }
+        } else {
+            0u8.hash(&mut h);
+        }
+        r.ruby_spans.len().hash(&mut h);
+        for (s, e, t) in &r.ruby_spans {
+            s.hash(&mut h);
+            e.hash(&mut h);
+            t.hash(&mut h);
+        }
+        r.inline_images.hash(&mut h);
+    }
+    h.finish()
+}
+
 fn hash_transition_quads(quads: &[Quad], sw: u32, sh: u32, epoch: u64) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sw.hash(&mut h);
@@ -759,6 +820,32 @@ impl Renderer {
             make_pipeline(BlendMode::Screen),
         ];
 
+        let plain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("quad_plain"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &vlayout,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_plain"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(blend_state(BlendMode::Normal)),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let mip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mipmap_blit"),
             layout: Some(&pl),
@@ -924,6 +1011,7 @@ impl Renderer {
             config,
             format,
             pipelines,
+            plain_pipeline,
             mix_pipeline,
             mip_pipeline,
             blur_pipeline,
@@ -952,6 +1040,10 @@ impl Renderer {
             text_renderer,
             viewport,
             last_viewport: [0, 0],
+            last_text_sig: None,
+            text_font_epoch: 0,
+            text_prepares: 0,
+            cached_inline_quads: Vec::new(),
             swash: SwashCache::new(),
             submitted: 0,
             backend,
@@ -978,14 +1070,20 @@ impl Renderer {
         }
         self.text
             .add_font_asset(id, bytes)
-            .map_err(|e| NirError::new("E_FONT", "load_font", e))
+            .map_err(|e| NirError::new("E_FONT", "load_font", e))?;
+        self.text_font_epoch = self.text_font_epoch.wrapping_add(1);
+        self.last_text_sig = None;
+        Ok(())
     }
 
     /// Loads a shared fallback font (e.g. Web Pan-CJK fallback) used after bundled game fonts.
     pub fn load_fallback_font(&mut self, bytes: Vec<u8>) -> Result<()> {
         self.text
             .add_fallback_font(bytes)
-            .map_err(|e| NirError::new("E_FONT", "load_fallback_font", e))
+            .map_err(|e| NirError::new("E_FONT", "load_fallback_font", e))?;
+        self.text_font_epoch = self.text_font_epoch.wrapping_add(1);
+        self.last_text_sig = None;
+        Ok(())
     }
 
     pub fn has_any_font(&self) -> bool {
@@ -1028,6 +1126,7 @@ impl Renderer {
         let max_dim = self.device.limits().max_texture_dimension_2d;
         self.config.width = width.clamp(1, max_dim);
         self.config.height = height.clamp(1, max_dim);
+        self.last_text_sig = None;
         if let Some(surface) = &self.surface {
             surface.configure(&self.device, &self.config);
         }
@@ -1039,6 +1138,7 @@ impl Renderer {
 
     pub fn rebind_surface(&mut self, surface: wgpu::Surface<'static>) {
         surface.configure(&self.device, &self.config);
+        self.last_text_sig = None;
         self.surface = Some(surface);
     }
 
@@ -1578,95 +1678,7 @@ impl Renderer {
             self.scratch_to_sig = None;
         }
 
-        // 1. Prepare text glyphs via glyphon (zero TextRun cloning, cached line_offsets, ruby & crisp outlines!)
-        self.text.layout_texts(&p.texts);
-
-        // Compute positioned ruby annotations directly from shaped base glyph boxes!
-        let mut ruby_runs: Vec<TextRun> = Vec::new();
-        for r in &p.texts {
-            if r.ruby_spans.is_empty() {
-                continue;
-            }
-            let Some(entry) = self.text.buffers.get(&r.cache_key) else {
-                continue;
-            };
-            let y_draw = if r.valign_center && entry.content_height > 0.0 {
-                r.y + ((r.height - entry.content_height) * 0.5).max(0.0)
-            } else {
-                r.y
-            };
-            let ruby_sz = (entry.effective_size * 0.44).clamp(8.0, 15.0);
-            let offsets = &entry.line_offsets;
-            for (b_start, b_end, ruby_text) in &r.ruby_spans {
-                if ruby_text.is_empty() {
-                    continue;
-                }
-                if let Some(vis) = r.visible_bytes {
-                    if *b_start >= vis {
-                        continue;
-                    }
-                }
-                let mut min_x = f32::INFINITY;
-                let mut max_x = f32::NEG_INFINITY;
-                let mut line_y = None;
-                for run in entry.buffer.layout_runs() {
-                    let base = *offsets.get(run.line_i).unwrap_or(&0);
-                    for g in run.glyphs {
-                        let gs = base + g.start;
-                        let ge = base + g.end;
-                        if ge > *b_start && gs < *b_end {
-                            if line_y.is_none() {
-                                line_y = Some(y_draw + run.line_top - r.scroll);
-                            }
-                            min_x = min_x.min(r.x + g.x);
-                            max_x = max_x.max(r.x + g.x + g.w);
-                        }
-                    }
-                    if line_y.is_some() {
-                        break;
-                    }
-                }
-                if let Some(ly) = line_y {
-                    if max_x > min_x {
-                        let span_w = max_x - min_x;
-                        let ruby_w = (ruby_text.chars().count().max(1) as f32 * ruby_sz * 1.15)
-                            .max(span_w + 8.0);
-                        let rx = min_x + (span_w - ruby_w) * 0.5;
-                        let ry = ly - ruby_sz * 0.92;
-                        let mut rr = TextRun {
-                            text: ruby_text.clone(),
-                            visible_bytes: None,
-                            x: rx,
-                            y: ry,
-                            width: ruby_w,
-                            height: ruby_sz * 1.35,
-                            size: ruby_sz,
-                            line_height: ruby_sz * 1.18,
-                            color: r.color,
-                            emphasis: Vec::new(),
-                            color_spans: Vec::new(),
-                            ruby_spans: Vec::new(),
-                            shadow: r.shadow,
-                            outline: r.outline,
-                            scroll: 0.0,
-                            clip: r.clip.map(|[cx, cy, cw, ch]| [cx, cy - ruby_sz, cw, ch + ruby_sz]),
-                            font_assets: r.font_assets.clone(),
-                            align: nir_ir::TextAlign::Center,
-                            valign_center: false,
-                            auto_fit: false,
-                            inline_images: Vec::new(),
-                            cache_key: 0,
-                        };
-                        rr.compute_key();
-                        ruby_runs.push(rr);
-                    }
-                }
-            }
-        }
-        if !ruby_runs.is_empty() {
-            self.text.layout_texts(&ruby_runs);
-        }
-
+        // 1. Prepare text glyphs via glyphon — skip prepare completely when text signature is unchanged!
         let cur_vp = [self.config.width, self.config.height];
         if cur_vp != self.last_viewport {
             self.viewport.update(
@@ -1677,97 +1689,204 @@ impl Renderer {
                 },
             );
             self.last_viewport = cur_vp;
+            self.last_text_sig = None;
         }
-        let mut areas = Vec::with_capacity((p.texts.len() + ruby_runs.len()) * 5);
-        for r in p.texts.iter().chain(ruby_runs.iter()) {
-            let sk = r.shadow_cache_key();
-            if let Some(s) = r.shadow {
-                if let Some(entry) = self.text.buffers.get(&sk) {
-                    let scol = [s.color[0], s.color[1], s.color[2], s.color[3] * r.color[3]];
-                    Self::push_text_areas(
-                        &mut areas,
-                        entry,
-                        r,
-                        r.x + s.offset[0],
-                        r.y + s.offset[1],
-                        scol,
-                        dpr,
-                    );
-                }
-            }
-            if let Some(ocol) = r.outline {
-                if ocol[3] > 0.01 {
-                    if let Some(entry) = self.text.buffers.get(&sk) {
-                        let off = (entry.effective_size * 0.044).clamp(0.8, 1.35);
-                        let oc = [ocol[0], ocol[1], ocol[2], ocol[3] * r.color[3]];
-                        for (dx, dy) in [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off)] {
-                            Self::push_text_areas(
-                                &mut areas,
-                                entry,
-                                r,
-                                r.x + dx,
-                                r.y + dy,
-                                oc,
-                                dpr,
-                            );
-                        }
-                    }
-                }
-            }
-            if let Some(entry) = self.text.buffers.get(&r.cache_key) {
-                Self::push_text_areas(&mut areas, entry, r, r.x, r.y, r.color, dpr);
-            }
-        }
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.text.fonts,
-                &mut self.atlas,
-                &self.viewport,
-                areas,
-                &mut self.swash,
-            )
-            .map_err(|e| rerr(e.to_string()))?;
+        let text_sig = hash_text_runs(&p.texts, dpr, cur_vp, self.text_font_epoch);
+        let mut ran_text_prepare = false;
+        if self.last_text_sig != Some(text_sig) {
+            ran_text_prepare = true;
+            self.text.layout_texts(&p.texts);
 
-        let mut inline_quads: Vec<Quad> = Vec::new();
-        for r in &p.texts {
-            if r.inline_images.is_empty() {
-                continue;
-            }
-            if let Some(entry) = self.text.buffers.get(&r.cache_key) {
+            // Compute positioned ruby annotations directly from shaped base glyph boxes!
+            let mut ruby_runs: Vec<TextRun> = Vec::new();
+            for r in &p.texts {
+                if r.ruby_spans.is_empty() {
+                    continue;
+                }
+                let Some(entry) = self.text.buffers.get(&r.cache_key) else {
+                    continue;
+                };
                 let y_draw = if r.valign_center && entry.content_height > 0.0 {
                     r.y + ((r.height - entry.content_height) * 0.5).max(0.0)
                 } else {
                     r.y
                 };
-                let icon_sz = entry.effective_size.max(8.0);
+                let ruby_sz = (entry.effective_size * 0.44).clamp(8.0, 15.0);
                 let offsets = &entry.line_offsets;
-                for &(byte_off, asset) in &r.inline_images {
+                for (b_start, b_end, ruby_text) in &r.ruby_spans {
+                    if ruby_text.is_empty() {
+                        continue;
+                    }
                     if let Some(vis) = r.visible_bytes {
-                        if byte_off >= vis {
+                        if *b_start >= vis {
                             continue;
                         }
                     }
-                    'find_glyph: for run in entry.buffer.layout_runs() {
+                    let mut min_x = f32::INFINITY;
+                    let mut max_x = f32::NEG_INFINITY;
+                    let mut line_y = None;
+                    for run in entry.buffer.layout_runs() {
                         let base = *offsets.get(run.line_i).unwrap_or(&0);
                         for g in run.glyphs {
-                            if base + g.start == byte_off {
-                                let w = g.w.max(icon_sz);
-                                let gx = r.x + g.x + (w - icon_sz) * 0.5;
-                                let gy = y_draw + run.line_top - r.scroll
-                                    + (run.line_height - icon_sz) * 0.5;
-                                let mut q = Quad::image([gx, gy, icon_sz, icon_sz], asset);
-                                q.color[3] = r.color[3];
-                                q.clip = r.clip;
-                                inline_quads.push(q);
-                                break 'find_glyph;
+                            let gs = base + g.start;
+                            let ge = base + g.end;
+                            if ge > *b_start && gs < *b_end {
+                                if line_y.is_none() {
+                                    line_y = Some(y_draw + run.line_top - r.scroll);
+                                }
+                                min_x = min_x.min(r.x + g.x);
+                                max_x = max_x.max(r.x + g.x + g.w);
+                            }
+                        }
+                        if line_y.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(ly) = line_y {
+                        if max_x > min_x {
+                            let span_w = max_x - min_x;
+                            let ruby_w = (ruby_text.chars().count().max(1) as f32 * ruby_sz * 1.15)
+                                .max(span_w + 8.0);
+                            let rx = min_x + (span_w - ruby_w) * 0.5;
+                            let ry = ly - ruby_sz * 0.92;
+                            let mut rr = TextRun {
+                                text: ruby_text.clone(),
+                                visible_bytes: None,
+                                x: rx,
+                                y: ry,
+                                width: ruby_w,
+                                height: ruby_sz * 1.35,
+                                size: ruby_sz,
+                                line_height: ruby_sz * 1.18,
+                                color: r.color,
+                                emphasis: Vec::new(),
+                                color_spans: Vec::new(),
+                                ruby_spans: Vec::new(),
+                                shadow: r.shadow,
+                                outline: r.outline,
+                                scroll: 0.0,
+                                clip: r
+                                    .clip
+                                    .map(|[cx, cy, cw, ch]| [cx, cy - ruby_sz, cw, ch + ruby_sz]),
+                                font_assets: r.font_assets.clone(),
+                                align: nir_ir::TextAlign::Center,
+                                valign_center: false,
+                                auto_fit: false,
+                                inline_images: Vec::new(),
+                                cache_key: 0,
+                            };
+                            rr.compute_key();
+                            ruby_runs.push(rr);
+                        }
+                    }
+                }
+            }
+            if !ruby_runs.is_empty() {
+                self.text.layout_texts(&ruby_runs);
+            }
+
+            let mut areas = Vec::with_capacity((p.texts.len() + ruby_runs.len()) * 5);
+            for r in p.texts.iter().chain(ruby_runs.iter()) {
+                let sk = r.shadow_cache_key();
+                let has_outline = r.outline.is_some_and(|o| o[3] > 0.01);
+                if let Some(s) = r.shadow {
+                    // When 4-way outline is active and shadow offset is tiny, the outline already
+                    // provides crisp dark separation; skip redundant 6th TextArea!
+                    let shadow_redundant =
+                        has_outline && s.offset[0].abs() <= 1.25 && s.offset[1].abs() <= 1.5;
+                    if !shadow_redundant {
+                        if let Some(entry) = self.text.buffers.get(&sk) {
+                            let scol =
+                                [s.color[0], s.color[1], s.color[2], s.color[3] * r.color[3]];
+                            Self::push_text_areas(
+                                &mut areas,
+                                entry,
+                                r,
+                                r.x + s.offset[0],
+                                r.y + s.offset[1],
+                                scol,
+                                dpr,
+                            );
+                        }
+                    }
+                }
+                if let Some(ocol) = r.outline {
+                    if ocol[3] > 0.01 {
+                        if let Some(entry) = self.text.buffers.get(&sk) {
+                            let off = (entry.effective_size * 0.044).clamp(0.8, 1.35);
+                            let oc = [ocol[0], ocol[1], ocol[2], ocol[3] * r.color[3]];
+                            for (dx, dy) in [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off)] {
+                                Self::push_text_areas(
+                                    &mut areas,
+                                    entry,
+                                    r,
+                                    r.x + dx,
+                                    r.y + dy,
+                                    oc,
+                                    dpr,
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(entry) = self.text.buffers.get(&r.cache_key) {
+                    Self::push_text_areas(&mut areas, entry, r, r.x, r.y, r.color, dpr);
+                }
+            }
+            self.text_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text.fonts,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash,
+                )
+                .map_err(|e| rerr(e.to_string()))?;
+
+            self.cached_inline_quads.clear();
+            for r in &p.texts {
+                if r.inline_images.is_empty() {
+                    continue;
+                }
+                if let Some(entry) = self.text.buffers.get(&r.cache_key) {
+                    let y_draw = if r.valign_center && entry.content_height > 0.0 {
+                        r.y + ((r.height - entry.content_height) * 0.5).max(0.0)
+                    } else {
+                        r.y
+                    };
+                    let icon_sz = entry.effective_size.max(8.0);
+                    let offsets = &entry.line_offsets;
+                    for &(byte_off, asset) in &r.inline_images {
+                        if let Some(vis) = r.visible_bytes {
+                            if byte_off >= vis {
+                                continue;
+                            }
+                        }
+                        'find_glyph: for run in entry.buffer.layout_runs() {
+                            let base = *offsets.get(run.line_i).unwrap_or(&0);
+                            for g in run.glyphs {
+                                if base + g.start == byte_off {
+                                    let w = g.w.max(icon_sz);
+                                    let gx = r.x + g.x + (w - icon_sz) * 0.5;
+                                    let gy = y_draw + run.line_top - r.scroll
+                                        + (run.line_height - icon_sz) * 0.5;
+                                    let mut q = Quad::image([gx, gy, icon_sz, icon_sz], asset);
+                                    q.color[3] = r.color[3];
+                                    q.clip = r.clip;
+                                    self.cached_inline_quads.push(q);
+                                    break 'find_glyph;
+                                }
                             }
                         }
                     }
                 }
             }
+            self.last_text_sig = Some(text_sig);
+            self.text_prepares = self.text_prepares.wrapping_add(1);
         }
+        let inline_quads = std::mem::take(&mut self.cached_inline_quads);
 
         // 2. Build indexed vertices (4 vertices per quad; supports smooth gradients, SDF borders & CAS sharpening!)
         let mut verts = std::mem::take(&mut self.scratch_verts);
@@ -2158,10 +2277,11 @@ impl Renderer {
                 .map_err(|e| rerr(e.to_string()))?;
         }
 
+        self.cached_inline_quads = inline_quads;
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         self.submitted += 1;
-        if self.submitted.is_multiple_of(ATLAS_TRIM_INTERVAL) {
+        if ran_text_prepare && self.text_prepares.is_multiple_of(ATLAS_TRIM_INTERVAL) {
             self.atlas.trim();
         }
         Ok(())
@@ -2187,11 +2307,11 @@ impl Renderer {
         let sx = physical[0] as f32 / vw.max(1.0);
         let sy = physical[1] as f32 / vh.max(1.0);
 
-        // Batch consecutive quads sharing (asset, blend, scissor) into 1 indexed draw call,
-        // and track current pipeline/scissor to eliminate redundant GPU state binds!
-        type QuadBatch = (Option<AssetId>, BlendMode, [u32; 4], u32, u32);
+        // Batch consecutive quads sharing (asset, pipeline_id, scissor) into 1 indexed draw call,
+        // routing flat/unrounded Normal quads to the lightweight `fs_plain` pipeline!
+        type QuadBatch = (Option<AssetId>, u8, [u32; 4], u32, u32);
         let mut batch: Option<QuadBatch> = None;
-        let mut cur_pipeline: Option<u8> = None; // 0..3 = blend pipelines, 4 = mix_pipeline
+        let mut cur_pipeline: Option<u8> = None; // 0..3 = styled blend, 4 = mix, 5 = fs_plain
         let mut cur_scissor: Option<[u32; 4]> = None;
 
         let flush = |pass: &mut wgpu::RenderPass<'_>, b: &mut Option<QuadBatch>| {
@@ -2266,8 +2386,16 @@ impl Renderer {
                 continue;
             }
 
-            if let Some((ba, bb, bs, _, bend)) = batch.as_mut() {
-                if *ba == q.asset && *bb == q.blend && *bs == scissor && *bend == is {
+            let is_plain = q.blend == BlendMode::Normal
+                && q.special == SpecialQuad::None
+                && q.corner_radius <= 0.0
+                && q.border_width <= 0.0
+                && q.sharpen <= 0.01
+                && q.glass_rim <= 0.01;
+            let pl_id = if is_plain { 5u8 } else { q.blend as u8 };
+
+            if let Some((ba, bp, bs, _, bend)) = batch.as_mut() {
+                if *ba == q.asset && *bp == pl_id && *bs == scissor && *bend == is {
                     *bend = ie;
                     continue;
                 }
@@ -2281,9 +2409,12 @@ impl Renderer {
                 },
                 None => &self.white_tex,
             };
-            let pl_id = q.blend as u8;
             if cur_pipeline != Some(pl_id) {
-                pass.set_pipeline(&self.pipelines[q.blend as usize]);
+                if is_plain {
+                    pass.set_pipeline(&self.plain_pipeline);
+                } else {
+                    pass.set_pipeline(&self.pipelines[q.blend as usize]);
+                }
                 cur_pipeline = Some(pl_id);
             }
             if cur_scissor != Some(scissor) {
@@ -2291,7 +2422,7 @@ impl Renderer {
                 cur_scissor = Some(scissor);
             }
             pass.set_bind_group(0, &tex.bind, &[]);
-            batch = Some((q.asset, q.blend, scissor, is, ie));
+            batch = Some((q.asset, pl_id, scissor, is, ie));
         }
         flush(pass, &mut batch);
     }

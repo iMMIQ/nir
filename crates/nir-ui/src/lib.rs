@@ -1086,7 +1086,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         hovered: ctx.hovered_hit,
         pressed: ctx.pressed_hit,
         hover_anim: ctx.hover_anim,
-        can_frost: ctx.prefs.ambient_backdrop && has_stage_art,
+        can_frost: ctx.prefs.ambient_backdrop && !ctx.prefs.eco_mode && has_stage_art,
         input_mode: ctx.input_mode,
         safe,
         next_hit_id: 1,
@@ -1097,7 +1097,8 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
         || (stage_rect[1] > 2.0)
         || (stage_rect[0] + stage_rect[2] < width - 2.0)
         || (stage_rect[1] + stage_rect[3] < height - 2.0);
-    let use_ambient = ctx.prefs.ambient_backdrop && has_margins && has_stage_art;
+    let use_ambient =
+        ctx.prefs.ambient_backdrop && !ctx.prefs.eco_mode && has_margins && has_stage_art;
     if use_ambient {
         let mut amb = Quad::solid(
             [0.0, 0.0, width, height],
@@ -1115,7 +1116,7 @@ pub fn project(ctx: &UiContext<'_>, width: f32, height: f32, messages: &Messages
     }
 
     // Subtle CAS-lite edge sharpening ONLY when classic low-res CGs are meaningfully upscaled!
-    let sharpen_amt = if ctx.prefs.image_sharpening && scale > 1.22 {
+    let sharpen_amt = if ctx.prefs.image_sharpening && !ctx.prefs.eco_mode && scale > 1.22 {
         ((scale - 1.15) * 0.48).clamp(0.18, 0.56)
     } else {
         0.0
@@ -2065,9 +2066,8 @@ fn project_story_hud(
                 }
             }
 
-            let text_outline = ctx
-                .prefs
-                .text_outline
+            // Skip heavy 4-way outline in Eco mode or opaque docked portrait panels (saves 4x glyph passes!)
+            let text_outline = (ctx.prefs.text_outline && !ctx.prefs.eco_mode && !portrait_docked)
                 .then_some([0.02, 0.03, 0.06, 0.86]);
 
             // 4. Speaker nameplate (auto-matched to original light/dark skin & archetype!)
@@ -2405,14 +2405,12 @@ fn project_story_hud(
                 && !ctx.hold_skip;
             if waiting_click {
                 let ind_sz = (fsize * 0.70).clamp(11.0, 17.0);
+                let static_wait =
+                    ctx.prefs.reduced_motion || ctx.prefs.eco_mode || ctx.ui_time_s <= 0.0001;
                 let phase = (ctx.ui_time_s * 4.4).sin();
-                let bob = if ctx.prefs.reduced_motion {
-                    0.0
-                } else {
-                    phase * 2.0
-                };
-                let pulse = if ctx.prefs.reduced_motion {
-                    0.92
+                let bob = if static_wait { 0.0 } else { phase * 2.0 };
+                let pulse = if static_wait {
+                    0.90
                 } else {
                     0.68 + 0.32 * phase.abs()
                 };
@@ -2800,8 +2798,11 @@ fn overlay_shell(
     let touch = b.is_touch();
     let anim = ease_out_cubic(ctx.overlay_anim);
 
-    // True frosted-glass backdrop over blurred live stage when ambient_backdrop is enabled!
-    if ctx.prefs.ambient_backdrop && b.pkt.stage_quad_range[1] > b.pkt.stage_quad_range[0] {
+    // True frosted-glass backdrop over blurred live stage when ambient_backdrop is enabled (skipped in Eco mode)!
+    if ctx.prefs.ambient_backdrop
+        && !ctx.prefs.eco_mode
+        && b.pkt.stage_quad_range[1] > b.pkt.stage_quad_range[0]
+    {
         let mut frost = Quad::solid([0.0, 0.0, w, h], [0.24, 0.28, 0.36, 0.96 * anim]);
         frost.uv = cover_uv(b.pkt.stage_rect[2], b.pkt.stage_rect[3], w, h);
         frost.special = SpecialQuad::FrostedBackdrop;
@@ -3828,7 +3829,7 @@ fn project_settings_overlay(
             3usize,
             3 + usize::from(!locales.is_empty()) + usize::from(locales.len() >= 2),
         ),
-        1 => (1, 4),
+        1 => (1, 5),
         _ => (4, 2),
     };
     let total_rows = slider_count + toggle_count;
@@ -4045,6 +4046,20 @@ fn project_settings_overlay(
             messages.get(loc, "text-outline"),
             ctx.prefs.text_outline,
             UiAction::ToggleTextOutline,
+            messages,
+            loc,
+        );
+        y += row_h + gap;
+
+        push_toggle_row(
+            b,
+            area[0],
+            y,
+            area[2],
+            row_h,
+            messages.get(loc, "eco-mode"),
+            ctx.prefs.eco_mode,
+            UiAction::ToggleEcoMode,
             messages,
             loc,
         );

@@ -33,6 +33,12 @@ fn vs(v: VertexIn) -> VertexOut {
     return o;
 }
 
+// Fast-path fragment shader for full-bleed CGs, sprites & flat quads (no dpdx/dpdy, SDF, CAS, or blur).
+@fragment
+fn fs_plain(v: VertexOut) -> @location(0) vec4f {
+    return textureSample(image, image_sampler, v.uv) * v.color;
+}
+
 @fragment
 fn fs(v: VertexOut) -> @location(0) vec4f {
     // Always evaluate textureSample & screen-space derivatives in uniform control flow!

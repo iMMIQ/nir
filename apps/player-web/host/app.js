@@ -56,7 +56,8 @@ function detectDeviceProfile() {
     isIOS,
     hasTouch,
     lowMem,
-    maxDpr: isMobile ? (lowMem ? 1.5 : 2.0) : 3.0,
+    maxDpr: isMobile ? (lowMem ? 1.5 : 2.0) : 2.0,
+    ecoMaxDpr: isMobile ? 1.5 : 1.75,
     rangeCacheLimit: (isMobile ? (lowMem ? 16 : 32) : 64) * 1024 * 1024,
     audioDecodedLimit: (isMobile ? (lowMem ? 24 : 40) : 96) * 1024 * 1024,
     gpuCacheMb: isMobile ? (lowMem ? 64 : 80) : 0, // 0 = use Renderer backend default
@@ -67,11 +68,12 @@ function detectDeviceProfile() {
 
 const deviceProfile = detectDeviceProfile();
 
-function readViewportMetrics() {
+function readViewportMetrics(ecoActive = false) {
   const vv = window.visualViewport;
   const width = Math.max(1, Math.round(vv ? vv.width : window.innerWidth));
   const height = Math.max(1, Math.round(vv ? vv.height : window.innerHeight));
-  const dpr = Math.min(window.devicePixelRatio || 1, deviceProfile.maxDpr);
+  const cap = ecoActive ? deviceProfile.ecoMaxDpr : deviceProfile.maxDpr;
+  const dpr = Math.min(window.devicePixelRatio || 1, cap);
   let top = 0;
   let right = 0;
   let bottom = 0;
@@ -615,6 +617,8 @@ class SaveStore {
       ambient_backdrop: prefs.ambient_backdrop,
       image_sharpening: prefs.image_sharpening,
       text_outline: prefs.text_outline,
+      ui_style_mode: prefs.ui_style_mode,
+      eco_mode: prefs.eco_mode,
     };
     fetch(this.userPrefsApi, {
       method: 'PUT',
@@ -1159,13 +1163,34 @@ class WebAudioMixer {
     this.decodedLimit = decodedLimit || 96 * 1024 * 1024;
     this.inflightDecode = new Map();
     this.hostSuspended = false;
+    this.idleSuspendTimer = 0;
+    this.lowPowerMode = false;
     this.preferCafOpus = deviceProfile.isIOS;
     this.warnedOgg = false;
     this.onCodecUnsupported = onCodecUnsupported || null;
     this.prefs = { master_volume: 0.9, bgm_volume: 0.75, voice_volume: 1.0, sfx_volume: 0.85 };
   }
 
+  _cancelIdleSuspend() {
+    if (this.idleSuspendTimer) {
+      clearTimeout(this.idleSuspendTimer);
+      this.idleSuspendTimer = 0;
+    }
+  }
+
+  _scheduleIdleSuspend(delayMs = 2500) {
+    this._cancelIdleSuspend();
+    if (this.hostSuspended || !this.ctx || this.channels.size > 0) return;
+    this.idleSuspendTimer = setTimeout(() => {
+      this.idleSuspendTimer = 0;
+      if (!this.hostSuspended && this.channels.size === 0 && this.ctx && this.ctx.state === 'running') {
+        this.ctx.suspend().catch(() => {});
+      }
+    }, delayMs);
+  }
+
   ensureContext() {
+    this._cancelIdleSuspend();
     if (!this.ctx) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return null;
@@ -1195,6 +1220,7 @@ class WebAudioMixer {
   }
 
   suspendAll() {
+    this._cancelIdleSuspend();
     this.hostSuspended = true;
     for (const ch of this.channels.values()) {
       if (ch.mediaEl && !ch.mediaEl.paused) {
@@ -1209,7 +1235,7 @@ class WebAudioMixer {
 
   resumeAll() {
     this.hostSuspended = false;
-    if (this.ctx && this.ctx.state !== 'running') {
+    if (this.channels.size > 0 && this.ctx && this.ctx.state !== 'running') {
       this.ctx.resume().catch(() => {});
     }
     for (const ch of this.channels.values()) {
@@ -1217,6 +1243,9 @@ class WebAudioMixer {
         ch.wasPlayingBeforeSuspend = false;
         ch.mediaEl.play().then(() => { ch.pendingPlay = false; }).catch(() => {});
       }
+    }
+    if (this.channels.size === 0) {
+      this._scheduleIdleSuspend(1000);
     }
   }
 
@@ -1319,14 +1348,15 @@ class WebAudioMixer {
   }
 
   preload(assetId, mime, size, fetchBytes) {
-    // Skip pre-decoding large BGM tracks into float32 PCM on mobile!
-    if (deviceProfile.isMobile && size > 320 * 1024) return;
+    // Skip pre-decoding large BGM tracks into float32 PCM on mobile or low-power/save-data mode!
+    if ((deviceProfile.isMobile || this.lowPowerMode) && size > 256 * 1024) return;
     if (!this.ctx || this.decodedCache.has(assetId) || this.inflightDecode.has(assetId)) return;
     this._decodeAsset(this.ctx, assetId, mime, fetchBytes);
   }
 
   _canStreamMediaElement(cmd) {
-    if (!deviceProfile.isMobile) return false;
+    // Stream long BGM tracks via hardware-decoded <audio> on BOTH Desktop & Mobile
+    // (avoids 40+ MiB Float32 PCM full-track decode CPU spikes and memory bloat!)
     if (cmd.bus !== 'bgm' || cmd.size < 256 * 1024) return false;
     // Sample-accurate intro+loop regions still use WebAudio AudioBufferSourceNode
     if (cmd.looped && cmd.loop_start_s != null && cmd.loop_end_s != null && cmd.loop_end_s > cmd.loop_start_s) {
@@ -1397,6 +1427,7 @@ class WebAudioMixer {
         URL.revokeObjectURL(blobUrl);
         try { mediaNode.disconnect(); } catch {}
         onEnded(cmd.channel);
+        if (this.channels.size === 0) this._scheduleIdleSuspend();
       }
     };
     this.channels.set(cmd.channel, entry);
@@ -1451,6 +1482,7 @@ class WebAudioMixer {
       if (cur && cur.src === src) {
         this.channels.delete(cmd.channel);
         onEnded(cmd.channel);
+        if (this.channels.size === 0) this._scheduleIdleSuspend();
       }
     };
     this.channels.set(cmd.channel, { src, gainNode, bus: cmd.bus, asset: cmd.asset });
@@ -1469,6 +1501,7 @@ class WebAudioMixer {
           cur.mediaNode?.disconnect();
         } catch {}
         if (cur.blobUrl) URL.revokeObjectURL(cur.blobUrl);
+        if (this.channels.size === 0) this._scheduleIdleSuspend();
       };
       if (fadeOutMs > 0 && cur.gainNode) {
         const now = this.ctx.currentTime;
@@ -1481,7 +1514,10 @@ class WebAudioMixer {
       }
       return;
     }
-    if (!cur.src) return;
+    if (!cur.src) {
+      if (this.channels.size === 0) this._scheduleIdleSuspend();
+      return;
+    }
     const now = this.ctx.currentTime;
     try {
       if (fadeOutMs > 0) {
@@ -1489,8 +1525,10 @@ class WebAudioMixer {
         cur.gainNode.gain.setValueAtTime(cur.gainNode.gain.value, now);
         cur.gainNode.gain.linearRampToValueAtTime(0.0001, now + fadeOutMs / 1000);
         cur.src.stop(now + fadeOutMs / 1000 + 0.02);
+        if (this.channels.size === 0) this._scheduleIdleSuspend(fadeOutMs + 2500);
       } else {
         cur.src.stop();
+        if (this.channels.size === 0) this._scheduleIdleSuspend();
       }
     } catch { /* already stopped */ }
   }
@@ -1603,18 +1641,35 @@ async function main() {
   }
 
   setProgress(92, 'Starting GPU renderer…');
-  const initialView = readViewportMetrics();
+  // Respect OS `prefers-reduced-motion` automatically on first run (when no saved prefs exist yet)
+  let initialPrefsJson = initialSaves.prefsJson;
+  let initialEcoMode = false;
+  try {
+    const parsedPrefs = JSON.parse(initialPrefsJson || '{}');
+    if (
+      parsedPrefs &&
+      typeof parsedPrefs === 'object' &&
+      parsedPrefs.reduced_motion === undefined &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    ) {
+      parsedPrefs.reduced_motion = true;
+      initialPrefsJson = JSON.stringify(parsedPrefs);
+    }
+    initialEcoMode = Boolean(parsedPrefs?.eco_mode);
+  } catch { /* default */ }
+  const initialView = readViewportMetrics(initialEcoMode);
   canvas.width = Math.max(1, Math.round(initialView.width * initialView.dpr));
   canvas.height = Math.max(1, Math.round(initialView.height * initialView.dpr));
 
   const engine = await WebEngine.create(
     canvas,
     headerBytes,
-    initialSaves.prefsJson,
+    initialPrefsJson,
     initialSaves.profileJson,
     JSON.stringify(initialSaves.slots),
     initialView.dpr,
   );
+  let lastEcoMode = initialEcoMode;
   document.title = engine.title();
 
   // Apply adaptive mobile GPU cache cap & initial safe-area insets + touch modality
@@ -1737,7 +1792,34 @@ async function main() {
     engine.show_toast('当前浏览器不支持 OGG/Opus 音频，建议使用 MP3 音频构建', 4500);
     scheduleFrame();
   });
-  try { audio.applyPreferences(JSON.parse(initialSaves.prefsJson)); } catch { /* default */ }
+  try { audio.applyPreferences(JSON.parse(initialPrefsJson)); } catch { /* default */ }
+
+  // Automatically trim speculative lookahead & large audio pre-decode under Save-Data or low battery (<20% unplugged)
+  const applyLowPowerHint = (low) => {
+    audio.lowPowerMode = Boolean(low);
+    if (typeof engine.set_low_power_hint === 'function') {
+      engine.set_low_power_hint(Boolean(low));
+    }
+  };
+  let saveDataActive = Boolean(navigator.connection?.saveData);
+  let lowBatteryActive = false;
+  const syncLowPowerSignals = () => applyLowPowerHint(saveDataActive || lowBatteryActive);
+  syncLowPowerSignals();
+  navigator.connection?.addEventListener?.('change', () => {
+    saveDataActive = Boolean(navigator.connection?.saveData);
+    syncLowPowerSignals();
+  });
+  if (typeof navigator.getBattery === 'function') {
+    navigator.getBattery().then((bat) => {
+      const updateBat = () => {
+        lowBatteryActive = !bat.charging && typeof bat.level === 'number' && bat.level < 0.2;
+        syncLowPowerSignals();
+      };
+      updateBat();
+      bat.addEventListener('levelchange', updateBat);
+      bat.addEventListener('chargingchange', updateBat);
+    }).catch(() => {});
+  }
 
   // Screen Wake Lock during Auto/Skip reading on mobile
   let wakeLockSentinel = null;
@@ -1872,16 +1954,59 @@ async function main() {
     return createImageBitmap(cvs, { premultiplyAlpha: 'premultiply' });
   };
 
-  // Idle-pausing rAF scheduler (0% CPU/GPU when waiting for click/tap!)
+  // Idle-pausing rAF + exact timer wakeup scheduler (0% CPU/GPU when idle, zero 60Hz spin during Auto/Toast!)
   let rafId = 0;
+  let wakeupTimer = 0;
+  let isDeepIdle = false;
   let lastTs = performance.now();
   let contextLost = false;
   let recoveringRenderer = false;
 
+  const cancelPendingWakeup = () => {
+    if (wakeupTimer) {
+      clearTimeout(wakeupTimer);
+      wakeupTimer = 0;
+    }
+  };
+
   const scheduleFrame = () => {
+    cancelPendingWakeup();
     if (rafId === 0 && !contextLost && document.visibilityState !== 'hidden') {
-      lastTs = performance.now();
+      if (isDeepIdle) {
+        // Fresh wake from deep sleep: reset clock so new UI animations start cleanly from t=0!
+        isDeepIdle = false;
+        lastTs = performance.now();
+      }
       rafId = requestAnimationFrame(frame);
+    }
+  };
+
+  const scheduleNextWakeup = () => {
+    cancelPendingWakeup();
+    if (contextLost || document.visibilityState === 'hidden') return;
+    if (typeof engine.next_wakeup_delay_ms === 'function') {
+      const delayMs = engine.next_wakeup_delay_ms();
+      if (delayMs < 0) {
+        isDeepIdle = true;
+        return; // True 0% idle sleep!
+      }
+      isDeepIdle = false;
+      if (delayMs <= 36) {
+        rafId = requestAnimationFrame(frame);
+      } else {
+        const waitMs = Math.min(Math.ceil(delayMs), 6000);
+        wakeupTimer = setTimeout(() => {
+          wakeupTimer = 0;
+          if (rafId === 0 && !contextLost && document.visibilityState !== 'hidden') {
+            rafId = requestAnimationFrame(frame);
+          }
+        }, waitMs);
+      }
+    } else if (engine.needs_frame()) {
+      isDeepIdle = false;
+      rafId = requestAnimationFrame(frame);
+    } else {
+      isDeepIdle = true;
     }
   };
 
@@ -2034,16 +2159,18 @@ async function main() {
   };
 
   // Dynamic viewport + safe area resize handler (handles iOS Safari URL bar & rotation!)
+  let canvasRect = canvas.getBoundingClientRect();
   let resizeQueued = false;
   const applyResize = () => {
     resizeQueued = false;
-    const m = readViewportMetrics();
+    const m = readViewportMetrics(lastEcoMode);
     const w = Math.max(1, Math.round(m.width * m.dpr));
     const h = Math.max(1, Math.round(m.height * m.dpr));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
     }
+    canvasRect = canvas.getBoundingClientRect();
     engine.set_safe_insets(m.insets.top, m.insets.right, m.insets.bottom, m.insets.left);
     engine.resize(w, h, m.dpr);
     scheduleFrame();
@@ -2063,11 +2190,12 @@ async function main() {
     if (recoveringRenderer) return;
     recoveringRenderer = true;
     try {
-      const m = readViewportMetrics();
+      const m = readViewportMetrics(lastEcoMode);
       const w = Math.max(1, Math.round(m.width * m.dpr));
       const h = Math.max(1, Math.round(m.height * m.dpr));
       canvas.width = w;
       canvas.height = h;
+      canvasRect = canvas.getBoundingClientRect();
       await engine.recreate_renderer(canvas, w, h, m.dpr);
       if (deviceProfile.gpuCacheMb > 0) {
         engine.set_texture_cache_limit_mb(deviceProfile.gpuCacheMb);
@@ -2089,6 +2217,7 @@ async function main() {
   canvas.addEventListener('webglcontextlost', (e) => {
     e.preventDefault();
     contextLost = true;
+    cancelPendingWakeup();
     if (rafId) {
       cancelAnimationFrame(rafId);
       rafId = 0;
@@ -2100,10 +2229,12 @@ async function main() {
 
   // --- Cinema Idle Chrome Auto-Fade (Desktop + Mobile!) & Pointer Cursor Feedback ---
   let idleChromeTimer = 0;
+  let lastChromeWakeMs = 0;
   let chromeIsIdle = false;
   let mobileGestureHintShown = false;
   let prevStoryReading = false;
   const setChromeIdle = (idle) => {
+    if (chromeIsIdle === idle) return;
     chromeIsIdle = idle;
     if (shelfBtn) shelfBtn.classList.toggle('chrome-idle', idle);
     if (fsBtn) fsBtn.classList.toggle('chrome-idle', idle);
@@ -2122,8 +2253,14 @@ async function main() {
     }, delayMs);
   };
   const wakeChrome = () => {
-    setChromeIdle(false);
-    scheduleChromeFade();
+    if (chromeIsIdle) {
+      setChromeIdle(false);
+    }
+    const now = performance.now();
+    if (now - lastChromeWakeMs >= 400 || !idleChromeTimer) {
+      lastChromeWakeMs = now;
+      scheduleChromeFade();
+    }
   };
   const syncPointerCursor = () => {
     if (!deviceProfile.isMobile) {
@@ -2187,8 +2324,10 @@ async function main() {
   window.addEventListener('click', unlockAudio, { passive: true });
 
   const localPos = (e) => {
-    const rect = canvas.getBoundingClientRect();
-    return [e.clientX - rect.left, e.clientY - rect.top];
+    if (!canvasRect || canvasRect.width === 0) {
+      canvasRect = canvas.getBoundingClientRect();
+    }
+    return [e.clientX - canvasRect.left, e.clientY - canvasRect.top];
   };
 
   let primaryPointerDown = false;
@@ -2317,6 +2456,7 @@ async function main() {
       videoWasPlayingBeforeHide = true;
       videoEl.pause();
     }
+    cancelPendingWakeup();
     if (rafId) {
       cancelAnimationFrame(rafId);
       rafId = 0;
@@ -2333,6 +2473,7 @@ async function main() {
   };
 
   const onReturnForeground = () => {
+    lastTs = performance.now();
     dispatchCmdJson(engine.set_host_paused(false));
     audio.resumeAll();
     if (videoEl && !videoEl.hidden && videoWasPlayingBeforeHide) {
@@ -2384,13 +2525,13 @@ async function main() {
   };
 
   // Clean 160x90 WebP thumbnail capture cropped strictly to `stage_rect` (zero letterbox bars!)
-  // and cached during Story reading so manual saves inside the Saves overlay never capture the menu UI!
+  // Captured strictly on-demand (leaving Story for Menu/Saves, or saving) — zero periodic GPU stalls!
   const thumbCanvas = document.createElement('canvas');
   thumbCanvas.width = 160;
   thumbCanvas.height = 90;
   const thumbCtx = thumbCanvas.getContext('2d');
   let cleanStoryThumb = null;
-  let lastThumbCaptureMs = 0;
+  let cleanStoryThumbEpoch = -1;
   const captureStageThumb = () => {
     if (!thumbCtx || !canvas || canvas.width === 0 || canvas.height === 0) return null;
     try {
@@ -2440,10 +2581,15 @@ async function main() {
       })
       .catch(() => {});
   };
-  // Upload any previously stored save thumbnails lazily
-  for (const [key, dataUrl] of store.thumbnails.entries()) {
-    uploadThumbDataUrl(key, dataUrl);
-  }
+  // Defer decoding/uploading up to 26 saved thumbnails into VRAM until user actually opens Saves!
+  let thumbsUploaded = false;
+  const ensureThumbsUploaded = () => {
+    if (thumbsUploaded || contextLost) return;
+    thumbsUploaded = true;
+    for (const [key, dataUrl] of store.thumbnails.entries()) {
+      uploadThumbDataUrl(key, dataUrl);
+    }
+  };
   // --- Multi-Tab Sync (BroadcastChannel) + Concurrent Play Guard (Web Locks API) ---
   const syncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('nir-sync') : null;
   const broadcastSaveSync = (kind, snapshotJson, thumb) => {
@@ -2636,11 +2782,24 @@ async function main() {
   }
 
   // --- Gamepad API Controller (Xbox / PlayStation / Switch / Steam Deck / 8BitDo Micro) ---
-  // Zero overhead when no gamepad is connected!
+  // Zero overhead when disconnected; drops to 8Hz low-power polling after 5s idle!
   let gamepadRaf = 0;
+  let gamepadTimer = 0;
+  let gpLastActiveMs = performance.now();
   const gpPrev = new Map(); // btnIndex -> pressed
   let gpHoldSkip = false;
   let gpLastAxisMs = 0;
+  const scheduleGamepadPoll = () => {
+    if (activeGamepadIndex < 0 || document.visibilityState === 'hidden') return;
+    if (performance.now() - gpLastActiveMs < 5000) {
+      if (!gamepadRaf) gamepadRaf = requestAnimationFrame(pollGamepads);
+    } else if (!gamepadTimer) {
+      gamepadTimer = setTimeout(() => {
+        gamepadTimer = 0;
+        pollGamepads();
+      }, 120);
+    }
+  };
   const pollGamepads = () => {
     gamepadRaf = 0;
     if (activeGamepadIndex < 0 || !navigator.getGamepads || document.visibilityState === 'hidden') return;
@@ -2686,21 +2845,24 @@ async function main() {
       acted = true;
     }
     if (acted) {
+      gpLastActiveMs = nowMs;
       unlockAudio();
       scheduleFrame();
     }
-    gamepadRaf = requestAnimationFrame(pollGamepads);
+    scheduleGamepadPoll();
   };
   window.addEventListener('gamepadconnected', (e) => {
     activeGamepadIndex = e.gamepad.index;
+    gpLastActiveMs = performance.now();
     gpPrev.clear();
     engine.show_toast(`🎮 已连接手柄：${(e.gamepad.id || 'Gamepad').slice(0, 28)}`, 2400);
     scheduleFrame();
-    if (!gamepadRaf) gamepadRaf = requestAnimationFrame(pollGamepads);
+    scheduleGamepadPoll();
   });
   window.addEventListener('gamepaddisconnected', (e) => {
     if (e.gamepad.index === activeGamepadIndex) {
       activeGamepadIndex = -1;
+      if (gamepadTimer) { clearTimeout(gamepadTimer); gamepadTimer = 0; }
       if (gpHoldSkip) {
         gpHoldSkip = false;
         engine.dispatch_action_json(JSON.stringify({ HoldSkip: false }));
@@ -2938,29 +3100,53 @@ async function main() {
     error: null,
   };
 
+  let lastSeenDialogueEpoch = -1;
+  let lastWakeLockWant = false;
   const frame = (ts) => {
     rafId = 0;
     if (contextLost || document.visibilityState === 'hidden') return;
-    if (engine.is_device_lost()) {
+    const preFlags = typeof engine.frame_flags === 'function' ? engine.frame_flags() : 0;
+    if (preFlags & 1 || (typeof engine.frame_flags !== 'function' && engine.is_device_lost())) {
       recoverGpuRenderer();
       return;
     }
-    const dt = ts - lastTs;
-    lastTs = ts;
-    const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
-    // Keep a fresh, clean (menu-free, borderless) stage thumbnail while actively reading Story!
-    if (engine.is_story_reading() && ts - lastThumbCaptureMs > 650) {
+    // Capture a single clean (overlay-free) Story thumbnail RIGHT BEFORE drawing a newly-opened Menu/Saves overlay!
+    // Zero periodic GPU readbacks during normal Story reading!
+    const preStoryReading = Boolean(preFlags & 2);
+    if (prevStoryReading && !preStoryReading && cleanStoryThumbEpoch !== lastSeenDialogueEpoch) {
       const snap = captureStageThumb();
       if (snap) {
         cleanStoryThumb = snap;
-        lastThumbCaptureMs = ts;
+        cleanStoryThumbEpoch = lastSeenDialogueEpoch;
       }
     }
+    const dt = Math.max(0, ts - lastTs);
+    lastTs = ts;
+    const cmdsJson = engine.tick_and_render(dt, Date.now() / 1000);
+    const flags = typeof engine.frame_flags === 'function' ? engine.frame_flags() : 0;
+    const storyReadingNow = Boolean(flags & 2);
+    const hiddenUi = Boolean(flags & 4);
+    const shakingNow = Boolean(flags & 8);
+    const missingGlyphsNow = Boolean(flags & 16);
+    const wantWakeLockNow = Boolean(flags & 32);
+    const ecoModeNow = Boolean(flags & 64);
+    const savesScreenNow = Boolean(flags & 128);
+
+    // Live DPR adjustment when user toggles Eco Power Saver!
+    if (ecoModeNow !== lastEcoMode) {
+      lastEcoMode = ecoModeNow;
+      applyResize();
+    }
+    // Lazy-upload stored save thumbnails ONLY when user opens the Saves screen!
+    if (savesScreenNow && !thumbsUploaded) {
+      ensureThumbsUploaded();
+    }
+
     if (cmdsJson) {
       const cmds = JSON.parse(cmdsJson);
       const hasSaveCmd = cmds.some((c) => c.op === 'save_slot' || c.op === 'save_auto' || c.op === 'save_quick');
       latestCapturedThumb = hasSaveCmd
-        ? (engine.is_story_reading() ? (captureStageThumb() || cleanStoryThumb) : (cleanStoryThumb || captureStageThumb()))
+        ? (storyReadingNow ? (captureStageThumb() || cleanStoryThumb) : (cleanStoryThumb || captureStageThumb()))
         : null;
       const ranges = [];
       for (const cmd of cmds) {
@@ -2977,21 +3163,24 @@ async function main() {
       }
       latestCapturedThumb = null;
     }
-    // Sync live dialogue changes to Media Session lock-screen metadata & optional Texthooker clipboard!
-    const dlgJson = engine.current_dialogue_json();
-    if (dlgJson && dlgJson !== lastDialogueKey) {
-      lastDialogueKey = dlgJson;
-      try {
-        lastDialogueObj = JSON.parse(dlgJson);
-        syncMediaSession(lastDialogueObj);
-        if (autoCopyHook && lastDialogueObj?.text && document.hasFocus()) {
-          navigator.clipboard?.writeText(lastDialogueObj.text.trim()).catch(() => {});
-        }
-      } catch { /* ignore */ }
+    // Only pull & parse dialogue JSON across WASM when `dialogue_epoch` actually changes!
+    const dlgEpoch = typeof engine.dialogue_epoch === 'function' ? engine.dialogue_epoch() : -1;
+    if (dlgEpoch !== lastSeenDialogueEpoch || dlgEpoch < 0) {
+      lastSeenDialogueEpoch = dlgEpoch;
+      const dlgJson = engine.current_dialogue_json();
+      if (dlgJson && dlgJson !== lastDialogueKey) {
+        lastDialogueKey = dlgJson;
+        try {
+          lastDialogueObj = JSON.parse(dlgJson);
+          syncMediaSession(lastDialogueObj);
+          if (autoCopyHook && lastDialogueObj?.text && document.hasFocus()) {
+            navigator.clipboard?.writeText(lastDialogueObj.text.trim()).catch(() => {});
+          }
+        } catch { /* ignore */ }
+      }
     }
     // Surface clean screenshot button prominently while UI is hidden to admire CGs,
     // and automatically re-surface top chrome whenever leaving Story (Menu / Title / Saves / Settings)
-    const storyReadingNow = engine.is_story_reading();
     if (deviceProfile.isMobile) {
       if (!storyReadingNow && chromeIsIdle) {
         setChromeIdle(false);
@@ -3001,8 +3190,7 @@ async function main() {
     }
     prevStoryReading = storyReadingNow;
     if (quickToolsEl) {
-      const hiddenUi = engine.is_interface_hidden();
-      if (copyBtn) copyBtn.hidden = hiddenUi;
+      if (copyBtn && copyBtn.hidden !== hiddenUi) copyBtn.hidden = hiddenUi;
       if (hiddenUi) quickToolsEl.classList.remove('chrome-idle');
     }
     // One-time subtle mobile gesture cheat-sheet toast on first entry into Story reading!
@@ -3021,18 +3209,19 @@ async function main() {
       triggerHaptic(uiHapticMs, 0.22);
     }
     // Gentle haptic pulse when story triggers a dramatic screen Shake
-    if (engine.is_shaking() && ts - lastShakeHapticMs > 520) {
+    if (shakingNow && ts - lastShakeHapticMs > 520) {
       lastShakeHapticMs = ts;
       triggerHaptic(18, 0.42);
     }
     // Lazy-load 6.1 MiB Pan-CJK fallback font ONLY if a bundled font actually encounters a missing glyph!
-    if (!fallbackFontStarted && engine.has_missing_glyphs()) {
+    if (!fallbackFontStarted && missingGlyphsNow) {
       loadFallbackFontsLazy();
     }
-    syncWakeLock();
-    if (engine.needs_frame()) {
-      rafId = requestAnimationFrame(frame);
+    if (wantWakeLockNow !== lastWakeLockWant) {
+      lastWakeLockWant = wantWakeLockNow;
+      syncWakeLock();
     }
+    scheduleNextWakeup();
   };
 
   scheduleFrame();

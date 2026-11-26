@@ -211,4 +211,5 @@ pub enum UiAction {
     ToggleImageSharpening,
     ToggleTextOutline,
     CycleUiStyleMode,
+    ToggleEcoMode,
 }

@@ -139,3 +139,4 @@ ui-style-mode = 界面风格
 ui-style-hybrid = 自适应融合
 ui-style-modern = 现代毛玻璃
 ui-style-classic = 经典原味
+eco-mode = 省电节能模式

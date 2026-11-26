@@ -79,6 +79,14 @@ impl TouchGestureEngine {
             && self.active[0].max_dist_sq <= TAP_SLOP_PX * TAP_SLOP_PX
     }
 
+    /// Exact microseconds until the long-press threshold triggers (`None` if no stationary press).
+    pub fn next_wakeup_delay_us(&self) -> Option<u64> {
+        if !self.needs_clock() {
+            return None;
+        }
+        Some(LONG_PRESS_SKIP_US.saturating_sub(self.single_hold_us).max(1_000))
+    }
+
     pub fn is_long_press_active(&self) -> bool {
         self.long_press_active
     }

@@ -28,6 +28,9 @@ const TOAST_FADE_US: u64 = 160_000;
 const DIALOGUE_FADE_US: u64 = 85_000;
 const HOVER_ANIM_US: u64 = 110_000;
 const CHOICE_ANIM_US: u64 = 220_000;
+/// Waiting-for-click indicator breathes softly for ~2.4s then rests cleanly so idle CPU/GPU hits 0%!
+const WAIT_PULSE_DURATION_US: u64 = 2_400_000;
+const WAIT_PULSE_STEP_US: u64 = 55_000;
 
 /// Typed commands sent from `Runtime` to the platform host (Native / Web / Mobile).
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +137,11 @@ pub struct Runtime {
     choice_anim_us: u64,
     last_choice_active: bool,
     last_dialogue_key: Option<(TextId, usize)>,
+    dialogue_epoch: u64,
+    wait_pulse_us: u64,
+    was_waiting_click: bool,
     ui_time_us: u64,
+    low_power_hint: bool,
     host_top_left_pad: f32,
     host_top_right_pad: f32,
     title_analysis: Option<TitleAnalysis>,
@@ -233,7 +240,11 @@ impl Runtime {
             choice_anim_us: CHOICE_ANIM_US,
             last_choice_active: false,
             last_dialogue_key: None,
+            dialogue_epoch: 0,
+            wait_pulse_us: 0,
+            was_waiting_click: false,
             ui_time_us: 0,
+            low_power_hint: false,
             host_top_left_pad: 0.0,
             host_top_right_pad: 0.0,
             title_analysis: None,
@@ -403,6 +414,27 @@ impl Runtime {
     pub fn current_dialogue_info(&self) -> Option<(u32, &str, &str)> {
         let d = self.vm.dialogue.as_ref()?;
         Some((d.text_id.0, d.speaker.as_str(), d.full_text.as_str()))
+    }
+
+    /// Monotonically incremented whenever the active dialogue line changes so Web hosts
+    /// skip per-frame JSON serialization & WASM string copying!
+    pub fn dialogue_epoch(&self) -> u64 {
+        self.dialogue_epoch
+    }
+
+    pub fn set_low_power_hint(&mut self, low_power: bool) {
+        self.low_power_hint = low_power;
+    }
+
+    pub fn is_eco_mode(&self) -> bool {
+        self.prefs.eco_mode
+    }
+
+    fn is_wait_pulse_active(&self) -> bool {
+        !self.prefs.reduced_motion
+            && !self.prefs.eco_mode
+            && self.is_waiting_dialogue_click()
+            && self.wait_pulse_us < WAIT_PULSE_DURATION_US
     }
 
     pub fn stage_rect(&self) -> [f32; 4] {
@@ -794,36 +826,94 @@ impl Runtime {
     }
 
     pub fn needs_clock(&self) -> bool {
+        self.next_wakeup_delay_us().is_some()
+    }
+
+    /// Computes exact microseconds until the next visual, timer, or debounced-save event.
+    /// Returns `None` when completely idle so hosts can sleep at 0% CPU & 0% GPU!
+    pub fn next_wakeup_delay_us(&self) -> Option<u64> {
         if self.paused_by_host {
-            return false;
+            return None;
         }
-        if self.toast.is_some() || self.gestures.needs_clock() {
-            return true;
+        let mut soonest: Option<u64> = None;
+        let mut consider = |us: u64| {
+            soonest = Some(soonest.map_or(us, |cur| cur.min(us)));
+        };
+
+        if let Some((_, rem)) = &self.toast {
+            if !self.prefs.reduced_motion
+                && !self.prefs.eco_mode
+                && (self.toast_elapsed_us < TOAST_FADE_US || *rem <= TOAST_FADE_US)
+            {
+                return Some(0);
+            }
+            if !self.prefs.reduced_motion && !self.prefs.eco_mode && *rem > TOAST_FADE_US {
+                consider(rem.saturating_sub(TOAST_FADE_US));
+            } else {
+                consider(*rem);
+            }
         }
+
+        if let Some(g_us) = self.gestures.next_wakeup_delay_us() {
+            consider(g_us);
+        }
+
         if !self.prefs.reduced_motion {
             if self.overlay_anim_us < OVERLAY_ANIM_US {
-                return true;
+                return Some(0);
             }
             if self.hover_anim_us < HOVER_ANIM_US {
-                return true;
+                return Some(0);
             }
             if self.screen == Screen::Story && self.dialogue_fade_us < DIALOGUE_FADE_US {
-                return true;
+                return Some(0);
             }
             if self.screen == Screen::Story && self.choice_anim_us < CHOICE_ANIM_US {
-                return true;
+                return Some(0);
             }
-            if self.is_waiting_dialogue_click() {
-                return true;
+            if self.is_wait_pulse_active() {
+                let rem_step = WAIT_PULSE_STEP_US - (self.ui_time_us % WAIT_PULSE_STEP_US);
+                let rem_total = WAIT_PULSE_DURATION_US.saturating_sub(self.wait_pulse_us);
+                consider(rem_step.min(rem_total).max(8_000));
             }
         }
+
         if self.has_urgent_image_loading() && self.urgent_loading_us < LOADING_INDICATOR_DELAY_US {
-            return true;
+            consider(LOADING_INDICATOR_DELAY_US.saturating_sub(self.urgent_loading_us));
         }
-        if self.screen != Screen::Story {
-            return false;
+
+        if self.profile_dirty && self.frozen_vm.is_none() {
+            consider(
+                PROFILE_FLUSH_INTERVAL_US
+                    .saturating_sub(self.profile_dirty_elapsed_us)
+                    .max(10_000),
+            );
         }
-        self.vm.needs_clock() || self.auto || self.skip || self.hold_skip
+
+        if self.screen == Screen::Story {
+            if let Some(vm_us) = self.vm.next_wakeup_delay_us(self.prefs.text_speed) {
+                consider(vm_us);
+            }
+            let skipping = self.hold_skip || self.skip;
+            if skipping && self.vm.choice.is_none() {
+                let can_skip = self.prefs.skip_unread
+                    || self.vm.is_current_dialogue_read()
+                    || self.vm.wait != WaitReason::Dialogue;
+                if can_skip {
+                    consider(SKIP_INTERVAL_US.saturating_sub(self.skip_elapsed_us));
+                }
+            } else if self.auto && self.vm.wait == WaitReason::Dialogue {
+                let dlg_done = self.vm.dialogue.as_ref().is_some_and(|d| d.finished);
+                let voice_ready =
+                    !self.prefs.auto_wait_voice || self.active_voice_channels.is_empty();
+                if dlg_done && voice_ready {
+                    let target_us = self.prefs.auto_delay_ms as u64 * 1000;
+                    consider(target_us.saturating_sub(self.auto_elapsed_us));
+                }
+            }
+        }
+
+        soonest
     }
 
     pub fn set_hover(&mut self, x: f32, y: f32) {
@@ -844,7 +934,11 @@ impl Runtime {
             )
         });
         if next != self.hovered_hit || is_toolbar_hit != self.hud_toolbar_hovered {
-            if next != self.hovered_hit && next.is_some() && !self.prefs.reduced_motion {
+            if next != self.hovered_hit
+                && next.is_some()
+                && !self.prefs.reduced_motion
+                && !self.prefs.eco_mode
+            {
                 self.hover_anim_us = 0;
             }
             self.hovered_hit = next;
@@ -1332,12 +1426,18 @@ impl Runtime {
                 self.skip = !self.skip;
                 if self.skip {
                     self.auto = false;
+                } else if self.screen == Screen::Story {
+                    self.request_active_and_lookahead_assets();
                 }
                 self.skip_elapsed_us = 0;
             }
             UiAction::HoldSkip(held) => {
+                let was_held = self.hold_skip;
                 self.hold_skip = held;
                 self.skip_elapsed_us = 0;
+                if was_held && !held && !self.skip && self.screen == Screen::Story {
+                    self.request_active_and_lookahead_assets();
+                }
             }
             UiAction::ToggleHideUi => {
                 if self.screen == Screen::Story {
@@ -1601,6 +1701,22 @@ impl Runtime {
                 let label = self.messages.get(&loc, "ui-style-mode");
                 self.show_toast(format!("{label}: {mode_name}"), 1800);
             }
+            UiAction::ToggleEcoMode => {
+                self.prefs.eco_mode = !self.prefs.eco_mode;
+                if self.prefs.eco_mode {
+                    self.wait_pulse_us = WAIT_PULSE_DURATION_US;
+                    self.ui_time_us = 0;
+                    self.hover_anim_us = HOVER_ANIM_US;
+                }
+                self.commands
+                    .push(HostCommand::SavePreferences(self.prefs.clone()));
+                let loc = self.prefs.ui_locale.clone();
+                let label = self.messages.get(&loc, "eco-mode");
+                let state = self
+                    .messages
+                    .get(&loc, if self.prefs.eco_mode { "on" } else { "off" });
+                self.show_toast(format!("{label}: {state}"), 1800);
+            }
             UiAction::ReturnShelf => {
                 self.emit_autosave();
                 self.flush_pending_saves();
@@ -1828,26 +1944,31 @@ impl Runtime {
         if self.paused_by_host || delta_us == 0 {
             return;
         }
-        let delta_us = delta_us.min(250_000); // Cap frame hitch catch-up to 250ms.
+        // Distinguish long sleep-safe timers (Auto / Toast / Wait / Profile flush, up to 6s)
+        // from continuous visual animation ticks (capped to 250ms against OS suspend hitches).
+        let timer_dt = delta_us.min(6_000_000);
+        let anim_dt = delta_us.min(250_000);
 
         // Debounced persistent profile flush (batches rapid read_texts updates into 1 write per 5s).
         if self.profile_dirty {
-            self.profile_dirty_elapsed_us = self.profile_dirty_elapsed_us.saturating_add(delta_us);
+            self.profile_dirty_elapsed_us =
+                self.profile_dirty_elapsed_us.saturating_add(timer_dt);
             if self.profile_dirty_elapsed_us >= PROFILE_FLUSH_INTERVAL_US {
                 self.flush_pending_saves();
             }
         }
 
         if let Some((_, rem)) = &mut self.toast {
-            self.toast_elapsed_us = self.toast_elapsed_us.saturating_add(delta_us);
-            if delta_us >= *rem {
+            self.toast_elapsed_us = self.toast_elapsed_us.saturating_add(timer_dt);
+            if timer_dt >= *rem {
                 self.toast = None;
                 self.toast_elapsed_us = 0;
                 self.dirty = true;
             } else {
-                *rem -= delta_us;
+                *rem -= timer_dt;
                 if !self.prefs.reduced_motion
-                    && (self.toast_elapsed_us <= TOAST_FADE_US + delta_us || *rem <= TOAST_FADE_US)
+                    && !self.prefs.eco_mode
+                    && (self.toast_elapsed_us <= TOAST_FADE_US + anim_dt || *rem <= TOAST_FADE_US)
                 {
                     self.dirty = true;
                 }
@@ -1857,7 +1978,7 @@ impl Runtime {
         if !self.prefs.reduced_motion && self.overlay_anim_us < OVERLAY_ANIM_US {
             self.overlay_anim_us = self
                 .overlay_anim_us
-                .saturating_add(delta_us)
+                .saturating_add(anim_dt)
                 .min(OVERLAY_ANIM_US);
             self.dirty = true;
         }
@@ -1865,7 +1986,7 @@ impl Runtime {
         if !self.prefs.reduced_motion && self.hover_anim_us < HOVER_ANIM_US {
             self.hover_anim_us = self
                 .hover_anim_us
-                .saturating_add(delta_us)
+                .saturating_add(anim_dt)
                 .min(HOVER_ANIM_US);
             self.dirty = true;
         }
@@ -1880,7 +2001,7 @@ impl Runtime {
             if self.choice_anim_us < CHOICE_ANIM_US {
                 self.choice_anim_us = self
                     .choice_anim_us
-                    .saturating_add(delta_us)
+                    .saturating_add(anim_dt)
                     .min(CHOICE_ANIM_US);
                 self.dirty = true;
             }
@@ -1888,15 +2009,27 @@ impl Runtime {
             self.last_choice_active = self.vm.choice.is_some();
         }
 
-        if !self.prefs.reduced_motion && self.screen == Screen::Story {
-            let cur_dlg = self.vm.dialogue.as_ref().map(|d| (d.text_id, d.full_text.len(), d.finished));
+        if self.screen == Screen::Story {
+            let cur_dlg = self
+                .vm
+                .dialogue
+                .as_ref()
+                .map(|d| (d.text_id, d.full_text.len(), d.finished));
             let cur_key = cur_dlg.map(|(id, len, _)| (id, len));
             if cur_key != self.last_dialogue_key {
                 let had_prev = self.last_dialogue_key.is_some();
                 self.last_dialogue_key = cur_key;
+                self.dialogue_epoch = self.dialogue_epoch.wrapping_add(1);
+                self.wait_pulse_us = 0;
+                self.ui_time_us = 0;
                 // Only apply subtle line-swap fade when instantly displaying a subsequent line
                 // (typewriter lines already reveal smoothly and keep sub-grapheme dirty-gating intact!).
-                if had_prev && cur_dlg.is_some_and(|(_, _, fin)| fin) && !self.skip && !self.hold_skip
+                if !self.prefs.reduced_motion
+                    && !self.prefs.eco_mode
+                    && had_prev
+                    && cur_dlg.is_some_and(|(_, _, fin)| fin)
+                    && !self.skip
+                    && !self.hold_skip
                 {
                     self.dialogue_fade_us = 0;
                     self.dirty = true;
@@ -1904,25 +2037,49 @@ impl Runtime {
                     self.dialogue_fade_us = DIALOGUE_FADE_US;
                 }
             }
-            if self.dialogue_fade_us < DIALOGUE_FADE_US {
+            if !self.prefs.reduced_motion && self.dialogue_fade_us < DIALOGUE_FADE_US {
                 self.dialogue_fade_us = self
                     .dialogue_fade_us
-                    .saturating_add(delta_us)
+                    .saturating_add(anim_dt)
                     .min(DIALOGUE_FADE_US);
                 self.dirty = true;
             }
-            if self.is_waiting_dialogue_click() {
-                let prev_step = self.ui_time_us / 33_000;
-                self.ui_time_us = self.ui_time_us.wrapping_add(delta_us);
-                if self.ui_time_us / 33_000 != prev_step {
-                    self.dirty = true;
+
+            let waiting_now = self.is_waiting_dialogue_click();
+            if waiting_now && !self.was_waiting_click {
+                self.wait_pulse_us = 0;
+                self.ui_time_us = 0;
+            }
+            self.was_waiting_click = waiting_now;
+
+            // Breathe click-to-continue indicator briefly (~2.4s at ~18Hz), then rest cleanly
+            // at bob=0 so idle reading reaches true 0% CPU & 0% GPU!
+            if !self.prefs.reduced_motion && !self.prefs.eco_mode && waiting_now {
+                if self.wait_pulse_us < WAIT_PULSE_DURATION_US {
+                    let prev_step = self.ui_time_us / WAIT_PULSE_STEP_US;
+                    self.wait_pulse_us = self
+                        .wait_pulse_us
+                        .saturating_add(anim_dt)
+                        .min(WAIT_PULSE_DURATION_US);
+                    if self.wait_pulse_us >= WAIT_PULSE_DURATION_US {
+                        // Snap cleanly to neutral resting pose and enter deep idle sleep.
+                        self.ui_time_us = 0;
+                        self.dirty = true;
+                    } else {
+                        self.ui_time_us = self.ui_time_us.wrapping_add(anim_dt);
+                        if self.ui_time_us / WAIT_PULSE_STEP_US != prev_step {
+                            self.dirty = true;
+                        }
+                    }
                 }
+            } else if self.ui_time_us != 0 {
+                self.ui_time_us = 0;
             }
         }
 
         if self.has_urgent_image_loading() {
             let was_vis = self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US;
-            self.urgent_loading_us = self.urgent_loading_us.saturating_add(delta_us);
+            self.urgent_loading_us = self.urgent_loading_us.saturating_add(timer_dt);
             if !was_vis && self.urgent_loading_us >= LOADING_INDICATOR_DELAY_US {
                 self.dirty = true;
             }
@@ -1939,7 +2096,7 @@ impl Runtime {
             && !self.interface_hidden
             && self.vm.choice.is_none()
             && !self.pressed_started_on_hit;
-        if let Some(act) = self.gestures.tick(delta_us, can_long_press) {
+        if let Some(act) = self.gestures.tick(timer_dt, can_long_press) {
             self.apply_touch_action(act);
         }
 
@@ -1947,9 +2104,17 @@ impl Runtime {
             return;
         }
 
-        let (intents, visual_changed) =
-            self.vm
-                .tick_with_dirty(delta_us, self.prefs.text_speed, self.prefs.reduced_motion);
+        let pure_timer_wait = matches!(self.vm.wait, WaitReason::Timer { .. })
+            && self.vm.tweens.is_empty()
+            && self.vm.shakes.is_empty()
+            && self.vm.transition.is_none()
+            && self.vm.window_reveal.is_none();
+        let vm_dt = if pure_timer_wait { timer_dt } else { anim_dt };
+        let (intents, visual_changed) = self.vm.tick_with_dirty(
+            vm_dt,
+            self.prefs.text_speed,
+            self.prefs.reduced_motion || self.prefs.eco_mode,
+        );
         self.handle_intents(intents);
         if visual_changed {
             self.dirty = true;
@@ -1966,7 +2131,7 @@ impl Runtime {
                 || self.vm.is_current_dialogue_read()
                 || self.vm.wait != WaitReason::Dialogue;
             if can_skip {
-                self.skip_elapsed_us = self.skip_elapsed_us.saturating_add(delta_us);
+                self.skip_elapsed_us = self.skip_elapsed_us.saturating_add(anim_dt);
                 if self.skip_elapsed_us >= SKIP_INTERVAL_US {
                     self.skip_elapsed_us = 0;
                     let intents = self.vm.advance(true);
@@ -1985,7 +2150,7 @@ impl Runtime {
             let dlg_done = self.vm.dialogue.as_ref().is_some_and(|d| d.finished);
             let voice_ready = !self.prefs.auto_wait_voice || self.active_voice_channels.is_empty();
             if dlg_done && voice_ready {
-                self.auto_elapsed_us = self.auto_elapsed_us.saturating_add(delta_us);
+                self.auto_elapsed_us = self.auto_elapsed_us.saturating_add(timer_dt);
                 let target_us = self.prefs.auto_delay_ms as u64 * 1000;
                 if self.auto_elapsed_us >= target_us {
                     self.auto_elapsed_us = 0;
@@ -2005,6 +2170,18 @@ impl Runtime {
             || (self.last_packet.height - height).abs() > 0.5;
         if !self.dirty && !size_changed {
             return None;
+        }
+        // Keep dialogue_epoch in sync immediately after dispatch/load/rollback even before next tick.
+        let cur_dlg_key = self
+            .vm
+            .dialogue
+            .as_ref()
+            .map(|d| (d.text_id, d.full_text.len()));
+        if cur_dlg_key != self.last_dialogue_key {
+            self.last_dialogue_key = cur_dlg_key;
+            self.dialogue_epoch = self.dialogue_epoch.wrapping_add(1);
+            self.wait_pulse_us = 0;
+            self.ui_time_us = 0;
         }
         let overlay_anim = if self.prefs.reduced_motion {
             1.0
@@ -2293,10 +2470,18 @@ impl Runtime {
         for &id in &pinned {
             self.request_asset(id, true);
         }
-        // Predictive multi-branch background lookahead over next 32 bytecode ops!
-        for id in self.vm.predict_assets(32) {
-            pinned.insert(id);
-            self.request_asset(id, false);
+        // Suppress speculative background lookahead while fast-skipping so transient CGs & voices
+        // never flood HTTP Range requests, decode workers, or GPU LRU cache!
+        if !(self.skip || self.hold_skip) {
+            let lookahead_ops = if self.prefs.eco_mode || self.low_power_hint {
+                10
+            } else {
+                32
+            };
+            for id in self.vm.predict_assets(lookahead_ops) {
+                pinned.insert(id);
+                self.request_asset(id, false);
+            }
         }
         self.commands.push(HostCommand::HintPinnedAssets(pinned));
     }
@@ -2837,5 +3022,57 @@ mod tests {
         rt.touch_move(25, 160.0, 362.0);
         rt.touch_end(25, 140.0, 362.0);
         assert_eq!(rt.viewing_cg, Some((0, 1)));
+    }
+
+    #[test]
+    fn wait_pulse_auto_sleeps_eco_mode_and_exact_wakeup_delay_work() {
+        let mut rt = Runtime::new(
+            test_prog(),
+            Preferences::default(),
+            ProfileData::default(),
+            vec![],
+        )
+        .unwrap();
+        rt.dispatch(UiAction::NewGame);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        let ep1 = rt.dialogue_epoch();
+        // Finish revealing line 1 -> enters click-waiting state
+        rt.dispatch(UiAction::Advance);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        assert!(
+            rt.next_wakeup_delay_us().is_some(),
+            "brief wait pulse should animate immediately after line finishes"
+        );
+        // Flush any debounced profile timer, render 1 mid-pulse frame, then let the 2.4s pulse finish
+        rt.flush_pending_saves();
+        rt.take_commands();
+        rt.tick(120_000);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some()); // mid-breath frame
+        for _ in 0..12 {
+            rt.tick(250_000);
+        }
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some()); // final resting pose frame
+        assert_eq!(
+            rt.next_wakeup_delay_us(),
+            None,
+            "after brief pulse, resting on finished dialogue must sleep at 0Hz!"
+        );
+        assert!(!rt.needs_clock());
+
+        // Auto mode sleeps precisely for auto_delay_ms instead of 60Hz spinning
+        rt.dispatch(UiAction::ToggleAuto);
+        let auto_delay = rt.next_wakeup_delay_us().expect("auto timer scheduled");
+        assert!(
+            auto_delay >= 1_000_000,
+            "auto wait wakeup should sleep ~1.5s, got {auto_delay}us"
+        );
+        rt.tick(auto_delay);
+        assert!(rt.prepare_frame(1280.0, 720.0).is_some());
+        assert!(rt.dialogue_epoch() > ep1, "dialogue_epoch must bump on line change");
+
+        // Eco mode disables wait pulse immediately and toggles cleanly
+        rt.dispatch(UiAction::ToggleAuto);
+        rt.dispatch(UiAction::ToggleEcoMode);
+        assert!(rt.is_eco_mode());
     }
 }

@@ -17,7 +17,7 @@ use nir_render::{
 };
 use nir_runtime::{HostCommand, Runtime};
 use pak::PakArchive;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,7 +53,20 @@ enum DecodedImage {
 
 struct DecodeRequest {
     pak: Arc<PakArchive>,
+    delta_bases: Arc<HashSet<AssetId>>,
     id: AssetId,
+}
+
+fn collect_delta_bases(pak: &PakArchive) -> Arc<HashSet<AssetId>> {
+    let mut set = HashSet::new();
+    if pak.program.features & FEATURE_DELTA_IMAGE != 0 {
+        for a in &pak.program.assets {
+            if let Some(d) = &a.delta {
+                set.insert(d.base);
+            }
+        }
+    }
+    Arc::new(set)
 }
 
 type BaseCacheEntry = (u32, u32, Arc<Vec<u8>>, u64);
@@ -158,7 +171,7 @@ impl DecodePool {
                             guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    let msg = decode_asset_for_pool(&req.pak, req.id, &bc);
+                    let msg = decode_asset_for_pool(&req.pak, &req.delta_bases, req.id, &bc);
                     if tx.send(msg).is_err() {
                         return;
                     }
@@ -207,6 +220,7 @@ impl DecodePool {
 
 fn decode_asset_for_pool(
     pak: &PakArchive,
+    delta_bases: &HashSet<AssetId>,
     id: AssetId,
     base_cache: &Mutex<BaseRgbaCache>,
 ) -> DecodedImage {
@@ -286,7 +300,8 @@ fn decode_asset_for_pool(
 
     match decode_image(bytes) {
         Ok((width, height, rgba)) => {
-            if pak.program.features & FEATURE_DELTA_IMAGE != 0 && width >= 128 && height >= 128 {
+            // Only clone & cache decoded RGBA when this asset is actually referenced as a delta base!
+            if delta_bases.contains(&id) {
                 if let Ok(mut g) = base_cache.lock() {
                     g.insert(id, width, height, Arc::new(rgba.clone()));
                 }
@@ -391,8 +406,10 @@ fn run_with_event_loop(
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
     let decode_pool = DecodePool::spawn(res_tx, event_loop.create_proxy());
 
+    let delta_bases = collect_delta_bases(&pak);
     let mut app = NativeApp {
         pak,
+        delta_bases,
         runtime,
         storage,
         audio,
@@ -405,6 +422,8 @@ fn run_with_event_loop(
         last_frame: Instant::now(),
         last_reload_check: Instant::now(),
         last_back_press: None,
+        next_wakeup_at: None,
+        was_idle_sleeping: false,
         watch_hot_reload,
         cursor_logical: [0.0, 0.0],
         scale_factor: 1.0,
@@ -424,6 +443,7 @@ fn run_with_event_loop(
 
 struct NativeApp {
     pak: Arc<PakArchive>,
+    delta_bases: Arc<HashSet<AssetId>>,
     runtime: Runtime,
     storage: LocalStorage,
     audio: AudioHost,
@@ -437,6 +457,8 @@ struct NativeApp {
     last_frame: Instant,
     last_reload_check: Instant,
     last_back_press: Option<Instant>,
+    next_wakeup_at: Option<Instant>,
+    was_idle_sleeping: bool,
     watch_hot_reload: bool,
     cursor_logical: [f32; 2],
     scale_factor: f32,
@@ -599,6 +621,7 @@ impl NativeApp {
                                         self.decode_pool.enqueue(
                                             DecodeRequest {
                                                 pak: Arc::clone(&self.pak),
+                                                delta_bases: Arc::clone(&self.delta_bases),
                                                 id,
                                             },
                                             urgent,
@@ -722,11 +745,16 @@ impl NativeApp {
 
     fn tick_and_render(&mut self) {
         let now = Instant::now();
-        let delta_us = now
-            .saturating_duration_since(self.last_frame)
-            .as_micros()
-            .min(100_000) as u64;
+        let delta_us = if self.was_idle_sleeping {
+            self.was_idle_sleeping = false;
+            0
+        } else {
+            now.saturating_duration_since(self.last_frame)
+                .as_micros()
+                .min(6_000_000) as u64
+        };
         self.last_frame = now;
+        self.next_wakeup_at = None;
 
         // Optional live hot-reload watch on `game.nirpak`
         if self.watch_hot_reload
@@ -734,6 +762,7 @@ impl NativeApp {
         {
             self.last_reload_check = now;
             if let Some(new_pak) = self.pak.check_reloaded() {
+                self.delta_bases = collect_delta_bases(&new_pak);
                 self.pak = new_pak;
                 self.pending_decodes.clear();
                 self.decode_pool.clear_pending();
@@ -1016,25 +1045,55 @@ impl ApplicationHandler<UserEvent> for NativeApp {
         self.drain_decoded_images();
         // NOTE: Do NOT poll while waiting on `pending_decodes` — background workers wake us
         // immediately via `EventLoopProxy::send_event(UserEvent::ImageDecoded)`!
-        if self.runtime.dirty || self.runtime.needs_clock() {
+        let now = Instant::now();
+        if self.runtime.dirty {
+            self.next_wakeup_at = None;
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
-            if self.runtime.needs_clock() {
+            if let Some(delay_us) = self.runtime.next_wakeup_delay_us() {
+                let wait_us = delay_us.max(16_000);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(16),
+                    now + Duration::from_micros(wait_us),
                 ));
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
+            return;
+        }
+
+        if let Some(delay_us) = self.runtime.next_wakeup_delay_us() {
+            self.was_idle_sleeping = false;
+            if delay_us <= 16_000 {
+                self.next_wakeup_at = None;
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
+            } else if self.next_wakeup_at.is_some_and(|at| now >= at) {
+                // Exact timer deadline reached -> run one tick now!
+                self.next_wakeup_at = None;
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
+            } else {
+                // Sleep precisely until next Auto / Toast / Typewriter / Timer event (0% CPU between wakes!)
+                let target = self
+                    .next_wakeup_at
+                    .unwrap_or_else(|| now + Duration::from_micros(delay_us.min(6_000_000)));
+                self.next_wakeup_at = Some(target);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(target));
+            }
         } else if self.watch_hot_reload {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(250),
-            ));
+            self.next_wakeup_at = None;
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(250)));
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
         } else {
+            self.next_wakeup_at = None;
+            self.was_idle_sleeping = true;
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }

@@ -139,3 +139,4 @@ ui-style-mode = Interface style
 ui-style-hybrid = Auto Hybrid
 ui-style-modern = Modern Glass
 ui-style-classic = Classic Original
+eco-mode = Eco power saver

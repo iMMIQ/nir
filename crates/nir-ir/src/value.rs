@@ -182,6 +182,9 @@ pub struct Preferences {
     /// Player-selectable UI visual style (`Hybrid` / `Modern` / `Classic`).
     #[serde(default)]
     pub ui_style_mode: crate::UiStyleMode,
+    /// Power-saving Eco Mode (caps DPR, skips offscreen blur & CAS sharpening, trims lookahead).
+    #[serde(default)]
+    pub eco_mode: bool,
     /// Per-character voice volume override (0.0 = muted, 1.0 = full).
     pub character_volumes: BTreeMap<String, f32>,
 }
@@ -218,6 +221,7 @@ impl Default for Preferences {
             image_sharpening: true,
             text_outline: true,
             ui_style_mode: crate::UiStyleMode::default(),
+            eco_mode: false,
             character_volumes: BTreeMap::new(),
         }
     }
