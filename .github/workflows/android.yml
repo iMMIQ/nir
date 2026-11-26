@@ -19,21 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
-      - name: Native build prerequisites
+      - name: Native & Android Gradle prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake openjdk-17-jre-headless
-      - name: Locate NDK and build tools
+          sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake openjdk-17-jdk-headless
+      - name: Locate NDK, platform-35, and build tools
         run: |
           ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)
           if [ -z "$ndk" ]; then
             echo "E_NDK: no NDK under $ANDROID_SDK_ROOT/ndk; install one (r27c or newer)" >&2
             exit 1
           fi
+          if [ ! -f "$ANDROID_SDK_ROOT/platforms/android-35/android.jar" ]; then
+            (yes || true) | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-35" || true
+          fi
+          test -f "$ANDROID_SDK_ROOT/platforms/android-35/android.jar"
           tools="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
             echo "ANDROID_NDK_HOME=$ndk"
             echo "ANDROID_NDK_ROOT=$ndk"
+            echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tools/aarch64-linux-android26-clang"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$tools/llvm-ar"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384"
@@ -61,18 +66,22 @@ jobs:
           test -f dist/sdk/android/lib/arm64-v8a/libplayer.so
           LC_ALL=C readelf -h dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -q 'AArch64'
           LC_ALL=C readelf -lW dist/sdk/android/lib/arm64-v8a/libplayer.so | grep -E 'LOAD.*0x4000'
-      - name: Package independent sample
+      - name: Package Universal NIR Player & independent GameActivity sample
         run: |
           rm -rf target/android-sample
+          ./dist/novelc android-player --out target/android-sample/dist/nir-player.apk
           ./dist/novelc init target/android-sample --title "Android Sample"
           ./dist/novelc check target/android-sample
           ./dist/novelc build target/android-sample --target android --out target/android-sample/dist/Game.apk
-          test -s target/android-sample/dist/Game.apk
-          "$ZIPALIGN" -c -v -P 16 4 target/android-sample/dist/Game.apk
-          badging=$("$AAPT2" dump badging target/android-sample/dist/Game.apk)
-          echo "$badging"
-          echo "$badging" | grep -q "application-icon"
-          "$APKSIGNER" verify --verbose target/android-sample/dist/Game.apk
+          for apk in target/android-sample/dist/nir-player.apk target/android-sample/dist/Game.apk; do
+            test -s "$apk"
+            "$ZIPALIGN" -c -v -P 16 4 "$apk"
+            badging=$("$AAPT2" dump badging "$apk")
+            echo "$badging"
+            echo "$badging" | grep -q "NirGameActivity"
+            echo "$badging" | grep -q "application-icon"
+            "$APKSIGNER" verify --verbose "$apk"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

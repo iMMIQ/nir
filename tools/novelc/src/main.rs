@@ -181,12 +181,13 @@ enum Cmd {
         #[arg(long)]
         face_index: Option<u32>,
     },
-    /// Package a standalone Universal Android `.nirpak` Player APK (built-in Shelf, zero bundled game)
+    /// Package a standalone Universal Android `.nirpak` Player APK or Play Store AAB (`.aab`)
+    /// powered by Jetpack GameActivity (built-in Shelf + SAF picker + ACTION_VIEW, zero bundled game)
     AndroidPlayer {
-        /// Output APK path (default: `dist/nir-player.apk`)
+        /// Output APK or AAB path (default: `dist/nir-player.apk`; use `.aab` for Google Play Bundle)
         #[arg(long, default_value = "dist/nir-player.apk")]
         out: PathBuf,
-        /// Optional EC P-256 signing key PEM path (generated automatically if absent)
+        /// Optional legacy EC P-256 signing key PEM path (used only when `NIR_ANDROID_LEGACY_APK=1`)
         #[arg(long, default_value = "dist/android-player-signing.pem")]
         key: PathBuf,
         #[arg(long)]
@@ -335,8 +336,17 @@ fn main() -> Result<()> {
                 );
             }
             nir_build::package_android_player(&so_path, &out, &key)?;
+            let kind = if out
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("aab"))
+            {
+                "AAB"
+            } else {
+                "APK"
+            };
             println!(
-                "Built Universal Android NIR Player APK: {} ({:.2} MiB)",
+                "Built Universal Android NIR Player {kind}: {} ({:.2} MiB)",
                 out.display(),
                 fs::metadata(&out).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
             );

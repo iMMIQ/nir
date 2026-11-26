@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Stylized luminous book / visual-novel diamond emblem -->
+    <path
+        android:fillColor="#EBF4FF"
+        android:pathData="M34,34 L42,34 L66,64 L66,34 L74,34 L74,74 L66,74 L42,44 L42,74 L34,74 Z" />
+    <path
+        android:fillColor="#6CB4FF"
+        android:pathData="M54,22 L59,27 L54,32 L49,27 Z" />
+</vector>

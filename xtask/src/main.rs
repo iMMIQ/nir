@@ -49,6 +49,34 @@ fn android_ndk_tools() -> Option<(PathBuf, PathBuf)> {
         .next()
 }
 
+fn copy_android_gradle_template(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            "build" | ".gradle" | "local.properties" | "jniLibs" | ".idea"
+        ) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if from.is_dir() {
+            copy_android_gradle_template(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+            #[cfg(unix)]
+            if name_str == "gradlew" {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&to, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     std::env::set_current_dir(root)?;
@@ -202,6 +230,12 @@ fn main() -> Result<()> {
                 )?;
                 if std::env::var_os("NIR_BUILD_ANDROID_X86_64").is_some() {
                     build_android_abi("x86_64-linux-android", "x86_64-linux-android", "x86_64")?;
+                }
+                let gradle_src = Path::new("apps/player-android/android");
+                if gradle_src.join("settings.gradle.kts").is_file() {
+                    let gradle_dst = Path::new("dist/sdk/android/gradle-project");
+                    let _ = fs::remove_dir_all(gradle_dst);
+                    copy_android_gradle_template(gradle_src, gradle_dst)?;
                 }
             } else {
                 println!("SDK: Android player skipped (ANDROID_NDK_HOME not set)");

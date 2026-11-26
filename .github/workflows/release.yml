@@ -21,7 +21,7 @@ jobs:
         with:
           save-cache: 'false'
       - name: Install native build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake openjdk-17-jre-headless
+        run: sudo apt-get update && sudo apt-get install -y clang g++ libclang-dev libasound2-dev cmake openjdk-17-jdk-headless
       - name: Locate NDK and build tools
         run: |
           ndk=$(ls -d "$ANDROID_SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)
@@ -29,10 +29,14 @@ jobs:
             echo "E_NDK: no NDK under $ANDROID_SDK_ROOT/ndk; install one (r27c or newer)" >&2
             exit 1
           fi
+          if [ ! -f "$ANDROID_SDK_ROOT/platforms/android-35/android.jar" ]; then
+            (yes || true) | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-35" || true
+          fi
           tools="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
             echo "ANDROID_NDK_HOME=$ndk"
             echo "ANDROID_NDK_ROOT=$ndk"
+            echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tools/aarch64-linux-android26-clang"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$tools/llvm-ar"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384"

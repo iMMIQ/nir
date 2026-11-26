@@ -1,13 +1,81 @@
-//! Android platform host integrations for `player-native` (pure Rust + minimal JNI, zero Java/DEX!).
+//! Android platform host bridge for `player-native`, backed by Jetpack `GameActivity`
+//! (`org.nir.player.NirGameActivity` in `apps/player-android/android`).
 //!
-//! Preserves `nir-apk`'s `hasCode="false"` zero-Gradle APK architecture while exposing:
-//! - Direct `liblog` (`__android_log_print`) logcat diagnostics
-//! - UI-thread immersive fullscreen + `shortEdges` display cutout setup (`android_on_create`)
-//! - Accurate `WindowInsets` + `DisplayCutout` safe-area probing (API 28+ / 30+)
-//! - Native haptic feedback (`Vibrator` / `VibrationEffect.createOneShot`, API 26+)
-//! - Power-save & low-battery hint (`PowerManager.isPowerSaveMode` + `BatteryManager`)
-//! - Native clipboard copy (`ClipboardManager`)
-//! - Screenshot export to user-accessible external pictures / `MediaStore`
+//! Replaces fragile hand-written JNI reflection with thin strongly-typed calls into
+//! `NirGameActivity.kt` plus an asynchronous Kotlin -> Rust event bus for:
+//! - SAF `.nirpak` picker & `ACTION_VIEW` file open
+//! - SAF `nir-backup-v1` save export (`ACTION_CREATE_DOCUMENT`) & import (`ACTION_OPEN_DOCUMENT`)
+//! - `AudioManager` AudioFocus & `ACTION_AUDIO_BECOMING_NOISY` (headphone unplug auto-pause)
+//! - `WindowInsetsCompat` display cutout & gesture safe-area insets
+//! - `MediaStore` Gallery screenshot saving, `ClipboardManager`, `Vibrator`, and power-save hints
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Asynchronous events pushed from Kotlin (`NirGameActivity` / `NirHostBridge`) into `NativeApp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AndroidHostEvent {
+    /// A `.nirpak` file was picked via SAF or opened via `ACTION_VIEW` and staged to a local path.
+    PakImported { path: PathBuf, launch_now: bool },
+    /// A `nir-backup-v1` save backup JSON was picked via SAF or `ACTION_VIEW` and staged locally.
+    SaveBackupImported(PathBuf),
+    /// System audio focus or noisy-output (`ACTION_AUDIO_BECOMING_NOISY`) changed pause state.
+    AudioFocusPaused(bool),
+    /// Updated physical-pixel safe insets `[left, top, right, bottom]` from `WindowInsetsCompat`.
+    SafeInsetsPx([i32; 4]),
+    /// Informational toast message emitted by the Kotlin host (e.g., SAF export completed / failed).
+    Toast(String),
+}
+
+type EventWaker = Arc<dyn Fn() + Send + Sync>;
+
+struct HostEventBus {
+    queue: VecDeque<AndroidHostEvent>,
+    waker: Option<EventWaker>,
+}
+
+fn event_bus() -> &'static Mutex<HostEventBus> {
+    static BUS: OnceLock<Mutex<HostEventBus>> = OnceLock::new();
+    BUS.get_or_init(|| {
+        Mutex::new(HostEventBus {
+            queue: VecDeque::new(),
+            waker: None,
+        })
+    })
+}
+
+/// Registers a thread-safe waker (backed by `winit::EventLoopProxy`) invoked whenever Kotlin
+/// enqueues a new [`AndroidHostEvent`].
+pub fn set_event_waker(waker: Option<EventWaker>) {
+    let wake_now = {
+        let mut bus = event_bus().lock().unwrap_or_else(|e| e.into_inner());
+        let has_pending = !bus.queue.is_empty();
+        bus.waker = waker;
+        has_pending.then(|| bus.waker.clone()).flatten()
+    };
+    if let Some(w) = wake_now {
+        w();
+    }
+}
+
+/// Enqueues an event from Kotlin (`NirHostBridge`) and wakes the native event loop.
+pub fn push_host_event(ev: AndroidHostEvent) {
+    let waker = {
+        let mut bus = event_bus().lock().unwrap_or_else(|e| e.into_inner());
+        bus.queue.push_back(ev);
+        bus.waker.clone()
+    };
+    if let Some(w) = waker {
+        w();
+    }
+}
+
+/// Drains all pending [`AndroidHostEvent`] items into a caller-owned `Vec`.
+pub fn drain_host_events() -> Vec<AndroidHostEvent> {
+    let mut bus = event_bus().lock().unwrap_or_else(|e| e.into_inner());
+    bus.queue.drain(..).collect()
+}
 
 /// Computes the Android GPU texture cache budget (bytes) based on backend and power state.
 pub fn recommended_android_gpu_budget_bytes(is_gl: bool, eco_or_low_power: bool) -> u64 {
@@ -36,7 +104,7 @@ pub fn log_error(msg: &str) {
 #[cfg(target_os = "android")]
 mod imp {
     use android_activity::AndroidApp;
-    use jni::objects::{JObject, JValue};
+    use jni::objects::{JIntArray, JObject, JValue};
     use jni::{JNIEnv, JavaVM};
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::mem::ManuallyDrop;
@@ -84,12 +152,13 @@ mod imp {
         }
         let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }.ok()?;
         let mut env = vm.attach_current_thread().ok()?;
-        // SAFETY: `activity_ptr` is a borrowed global reference owned by `NativeActivity`.
+        // SAFETY: `activity_ptr` is a borrowed global reference owned by `GameActivity`.
         // Wrapping in `ManuallyDrop` ensures we never call `DeleteLocalRef` on it.
         let activity = ManuallyDrop::new(unsafe { JObject::from_raw(activity_ptr.cast()) });
         match f(&mut env, &activity) {
             Ok(v) => Some(v),
-            Err(_) => {
+            Err(err) => {
+                log_warn(&format!("JNI host call failed: {err}"));
                 let _ = env.exception_clear();
                 None
             }
@@ -103,452 +172,155 @@ mod imp {
         with_raw_activity(app.vm_as_ptr(), app.activity_as_ptr(), f)
     }
 
-    fn sdk_int(env: &mut JNIEnv<'_>) -> i32 {
-        env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
-            .and_then(|v| v.i())
-            .unwrap_or(26)
-    }
-
-    /// Configures immersive sticky fullscreen + `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`.
-    /// Must be invoked on the Java UI thread (e.g. from `android_on_create`).
-    pub fn apply_immersive_on_ui_thread(vm_ptr: *mut c_void, activity_ptr: *mut c_void) {
-        let _ = with_raw_activity(vm_ptr, activity_ptr, |env, activity| {
-            let api = sdk_int(env);
-            let window = env
-                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
-                .l()?;
-            if window.is_null() {
-                return Ok(());
-            }
-
-            // API 28+: Allow rendering into display cutout (notch / punch-hole) area so
-            // `SafeInsets` cleanly frames content edge-to-edge without ugly black sidebars.
-            if api >= 28 {
-                if let Ok(lp_val) = env.call_method(
-                    &window,
-                    "getAttributes",
-                    "()Landroid/view/WindowManager$LayoutParams;",
-                    &[],
-                ) {
-                    if let Ok(lp) = lp_val.l() {
-                        if !lp.is_null() {
-                            // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES = 1
-                            let _ = env.set_field(
-                                &lp,
-                                "layoutInDisplayCutoutMode",
-                                "I",
-                                JValue::Int(1),
-                            );
-                            let _ = env.call_method(
-                                &window,
-                                "setAttributes",
-                                "(Landroid/view/WindowManager$LayoutParams;)V",
-                                &[JValue::Object(&lp)],
-                            );
-                        }
-                    }
-                }
-                let _ = env.exception_clear();
-            }
-
-            let decor = env
-                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
-                .l()?;
-            if decor.is_null() {
-                return Ok(());
-            }
-
-            if api >= 30 {
-                // WindowInsetsController: hide status + navigation bars with transient swipe reveal.
-                let _ = env.call_method(
-                    &window,
-                    "setDecorFitsSystemWindows",
-                    "(Z)V",
-                    &[JValue::Bool(0)],
-                );
-                if let Ok(ctrl_val) = env.call_method(
-                    &decor,
-                    "getWindowInsetsController",
-                    "()Landroid/view/WindowInsetsController;",
-                    &[],
-                ) {
-                    if let Ok(ctrl) = ctrl_val.l() {
-                        if !ctrl.is_null() {
-                            // WindowInsets.Type.systemBars() = 7 (statusBars=1 | navigationBars=2 | captionBar=4)
-                            let bars = env
-                                .call_static_method(
-                                    "android/view/WindowInsets$Type",
-                                    "systemBars",
-                                    "()I",
-                                    &[],
-                                )
-                                .and_then(|v| v.i())
-                                .unwrap_or(7);
-                            let _ = env.call_method(&ctrl, "hide", "(I)V", &[JValue::Int(bars)]);
-                            // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE = 2
-                            let _ = env.call_method(
-                                &ctrl,
-                                "setSystemBarsBehavior",
-                                "(I)V",
-                                &[JValue::Int(2)],
-                            );
-                        }
-                    }
-                }
-                let _ = env.exception_clear();
-            } else {
-                // API 26-29: IMMERSIVE_STICKY | FULLSCREEN | HIDE_NAVIGATION | LAYOUT_*
-                const FLAGS: i32 = 0x0000_0100 // LAYOUT_STABLE
-                    | 0x0000_0200 // LAYOUT_HIDE_NAVIGATION
-                    | 0x0000_0400 // LAYOUT_FULLSCREEN
-                    | 0x0000_0002 // HIDE_NAVIGATION
-                    | 0x0000_0004 // FULLSCREEN
-                    | 0x0000_1000; // IMMERSIVE_STICKY
-                let _ = env.call_method(
-                    &decor,
-                    "setSystemUiVisibility",
-                    "(I)V",
-                    &[JValue::Int(FLAGS)],
-                );
-                let _ = env.exception_clear();
-            }
-            Ok(())
-        });
-    }
-
-    /// Queries real physical pixel safe insets `(left, top, right, bottom)` from
-    /// `DecorView.getRootWindowInsets()` (display cutout + system gesture/bar insets).
+    /// Queries physical pixel safe insets `[left, top, right, bottom]` from `NirGameActivity.querySafeInsetsPx()`.
     pub fn query_window_insets_px(app: &AndroidApp) -> Option<[i32; 4]> {
         with_activity(app, |env, activity| {
-            let api = sdk_int(env);
-            let window = env
-                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+            let obj = env
+                .call_method(activity, "querySafeInsetsPx", "()[I", &[])?
                 .l()?;
-            if window.is_null() {
+            if obj.is_null() {
                 return Ok(None);
             }
-            let decor = env
-                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
-                .l()?;
-            if decor.is_null() {
-                return Ok(None);
+            let arr = JIntArray::from(obj);
+            let mut buf = [0i32; 4];
+            if env.get_array_length(&arr)? >= 4 {
+                env.get_int_array_region(&arr, 0, &mut buf)?;
+                Ok(Some([
+                    buf[0].max(0),
+                    buf[1].max(0),
+                    buf[2].max(0),
+                    buf[3].max(0),
+                ]))
+            } else {
+                Ok(None)
             }
-            let insets = env
-                .call_method(
-                    &decor,
-                    "getRootWindowInsets",
-                    "()Landroid/view/WindowInsets;",
-                    &[],
-                )?
-                .l()?;
-            if insets.is_null() {
-                return Ok(None);
-            }
-
-            let mut left = 0i32;
-            let mut top = 0i32;
-            let mut right = 0i32;
-            let mut bottom = 0i32;
-
-            if api >= 30 {
-                // `displayCutout()` covers camera notches/punch-holes; `systemGestures()` or
-                // `mandatorySystemGestures()` keeps HUD clear of edge-swipe zones while bars are hidden.
-                let mask = env
-                    .call_static_method(
-                        "android/view/WindowInsets$Type",
-                        "displayCutout",
-                        "()I",
-                        &[],
-                    )
-                    .and_then(|v| v.i())
-                    .unwrap_or(128);
-                if let Ok(ins_obj) = env
-                    .call_method(
-                        &insets,
-                        "getInsets",
-                        "(I)Landroid/graphics/Insets;",
-                        &[JValue::Int(mask)],
-                    )
-                    .and_then(|v| v.l())
-                {
-                    if !ins_obj.is_null() {
-                        left = left.max(env.get_field(&ins_obj, "left", "I")?.i().unwrap_or(0));
-                        top = top.max(env.get_field(&ins_obj, "top", "I")?.i().unwrap_or(0));
-                        right = right.max(env.get_field(&ins_obj, "right", "I")?.i().unwrap_or(0));
-                        bottom =
-                            bottom.max(env.get_field(&ins_obj, "bottom", "I")?.i().unwrap_or(0));
-                    }
-                }
-                let _ = env.exception_clear();
-            } else if api >= 28 {
-                if let Ok(cutout) = env
-                    .call_method(
-                        &insets,
-                        "getDisplayCutout",
-                        "()Landroid/view/DisplayCutout;",
-                        &[],
-                    )
-                    .and_then(|v| v.l())
-                {
-                    if !cutout.is_null() {
-                        left = left.max(
-                            env.call_method(&cutout, "getSafeInsetLeft", "()I", &[])?
-                                .i()
-                                .unwrap_or(0),
-                        );
-                        top = top.max(
-                            env.call_method(&cutout, "getSafeInsetTop", "()I", &[])?
-                                .i()
-                                .unwrap_or(0),
-                        );
-                        right = right.max(
-                            env.call_method(&cutout, "getSafeInsetRight", "()I", &[])?
-                                .i()
-                                .unwrap_or(0),
-                        );
-                        bottom = bottom.max(
-                            env.call_method(&cutout, "getSafeInsetBottom", "()I", &[])?
-                                .i()
-                                .unwrap_or(0),
-                        );
-                    }
-                }
-                let _ = env.exception_clear();
-            }
-
-            Ok(Some([left.max(0), top.max(0), right.max(0), bottom.max(0)]))
         })
         .flatten()
     }
 
-    /// Triggers a subtle Android haptic pulse (`duration_ms`, API 26+ `VibrationEffect.createOneShot`).
-    /// Safe no-op if `VIBRATE` permission or hardware vibrator is unavailable.
+    /// Triggers a subtle Android haptic pulse via `NirGameActivity.triggerHaptic(durationMs)`.
     pub fn vibrate(app: &AndroidApp, duration_ms: u16) {
         if duration_ms == 0 {
             return;
         }
         let _ = with_activity(app, |env, activity| {
-            let svc_name = env.new_string("vibrator")?;
-            let vib = env
-                .call_method(
-                    activity,
-                    "getSystemService",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[JValue::Object(&svc_name)],
-                )?
-                .l()?;
-            if vib.is_null() {
-                return Ok(());
-            }
-            let has = env
-                .call_method(&vib, "hasVibrator", "()Z", &[])?
-                .z()
-                .unwrap_or(false);
-            if !has {
-                return Ok(());
-            }
-            // VibrationEffect.createOneShot(long milliseconds, int amplitude)
-            // DEFAULT_AMPLITUDE = -1 (use subtle ~64 amplitude for crisp UI ticks on amplitude-capable motors).
-            let has_amp = env
-                .call_method(&vib, "hasAmplitudeControl", "()Z", &[])
-                .and_then(|v| v.z())
-                .unwrap_or(false);
-            let amp: i32 = if has_amp { 72 } else { -1 };
-            let effect = env
-                .call_static_method(
-                    "android/os/VibrationEffect",
-                    "createOneShot",
-                    "(JI)Landroid/os/VibrationEffect;",
-                    &[
-                        JValue::Long(i64::from(duration_ms.clamp(5, 45))),
-                        JValue::Int(amp),
-                    ],
-                )?
-                .l()?;
-            if !effect.is_null() {
-                let _ = env.call_method(
-                    &vib,
-                    "vibrate",
-                    "(Landroid/os/VibrationEffect;)V",
-                    &[JValue::Object(&effect)],
-                );
-            }
+            env.call_method(
+                activity,
+                "triggerHaptic",
+                "(I)V",
+                &[JValue::Int(i32::from(duration_ms.clamp(5, 45)))],
+            )?;
             Ok(())
         });
     }
 
-    /// Checks whether Android is in Battery Saver mode (`PowerManager.isPowerSaveMode()`)
-    /// or low battery (< 20% via `BatteryManager.BATTERY_PROPERTY_CAPACITY`).
+    /// Checks Android Battery Saver / low battery (< 20%) via `NirGameActivity.isLowPowerMode()`.
     pub fn read_low_power_hint(app: &AndroidApp) -> bool {
         with_activity(app, |env, activity| {
-            // 1. PowerManager.isPowerSaveMode()
-            let pm_name = env.new_string("power")?;
-            if let Ok(pm) = env
-                .call_method(
-                    activity,
-                    "getSystemService",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[JValue::Object(&pm_name)],
-                )
-                .and_then(|v| v.l())
-            {
-                if !pm.is_null()
-                    && env
-                        .call_method(&pm, "isPowerSaveMode", "()Z", &[])
-                        .and_then(|v| v.z())
-                        .unwrap_or(false)
-                {
-                    return Ok(true);
-                }
-            }
-            let _ = env.exception_clear();
-
-            // 2. BatteryManager.getIntProperty(BATTERY_PROPERTY_CAPACITY = 4)
-            let bm_name = env.new_string("batterymanager")?;
-            if let Ok(bm) = env
-                .call_method(
-                    activity,
-                    "getSystemService",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[JValue::Object(&bm_name)],
-                )
-                .and_then(|v| v.l())
-            {
-                if !bm.is_null() {
-                    let cap = env
-                        .call_method(&bm, "getIntProperty", "(I)I", &[JValue::Int(4)])
-                        .and_then(|v| v.i())
-                        .unwrap_or(100);
-                    if (1..20).contains(&cap) {
-                        return Ok(true);
-                    }
-                }
-            }
-            let _ = env.exception_clear();
-            Ok(false)
+            env.call_method(activity, "isLowPowerMode", "()Z", &[])?
+                .z()
         })
         .unwrap_or(false)
     }
 
-    /// Copies text to Android system clipboard (`ClipboardManager.setPrimaryClip`).
+    /// Copies text to Android system clipboard via `NirGameActivity.copyToClipboard(text)`.
     pub fn copy_to_clipboard(app: &AndroidApp, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
         with_activity(app, |env, activity| {
-            let svc = env.new_string("clipboard")?;
-            let cm = env
-                .call_method(
-                    activity,
-                    "getSystemService",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[JValue::Object(&svc)],
-                )?
-                .l()?;
-            if cm.is_null() {
-                return Ok(false);
-            }
-            let label = env.new_string("NIR Dialogue")?;
-            let body = env.new_string(text)?;
-            let clip = env
-                .call_static_method(
-                    "android/content/ClipData",
-                    "newPlainText",
-                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
-                    &[JValue::Object(&label), JValue::Object(&body)],
-                )?
-                .l()?;
-            if clip.is_null() {
-                return Ok(false);
-            }
+            let jtext = env.new_string(text)?;
             env.call_method(
-                &cm,
-                "setPrimaryClip",
-                "(Landroid/content/ClipData;)V",
-                &[JValue::Object(&clip)],
+                activity,
+                "copyToClipboard",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&jtext)],
+            )?
+            .z()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Saves a PNG screenshot into Android Gallery (`MediaStore`) via `NirGameActivity.saveScreenshotToGallery`.
+    pub fn save_screenshot_mediastore(app: &AndroidApp, filename: &str, png_bytes: &[u8]) -> bool {
+        if png_bytes.is_empty() {
+            return false;
+        }
+        with_activity(app, |env, activity| {
+            let jname = env.new_string(filename)?;
+            let jbytes = env.byte_array_from_slice(png_bytes)?;
+            env.call_method(
+                activity,
+                "saveScreenshotToGallery",
+                "(Ljava/lang/String;[B)Z",
+                &[JValue::Object(&jname), JValue::Object(&jbytes.into())],
+            )?
+            .z()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Launches Android SAF file picker (`ACTION_OPEN_DOCUMENT`) to import & open a `.nirpak` package.
+    pub fn launch_nirpak_picker(app: &AndroidApp) -> bool {
+        with_activity(app, |env, activity| {
+            env.call_method(activity, "launchNirpakPicker", "()V", &[])?;
+            Ok(true)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Launches Android SAF save creator (`ACTION_CREATE_DOCUMENT`) to export a `nir-backup-v1` JSON.
+    pub fn launch_save_export(
+        app: &AndroidApp,
+        suggested_filename: &str,
+        json_payload: &str,
+    ) -> bool {
+        with_activity(app, |env, activity| {
+            let jname = env.new_string(suggested_filename)?;
+            let jbody = env.new_string(json_payload)?;
+            env.call_method(
+                activity,
+                "launchSaveExport",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&jname), JValue::Object(&jbody)],
             )?;
             Ok(true)
         })
         .unwrap_or(false)
     }
 
-    /// Saves a PNG screenshot into Android's shared Gallery (`MediaStore.Images.Media` on API 29+),
-    /// returning `true` on success (caller falls back to external app `screenshots/` directory).
-    pub fn save_screenshot_mediastore(app: &AndroidApp, filename: &str, png_bytes: &[u8]) -> bool {
-        if png_bytes.is_empty() {
-            return false;
-        }
+    /// Launches Android SAF file picker (`ACTION_OPEN_DOCUMENT`) to import a `nir-backup-v1` JSON.
+    pub fn launch_save_import(app: &AndroidApp) -> bool {
         with_activity(app, |env, activity| {
-            if sdk_int(env) < 29 {
-                return Ok(false);
-            }
-            let resolver = env
-                .call_method(
-                    activity,
-                    "getContentResolver",
-                    "()Landroid/content/ContentResolver;",
-                    &[],
-                )?
-                .l()?;
-            if resolver.is_null() {
-                return Ok(false);
-            }
-            let values = env.new_object("android/content/ContentValues", "()V", &[])?;
-            let put_str = |env: &mut JNIEnv<'_>, k: &str, v: &str| -> jni::errors::Result<()> {
-                let jk = env.new_string(k)?;
-                let jv = env.new_string(v)?;
-                env.call_method(
-                    &values,
-                    "put",
-                    "(Ljava/lang/String;Ljava/lang/String;)V",
-                    &[JValue::Object(&jk), JValue::Object(&jv)],
-                )?;
-                Ok(())
-            };
-            put_str(env, "_display_name", filename)?;
-            put_str(env, "mime_type", "image/png")?;
-            put_str(env, "relative_path", "Pictures/NIR")?;
-
-            let external_uri = env
-                .get_static_field(
-                    "android/provider/MediaStore$Images$Media",
-                    "EXTERNAL_CONTENT_URI",
-                    "Landroid/net/Uri;",
-                )?
-                .l()?;
-            if external_uri.is_null() {
-                return Ok(false);
-            }
-            let uri = env
-                .call_method(
-                    &resolver,
-                    "insert",
-                    "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
-                    &[JValue::Object(&external_uri), JValue::Object(&values)],
-                )?
-                .l()?;
-            if uri.is_null() {
-                return Ok(false);
-            }
-            let stream = env
-                .call_method(
-                    &resolver,
-                    "openOutputStream",
-                    "(Landroid/net/Uri;)Ljava/io/OutputStream;",
-                    &[JValue::Object(&uri)],
-                )?
-                .l()?;
-            if stream.is_null() {
-                return Ok(false);
-            }
-            let jbytes = env.byte_array_from_slice(png_bytes)?;
-            let write_res =
-                env.call_method(&stream, "write", "([B)V", &[JValue::Object(&jbytes.into())]);
-            let _ = env.call_method(&stream, "close", "()V", &[]);
-            write_res?;
+            env.call_method(activity, "launchSaveImport", "()V", &[])?;
             Ok(true)
         })
         .unwrap_or(false)
+    }
+
+    /// Requests system Android AudioFocus when active playback resumes.
+    pub fn request_audio_focus(app: &AndroidApp) -> bool {
+        with_activity(app, |env, activity| {
+            env.call_method(activity, "requestAudioFocus", "()Z", &[])?
+                .z()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Releases system Android AudioFocus when the activity suspends.
+    pub fn abandon_audio_focus(app: &AndroidApp) {
+        let _ = with_activity(app, |env, activity| {
+            env.call_method(activity, "abandonAudioFocus", "()V", &[])?;
+            Ok(())
+        });
+    }
+
+    /// Notifies `NirGameActivity` that Rust is ready to receive any cold-start `ACTION_VIEW` intent.
+    pub fn consume_initial_pending_intent(app: &AndroidApp) {
+        let _ = with_activity(app, |env, activity| {
+            env.call_method(activity, "consumeInitialPendingIntent", "()V", &[])?;
+            Ok(())
+        });
     }
 }
 
@@ -577,5 +349,29 @@ mod tests {
             recommended_android_gpu_budget_bytes(true, true),
             64 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn host_event_bus_delivers_and_wakes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let w = Arc::clone(&wakes);
+        set_event_waker(Some(Arc::new(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        })));
+        let _ = drain_host_events();
+        let before = wakes.load(Ordering::SeqCst);
+        push_host_event(AndroidHostEvent::AudioFocusPaused(true));
+        push_host_event(AndroidHostEvent::Toast("SAF OK".into()));
+        assert!(wakes.load(Ordering::SeqCst) >= before + 2);
+        let drained = drain_host_events();
+        assert_eq!(
+            drained,
+            vec![
+                AndroidHostEvent::AudioFocusPaused(true),
+                AndroidHostEvent::Toast("SAF OK".into()),
+            ]
+        );
+        set_event_waker(None);
     }
 }

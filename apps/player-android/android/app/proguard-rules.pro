@@ -1,0 +1,3 @@
+-keep class org.nir.player.NirHostBridge { *; }
+-keep class org.nir.player.NirGameActivity { *; }
+-keep class com.google.androidgamesdk.** { *; }

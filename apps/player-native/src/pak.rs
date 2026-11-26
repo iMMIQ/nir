@@ -9,7 +9,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 enum Backing {
-    Mmap(Mmap),
+    Mmap {
+        mmap: Mmap,
+        /// Byte offset inside `mmap` where the `.nirpak` payload begins (allows zero-copy
+        /// page-aligned mapping of arbitrary APK asset offsets on 4 KiB & 16 KiB page devices!).
+        start: usize,
+        len: usize,
+    },
     Bytes(Vec<u8>),
 }
 
@@ -17,7 +23,7 @@ impl Backing {
     #[inline]
     fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Mmap(m) => m.as_ref(),
+            Self::Mmap { mmap, start, len } => &mmap.as_ref()[*start..*start + *len],
             Self::Bytes(b) => b.as_slice(),
         }
     }
@@ -42,29 +48,59 @@ impl PakArchive {
         // replaces the directory entry while the existing mmap keeps referencing the old inode.
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("memory-mapping `{}`", path.display()))?;
+        let len = mmap.len();
         let (program, media_base) = decode_nirpak_header(mmap.as_ref())
             .map_err(|e| anyhow::anyhow!("decoding nirpak header: {e}"))?;
         Ok(Self {
             source_path: Some(path.to_path_buf()),
             last_modified,
-            backing: Backing::Mmap(mmap),
+            backing: Backing::Mmap {
+                mmap,
+                start: 0,
+                len,
+            },
             media_base,
             program: Arc::new(program),
         })
     }
 
     /// Memory-maps a sub-region `[offset..offset+len]` of an open file descriptor
-    /// (used on Android to `mmap` page-aligned `assets/game.nirpak` directly from the APK!).
+    /// (used on Android to `mmap` uncompressed `assets/game.nirpak` directly from the APK!).
+    /// Automatically rounds the mapping base down to the OS page boundary (4 KiB or 16 KiB)
+    /// so zero-copy `mmap` succeeds even when Gradle aligns APK assets to 4 bytes!
     pub fn from_fd_region(file: &File, offset: u64, len: usize) -> Result<Self> {
+        #[cfg(unix)]
+        let page_size = {
+            let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if ps > 0 {
+                ps as u64
+            } else {
+                16384u64
+            }
+        };
+        #[cfg(not(unix))]
+        let page_size = 4096u64;
+
+        let aligned_offset = offset & !(page_size - 1);
+        let delta = (offset - aligned_offset) as usize;
+        let map_len = delta
+            .checked_add(len)
+            .context("APK game.nirpak region overflow")?;
+
         // SAFETY: The APK file is immutable once installed by Android PackageManager.
-        let mmap = unsafe { MmapOptions::new().offset(offset).len(len).map(file) }
+        let mmap = unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(file) }
             .context("memory-mapping APK game.nirpak region")?;
-        let (program, media_base) = decode_nirpak_header(mmap.as_ref())
+        let slice = &mmap.as_ref()[delta..delta + len];
+        let (program, media_base) = decode_nirpak_header(slice)
             .map_err(|e| anyhow::anyhow!("decoding nirpak header: {e}"))?;
         Ok(Self {
             source_path: None,
             last_modified: None,
-            backing: Backing::Mmap(mmap),
+            backing: Backing::Mmap {
+                mmap,
+                start: delta,
+                len,
+            },
             media_base,
             program: Arc::new(program),
         })

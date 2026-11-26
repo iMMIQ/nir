@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 [target.'cfg(target_os = "android")'.dependencies]
 player-native = { path = "../player-native" }
 android-activity.workspace = true
+jni = "0.21"

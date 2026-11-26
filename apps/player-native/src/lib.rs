@@ -57,6 +57,8 @@ enum UserEvent {
     MediaKey,
     #[cfg(target_os = "android")]
     VideoFrame,
+    #[cfg(target_os = "android")]
+    AndroidHostEvent,
 }
 
 enum DecodedImage {
@@ -724,6 +726,16 @@ fn run_with_event_loop(
     }
 
     let event_proxy = event_loop.create_proxy();
+    #[cfg(target_os = "android")]
+    {
+        let host_proxy = event_proxy.clone();
+        android_host::set_event_waker(Some(Arc::new(move || {
+            let _ = host_proxy.send_event(UserEvent::AndroidHostEvent);
+        })));
+        if let Some(app) = &android_app {
+            android_host::consume_initial_pending_intent(app);
+        }
+    }
     let (res_tx, res_rx) = mpsc::channel::<DecodedImage>();
     let decode_pool = DecodePool::spawn(res_tx, event_proxy.clone());
     let gp_proxy = event_proxy.clone();
@@ -803,8 +815,14 @@ fn run_with_event_loop(
         last_low_power_hint: false,
         #[cfg(target_os = "android")]
         last_gpu_budget: 0,
+        #[cfg(target_os = "android")]
+        host_in_background: false,
+        #[cfg(target_os = "android")]
+        audio_focus_paused: false,
     };
     event_loop.run_app(&mut app).context("winit event loop")?;
+    #[cfg(target_os = "android")]
+    android_host::set_event_waker(None);
     app.save_and_flush_on_exit();
     if let Some(err) = app.init_error.take() {
         return Err(err);
@@ -875,6 +893,10 @@ struct NativeApp {
     last_low_power_hint: bool,
     #[cfg(target_os = "android")]
     last_gpu_budget: u64,
+    #[cfg(target_os = "android")]
+    host_in_background: bool,
+    #[cfg(target_os = "android")]
+    audio_focus_paused: bool,
 }
 
 impl NativeApp {
@@ -1501,8 +1523,87 @@ impl NativeApp {
                         self.switch_pak_file(&picked);
                     }
                 }
+                #[cfg(target_os = "android")]
+                {
+                    if let Some(app) = &self.android_app {
+                        if !android_host::launch_nirpak_picker(app) {
+                            if let Some(shelf) = &mut self.shelf {
+                                shelf.show_toast("系统文件选择器不可用", 2600);
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn sync_android_audio_pause(&mut self) {
+        let paused = self.host_in_background || self.audio_focus_paused;
+        self.audio.set_host_paused(paused);
+        self.android_video.set_paused(paused);
+    }
+
+    #[cfg(target_os = "android")]
+    fn drain_android_host_events(&mut self) -> bool {
+        let events = android_host::drain_host_events();
+        if events.is_empty() {
+            return false;
+        }
+        for ev in events {
+            match ev {
+                android_host::AndroidHostEvent::PakImported { path, launch_now } => {
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.record_recent(&path);
+                        shelf.rescan();
+                    }
+                    if launch_now {
+                        self.switch_pak_file(&path);
+                    } else if self.showing_shelf {
+                        if let Some(shelf) = &mut self.shelf {
+                            shelf.show_toast("已导入 .nirpak 作品至书架", 2600);
+                        }
+                    } else {
+                        self.runtime.show_toast("已导入 .nirpak 作品至书架", 2600);
+                    }
+                }
+                android_host::AndroidHostEvent::SaveBackupImported(path) => {
+                    if !self.showing_shelf {
+                        self.import_backup_from_path(&path);
+                    } else if let Some(shelf) = &mut self.shelf {
+                        shelf.show_toast("请先打开对应作品后再导入存档备份", 3200);
+                    }
+                }
+                android_host::AndroidHostEvent::AudioFocusPaused(paused) => {
+                    self.audio_focus_paused = paused;
+                    self.sync_android_audio_pause();
+                }
+                android_host::AndroidHostEvent::SafeInsetsPx([l, t, r, b]) => {
+                    let scale = self.scale_factor.max(0.5);
+                    let insets = nir_ui::SafeInsets {
+                        left: (l.max(0) as f32) / scale,
+                        top: (t.max(0) as f32) / scale,
+                        right: (r.max(0) as f32) / scale,
+                        bottom: (b.max(0) as f32) / scale,
+                    };
+                    self.runtime.set_safe_insets(insets);
+                    if let Some(shelf) = &mut self.shelf {
+                        shelf.safe_insets = insets;
+                        shelf.dirty = true;
+                    }
+                }
+                android_host::AndroidHostEvent::Toast(msg) => {
+                    if self.showing_shelf {
+                        if let Some(shelf) = &mut self.shelf {
+                            shelf.show_toast(msg, 3000);
+                        }
+                    } else {
+                        self.runtime.show_toast(msg, 3000);
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn export_saves_via_host(&mut self) {
@@ -1511,20 +1612,42 @@ impl NativeApp {
         };
         let game_id = self.pak.program.meta.game_id.clone();
         let slot_count = self.pak.program.meta.save_slots;
+        let stem = desktop::safe_filename_stem(&game_id);
+        let default_name = format!("{stem}-saves-backup.json");
 
         #[cfg(target_os = "android")]
-        let dest = self
-            .android_app
-            .as_ref()
-            .and_then(|a| a.external_data_path())
-            .map(|d| d.join("saves-backup.json"))
-            .unwrap_or_else(|| storage.screenshots_dir().join("saves-backup.json"));
+        {
+            match storage.export_backup_json_string(&game_id, slot_count) {
+                Ok((n, json)) => {
+                    let launched = self.android_app.as_ref().is_some_and(|app| {
+                        android_host::launch_save_export(app, &default_name, &json)
+                    });
+                    if launched {
+                        self.runtime
+                            .show_toast(format!("请选择保存位置以导出 {n} 个存档"), 2400);
+                        return;
+                    }
+                    // Fallback to app external directory if SAF launcher is unavailable
+                    let dest = self
+                        .android_app
+                        .as_ref()
+                        .and_then(|a| a.external_data_path())
+                        .map(|d| d.join(&default_name))
+                        .unwrap_or_else(|| storage.screenshots_dir().join(&default_name));
+                    match storage.export_backup_json(&game_id, slot_count, &dest) {
+                        Ok(n) => self
+                            .runtime
+                            .show_toast(format!("已导出 {n} 个存档至 {default_name}"), 3000),
+                        Err(e) => self.runtime.show_toast(format!("导出失败：{e}"), 3200),
+                    }
+                }
+                Err(e) => self.runtime.show_toast(format!("导出失败：{e}"), 3200),
+            }
+        }
 
         #[cfg(not(target_os = "android"))]
-        let dest = {
-            let stem = desktop::safe_filename_stem(&game_id);
-            let default_name = format!("{stem}-saves-backup.json");
-            match rfd::FileDialog::new()
+        {
+            let dest = match rfd::FileDialog::new()
                 .set_title("导出跨端存档备份 (nir-backup-v1)")
                 .set_file_name(&default_name)
                 .add_filter("NIR Save Backup", &["json"])
@@ -1532,27 +1655,32 @@ impl NativeApp {
             {
                 Some(p) => p,
                 None => return,
-            }
-        };
+            };
 
-        match storage.export_backup_json(&game_id, slot_count, &dest) {
-            Ok(n) => {
-                let name = dest
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("saves-backup.json");
-                self.runtime
-                    .show_toast(format!("已导出 {n} 个存档至 {name}"), 3000);
-            }
-            Err(e) => {
-                self.runtime.show_toast(format!("导出失败：{e}"), 3200);
+            match storage.export_backup_json(&game_id, slot_count, &dest) {
+                Ok(n) => {
+                    let name = dest
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("saves-backup.json");
+                    self.runtime
+                        .show_toast(format!("已导出 {n} 个存档至 {name}"), 3000);
+                }
+                Err(e) => {
+                    self.runtime.show_toast(format!("导出失败：{e}"), 3200);
+                }
             }
         }
     }
 
     fn import_saves_via_host(&mut self) {
         #[cfg(target_os = "android")]
-        let src = {
+        {
+            if let Some(app) = &self.android_app {
+                if android_host::launch_save_import(app) {
+                    return;
+                }
+            }
             let Some(ext_dir) = self
                 .android_app
                 .as_ref()
@@ -1563,30 +1691,32 @@ impl NativeApp {
             };
             let import_file = ext_dir.join("saves-import.json");
             let backup_file = ext_dir.join("saves-backup.json");
-            if import_file.is_file() {
+            let src = if import_file.is_file() {
                 import_file
             } else if backup_file.is_file() {
                 backup_file
             } else {
                 self.runtime.show_toast(
-                    "请将 nir-backup-v1 放入外部目录 saves-import.json 或 saves-backup.json",
+                    "系统文件选择器不可用；可将 nir-backup-v1 放入外部目录 saves-import.json",
                     3600,
                 );
                 return;
-            }
-        };
+            };
+            self.import_backup_from_path(&src);
+        }
 
         #[cfg(not(target_os = "android"))]
-        let src = match rfd::FileDialog::new()
-            .set_title("导入跨端存档备份 (nir-backup-v1)")
-            .add_filter("NIR Save Backup", &["json"])
-            .pick_file()
         {
-            Some(p) => p,
-            None => return,
-        };
-
-        self.import_backup_from_path(&src);
+            let src = match rfd::FileDialog::new()
+                .set_title("导入跨端存档备份 (nir-backup-v1)")
+                .add_filter("NIR Save Backup", &["json"])
+                .pick_file()
+            {
+                Some(p) => p,
+                None => return,
+            };
+            self.import_backup_from_path(&src);
+        }
     }
 
     fn import_backup_from_path(&mut self, src: &Path) {
@@ -2338,6 +2468,8 @@ impl ApplicationHandler<UserEvent> for NativeApp {
             UserEvent::GamepadInput | UserEvent::MediaKey => self.drain_gamepad_and_media_events(),
             #[cfg(target_os = "android")]
             UserEvent::VideoFrame => true,
+            #[cfg(target_os = "android")]
+            UserEvent::AndroidHostEvent => self.drain_android_host_events(),
         };
         if should_redraw {
             if let Some(win) = &self.window {
@@ -2349,9 +2481,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.runtime.set_host_paused(false);
         self.audio.reset_stream_backoff();
-        self.audio.set_host_paused(false);
         #[cfg(target_os = "android")]
-        self.android_video.set_paused(false);
+        {
+            self.host_in_background = false;
+            if let Some(app) = &self.android_app {
+                let _ = android_host::request_audio_focus(app);
+            }
+            self.sync_android_audio_pause();
+        }
+        #[cfg(not(target_os = "android"))]
+        self.audio.set_host_paused(false);
         if self.window.is_none() {
             let (title, sw, sh) = if self.showing_shelf {
                 ("NIR 书架", 1080u32, 680u32)
@@ -2442,9 +2581,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.runtime.set_host_paused(true);
-        self.audio.set_host_paused(true);
         #[cfg(target_os = "android")]
-        self.android_video.set_paused(true);
+        {
+            self.host_in_background = true;
+            if let Some(app) = &self.android_app {
+                android_host::abandon_audio_focus(app);
+            }
+            self.sync_android_audio_pause();
+        }
+        #[cfg(not(target_os = "android"))]
+        self.audio.set_host_paused(true);
         self.sync_wake_lock();
         if !self.showing_shelf {
             self.runtime.emit_autosave();
@@ -2485,11 +2631,16 @@ impl ApplicationHandler<UserEvent> for NativeApp {
                     self.runtime.pointer_cancel();
                     self.runtime.dispatch(UiAction::HoldSkip(false));
                 }
-                if cfg!(target_os = "android") {
+                #[cfg(target_os = "android")]
+                {
                     self.runtime.set_host_paused(!focused);
-                    self.audio.set_host_paused(!focused);
-                    #[cfg(target_os = "android")]
-                    self.android_video.set_paused(!focused);
+                    self.host_in_background = !focused;
+                    if focused {
+                        if let Some(app) = &self.android_app {
+                            let _ = android_host::request_audio_focus(app);
+                        }
+                    }
+                    self.sync_android_audio_pause();
                     self.sync_wake_lock();
                     if !focused && !self.showing_shelf {
                         self.runtime.emit_autosave();
@@ -2870,6 +3021,12 @@ impl ApplicationHandler<UserEvent> for NativeApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "android")]
+        if self.drain_android_host_events() {
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
+        }
         if self.showing_shelf {
             let wake_us = self
                 .shelf

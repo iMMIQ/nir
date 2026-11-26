@@ -830,9 +830,169 @@ fn build_android_launcher_icon_png(
     Some(png)
 }
 
-/// Packages a zero-Gradle signed Android APK with `assets/game.nirpak` and `lib/*/libplayer.so`
-/// stored uncompressed and 16 KiB-aligned (Android 15+ 16 KB page-size compatible!) plus
-/// auto-generated `resources.arsc` + launcher icon (`@mipmap/ic_launcher`).
+fn map_android_orientation_manifest(name: Option<&str>) -> &'static str {
+    match name
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "landscape" => "landscape",
+        "portrait" => "portrait",
+        "sensorlandscape" | "sensor_landscape" | "sensor-landscape" => "sensorLandscape",
+        "sensorportrait" | "sensor_portrait" | "sensor-portrait" => "sensorPortrait",
+        "fullsensor" | "full_sensor" | "full-sensor" | "auto" => "fullSensor",
+        _ => "unspecified",
+    }
+}
+
+fn find_android_gradle_project(libplayer_so: &Path) -> Option<PathBuf> {
+    let has_gradle = |dir: &Path| {
+        dir.join("settings.gradle.kts").is_file()
+            && (dir.join("gradlew").is_file() || dir.join("gradlew.bat").is_file())
+    };
+    if let Some(env_dir) = std::env::var_os("NIR_ANDROID_GRADLE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if has_gradle(&p) {
+            return Some(p);
+        }
+    }
+    // Check sibling `<sdk>/android/gradle-project` next to `<sdk>/android/lib/arm64-v8a/libplayer.so`
+    if let Some(android_sdk_dir) = libplayer_so
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        let staged = android_sdk_dir.join("gradle-project");
+        if has_gradle(&staged) {
+            return Some(staged);
+        }
+    }
+    let cwd_candidate = PathBuf::from("apps/player-android/android");
+    if has_gradle(&cwd_candidate) {
+        return Some(cwd_candidate);
+    }
+    let repo_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/player-android/android");
+    if has_gradle(&repo_candidate) {
+        return Some(repo_candidate);
+    }
+    None
+}
+
+struct GradleBuildSpec<'a> {
+    gradle_dir: &'a Path,
+    jni_libs_dir: &'a Path,
+    out_artifact: &'a Path,
+    app_id: &'a str,
+    app_label: &'a str,
+    version_code: u32,
+    version_name: &'a str,
+    min_sdk: u32,
+    target_sdk: u32,
+    orientation: &'a str,
+    pak_path: Option<&'a Path>,
+    icon_path: Option<&'a Path>,
+}
+
+fn run_android_gradle_build(spec: &GradleBuildSpec<'_>) -> Result<()> {
+    let gradle_dir = fs::canonicalize(spec.gradle_dir)
+        .with_context(|| format!("resolving Android Gradle project `{}`", spec.gradle_dir.display()))?;
+    let jni_libs_dir = fs::canonicalize(spec.jni_libs_dir)
+        .with_context(|| format!("resolving Android jniLibs `{}`", spec.jni_libs_dir.display()))?;
+    let is_aab = spec
+        .out_artifact
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("aab"));
+    let task = if is_aab {
+        ":app:bundleRelease"
+    } else {
+        ":app:assembleRelease"
+    };
+
+    let gradlew = if cfg!(windows) {
+        gradle_dir.join("gradlew.bat")
+    } else {
+        gradle_dir.join("gradlew")
+    };
+    let mut cmd = std::process::Command::new(&gradlew);
+    cmd.current_dir(&gradle_dir)
+        .arg("--no-daemon")
+        .arg(task)
+        .arg(format!("-PnirAppId={}", spec.app_id))
+        .arg(format!("-PnirAppLabel={}", spec.app_label))
+        .arg(format!("-PnirVersionCode={}", spec.version_code))
+        .arg(format!("-PnirVersionName={}", spec.version_name))
+        .arg(format!("-PnirMinSdk={}", spec.min_sdk))
+        .arg(format!("-PnirTargetSdk={}", spec.target_sdk))
+        .arg(format!("-PnirOrientation={}", spec.orientation))
+        .arg(format!("-PnirJniLibsDir={}", jni_libs_dir.display()));
+
+    if let Some(pak) = spec.pak_path {
+        let abs = fs::canonicalize(pak).unwrap_or_else(|_| pak.to_path_buf());
+        cmd.arg(format!("-PnirPakPath={}", abs.display()));
+    }
+    if let Some(icon) = spec.icon_path {
+        let abs = fs::canonicalize(icon).unwrap_or_else(|_| icon.to_path_buf());
+        cmd.arg(format!("-PnirIconPath={}", abs.display()));
+    }
+    if let Ok(store) = std::env::var("NIR_ANDROID_KEYSTORE") {
+        if !store.trim().is_empty() {
+            cmd.arg(format!("-PnirStoreFile={store}"));
+            if let Ok(pw) = std::env::var("NIR_ANDROID_KEYSTORE_PASSWORD") {
+                cmd.arg(format!("-PnirStorePassword={pw}"));
+            }
+            if let Ok(alias) = std::env::var("NIR_ANDROID_KEY_ALIAS") {
+                cmd.arg(format!("-PnirKeyAlias={alias}"));
+            }
+            if let Ok(kpw) = std::env::var("NIR_ANDROID_KEY_PASSWORD") {
+                cmd.arg(format!("-PnirKeyPassword={kpw}"));
+            }
+        }
+    }
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("executing Gradle `{}`", gradlew.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "Android Gradle build (`{task}`) failed with exit status {status}; ensure ANDROID_SDK_ROOT (with platforms;android-35) and JDK 17+ are configured"
+        );
+    }
+
+    let produced = if is_aab {
+        gradle_dir.join("app/build/outputs/bundle/release/app-release.aab")
+    } else {
+        gradle_dir.join("app/build/outputs/apk/release/app-release.apk")
+    };
+    if !produced.is_file() {
+        anyhow::bail!(
+            "Gradle succeeded but expected output `{}` was not found",
+            produced.display()
+        );
+    }
+    if let Some(parent) = spec.out_artifact.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::copy(&produced, spec.out_artifact).with_context(|| {
+        format!(
+            "copying Gradle artifact `{}` -> `{}`",
+            produced.display(),
+            spec.out_artifact.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Packages a signed Android APK or Google Play App Bundle (`.aab`) powered by Jetpack
+/// `GameActivity` (`apps/player-android/android` Gradle project), embedding `assets/game.nirpak`
+/// uncompressed (`noCompress`) with 16 KiB ELF page alignment and Adaptive Icon support.
+///
+/// Set `NIR_ANDROID_LEGACY_APK=1` only when packaging a legacy `native-activity` `libplayer.so`
+/// via the pure-Rust `nir-apk` fallback.
 pub fn package_android(
     root: &Path,
     built: &BuiltBundle,
@@ -844,15 +1004,6 @@ pub fn package_android(
         toml::from_str(&fs::read_to_string(&manifest_path)?).unwrap_or_default()
     } else {
         ProjectManifest::default()
-    };
-
-    let key_path = root.join("android-signing.pem");
-    let key = if key_path.is_file() {
-        nir_apk::key::SigningIdentity::load(&key_path)?
-    } else {
-        let k = nir_apk::key::SigningIdentity::generate()?;
-        k.save_new(&key_path)?;
-        nir_apk::key::SigningIdentity::load(&key_path)?
     };
 
     let package_name = if let Some(custom) = manifest
@@ -880,13 +1031,67 @@ pub fn package_android(
         format!("org.nir.g{pkg_suffix}")
     };
 
-    const ICON_APK_PATH: &str = "res/mipmap-xxxhdpi/ic_launcher.png";
     let icon_png = build_android_launcher_icon_png(root, &manifest, built);
+
+    if std::env::var_os("NIR_ANDROID_LEGACY_APK").is_none() {
+        if let Some(gradle_dir) = find_android_gradle_project(libplayer_so) {
+            let jni_libs_dir = libplayer_so
+                .parent()
+                .and_then(Path::parent)
+                .context("resolving Android jniLibs parent directory from libplayer.so")?;
+            let stage_dir = std::env::temp_dir().join(format!(
+                "nir-android-stage-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&stage_dir)?;
+            let staged_pak = stage_dir.join("game.nirpak");
+            fs::write(&staged_pak, &built.nirpak)?;
+            let staged_icon = if let Some(png) = &icon_png {
+                let p = stage_dir.join("ic_launcher.png");
+                fs::write(&p, png)?;
+                Some(p)
+            } else {
+                None
+            };
+            let res = run_android_gradle_build(&GradleBuildSpec {
+                gradle_dir: &gradle_dir,
+                jni_libs_dir,
+                out_artifact: out_apk,
+                app_id: &package_name,
+                app_label: &built.program.meta.title,
+                version_code: manifest.android.version_code,
+                version_name: &built.program.meta.version,
+                min_sdk: manifest.android.min_sdk,
+                target_sdk: manifest.android.target_sdk.max(35),
+                orientation: map_android_orientation_manifest(
+                    manifest.android.orientation.as_deref(),
+                ),
+                pak_path: Some(&staged_pak),
+                icon_path: staged_icon.as_deref(),
+            });
+            let _ = fs::remove_dir_all(&stage_dir);
+            return res;
+        }
+    }
+
+    // Legacy pure-Rust `nir-apk` path (for `native-activity` builds or environments without Gradle).
+    let key_path = root.join("android-signing.pem");
+    let key = if key_path.is_file() {
+        nir_apk::key::SigningIdentity::load(&key_path)?
+    } else {
+        let k = nir_apk::key::SigningIdentity::generate()?;
+        k.save_new(&key_path)?;
+        nir_apk::key::SigningIdentity::load(&key_path)?
+    };
+
+    const ICON_APK_PATH: &str = "res/mipmap-xxxhdpi/ic_launcher.png";
     let arsc_bytes = icon_png
         .as_ref()
         .and_then(|_| nir_apk::arsc::encode_launcher_icon(&package_name, ICON_APK_PATH).ok());
 
-    // Optionally include sibling `x86_64/libplayer.so` if present in the SDK alongside `arm64-v8a`.
     let x86_64_so = libplayer_so
         .parent()
         .and_then(Path::parent)
@@ -962,14 +1167,38 @@ fn encode_default_android_emblem_png() -> Option<Vec<u8>> {
     Some(png)
 }
 
-/// Packages a standalone zero-Gradle **Universal NIR Android Player APK** (`org.nir.player`)
-/// containing NO bundled `assets/game.nirpak`. On launch, it opens the built-in touch Shelf
-/// scanning `Android/data/org.nir.player/files/games/*.nirpak` so users can play any `.nirpak`!
+/// Packages a standalone **Universal NIR Android Player APK or AAB** (`org.nir.player`)
+/// powered by Jetpack `GameActivity` with NO bundled `assets/game.nirpak`.
+/// On launch, opens the built-in touch Shelf with SAF `.nirpak` picker, `ACTION_VIEW` file
+/// association, SAF `nir-backup-v1` save export/import, AudioFocus, and Adaptive Icon!
 pub fn package_android_player(
     libplayer_so: &Path,
     out_apk: &Path,
     key_path: &Path,
 ) -> Result<()> {
+    if std::env::var_os("NIR_ANDROID_LEGACY_APK").is_none() {
+        if let Some(gradle_dir) = find_android_gradle_project(libplayer_so) {
+            let jni_libs_dir = libplayer_so
+                .parent()
+                .and_then(Path::parent)
+                .context("resolving Android jniLibs parent directory from libplayer.so")?;
+            return run_android_gradle_build(&GradleBuildSpec {
+                gradle_dir: &gradle_dir,
+                jni_libs_dir,
+                out_artifact: out_apk,
+                app_id: "org.nir.player",
+                app_label: "NIR Player",
+                version_code: 1,
+                version_name: env!("CARGO_PKG_VERSION"),
+                min_sdk: 26,
+                target_sdk: 35,
+                orientation: "unspecified",
+                pak_path: None,
+                icon_path: None,
+            });
+        }
+    }
+
     let key = if key_path.is_file() {
         nir_apk::key::SigningIdentity::load(key_path)?
     } else {
@@ -1288,7 +1517,8 @@ fn run_delta_pass(
     }
 
     // --- Pass 2: Trimmed Standing-Sprite Union-BBox Delta ---
-    let mut trim_buckets: BTreeMap<(u32, u32), Vec<(String, usize, SpriteTrim)>> = BTreeMap::new();
+    type TrimBucketItem = (String, usize, SpriteTrim);
+    let mut trim_buckets: BTreeMap<(u32, u32), Vec<TrimBucketItem>> = BTreeMap::new();
     for (idx, meta) in program.assets.iter().enumerate() {
         if meta.kind == AssetKind::Image && meta.codec != MediaCodec::Ktx2 && meta.delta.is_none() {
             if let Some(t) = meta.trim {

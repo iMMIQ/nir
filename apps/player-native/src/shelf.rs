@@ -235,7 +235,7 @@ impl ShelfState {
             TextAlign::Left,
         );
 
-        // Header action buttons (Rescan + Open .nirpak on Desktop)
+        // Header action buttons (Rescan + Open/Import .nirpak on both Desktop & Android SAF!)
         let btn_h = if touch { 38.0 } else { 34.0 };
         let btn_y = hy + (hdr_h - btn_h) * 0.5;
         let rescan_w = if touch { 84.0 } else { 78.0 };
@@ -250,19 +250,21 @@ impl ShelfState {
             false,
         );
 
-        if !self.is_android {
-            let open_w = 124.0;
-            let open_rect = [rescan_rect[0] - 10.0 - open_w, btn_y, open_w, btn_h];
-            let open_idx = self.hit_rects.len();
-            self.hit_rects.push((open_rect, ShelfAction::OpenFilePicker));
-            draw_pill_button(
-                &mut pkt,
-                open_rect,
-                "打开 .nirpak…",
-                self.hovered_hit == Some(open_idx),
-                true,
-            );
-        }
+        let open_w = if touch { 132.0 } else { 124.0 };
+        let open_rect = [rescan_rect[0] - 10.0 - open_w, btn_y, open_w, btn_h];
+        let open_idx = self.hit_rects.len();
+        self.hit_rects.push((open_rect, ShelfAction::OpenFilePicker));
+        draw_pill_button(
+            &mut pkt,
+            open_rect,
+            if self.is_android {
+                "导入 .nirpak…"
+            } else {
+                "打开 .nirpak…"
+            },
+            self.hovered_hit == Some(open_idx),
+            true,
+        );
 
         let content_y = hy + hdr_h + 10.0;
         let content_h = (sy + sh - content_y - pad).max(120.0);
@@ -291,7 +293,7 @@ impl ShelfState {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "Android/data/org.nir.player/files/games".into());
                 format!(
-                    "将任意 .nirpak 放入以下目录后点击「刷新」即可开玩：\n{primary_dir}"
+                    "点击下方按钮从系统文件选择器导入任意 .nirpak，\n或直接将文件放入：{primary_dir}"
                 )
             } else {
                 "将任意 .nirpak 文件拖拽到此窗口，或点击下方按钮选择游戏包。".into()
@@ -312,7 +314,7 @@ impl ShelfState {
                 [0.74, 0.80, 0.90, 1.0],
                 TextAlign::Center,
             );
-            let cta_w = 186.0;
+            let cta_w = 200.0;
             let cta_h = if touch { 44.0 } else { 40.0 };
             let cta_rect = [
                 cx + (card_w - cta_w) * 0.5,
@@ -321,12 +323,12 @@ impl ShelfState {
                 cta_h,
             ];
             let cta_idx = self.hit_rects.len();
-            let (cta_label, cta_action) = if self.is_android {
-                ("重新扫描目录", ShelfAction::Rescan)
+            let cta_label = if self.is_android {
+                "选择并导入 .nirpak…"
             } else {
-                ("选择 .nirpak 文件…", ShelfAction::OpenFilePicker)
+                "选择 .nirpak 文件…"
             };
-            self.hit_rects.push((cta_rect, cta_action));
+            self.hit_rects.push((cta_rect, ShelfAction::OpenFilePicker));
             draw_pill_button(
                 &mut pkt,
                 cta_rect,

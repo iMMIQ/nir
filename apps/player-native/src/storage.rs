@@ -312,9 +312,13 @@ impl LocalStorage {
         out
     }
 
-    /// Exports all saves (slots + autosave + quicksave), profile, and preferences into a single
-    /// portable `nir-backup-v1` JSON file (100% interoperable across Desktop, Android, and Web!).
-    pub fn export_backup_json(&self, game_id: &str, slot_count: u32, dest: &Path) -> Result<usize> {
+    /// Serializes all saves (slots + autosave + quicksave), profile, and preferences into a single
+    /// portable `nir-backup-v1` JSON string (100% interoperable across Desktop, Android, and Web!).
+    pub fn export_backup_json_string(
+        &self,
+        game_id: &str,
+        slot_count: u32,
+    ) -> Result<(usize, String)> {
         self.flush();
         let mut saves = BTreeMap::<String, SaveSnapshot>::new();
         for name in ["autosave", "quicksave"] {
@@ -334,11 +338,18 @@ impl LocalStorage {
             Some(self.load_profile()),
             saves,
         );
+        let json = serde_json::to_string_pretty(&bundle)?;
+        Ok((count, json))
+    }
+
+    /// Exports all saves (slots + autosave + quicksave), profile, and preferences into a single
+    /// portable `nir-backup-v1` JSON file (100% interoperable across Desktop, Android, and Web!).
+    pub fn export_backup_json(&self, game_id: &str, slot_count: u32, dest: &Path) -> Result<usize> {
+        let (count, json) = self.export_backup_json_string(game_id, slot_count)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec_pretty(&bundle)?;
-        write_bytes_atomic(dest, &data)?;
+        write_bytes_atomic(dest, json.as_bytes())?;
         Ok(count)
     }
 
